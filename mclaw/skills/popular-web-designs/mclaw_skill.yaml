@@ -1,0 +1,10 @@
+schema_version: 1
+name: popular-web-designs
+short_description: 提供真实网站设计系统模板，辅助生成高质量网页界面。
+source:
+  type: local
+created_at: '2026-06-11T09:54:41.892057+00:00'
+updated_at: '2026-06-11T09:54:41.892057+00:00'
+created_by: install
+updated_by: install
+status: enabled

@@ -1,0 +1,787 @@
+"""Context compressor — automatic conversation summarization when context grows large.
+
+M-Claw compressor with:
+  - Tool output pruning before LLM summarization (cheap pre-pass)
+  - Token-budget tail protection instead of fixed message count
+  - Structured summary template (Goal, Progress, Decisions, Files, Next Steps)
+  - Head+tail content truncation (preserves beginning and end of messages)
+  - Real token tracking via update_from_response() + last_completion_tokens
+"""
+
+import logging
+import time
+from typing import Any, Dict, List, Optional
+
+from mclaw.prompts.compression import build_context_compression_prompt
+
+logger = logging.getLogger(__name__)
+
+# 压缩上下文摘要前缀。
+SUMMARY_PREFIX = (
+    "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted "
+    "to save context space. The summary below describes work that was "
+    "already completed, and the current session state may still reflect "
+    "that work. Use the summary and the current state to continue "
+    "from where things left off, and avoid repeating work:"
+)
+
+# 裁剪旧工具结果时使用的占位文本。
+_PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+
+# 摘要 token 预算。
+_MIN_SUMMARY_TOKENS = 2000
+_SUMMARY_RATIO = 0.20
+_SUMMARY_TOKENS_CEILING = 12_000
+_SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
+
+# 内容截断上限。
+_CONTENT_MAX = 6000       # total chars per message body
+_CONTENT_HEAD = 4000      # chars kept from the start
+_CONTENT_TAIL = 1500      # chars kept from the end
+_TOOL_ARGS_MAX = 1500    # 工具调用参数最大字符数。
+_TOOL_ARGS_HEAD = 1200   # 从工具参数开头保留的字符数。
+
+
+def estimate_tokens_rough(text: str) -> int:
+    if not text:
+        return 0
+    # Chinese chars ≈ 1 token each; ASCII ≈ 0.25 tokens each.
+    # 对代码密集内容，这比简单使用 len/2 或 len/4 更准确。
+    chinese = sum(1 for c in text if "一" <= c <= "鿿")
+    ascii_chars = len(text) - chinese
+    return max(1, chinese + int(ascii_chars / 4))
+
+
+def estimate_messages_tokens(messages: List[Dict]) -> int:
+    total = 0
+    for msg in messages:
+        content = msg.get("content", "") or ""
+        if isinstance(content, list):
+            content = " ".join(
+                str(b.get("text", "") or b.get("content", ""))
+                for b in content if isinstance(b, dict)
+            )
+        total += estimate_tokens_rough(content)
+        total += estimate_tokens_rough(msg.get("reasoning_content", ""))
+        if msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                fn = tc.get("function", {})
+                total += estimate_tokens_rough(fn.get("name", ""))
+                total += estimate_tokens_rough(fn.get("arguments", ""))
+    return total
+
+
+def get_context_length(model: str, base_url: str = "", api_key: str = "", provider: str = "") -> int:
+    """Resolve context length for a model.
+
+    Delegates to context_metadata for 8-level resolution:
+    config override → persistent cache → custom /models →
+    Anthropic API → models.dev → DEFAULT_CONTEXT_LENGTHS → 128K fallback.
+    """
+    from mclaw.agent.context_metadata import get_model_context_length
+    return get_model_context_length(model, base_url, api_key, provider=provider)
+
+
+class ContextCompressor:
+    """Manages context window pressure by summarizing old turns.
+
+    Algorithm:
+      1. Prune old tool results (cheap, no LLM call)
+      2. Protect head messages (system + first exchange)
+      3. Find tail boundary by token budget (~20% of context)
+      4. Summarize middle turns with structured LLM prompt
+      5. Sanitize tool-call/result pairs to avoid broken references
+    """
+
+    def __init__(
+        self,
+        model: str,
+        threshold_percent: float = 0.50,
+        protect_first_n: int = 3,
+        protect_last_n: int = 20,
+        summary_target_ratio: float = 0.20,
+        base_url: str = "",
+        api_key: str = "",
+        api_mode: str = "chat_completions",
+        provider: str = "",
+        quiet_mode: bool = False,
+        summary_model_override: str = None,
+        summary_provider_override: str = "",
+        summary_base_url_override: str = "",
+        summary_api_key_override: str = "",
+        summary_api_mode_override: str = "",
+        summary_timeout: int = 180,
+        session_id: str = "",
+    ):
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.api_mode = api_mode
+        self.provider = provider
+        self.protect_first_n = protect_first_n
+        self.protect_last_n = protect_last_n
+        self.threshold_percent = threshold_percent
+        self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
+        self.quiet_mode = quiet_mode
+        self.summary_model = summary_model_override or ""
+        self.summary_provider = summary_provider_override or ""
+        self.summary_base_url = summary_base_url_override or ""
+        self.summary_api_key = summary_api_key_override or ""
+        self.summary_api_mode = summary_api_mode_override or ""
+        try:
+            parsed_summary_timeout = int(summary_timeout or 180)
+        except (TypeError, ValueError):
+            parsed_summary_timeout = 180
+        self.summary_timeout = max(30, min(parsed_summary_timeout, 600))
+        self.session_id = session_id
+
+        self._refresh_context_budgets()
+        self.compression_count = 0
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+
+        self._summary_failure_cooldown_until: float = 0.0
+        self._previous_summary: Optional[str] = None
+        self._context_probed: bool = False
+
+        # 熔断标记：防止同一轮内多次压缩。
+        # 压缩后置位，由调用方在下一次 API 调用前清除。
+        self._compressed_this_turn: bool = False
+
+        if not quiet_mode:
+            logger.info(
+                "Context compressor initialized: model=%s context_length=%d "
+                "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
+                "summary_timeout=%ds provider=%s base_url=%s",
+                model, self.context_length, self.threshold_tokens,
+                threshold_percent * 100, self.summary_target_ratio * 100,
+                self.tail_token_budget,
+                self.summary_timeout,
+                provider or "none", base_url or "none",
+            )
+
+    def _refresh_context_budgets(self) -> None:
+        self.context_length = get_context_length(
+            self.model,
+            self.base_url,
+            self.api_key,
+            self.provider,
+        )
+        self.threshold_tokens = int(self.context_length * self.threshold_percent)
+        self.tail_token_budget = int(self.threshold_tokens * self.summary_target_ratio)
+        self.max_summary_tokens = min(
+            int(self.context_length * 0.05), _SUMMARY_TOKENS_CEILING,
+        )
+
+    def reconfigure_model(
+        self,
+        model: str,
+        *,
+        base_url: str = "",
+        api_key: str = "",
+        api_mode: str = "chat_completions",
+        provider: str = "",
+    ) -> None:
+        """Apply a runtime model switch and recompute context budgets."""
+        old_model = self.model
+        old_context_length = self.context_length
+        old_threshold_tokens = self.threshold_tokens
+
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.api_mode = api_mode
+        self.provider = provider
+        self._context_probed = False
+        self._refresh_context_budgets()
+
+        logger.info(
+            "Context compressor reconfigured: model=%s context_length=%d "
+            "threshold=%d provider=%s base_url=%s (was model=%s "
+            "context_length=%d threshold=%d)",
+            self.model,
+            self.context_length,
+            self.threshold_tokens,
+            self.provider or "none",
+            self.base_url or "none",
+            old_model,
+            old_context_length,
+            old_threshold_tokens,
+        )
+
+    def update_from_response(self, usage: Dict[str, Any]) -> None:
+        """Store real token counts from API response.
+
+        Called by core.py after each API call.
+        """
+        self.last_prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
+        self.last_completion_tokens = usage.get("completion_tokens", 0)
+        self.last_total_tokens = usage.get("total_tokens", 0)
+
+    def should_compress(self, total_tokens: int = None) -> bool:
+        """Check if compression should fire.
+
+        total_tokens: prompt + completion from the most recent API call.
+        Falls back to last_prompt_tokens if not provided.
+
+        The context window is shared between input and output, so we check
+        the combined total against threshold_tokens.
+        """
+        if self._compressed_this_turn:
+            return False
+        if total_tokens is None:
+            total_tokens = self.last_prompt_tokens + self.last_completion_tokens
+        return total_tokens >= self.threshold_tokens
+
+    def should_compress_preflight(self, messages: List[Dict]) -> bool:
+        """Quick pre-flight check using rough estimate (before API call)."""
+        rough_estimate = estimate_messages_tokens(messages)
+        return rough_estimate >= self.threshold_tokens
+
+    def get_status(self) -> Dict[str, Any]:
+        """Return compression status for display/logging."""
+        return {
+            "last_prompt_tokens": self.last_prompt_tokens,
+            "last_completion_tokens": self.last_completion_tokens,
+            "threshold_tokens": self.threshold_tokens,
+            "context_length": self.context_length,
+            "usage_percent": min(100, ((self.last_prompt_tokens + self.last_completion_tokens) / self.context_length * 100)) if self.context_length else 0,
+            "compression_count": self.compression_count,
+        }
+
+    def prune(self, messages: List[Dict]) -> tuple[List[Dict], int]:
+        """Lightweight pre-pass: replace old tool results with placeholders.
+
+        Safe to call every turn — it only touches messages outside the
+        protected tail window and never drops data silently.
+
+        Returns (pruned_messages, pruned_count).
+        """
+        return self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+
+    # ------------------------------------------------------------------
+    # 工具输出裁剪：低成本预处理。
+    # ------------------------------------------------------------------
+
+    def _prune_old_tool_results(
+        self, messages: List[Dict], protect_tail_count: int,
+        protect_tail_tokens: int,
+    ) -> tuple[List[Dict], int]:
+        """Replace old tool result contents with a short placeholder.
+
+        Walks backward protecting recent messages by token budget.
+        Returns (pruned_messages, pruned_count).
+        """
+        if not messages:
+            return messages, 0
+
+        result = [m.copy() for m in messages]
+        pruned = 0
+
+        # 确定裁剪边界。
+        accumulated = 0
+        boundary = len(result)
+        min_protect = min(protect_tail_count, len(result) - 1)
+        for i in range(len(result) - 1, -1, -1):
+            msg = result[i]
+            content = msg.get("content") or ""
+            msg_tokens = estimate_tokens_rough(content) + 10
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    args = tc.get("function", {}).get("arguments", "")
+                    msg_tokens += estimate_tokens_rough(args)
+            if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
+                boundary = i
+                break
+            accumulated += msg_tokens
+            boundary = i
+        prune_boundary = max(boundary, len(result) - min_protect)
+
+        for i in range(prune_boundary):
+            msg = result[i]
+            if msg.get("role") != "tool":
+                continue
+            content = msg.get("content", "")
+            if not content or content == _PRUNED_TOOL_PLACEHOLDER:
+                continue
+            # Only prune substantial content (>200 chars)
+            if len(content) > 200:
+                result[i] = {**msg, "content": _PRUNED_TOOL_PLACEHOLDER}
+                pruned += 1
+
+        return result, pruned
+
+    # ------------------------------------------------------------------
+    # Content serialization for summarizer (with head+tail truncation)
+    # ------------------------------------------------------------------
+
+    def _serialize_for_summary(self, turns: List[Dict]) -> str:
+        """Serialize turns with head+tail truncation.
+
+        Preserves both the beginning and end of long content so that
+        file paths, variable names, and results are not lost.
+        """
+        parts = []
+        for msg in turns:
+            role = msg.get("role", "unknown")
+            content = msg.get("content") or ""
+
+            # Tool results: head+tail truncation
+            if role == "tool":
+                tool_id = msg.get("tool_call_id", "")
+                if len(content) > _CONTENT_MAX:
+                    content = content[:_CONTENT_HEAD] + "\n...[truncated]...\n" + content[-_CONTENT_TAIL:]
+                parts.append(f"[TOOL RESULT {tool_id}]: {content}")
+                continue
+
+            # assistant 消息：保留工具调用名称和参数。
+            if role == "assistant":
+                if len(content) > _CONTENT_MAX:
+                    content = content[:_CONTENT_HEAD] + "\n...[truncated]...\n" + content[-_CONTENT_TAIL:]
+                tool_calls = msg.get("tool_calls", [])
+                if tool_calls:
+                    tc_parts = []
+                    for tc in tool_calls:
+                        if isinstance(tc, dict):
+                            fn = tc.get("function", {})
+                            name = fn.get("name", "?")
+                            args = fn.get("arguments", "")
+                            if len(args) > _TOOL_ARGS_MAX:
+                                args = args[:_TOOL_ARGS_HEAD] + "..."
+                            tc_parts.append(f"  {name}({args})")
+                        else:
+                            fn = getattr(tc, "function", None)
+                            name = getattr(fn, "name", "?") if fn else "?"
+                            tc_parts.append(f"  {name}(...)")
+                    content += "\n[Tool calls:\n" + "\n".join(tc_parts) + "\n]"
+                parts.append(f"[ASSISTANT]: {content}")
+                continue
+
+            # user 和其他角色。
+            if len(content) > _CONTENT_MAX:
+                content = content[:_CONTENT_HEAD] + "\n...[truncated]...\n" + content[-_CONTENT_TAIL:]
+            parts.append(f"[{role.upper()}]: {content}")
+
+        return "\n\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # 基于 token 预算裁剪尾部。
+    # ------------------------------------------------------------------
+
+    def _find_tail_cut_by_tokens(
+        self, messages: List[Dict], head_end: int,
+        token_budget: int | None = None,
+    ) -> int:
+        """Walk backward from the end, accumulating tokens until budget is reached.
+
+        Returns the index where the tail starts. Never cuts inside a
+        tool_call/result group.
+        """
+        if token_budget is None:
+            token_budget = self.tail_token_budget
+        n = len(messages)
+
+        # Hard minimum: always keep at least 3 messages in the tail
+        min_tail = min(3, n - head_end - 1) if n - head_end > 1 else 0
+        soft_ceiling = int(token_budget * 1.5)
+        accumulated = 0
+        cut_idx = n
+
+        for i in range(n - 1, head_end - 1, -1):
+            msg = messages[i]
+            content = msg.get("content") or ""
+            msg_tokens = estimate_tokens_rough(content) + 10
+            for tc in msg.get("tool_calls") or []:
+                if isinstance(tc, dict):
+                    args = tc.get("function", {}).get("arguments", "")
+                    msg_tokens += estimate_tokens_rough(args)
+            if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
+                break
+            accumulated += msg_tokens
+            cut_idx = i
+
+        # 至少保护 min_tail 条尾部消息。
+        fallback_cut = n - min_tail
+        if cut_idx > fallback_cut:
+            cut_idx = fallback_cut
+
+        # 如果预算会保护全部内容，则强制在头部之后切分。
+        if cut_idx <= head_end:
+            cut_idx = max(fallback_cut, head_end + 1)
+
+        # 对齐边界，避免拆开工具调用组。
+        cut_idx = self._align_boundary_backward(messages, cut_idx)
+
+        return max(cut_idx, head_end + 1)
+
+    # ------------------------------------------------------------------
+    # 边界对齐辅助函数。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _align_boundary_forward(messages: List[Dict], idx: int) -> int:
+        """Advance idx past any tool result messages so we don't split a group."""
+        while idx < len(messages) and messages[idx].get("role") == "tool":
+            idx += 1
+        return idx
+
+    @staticmethod
+    def _align_boundary_backward(messages: List[Dict], idx: int) -> int:
+        """Pull idx backward to avoid splitting a tool_call / result group.
+
+        If boundary falls in the middle of a tool-result group, walk backward
+        to the parent assistant message so the whole group is included in
+        the summarized region rather than being split.
+        """
+        if idx <= 0 or idx >= len(messages):
+            return idx
+        check = idx - 1
+        while check >= 0 and messages[check].get("role") == "tool":
+            check -= 1
+        if check >= 0 and messages[check].get("role") == "assistant" and messages[check].get("tool_calls"):
+            idx = check
+        return idx
+
+    # ------------------------------------------------------------------
+    # 摘要生成：支持迭代更新。
+    # ------------------------------------------------------------------
+
+    def _compute_summary_budget(self, turns_to_summarize: List[Dict]) -> int:
+        """Scale summary token budget with the amount of content being compressed."""
+        content_tokens = estimate_messages_tokens(turns_to_summarize)
+        budget = int(content_tokens * _SUMMARY_RATIO)
+        return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
+
+    def _generate_summary(self, turns_to_summarize: List[Dict]) -> Optional[str]:
+        """Generate a structured summary of compacted conversation turns."""
+        now = time.monotonic()
+        if now < self._summary_failure_cooldown_until:
+            logger.debug(
+                "Skipping context summary during cooldown (%.0fs remaining)",
+                self._summary_failure_cooldown_until - now,
+            )
+            return None
+
+        summary_budget = self._compute_summary_budget(turns_to_summarize)
+        content_to_summarize = self._serialize_for_summary(turns_to_summarize)
+
+        prompt = build_context_compression_prompt(
+            previous_summary=self._previous_summary or "",
+            content_to_summarize=content_to_summarize,
+            summary_budget=summary_budget,
+        )
+
+        try:
+            summary_api_mode = self._resolve_summary_api_mode()
+            logger.info("[_generate_summary] calling summarization API (mode=%s)", summary_api_mode)
+            _summarize_start = time.monotonic()
+            if summary_api_mode == "anthropic_messages":
+                summary = self._summarize_anthropic(prompt, summary_budget)
+            else:
+                summary = self._summarize_openai(prompt, summary_budget)
+            _summarize_elapsed = time.monotonic() - _summarize_start
+            logger.info("[_generate_summary] summarization API returned in %.2fs, got_summary=%s", _summarize_elapsed, bool(summary))
+            if summary:
+                # 存储迭代摘要前移除摘要前缀。
+                stored = summary.replace(SUMMARY_PREFIX, "").strip()
+                self._previous_summary = stored
+            return summary
+        except Exception as e:
+            exc_name = type(e).__name__.lower()
+            exc_msg = str(e).lower()
+            is_auth = (
+                "authentication" in exc_name or "401" in exc_msg
+                or "403" in exc_msg or "api key" in exc_msg
+                or "api_key" in exc_msg or "invalid_api_key" in exc_msg
+                or "unauthorized" in exc_msg or "permission" in exc_msg
+            )
+            if is_auth:
+                logger.error("Summary generation failed (authentication error): %s", e)
+            else:
+                logger.warning("Summary generation failed: %s", e)
+            self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
+            return None
+
+    def _resolve_summary_api_mode(self) -> str:
+        if self.summary_api_mode:
+            return self.summary_api_mode
+        summary_provider = (self.summary_provider or "").strip()
+        if summary_provider and summary_provider != "auto":
+            try:
+                from mclaw.cli.auth import PROVIDER_REGISTRY
+                provider_def = PROVIDER_REGISTRY.get(summary_provider)
+                if provider_def and getattr(provider_def, "api_mode", ""):
+                    self.summary_api_mode = provider_def.api_mode
+                    return self.summary_api_mode
+            except Exception:
+                pass
+        return self.api_mode
+
+    def _get_summarize_credentials(self) -> tuple:
+        """Resolve API credentials for summarization, falling back to env vars.
+
+        self.api_key may be empty when ContextCompressor is created during
+        Agent.__init__ before resolve_provider() has been called.
+        """
+        if self.summary_api_key or self.summary_base_url:
+            return self.summary_api_key or self.api_key, self.summary_base_url or self.base_url
+
+        summary_provider = (self.summary_provider or "").strip()
+        if summary_provider and summary_provider != "auto":
+            try:
+                from mclaw.cli.auth import resolve_provider
+                resolved = resolve_provider(
+                    model=self.summary_model or self.model,
+                    provider=summary_provider,
+                    base_url=self.summary_base_url,
+                    api_key=self.summary_api_key,
+                    config=getattr(self, "config", None),
+                )
+                if resolved.get("api_key") or resolved.get("base_url"):
+                    self.summary_api_mode = resolved.get("api_mode") or self.summary_api_mode
+                    return resolved.get("api_key") or "", resolved.get("base_url") or ""
+            except Exception:
+                pass
+
+        if self.api_key:
+            return self.api_key, self.base_url
+        try:
+            from mclaw.cli.auth import resolve_api_key, resolve_base_url
+            key = resolve_api_key(self.provider) if self.provider else None
+            url = resolve_base_url(self.provider) if self.provider else ""
+            return key, url
+        except Exception:
+            return None, ""
+
+    def _summarize_openai(self, prompt: str, budget: int) -> str:
+        import openai
+        logger.info("[_summarize_openai] creating client for model=%s", self.summary_model or self.model)
+        key, url = self._get_summarize_credentials()
+        client = openai.OpenAI(api_key=key or openai.NOT_GIVEN, base_url=url or openai.NOT_GIVEN)
+        logger.info("[_summarize_openai] calling API (timeout=%s)", self.summary_timeout)
+        resp = client.chat.completions.create(
+            model=self.summary_model or self.model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=budget * 2,
+            timeout=self.summary_timeout,
+        )
+        logger.info("[_summarize_openai] API returned")
+        content = resp.choices[0].message.content or ""
+        summary = content.strip()
+        return f"{SUMMARY_PREFIX}\n{summary}"
+
+    def _summarize_anthropic(self, prompt: str, budget: int) -> str:
+        import anthropic
+        logger.info("[_summarize_anthropic] creating client for model=%s", self.summary_model or self.model)
+        key, url = self._get_summarize_credentials()
+        client = anthropic.Anthropic(api_key=key or anthropic.NOT_GIVEN, base_url=url or anthropic.NOT_GIVEN)
+        model = self.summary_model or self.model
+        if model.lower().startswith("anthropic/"):
+            model = model[len("anthropic/"):]
+        model = model.replace(".", "-")
+        logger.info("[_summarize_anthropic] calling API (timeout=%s)", self.summary_timeout)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=budget * 2,
+            messages=[{"role": "user", "content": prompt}],
+            timeout=self.summary_timeout,
+        )
+        logger.info("[_summarize_anthropic] API returned")
+        content = resp.content[0].text if resp.content else ""
+        summary = content.strip()
+        return f"{SUMMARY_PREFIX}\n{summary}"
+
+    # ------------------------------------------------------------------
+    # 工具调用和工具结果的成对完整性。
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sanitize_tool_pairs(messages: List[Dict]) -> List[Dict]:
+        """Remove orphaned tool results and insert stubs for missing results."""
+        # 收集仍保留的调用 ID。
+        surviving_call_ids = set()
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "") or ""
+                    if tc_id:
+                        surviving_call_ids.add(tc_id)
+
+        # 收集当前存在的结果 ID。
+        present_result_ids = set()
+        for msg in messages:
+            if msg.get("role") == "tool":
+                tid = msg.get("tool_call_id", "")
+                if tid:
+                    present_result_ids.add(tid)
+
+        # 1. 移除孤立工具结果。
+        orphaned_results = present_result_ids - surviving_call_ids
+        if orphaned_results:
+            messages = [
+                m for m in messages
+                if not (m.get("role") == "tool" and m.get("tool_call_id") in orphaned_results)
+            ]
+            logger.info("Compression sanitizer: removed %d orphaned tool result(s)", len(orphaned_results))
+
+        # 2. Add stub results for orphaned calls
+        surviving_call_ids = set()
+        for msg in messages:
+            if msg.get("role") == "assistant":
+                for tc in msg.get("tool_calls") or []:
+                    tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "") or ""
+                    if tc_id:
+                        surviving_call_ids.add(tc_id)
+
+        result_call_ids = set()
+        for msg in messages:
+            if msg.get("role") == "tool":
+                tid = msg.get("tool_call_id", "")
+                if tid:
+                    result_call_ids.add(tid)
+
+        missing_results = surviving_call_ids - result_call_ids
+        if missing_results:
+            patched: List[Dict] = []
+            for msg in messages:
+                patched.append(msg)
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for tc in msg.get("tool_calls") or []:
+                        tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "") or ""
+                        if tc_id in missing_results:
+                            tool_name = tc.get("function", {}).get("name", "unknown") if isinstance(tc, dict) else getattr(getattr(tc, "function", None), "name", "unknown")
+                            patched.append({
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": "[Result from earlier conversation — see context summary above]",
+                            })
+            messages = patched
+            logger.info("Compression sanitizer: added %d stub tool result(s)", len(missing_results))
+
+        return messages
+
+    # ------------------------------------------------------------------
+    # 主压缩入口。
+    # ------------------------------------------------------------------
+
+    def compress(self, messages: List[Dict]) -> List[Dict]:
+        """Compress conversation history.
+
+        Returns a new list with middle turns replaced by a structured summary.
+        """
+        n = len(messages)
+        _min_for_compress = self.protect_first_n + 3 + 1
+        if n <= _min_for_compress:
+            return messages
+
+        logger.info("[COMPRESSION START] messages=%d threshold=%d", n, self.threshold_tokens)
+
+        # 阶段 1：裁剪旧工具结果，作为低成本预处理。
+        logger.info("[COMPRESSION] Phase 1: pruning old tool results")
+        messages, pruned_count = self._prune_old_tool_results(
+            messages,
+            protect_tail_count=self.protect_last_n,
+            protect_tail_tokens=self.tail_token_budget,
+        )
+        if pruned_count:
+            logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+
+        # Phase 2: Determine boundaries
+        logger.info("[COMPRESSION] Phase 2: determining boundaries")
+        compress_start = self._align_boundary_forward(messages, self.protect_first_n)
+
+        # 使用 token 预算保护尾部消息。
+        compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+        # 向后对齐：如果 compress_end 落在工具结果上，
+        # 则回退边界，避免拆开 tool_call/result 对。
+        compress_end = self._align_boundary_backward(messages, compress_end)
+
+        if compress_start >= compress_end:
+            logger.info("[COMPRESSION] boundaries invalid (start=%d >= end=%d), skipping", compress_start, compress_end)
+            return messages
+
+        turns_to_summarize = messages[compress_start:compress_end]
+        logger.info(
+            "Context compression: summarizing turns %d-%d (%d turns), protecting %d head + %d tail",
+            compress_start + 1, compress_end, len(turns_to_summarize),
+            compress_start, n - compress_end,
+        )
+
+        # Phase 3: Generate structured summary
+        logger.info("[COMPRESSION] Phase 3: generating summary")
+        summary = self._generate_summary(turns_to_summarize)
+        logger.info("[COMPRESSION] summary generated: len=%d", len(summary) if summary else 0)
+
+        # Phase 4: Assemble compressed messages
+        logger.info("[COMPRESSION] Phase 4: assembling compressed messages")
+        compressed = []
+
+        for i in range(compress_start):
+            msg = messages[i].copy()
+            if i == 0 and msg.get("role") == "system" and self.compression_count == 0:
+                msg["content"] = (
+                    (msg.get("content") or "")
+                    + "\n\n[Note: Some earlier conversation turns have been compacted into a "
+                    "handoff summary to preserve context space. The current session state "
+                    "may still reflect earlier work, so build on that summary and state "
+                    "rather than re-doing work.]"
+                )
+            compressed.append(msg)
+
+        # 如果 LLM 摘要失败，插入静态降级摘要。
+        if not summary:
+            logger.warning("Summary generation failed — inserting static fallback context marker")
+            n_dropped = compress_end - compress_start
+            summary = (
+                f"{SUMMARY_PREFIX}\n"
+                f"Summary generation was unavailable. {n_dropped} conversation turns were "
+                f"removed to free context space but could not be summarized."
+            )
+
+        # 选择不会与相邻消息形成连续同角色的 role。
+        last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
+        first_tail_role = messages[compress_end].get("role", "user") if compress_end < n else "user"
+
+        if last_head_role in ("assistant", "tool"):
+            summary_role = "user"
+        else:
+            summary_role = "assistant"
+
+        if summary_role == first_tail_role:
+            flipped = "assistant" if summary_role == "user" else "user"
+            if flipped != last_head_role:
+                summary_role = flipped
+
+        compressed.append({"role": summary_role, "content": summary})
+
+        for i in range(compress_end, n):
+            compressed.append(messages[i].copy())
+
+        self.compression_count += 1
+        self._compressed_this_turn = True
+
+        # 阶段 5：修复工具调用/结果配对。
+        logger.info("[COMPRESSION] Phase 5: sanitizing tool pairs")
+        compressed = self._sanitize_tool_pairs(compressed)
+
+        before = estimate_messages_tokens(messages)
+        after = estimate_messages_tokens(compressed)
+        logger.info(
+            "Compressed context: %d→%d messages, ~%d→~%d tokens (compression #%d)",
+            n, len(compressed), before, after, self.compression_count,
+        )
+        logger.info("[COMPRESSION END] compression #%d complete", self.compression_count)
+
+        # 压缩后重置文件去重状态，因为原始读取内容已被摘要替代。
+        # 已被摘要替代，因此模型后续需要重新看到完整内容。
+        try:
+            from mclaw.tools.read_tracker import reset_file_dedup
+            reset_file_dedup(task_id=self.session_id or None)
+        except Exception:
+            pass
+
+        return compressed

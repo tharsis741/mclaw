@@ -1,0 +1,10 @@
+schema_version: 1
+name: data-analyzer
+short_description: 分析多格式数据文件并生成统计、图表和报告。
+source:
+  type: local
+created_at: '2026-06-11T09:54:41.899615+00:00'
+updated_at: '2026-06-11T09:54:41.899615+00:00'
+created_by: install
+updated_by: install
+status: enabled

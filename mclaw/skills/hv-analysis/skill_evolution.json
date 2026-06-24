@@ -1,0 +1,16 @@
+{
+  "adaptation_summary": [
+    "Windows 兼容性适配：新增 scripts/md_to_pdf_fpdf2.py 作为 WeasyPrint 的纯 Python 替代方案，使用 fpdf2 生成 PDF。SKILL.md 中依赖说明已更新，区分 Linux/macOS（WeasyPrint）和 Windows（fpdf2）两套路径。",
+    "Windows 下 PDF 生成已验证方案：使用 reportlab 替代 weasyprint/fpdf2。操作步骤：pip install reportlab → registerFont(TTFont('YaHei', 'C:/Windows/Fonts/msyh.ttc')) → 用 SimpleDocTemplate + 自定义 ParagraphStyle 构建完整报告（含封面、目录、数据表格、正文、信息来源页）。msyh.ttc 和 msyhbd.ttc 均渲染正常，无需额外 TTF 字体转换。实测生成 12 页 A4 PDF 约 15 秒。参考生成脚本模板：见桌面测试目录 generate_pdf.py（使用完毕已清理）。"
+  ],
+  "user_preferences": [],
+  "known_failures": [
+    "Windows 下 `weasyprint` 不可用：需要 GTK 3 运行时（libgobject-2.0-0.dll），标准 Windows 环境不含该依赖，直接运行 `md_to_pdf.py` 会报 WeasyPrint dependency error (libgobject-2.0-0)。",
+    "fpdf2 + msyh.ttc (TTC) 在部分 Windows 环境会报 \"MERG NOT subset; don't know how to subset; dropped\" 错误，导致中文字体完全丢失渲染。fpdf2 v2.5.1+ 对 TTC/OTF 字体子集化支持不完善，不能作为稳定替代方案。",
+    "SKILL.md 引用的 scripts/md_to_pdf_fpdf2.py 脚本在仓库中不存在（该文件被原作者移除），Windows 用户按该路径会找不到文件。应改用 reportlab 方案或自定义生成脚本。"
+  ],
+  "runtime_notes": [
+    "Windows 环境替代方案：用 fpdf2 替代 weasyprint。流程：pip install fpdf2 → 注册 Windows 中文字体（Noto Sans SC 或 msyh.ttc） → 用 FPDF 手动构建 PDF（含封面、章节标题、正文、表格、信息页）。参考 convert_pdf.py 实现。注意 fpdf2 v2.5.1+ 已弃用 uni 参数。",
+    "Windows 环境实际可行的 PDF 方案：使用 reportlab 替代 weasyprint/fpdf2。reportlab 对 TTC 字体（msyh.ttc, msyhbd.ttc）支持良好，通过 TTFont() 注册后可正常渲染中文。生成流程：pip install reportlab → pdfmetrics.registerFont(TTFont('YaHei', 'C:/Windows/Fonts/msyh.ttc')) → 用 SimpleDocTemplate + 中日韩 ParagraphStyle 构建 PDF。注意封面标题过长时需要手动分行，避免超大字号（26pt+）单行长字符串。实际方案参考 gen_pdf.py（reportlab 版本）。"
+  ]
+}

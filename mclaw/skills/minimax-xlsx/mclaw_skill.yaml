@@ -1,0 +1,11 @@
+schema_version: 1
+name: minimax-xlsx
+short_description: 创建、读取、分析、编辑和验证 Excel/表格文件。
+source:
+  type: github
+  original: https://github.com/MiniMax-AI/skills/tree/main/skills/minimax-xlsx
+created_at: '2026-06-14T16:57:31+08:00'
+updated_at: '2026-06-14T16:57:34+08:00'
+created_by: install
+updated_by: install
+status: enabled

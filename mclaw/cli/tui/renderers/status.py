@@ -1,0 +1,246 @@
+"""prompt_toolkit status bar fragment rendering."""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+_CTX_BAR_WIDTH = 8
+_CTX_FILLED = "■"
+_CTX_EMPTY = "□"
+_CTX_THRESHOLD = "▣"
+
+_CTX_COLOR_LOW = "#7dd3fc"
+_CTX_COLOR_NORM = "#7ee787"
+_CTX_COLOR_WARN = "#fcd34d"
+_CTX_COLOR_HIGH = "#fb923c"
+_CTX_COLOR_CRIT = "#f87171"
+
+_LIFECYCLE_STATES = [
+    ("Initializing", "#8ab4d6"),
+    ("Requesting", "#6CB4EE"),
+    ("Streaming", "#f0c040"),
+    ("Tools", "#4A90D9"),
+    ("Done", "#50c878"),
+    ("Delegating", "#c084fc"),
+    ("Aggregating", "#4ecdc4"),
+]
+
+_STATUS_ANIM_FRAMES = [
+    "🌕", "🌖", "🌗", "🌘", "🌑", "🌑", "🌒", "🌓", "🌔", "🌕",
+]
+STATUS_ANIM_FRAME_COUNT = len(_STATUS_ANIM_FRAMES)
+
+
+def format_duration(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    m, s = divmod(int(seconds), 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def fmt_tokens(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        s = f"{n / 1000:.1f}"
+        return s.rstrip("0").rstrip(".") + "k"
+    s = f"{n / 1_000_000:.1f}"
+    return s.rstrip("0").rstrip(".") + "M"
+
+
+def user_message_count(agent) -> int:
+    if not agent:
+        return 0
+    value = getattr(agent, "session_user_messages", None)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return max(0, int(value))
+    messages = getattr(agent, "messages", None)
+    if isinstance(messages, list):
+        return sum(1 for msg in messages if isinstance(msg, dict) and msg.get("role") == "user")
+    return 0
+
+
+def format_context_bar(compressor) -> tuple[str, str] | tuple[None, None]:
+    if not compressor or compressor.context_length <= 0:
+        return None, None
+
+    real_tokens = compressor.last_prompt_tokens + compressor.last_completion_tokens
+    context_length = compressor.context_length
+    threshold_tokens = compressor.threshold_tokens
+
+    usage = real_tokens / context_length
+    filled = min(int(usage * _CTX_BAR_WIDTH), _CTX_BAR_WIDTH)
+
+    threshold_pos = -1
+    if threshold_tokens > 0 and context_length > 0:
+        threshold_pos = min(
+            int((threshold_tokens / context_length) * _CTX_BAR_WIDTH),
+            _CTX_BAR_WIDTH - 1,
+        )
+
+    chars = []
+    for i in range(_CTX_BAR_WIDTH):
+        if i == threshold_pos:
+            chars.append(_CTX_THRESHOLD)
+        elif i < filled:
+            chars.append(_CTX_FILLED)
+        else:
+            chars.append(_CTX_EMPTY)
+    bar = "".join(chars)
+    label = f"{fmt_tokens(real_tokens)}/{fmt_tokens(context_length)}"
+
+    if usage >= 0.90:
+        color = _CTX_COLOR_CRIT
+    elif usage >= 0.75:
+        color = _CTX_COLOR_HIGH
+    elif usage >= 0.50:
+        color = _CTX_COLOR_WARN
+    elif usage >= 0.30:
+        color = _CTX_COLOR_NORM
+    else:
+        color = _CTX_COLOR_LOW
+
+    return f"{bar} {label}", f"fg:{color}"
+
+
+class StatusRenderer:
+    """Build prompt_toolkit fragments for the live status area."""
+
+    def build_status_fragments(self, owner) -> list:
+        if not owner._status_bar_visible:
+            return []
+
+        agent = owner.agent
+        model_short = owner.model.split("/")[-1] if "/" in owner.model else owner.model
+        if len(model_short) > 24:
+            model_short = model_short[:21] + "..."
+
+        total_tokens = (agent.session_input_tokens + agent.session_output_tokens) if agent else 0
+
+        ctx_bar_text = None
+        ctx_bar_style = None
+        if agent and agent.context_compressor:
+            ctx_bar_text, ctx_bar_style = format_context_bar(agent.context_compressor)
+
+        if owner._agent_running and owner._turn_start_at:
+            turn_elapsed = format_duration((datetime.now() - owner._turn_start_at).total_seconds())
+            time_label = f" {turn_elapsed} "
+        else:
+            session_elapsed = format_duration((datetime.now() - owner.session_start).total_seconds())
+            if owner._last_turn_duration > 0:
+                last_turn = format_duration(owner._last_turn_duration)
+                time_label = f" last {last_turn} · {session_elapsed} "
+            else:
+                time_label = f" {session_elapsed} "
+
+        if owner._agent_running:
+            moon = _STATUS_ANIM_FRAMES[owner._spinner_idx % len(_STATUS_ANIM_FRAMES)]
+        elif owner._lifecycle_idx == 4:
+            moon = "🌕"
+        else:
+            moon = "🌕"
+
+        fragments = [
+            ("class:status-bar-active", f" {moon}"),
+            ("class:status-bar-model", f" {model_short} "),
+            ("class:status-bar", time_label),
+        ]
+
+        if owner._project_name:
+            fragments.append(("class:status-bar", f" 📁 {owner._project_name} "))
+
+        if ctx_bar_text and ctx_bar_style:
+            fragments.append((ctx_bar_style, f" {ctx_bar_text} "))
+
+        fragments.append(("class:status-bar", f" {fmt_tokens(total_tokens)}tk "))
+        fragments.append(("class:status-bar", f" #{user_message_count(agent)} "))
+        if owner._input_mode == "asr" or owner._asr_status_text not in ("", "off"):
+            asr_label = owner._compact_asr_status(owner._asr_status_text or owner._input_mode)
+            fragments.append(("class:status-bar-active", f" ASR:{asr_label} "))
+
+        if owner._agent_running:
+            lc_label, lc_color = _LIFECYCLE_STATES[min(owner._lifecycle_idx, len(_LIFECYCLE_STATES) - 1)]
+            fragments.append((f"fg:{lc_color} bold", f" {lc_label} "))
+            if owner._active_tools:
+                tools_str = " | ".join(sorted(owner._active_tools))
+                if len(tools_str) > 30:
+                    tools_str = tools_str[:27] + "..."
+                fragments.append(("class:status-bar", f" · {tools_str}"))
+            if owner._spinner_text:
+                fragments.append(("class:status-bar", f" · {owner._spinner_text}"))
+        elif owner._lifecycle_idx == 4:
+            fragments.append(("class:status-bar-done", " ✓ Done "))
+
+        if owner.subtask_manager:
+            sm = owner.subtask_manager
+            running = sum(1 for t in sm.tasks if t["status"] == "running")
+            done = sum(1 for t in sm.tasks if t["status"] == "completed")
+            errs = sum(1 for t in sm.tasks if t["status"] == "error")
+            total = len(sm.tasks)
+            if running:
+                badge_text = f"🔀 {running}/{total} running"
+            elif errs:
+                badge_text = f"🔀 {done}/{total} done · {errs} failed"
+            else:
+                badge_text = f"🔀 {done}/{total} done"
+            fragments.append(("class:status-bar-subagent-badge", f" {badge_text}"))
+
+        if owner.subtask_manager:
+            fragments.append(("", "\n"))
+            fragments.extend(self.build_subagent_compact_progress(owner))
+
+        return fragments
+
+    def build_subagent_compact_progress(self, owner) -> list:
+        sm = getattr(owner, "subtask_manager", None)
+        if not sm:
+            return []
+
+        frags: list = []
+        visible_tasks = [task for task in sm.tasks if task["status"] != "completed"]
+        completed_count = sum(1 for task in sm.tasks if task["status"] == "completed")
+        if not visible_tasks and sm.tasks:
+            visible_tasks = sm.tasks[-1:]
+            completed_count = max(0, completed_count - 1)
+
+        max_visible = 5
+        for task in visible_tasks[:max_visible]:
+            idx = task["index"] + 1
+            status = task["status"]
+            goal = self.format_subagent_goal(task["goal"], max_len=72)
+            if status == "error":
+                marker = "✗"
+                style = "class:status-bar-subagent-error"
+            elif status == "running":
+                marker = "◼"
+                style = "class:status-bar-subagent-running"
+            elif status == "completed":
+                marker = "✓"
+                style = "class:status-bar-subagent-done"
+            else:
+                marker = "◻"
+                style = "class:status-bar-subagent-pending"
+            frags.append((style, f"     {marker} 任务{idx}: {goal}"))
+            frags.append(("", "\n"))
+
+        hidden_pending = max(0, len(visible_tasks) - max_visible)
+        hidden_done = completed_count
+        extras = []
+        if hidden_pending:
+            extras.append(f"+{hidden_pending} pending")
+        if hidden_done:
+            extras.append(f"+{hidden_done} done")
+        if extras:
+            suffix = "  ".join(extras)
+            frags.append(("class:status-bar-subagent-pending", f"       ... {suffix}"))
+        return frags
+
+    @staticmethod
+    def format_subagent_goal(goal: str, max_len: int = 72) -> str:
+        text = " ".join(str(goal or "").split())
+        if len(text) <= max_len:
+            return text
+        return text[: max_len - 3] + "…"

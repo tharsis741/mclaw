@@ -1,0 +1,11 @@
+schema_version: 1
+name: arm-cortex-expert
+short_description: ARM Cortex-M 固件、驱动和嵌入式调试专家。
+source:
+  type: github
+  original: https://github.com/sickn33/antigravity-awesome-skills/tree/main/skills/arm-cortex-expert
+created_at: '2026-06-13T15:02:09+08:00'
+updated_at: '2026-06-13T15:02:17+08:00'
+created_by: install
+updated_by: install
+status: enabled

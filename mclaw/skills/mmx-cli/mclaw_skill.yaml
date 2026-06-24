@@ -1,0 +1,11 @@
+schema_version: 1
+name: mmx-cli
+short_description: 通过 MiniMax 平台生成文本、图片、视频、语音和音乐。
+source:
+  type: github
+  original: https://github.com/MiniMax-AI/skills/tree/main/skills/minimax-multimodal-toolkit
+created_at: '2026-06-15T20:24:55+08:00'
+updated_at: '2026-06-15T20:25:10+08:00'
+created_by: install
+updated_by: install
+status: enabled

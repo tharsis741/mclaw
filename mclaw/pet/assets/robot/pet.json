@@ -1,0 +1,21 @@
+{
+  "name": "mclaw-robot",
+  "frame_width": 128,
+  "frame_height": 128,
+  "image": "spritesheet.png",
+  "states": {
+    "idle": {"row": 0, "frames": 10, "fps": 6, "loop": true, "effects": ["glow"]},
+    "running-right": {"row": 1, "frames": 10, "fps": 12, "loop": true, "effects": ["thruster"]},
+    "running-left": {"row": 2, "frames": 10, "fps": 12, "loop": true, "effects": ["thruster"]},
+    "waving": {"row": 3, "frames": 10, "fps": 9, "loop": false, "effects": ["glow", "complete"]},
+    "jumping": {"row": 4, "frames": 10, "fps": 10, "loop": false, "effects": ["thruster"]},
+    "failed": {"row": 5, "frames": 10, "fps": 8, "loop": false, "effects": ["shake", "spark"]},
+    "waiting": {"row": 6, "frames": 10, "fps": 6, "loop": true, "effects": ["question"]},
+    "running": {"row": 7, "frames": 10, "fps": 10, "loop": true, "effects": ["core"]},
+    "review": {"row": 8, "frames": 10, "fps": 8, "loop": true, "effects": ["scanline"]},
+    "sleeping": {"row": 9, "frames": 10, "fps": 4, "loop": true, "effects": ["low-power"]},
+    "reading": {"row": 10, "frames": 10, "fps": 6, "loop": true, "effects": ["scanline"]},
+    "typing": {"row": 11, "frames": 10, "fps": 12, "loop": true, "effects": ["terminal", "glow"]},
+    "carrying": {"row": 12, "frames": 10, "fps": 10, "loop": true, "effects": ["data-cube"]}
+  }
+}

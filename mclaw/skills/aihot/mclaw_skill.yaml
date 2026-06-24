@@ -1,0 +1,11 @@
+schema_version: 1
+name: aihot
+short_description: 查询 AI HOT 中文 AI 资讯、日报、模型发布和行业动态。
+source:
+  type: github
+  original: https://github.com/KKKKhazix/khazix-skills/tree/main/aihot
+created_at: '2026-06-14T20:21:36+08:00'
+updated_at: '2026-06-14T20:21:38+08:00'
+created_by: install
+updated_by: install
+status: enabled

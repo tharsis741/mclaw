@@ -1,0 +1,14 @@
+{
+  "adaptation_summary": [],
+  "user_preferences": [
+    "用户的幻尔机器狗是原装 Raspberry Pi 4B + Ubuntu 系统；M-Claw 通过局域网 HTTP server 控制，不使用旧 hiwonder-puppypi-control 的 Kaihong/HDC/UART 控制方案。",
+    "控制 skill 保持精简：只处理 ROBOT_DOG_IP、health、actions、action、move 和 stop。",
+    "缺失或失效的 ROBOT_DOG_IP 通过 secret_request_many(required_for='skill:kaihong-robot-dog') 获取并保存，不走普通聊天追问。"
+  ],
+  "known_failures": [
+    "不要把 hiwonder-puppypi-control 的 KaihongBoard、HDC、OpenHarmony、/data/robotdog 流程套用到这台原装 PuppyPi 机器狗。"
+  ],
+  "runtime_notes": [
+    "控制入口为 http://<ROBOT_DOG_IP>:8082；需要机器人已在同一局域网并启动 HTTP server。"
+  ]
+}

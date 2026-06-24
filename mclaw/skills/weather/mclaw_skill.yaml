@@ -1,0 +1,11 @@
+schema_version: 1
+name: weather
+short_description: 获取当前天气和天气预报，无需 API key。
+source:
+  type: local
+  original: C:\Users\kaihong\Desktop\clawhub_skills_db\生活服务\weather
+created_at: '2026-06-13T14:24:37+08:00'
+updated_at: '2026-06-13T14:24:42+08:00'
+created_by: install
+updated_by: install
+status: enabled

@@ -1,0 +1,2 @@
+"""Vision tool implementation helpers."""
+

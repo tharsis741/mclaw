@@ -1,0 +1,110 @@
+"""Path and validation helpers for the Skill 2.0 runtime layout."""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+from mclaw.constants import get_mclaw_home, get_skills_dir
+
+MAX_SKILL_NAME_LENGTH = 64
+VALID_SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
+RECOMMENDED_SUPPORT_DIRS = frozenset({"assets", "references", "scripts", "templates"})
+SIDECAR_FILENAMES = frozenset({"SKILL.md", "mclaw_skill.yaml", "skill_evolution.json"})
+RUNTIME_ARTIFACT_FILENAMES = frozenset({
+    "install_audit.json",
+    "security_review.json",
+    "skill_evolution.json.lock",
+})
+
+
+class SkillPathError(ValueError):
+    """Raised when a skill name or relative path violates the 2.0 contract."""
+
+
+def get_enabled_skills_dir() -> Path:
+    """Return the only runtime skills root under M-Claw home."""
+    return get_skills_dir()
+
+
+def get_skill_drafting_dir() -> Path:
+    """Return the shared drafting root for create/install transactions."""
+    return get_mclaw_home() / "skill-drafting"
+
+
+def get_drafting_locks_dir() -> Path:
+    return get_skill_drafting_dir() / ".locks"
+
+
+def validate_skill_name(name: str) -> str:
+    value = str(name or "").strip()
+    if not value:
+        raise SkillPathError("Skill name is required.")
+    if len(value) > MAX_SKILL_NAME_LENGTH:
+        raise SkillPathError(f"Skill name exceeds {MAX_SKILL_NAME_LENGTH} characters.")
+    if "/" in value or "\\" in value or ".." in value:
+        raise SkillPathError("Skill name must be a single slug directory name.")
+    if not VALID_SKILL_NAME_RE.match(value):
+        raise SkillPathError(
+            "Invalid skill name. Use lowercase letters, numbers, hyphens, dots, and underscores."
+        )
+    return value
+
+
+def validate_drafting_id(drafting_id: str) -> str:
+    value = str(drafting_id or "").strip()
+    if not value:
+        raise SkillPathError("drafting_id is required.")
+    if "/" in value or "\\" in value or ".." in value:
+        raise SkillPathError("Invalid drafting_id.")
+    if not re.match(r"^(skill_drafting|create)_\d{8}_\d{6}_[0-9a-f]{8}$", value):
+        raise SkillPathError("Invalid drafting_id.")
+    return value
+
+
+def resolve_skill_dir(name: str) -> Path:
+    return get_enabled_skills_dir() / validate_skill_name(name)
+
+
+def validate_relative_skill_path(path: str, *, support_only: bool = False) -> Path:
+    value = str(path or "").strip().replace("\\", "/")
+    if not value:
+        raise SkillPathError("file_path is required.")
+    rel = Path(value)
+    if rel.is_absolute():
+        raise SkillPathError("Absolute paths are not allowed.")
+    if ".." in rel.parts:
+        raise SkillPathError("Path traversal ('..') is not allowed.")
+    if ".git" in rel.parts:
+        raise SkillPathError(".git paths are not allowed.")
+    if rel.name in SIDECAR_FILENAMES or value in SIDECAR_FILENAMES:
+        raise SkillPathError("Sidecar files must be maintained by skill_manage service.")
+    if support_only:
+        if not rel.parts or rel.parts[0] not in RECOMMENDED_SUPPORT_DIRS:
+            allowed = ", ".join(sorted(RECOMMENDED_SUPPORT_DIRS))
+            raise SkillPathError(f"File must be under one of the conventional support directories: {allowed}.")
+        if len(rel.parts) < 2:
+            raise SkillPathError("Provide a file path under a support directory.")
+    return rel
+
+
+def validate_mutable_skill_path(path: str) -> Path:
+    rel = validate_relative_skill_path(path, support_only=False)
+    value = rel.as_posix()
+    if rel.name in RUNTIME_ARTIFACT_FILENAMES or value in RUNTIME_ARTIFACT_FILENAMES:
+        raise SkillPathError("Generated audit and security review files are maintained by skill_manage service.")
+    return rel
+
+
+def ensure_within_dir(root: Path, rel_path: Path | str) -> Path:
+    root_resolved = root.resolve()
+    target = (root / rel_path).resolve()
+    if not target.is_relative_to(root_resolved):
+        raise SkillPathError("Path escapes skill directory boundary.")
+    return target
+
+
+def ensure_runtime_roots() -> None:
+    get_enabled_skills_dir().mkdir(parents=True, exist_ok=True)
+    get_skill_drafting_dir().mkdir(parents=True, exist_ok=True)
+    get_drafting_locks_dir().mkdir(parents=True, exist_ok=True)

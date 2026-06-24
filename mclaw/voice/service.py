@@ -1,0 +1,256 @@
+"""Voice input service lifecycle.
+
+The service is intentionally conservative: it exposes the CLI lifecycle now,
+while real recorder/backend implementations are lazy optional integrations.
+"""
+
+from __future__ import annotations
+
+import queue
+import threading
+from typing import Callable, Optional
+
+from mclaw.voice.filters import TranscriptFilter
+
+
+class VoiceInputService:
+    def __init__(
+        self,
+        config: dict,
+        on_text: Callable[[str], None],
+        on_interrupt: Optional[Callable[[], None]] = None,
+        on_status: Optional[Callable[[str], None]] = None,
+    ):
+        self.config = config or {}
+        self.on_text = on_text
+        self.on_interrupt = on_interrupt
+        self.on_status = on_status
+        self.running = False
+        self.recording = False
+        self.listen_mode = str(self.config.get("listen_mode") or "wake_word")
+        self.last_error = ""
+        self._filter = TranscriptFilter(self.config)
+        self._recorder = None
+        self._backend = None
+        self._finishing_manual = False
+        self._audio_queue = None
+        self._audio_worker = None
+        self._audio_stop = None
+
+    def update_config(self, config: dict):
+        self.config = config or {}
+        self.listen_mode = str(self.config.get("listen_mode") or self.listen_mode or "wake_word")
+        self._filter = TranscriptFilter(self.config)
+
+    def start(self, listen_mode: str | None = None):
+        if listen_mode:
+            self.listen_mode = listen_mode
+            self.config["listen_mode"] = listen_mode
+        if not self.config.get("api_key"):
+            self.last_error = "DashScope/Qwen API key is not configured."
+            self._status("error")
+            return False
+        self.running = True
+        self.last_error = ""
+        if self.listen_mode == "wake_word":
+            if not self._start_audio_session():
+                return False
+        else:
+            self.recording = False
+            self._status(f"{self.listen_mode} ready")
+        return True
+
+    def stop(self):
+        self._stop_audio_session()
+        self.running = False
+        self.recording = False
+        self._status("off")
+
+    def start_once(self):
+        if not self.running:
+            ok = self.start("once")
+            if not ok:
+                return False
+        self.listen_mode = "once"
+        self.config["listen_mode"] = "once"
+        return self._start_audio_session()
+
+    def toggle_push_to_talk(self):
+        if self.listen_mode != "push_to_talk":
+            return False
+        if not self.running:
+            if not self.start("push_to_talk"):
+                return False
+        if self.recording:
+            self._finish_audio_session(commit=True)
+            self._status("push_to_talk ready")
+            return True
+        return self._start_audio_session()
+
+    def handle_transcript(self, text: str):
+        result = self._filter.process(text, mode=self.listen_mode)
+        if result.action == "submit" and result.text:
+            self.on_text(result.text)
+            if self.listen_mode in ("once", "push_to_talk"):
+                if not self._finishing_manual:
+                    self._stop_audio_session()
+                if self.listen_mode == "once":
+                    self.running = False
+                    self._status("off")
+                else:
+                    self._status("push_to_talk ready")
+        elif result.action == "interrupt":
+            if self.on_interrupt:
+                self.on_interrupt()
+        return result
+
+    def status(self) -> dict:
+        return {
+            "running": self.running,
+            "recording": self.recording,
+            "listen_mode": self.listen_mode,
+            "backend": self.config.get("backend", ""),
+            "provider": self.config.get("provider", ""),
+            "model": self.config.get("model", ""),
+            "key_source": self.config.get("key_source", ""),
+            "last_error": self.last_error,
+        }
+
+    def _status(self, text: str):
+        if self.on_status:
+            self.on_status(text)
+
+    def _start_audio_session(self) -> bool:
+        try:
+            self._stop_audio_session()
+            from mclaw.voice.qwen_realtime import QwenRealtimeASRBackend
+            from mclaw.voice.recorder import AudioRecorder
+
+            backend_config = dict(self.config)
+            backend_config["enable_server_vad"] = self.listen_mode in ("wake_word", "once")
+            self._backend = QwenRealtimeASRBackend(
+                backend_config,
+                on_transcript=self.handle_transcript,
+                on_error=self._handle_backend_error,
+                on_status=self._status,
+            )
+            self._backend.connect()
+            self._start_audio_worker()
+            self._recorder = AudioRecorder(self.config)
+            self._recorder.start(self._send_audio)
+            self.recording = True
+            self.running = True
+            self.last_error = ""
+            self._status(f"{self.listen_mode} recording")
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            self.recording = False
+            self._stop_audio_session()
+            self._status("error")
+            return False
+
+    def _stop_audio_session(self):
+        recorder = self._recorder
+        backend = self._backend
+        self._recorder = None
+        self._backend = None
+        self._stop_audio_worker()
+        if recorder is not None:
+            try:
+                recorder.stop()
+            except Exception:
+                pass
+        if backend is not None:
+            try:
+                backend.close()
+            except Exception:
+                pass
+        self.recording = False
+
+    def _finish_audio_session(self, commit: bool = False):
+        recorder = self._recorder
+        backend = self._backend
+        self._recorder = None
+        self._backend = None
+        if recorder is not None:
+            try:
+                recorder.stop()
+            except Exception:
+                pass
+        self._stop_audio_worker()
+        if backend is not None:
+            self._drain_audio_queue()
+            self._finishing_manual = bool(commit)
+            try:
+                if hasattr(backend, "finish"):
+                    backend.finish(commit=commit, timeout=int(self.config.get("manual_commit_timeout") or 10))
+                else:
+                    backend.close()
+            except Exception as exc:
+                self._handle_backend_error(str(exc))
+            finally:
+                self._finishing_manual = False
+        self.recording = False
+
+    def _drain_audio_queue(self):
+        audio_queue = self._audio_queue
+        backend = self._backend
+        if audio_queue is None or backend is None:
+            return
+        while True:
+            try:
+                chunk = audio_queue.get_nowait()
+            except queue.Empty:
+                break
+            try:
+                backend.send_audio(chunk)
+            except Exception as exc:
+                self._handle_backend_error(str(exc))
+                break
+
+    def _send_audio(self, pcm_bytes: bytes):
+        audio_queue = self._audio_queue
+        if audio_queue is None:
+            return
+        try:
+            audio_queue.put_nowait(pcm_bytes)
+        except queue.Full:
+            # Dropping a chunk is preferable to blocking PortAudio's callback.
+            pass
+
+    def _handle_backend_error(self, message: str):
+        self.last_error = message
+        self._status("error")
+
+    def _start_audio_worker(self):
+        self._audio_queue = queue.Queue(maxsize=int(self.config.get("audio_queue_size") or 50))
+        self._audio_stop = threading.Event()
+
+        def _worker():
+            while self._audio_stop is not None and not self._audio_stop.is_set():
+                try:
+                    chunk = self._audio_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                backend = self._backend
+                if backend is None:
+                    continue
+                try:
+                    backend.send_audio(chunk)
+                except Exception as exc:
+                    self._handle_backend_error(str(exc))
+
+        self._audio_worker = threading.Thread(target=_worker, daemon=True)
+        self._audio_worker.start()
+
+    def _stop_audio_worker(self):
+        stop = self._audio_stop
+        worker = self._audio_worker
+        self._audio_stop = None
+        self._audio_worker = None
+        self._audio_queue = None
+        if stop is not None:
+            stop.set()
+        if worker is not None:
+            worker.join(timeout=1.0)
