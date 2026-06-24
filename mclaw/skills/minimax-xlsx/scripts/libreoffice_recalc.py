@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 libreoffice_recalc.py — Tier 2 dynamic formula recalculation via LibreOffice headless.
 

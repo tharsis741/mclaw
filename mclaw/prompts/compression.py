@@ -1,4 +1,8 @@
-"""Context compression prompt builders."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prompt builders for summarizing and compressing conversation context."""
 
 from __future__ import annotations
 

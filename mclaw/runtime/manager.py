@@ -1,4 +1,13 @@
-"""Runtime detection and singleton access."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Runtime detection and singleton access.
+
+RuntimeManager chooses the host runtime once per process and exposes a cached
+instance to tools that need command execution, filesystem policy, or feature
+detection.
+"""
 
 from __future__ import annotations
 

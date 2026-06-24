@@ -1,4 +1,12 @@
-"""Runtime base interface."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Base runtime interface for command execution and host capabilities.
+
+Runtime implementations share path policy, shell profile, process spawning,
+and search behavior through this interface so tools can stay platform-neutral.
+"""
 
 from __future__ import annotations
 

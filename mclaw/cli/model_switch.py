@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Model switching logic for M-Claw.
 
 Handles the full flow:
@@ -114,7 +118,7 @@ def switch_model(
 
     user_providers = user_providers or {}
 
-    # ── 步骤 1：识别模型名和目标接入方 ──
+    # Step 1: resolve the model name and target provider.
 
     resolution = resolve_model_input(
         new_model,
@@ -152,7 +156,7 @@ def switch_model(
             info_message=info,
         )
 
-    # ── 步骤 3：检查是否保持当前供应商 ──
+    # Step 3: check whether the current provider can be kept.
 
     if not target_provider:
         return ModelSwitchResult(
@@ -165,7 +169,7 @@ def switch_model(
             ),
         )
 
-    # ── 步骤 4：解析凭据，缺失时提示用户 ──
+    # Step 4: resolve credentials and prompt when missing.
 
     pcfg = PROVIDER_REGISTRY.get(target_provider)
     if not pcfg:
@@ -219,8 +223,8 @@ def switch_model(
 
     if not api_key:
         if current_provider in ("custom", "custom_anthropic") and not explicit_provider:
-            # 检测到的供应商与当前自定义 endpoint 不同。
-            # warn user clearly, but still allow it (the custom endpoint
+            # The detected provider differs from the current custom endpoint.
+            # Warn the user clearly, but still allow it (the custom endpoint
             # may proxy multiple providers).
             print_fn("")
             print_fn(f"  ⚠ '{new_model}' 看起来属于 {pcfg.display_name}，")

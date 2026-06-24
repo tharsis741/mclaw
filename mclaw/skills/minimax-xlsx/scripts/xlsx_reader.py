@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 xlsx_reader.py — Structure discovery and data analysis tool for Excel/CSV files.
 

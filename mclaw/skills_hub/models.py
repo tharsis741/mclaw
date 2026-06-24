@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Data models for the Skill 2.0 skills_hub package."""
 
 from __future__ import annotations

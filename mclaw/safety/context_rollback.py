@@ -1,4 +1,12 @@
-"""Context rollback coordination helpers."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Coordinate chat-context invalidation around filesystem rollback.
+
+Filesystem rollback can make prior tool observations stale. This module keeps
+that context adjustment explicit and separate from the file restore operation.
+"""
 
 from __future__ import annotations
 

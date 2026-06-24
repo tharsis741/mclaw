@@ -1,4 +1,12 @@
-"""Shell profile definitions for runtimes."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shell profile definitions for runtime command execution.
+
+Profiles own command wrapping, quoting, cwd reporting, and login/TTY behavior
+so terminal tools can execute through a consistent runtime boundary.
+"""
 
 from __future__ import annotations
 

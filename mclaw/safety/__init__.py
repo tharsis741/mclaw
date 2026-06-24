@@ -1,4 +1,8 @@
-"""File safety infrastructure for M-Claw."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Public entry points for M-Claw file safety infrastructure."""
 
 from mclaw.safety.safety_layer import MClawSafetyLayer, SafetyPlan
 

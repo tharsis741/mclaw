@@ -1,4 +1,13 @@
-"""Memory manager for M-Claw"""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Coordinate memory providers and safe memory context rendering.
+
+The manager keeps provider registration separate from prompt assembly, so
+memory sources can expose tools, build system context, and refresh snapshots
+without leaking provider-specific details into the agent loop.
+"""
 
 from __future__ import annotations
 

@@ -1,6 +1,11 @@
-"""Search backend switching logic for M-Claw CLI.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Handles /search-backend slash command.
+"""Search backend switching logic for the M-Claw CLI.
+
+Handles /search-backend status display, backend selection, credential prompts,
+and persistence of the auxiliary web-search backend setting.
 """
 
 from __future__ import annotations
@@ -55,7 +60,7 @@ def switch_search_backend(
     backend = raw_input.strip().lower()
 
     if not backend:
-        # 展示当前配置。
+        # Show current configuration.
         status = get_search_backend_status()
         print_fn(f"  当前搜索后端: {status.current}")
         print_fn(f"  DashScope: {'✓ 可用' if status.dashscope_available else '✗ 未配置'}")
@@ -69,7 +74,7 @@ def switch_search_backend(
             error_message=f"未知后端 '{backend}'。可用: {', '.join(VALID_BACKENDS)}",
         )
 
-    # 检查目标后端凭据。
+    # Check target backend credentials.
     if backend == "tavily":
         if not _tavily_available():
             if not prompt_for_missing_key:
@@ -102,7 +107,7 @@ def switch_search_backend(
                 error_message=f"DashScope 未配置。请在 {display_mclaw_path('.env')} 设置 DASHSCOPE_API_KEY 或 QWEN_API_KEY。",
             )
 
-    # 保存选择。
+    # Save selection.
     config = load_config()
     if "auxiliary" not in config:
         config["auxiliary"] = {}

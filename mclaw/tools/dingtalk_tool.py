@@ -1,4 +1,12 @@
-"""DingTalk channel tools."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Function-call tools for DingTalk outbound channel sessions.
+
+These tools send text and files through the DingTalk target bound to the active
+agent session. They intentionally fail closed when no channel target is bound.
+"""
 
 from __future__ import annotations
 

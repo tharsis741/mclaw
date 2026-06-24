@@ -1,4 +1,12 @@
-"""Weixin text formatting and splitting."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Format and split text for Weixin outbound delivery.
+
+The helpers keep message-length limits and lightweight formatting decisions out
+of the shared channel runner.
+"""
 
 from __future__ import annotations
 
@@ -76,4 +84,3 @@ def split_text_for_weixin(content: str, max_length: int = 2000) -> list[str]:
         return chunks
     total = len(chunks)
     return [f"{chunk}\n({idx + 1}/{total})" for idx, chunk in enumerate(chunks)]
-

@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Skill 2.0 manager tool.
 
 All Skill writes go through the skills_hub service layer. This module only

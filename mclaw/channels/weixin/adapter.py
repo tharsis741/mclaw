@@ -1,4 +1,12 @@
-"""Weixin private-chat adapter."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Adapt Weixin private-chat events into normalized channel messages.
+
+The adapter isolates Weixin-specific payload parsing and media extraction from
+session routing and shared agent execution.
+"""
 
 from __future__ import annotations
 

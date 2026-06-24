@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Provider profile metadata for setup and model catalog UX.
 
 M-Claw's callable provider key is intentionally not the same thing as a
@@ -30,7 +34,7 @@ class ProviderProfile:
 
 
 CORE_PROVIDER_KEYS: list[str] = [
-    # 中国主流接入方。
+    # Major China-region providers.
     "qwen",
     "deepseek",
     "moonshot",
@@ -41,7 +45,7 @@ CORE_PROVIDER_KEYS: list[str] = [
     "tencent",
     "baichuan",
     "xiaomi",
-    # 海外主流接入方。
+    # Major global providers.
     "openai",
     "anthropic",
     "google",
@@ -52,7 +56,7 @@ CORE_PROVIDER_KEYS: list[str] = [
     "together",
     "fireworks",
     "deepinfra",
-    # 中转/聚合接入方。
+    # Router and aggregator providers.
     "openrouter",
 ]
 

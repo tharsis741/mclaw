@@ -1,4 +1,8 @@
-"""M-Claw CLI entry point."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Command-line entry point, first-run setup, and startup wiring for M-Claw."""
 
 import argparse
 import multiprocessing as mp
@@ -303,17 +307,17 @@ def _has_any_provider_configured() -> bool:
     from mclaw.cli.auth import PROVIDER_REGISTRY, resolve_api_key
     from mclaw.cli.config import get_env_value, load_config
 
-    # 检查全部已注册供应商。
+    # Check all registered providers.
     for pname in PROVIDER_REGISTRY:
         if resolve_api_key(pname):
             return True
 
-    # 检查自定义 endpoint。
+    # Check custom endpoint compatibility variables.
     for var in ("MCLAW_API_KEY", "MCLAW_ANTHROPIC_API_KEY", "OPENAI_BASE_URL"):
         if get_env_value(var):
             return True
 
-    # 检查 config.yaml 中的 active_provider 和用户自定义供应商。
+    # Check active_provider and user-defined providers in config.yaml.
     try:
         cfg = load_config()
         if cfg.get("active_provider") or cfg.get("providers"):
@@ -333,7 +337,7 @@ def _first_run_check() -> bool:
     if not (home / "config.yaml").exists():
         return True
 
-    # 配置文件存在时，继续检查是否包含有效内容。
+    # If the config file exists, keep checking whether it contains usable content.
     from mclaw.cli.config import load_config
     try:
         cfg = load_config()
@@ -1164,7 +1168,7 @@ def _run_setup_impl(args):
         print_plain(color("\n  未配置任何接入方，退出。\n", Colors.RED))
         sys.exit(1)
 
-    # 选择默认模型。
+    # Select the default model.
     if len(configured) == 1:
         default = next(iter(configured.values()))
         _print_setup_step("步骤 2/3  确认默认模型", "只配置了一个接入方，已自动设为默认。")

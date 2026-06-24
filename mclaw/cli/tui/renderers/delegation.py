@@ -1,4 +1,8 @@
-"""Subagent delegation result rendering."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Render subagent delegation progress and result summaries."""
 
 from __future__ import annotations
 

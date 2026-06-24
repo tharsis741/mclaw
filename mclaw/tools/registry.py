@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Central registry for all M-Claw tools.
 
 Each tool file calls ``registry.register()`` at module level to declare its

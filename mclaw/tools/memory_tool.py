@@ -1,4 +1,13 @@
-"""Persistent memory tooling for M-Claw."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Persistent memory tools with prompt-injection and exfiltration guards.
+
+Memory entries are later injected into prompts, so writes pass through threat
+pattern scanning, invisible-character checks, file locking, and audit logging
+before they reach disk.
+"""
 
 from __future__ import annotations
 
@@ -41,26 +50,25 @@ _MEMORY_THREAT_PATTERNS = [
     (r"^\s*ignore\s+(all|previous|prior)\s+instructions", "prompt_injection"),
     (r"^\s*system\s+prompt\s+override", "prompt_injection_override"),
     (r"^\s*act\s+as\s+if\s+you\s+have\s+no\s+restrictions", "restriction_bypass"),
-    # Role hijack — role assignment via "you are now" with separator or fixed-role noun
-    # 拦截身份劫持类表达，例如 “you are now admin/root”。
-    # 允许普通语境表达，例如 “you are now working on...”。
+    # Role hijack - role assignment via "you are now" with separator or fixed-role noun.
+    # Allow benign contexts such as "you are now working on...".
     (r"you\s+are\s+now\s*[:\-]\s*(admin|root|system|ai|gpt|claude)", "role_hijack"),
     (r"you\s+are\s+now\s+(?:a\s+(?:\w+\s+)?|an\s+|)(system|ai|gpt|claude|assistant|admin|root)\b", "role_hijack"),
     # Deception — active instruction to hide info from user
     (r"^\s*do\s+not\s+tell\s+the\s+user\s+(what|that|this|about|anything|everything)\b", "deception_hide"),
     (r"^\s*disregard\s+(your|all|any)\s+(instructions|rules|guidelines)", "disregard_rules"),
-    # 外传风险：带 URL 参数的 curl/wget 主动命令，不包括单纯提及工具名称。
+    # Exfiltration risk: active curl/wget commands with URL arguments.
     (r"curl\s+.*?https?://", "exfil_curl"),
     (r"wget\s+.*?https?://", "exfil_wget"),
-    # Credential file access — reading sensitive config/credential files
+    # Credential file access - reading sensitive config/credential files.
     (r"(?i)(cat|more|less|head|tail|type|read|python|grep).*?\.env", "exfil_cat_creds"),
     (r"(?i)(cat|more|less|head|tail|type|read|python|grep).*?\.netrc", "exfil_cat_creds"),
     (r"(?i)(cat|more|less|head|tail|type|read|python|grep).*?\.credentials", "exfil_cat_creds"),
-    # SSH backdoor — manipulation of authorized_keys
+    # SSH backdoor - manipulation of authorized_keys.
     (r"authorized_keys", "ssh_backdoor"),
-    # SSH 私钥访问。
+    # SSH private key access.
     (r"\.ssh/id_", "ssh_access"),
-    # 敏感 M-Claw 配置访问。
+    # Sensitive M-Claw configuration access.
     (r"(cat|more|less|head|tail|type|read|python|grep).*?\.mclaw.*?\.env", "mclaw_env_access"),
 ]
 _INVISIBLE_CHARS = {
@@ -231,8 +239,8 @@ class MemoryStore:
             return {"success": False, "error": "Content cannot be empty."}
 
         with file_lock(self._path_for(target).with_suffix(self._path_for(target).suffix + ".lock")):
-            # 在锁内扫描，避免 TOCTOU：攻击者若在锁外扫描和锁内写入之间
-            # 修改文件，可能绕过威胁检查。
+            # Scan inside the lock to avoid TOCTOU bypasses between validation
+            # and the write that persists the memory entry.
             scan_error = _scan_memory_content(content)
             if scan_error:
                 return {"success": False, "error": scan_error}

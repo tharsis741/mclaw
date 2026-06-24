@@ -1,4 +1,15 @@
-"""File tool registrations — read, write, patch, edit, delete, search, list."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Register file-system tools and enforce their runtime safety boundaries.
+
+This module exposes the public tool schemas and handlers for read, write,
+patch, edit, delete, search, and directory listing operations. Low-level file
+I/O lives in ``file_operations``; this layer adds tool JSON formatting,
+delegation workspace restrictions, Skill-store protection, and read-size
+guardrails before registering handlers with the tool registry.
+"""
 
 import json
 from pathlib import Path
@@ -9,6 +20,7 @@ from mclaw.runtime.manager import RuntimeManager
 from mclaw.tools.registry import registry
 from mclaw.constants import get_skills_dir
 from mclaw.skills_hub.paths import get_skill_drafting_dir
+
 
 def _is_path_within(path: Path, root: Path) -> bool:
     try:
@@ -50,7 +62,7 @@ def _skill_store_mutation_error(file_path: str, tool_name: str) -> str | None:
 
 
 def _check_delegation_path(file_path: str, parent_agent, mode: str = "write") -> tuple[bool, str]:
-    """验证子代理文件操作路径。返回 (允许, 错误信息)。"""
+    """Validate delegated file access and return ``(allowed, error_message)``."""
     if parent_agent is None:
         return True, ""
     if getattr(parent_agent, "_delegate_depth", 0) <= 0:
@@ -79,24 +91,20 @@ def _check_delegation_path(file_path: str, parent_agent, mode: str = "write") ->
             ]) == os.path.normcase(str(root))
         if not allowed:
             return False, (
-                f"子代理只能操作 {delegation_dir} 下的文件，"
-                f"禁止操作: {file_path}"
+                f"Subagents may only modify files under {delegation_dir}; "
+                f"refused path: {file_path}"
             )
     except Exception:
-        return False, f"无效路径: {file_path}"
+        return False, f"Invalid path: {file_path}"
     return True, ""
 
 
-# ---------------------------------------------------------------------------
-# read_file 工具。
-# ---------------------------------------------------------------------------
-
-# 安全上限：单次 read_file 返回不能超过该字符数。
+# Safety cap: one read_file call must not return more than this many chars.
 # 100K chars ≈ 25–50K tokens across typical tokenisers.  Files larger than
-# 单次读取超过该值会带来上下文风险，模型应使用 offset+limit 读取相关片段。
+# this create context pressure; callers should use offset+limit pagination.
 _READ_FILE_MAX_CHARS = 100_000
 
-# 模型未指定 limit 时使用的默认读取大小。
+# Default read size when the model did not provide an explicit limit.
 _READ_FILE_DEFAULT_LIMIT = 50_000
 
 
@@ -147,7 +155,7 @@ def read_file_tool(
             }, ensure_ascii=False)
 
         if limit is None:
-            # 探测剩余内容是否超过硬性安全上限。
+            # Probe whether remaining content exceeds the hard safety cap.
             probe_limit = hard_limit + 1
             content = ops.read_file(path, offset=offset, limit=probe_limit)
 
@@ -160,7 +168,7 @@ def read_file_tool(
                     ),
                 }, ensure_ascii=False)
 
-            # 正常返回时应用默认读取上限。
+            # Apply the default read size on normal responses.
             effective_limit = default_limit
             hint = None
             if len(content) > effective_limit:
@@ -218,11 +226,6 @@ def read_file_tool(
     except (OSError, PermissionError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-
-# ---------------------------------------------------------------------------
-# write_file 工具。
-# ---------------------------------------------------------------------------
-
 def write_file_tool(path: str, content: str) -> str:
     """Write content to a file atomically.
 
@@ -245,11 +248,6 @@ def write_file_tool(path: str, content: str) -> str:
     except (OSError, PermissionError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-
-# ---------------------------------------------------------------------------
-# patch 工具。
-# ---------------------------------------------------------------------------
-
 def patch_tool(path: str, old_str: str, new_str: str) -> str:
     """Replace the first occurrence of old_str with new_str in a file.
 
@@ -269,11 +267,6 @@ def patch_tool(path: str, old_str: str, new_str: str) -> str:
         return json.dumps({"path": patched}, ensure_ascii=False)
     except (OSError, ValueError, PermissionError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# edit_file 工具。
-# ---------------------------------------------------------------------------
 
 def edit_file_tool(path: str, old_block: str, new_block: str) -> str:
     """Replace one exact old_block with new_block.
@@ -297,11 +290,6 @@ def edit_file_tool(path: str, old_block: str, new_block: str) -> str:
     except (OSError, ValueError, PermissionError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-
-# ---------------------------------------------------------------------------
-# delete_file 工具。
-# ---------------------------------------------------------------------------
-
 def delete_file_tool(path: str) -> str:
     """Delete one file after Runtime PathPolicy approval."""
     blocked = _skill_store_mutation_error(path, "delete_file")
@@ -312,11 +300,6 @@ def delete_file_tool(path: str) -> str:
         return json.dumps({"path": deleted, "deleted": True}, ensure_ascii=False)
     except (OSError, FileNotFoundError, IsADirectoryError, PermissionError) as e:
         return json.dumps({"error": str(e), "success": False}, ensure_ascii=False)
-
-
-# ---------------------------------------------------------------------------
-# search_files 工具。
-# ---------------------------------------------------------------------------
 
 def search_files_tool(
     directory: str,
@@ -341,11 +324,6 @@ def search_files_tool(
     except (OSError, PermissionError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-
-# ---------------------------------------------------------------------------
-# list_directory 工具。
-# ---------------------------------------------------------------------------
-
 def list_directory_tool(path: str) -> str:
     """List directory contents with file size and modification time.
 
@@ -364,11 +342,7 @@ def list_directory_tool(path: str) -> str:
     except (OSError, NotADirectoryError, PermissionError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-
-# ---------------------------------------------------------------------------
-# 函数调用工具 schema。
-# ---------------------------------------------------------------------------
-
+# Public tool schemas.
 READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
@@ -619,7 +593,7 @@ def _handle_list_directory(args: dict, **kw) -> str:
         return json.dumps({"error": err}, ensure_ascii=False)
     return list_directory_tool(path=path)
 
-# 将全部文件工具注册到工具注册表。
+# Register all file tools with the central registry.
 registry.register(
     name="read_file",
     toolset="file",

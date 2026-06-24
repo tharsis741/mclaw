@@ -1,4 +1,12 @@
-"""Weixin long-poll runtime."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Run the Weixin long-poll channel loop.
+
+The runtime combines configuration, polling, deduplication, session routing,
+media handling, and outbound target registration around the shared runner.
+"""
 
 from __future__ import annotations
 

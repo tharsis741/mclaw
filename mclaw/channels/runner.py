@@ -1,4 +1,13 @@
-"""Shared channel-to-agent runner."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared runner that bridges channel messages into agent sessions.
+
+Channel runtimes use this boundary to create or resume sessions, forward user
+messages, and send final or intermediate responses back through channel-specific
+outbound handlers.
+"""
 
 from __future__ import annotations
 

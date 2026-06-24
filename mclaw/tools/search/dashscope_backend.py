@@ -1,4 +1,8 @@
-"""DashScope Search Backend — web search via DashScope Qwen enable_search.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""DashScope web-search backend using Qwen enable_search.
 
 Provides a thin synchronous wrapper around DashScope's compatible-mode OpenAI
 chat completions endpoint with enable_search.
@@ -91,7 +95,7 @@ def search(
             ),
         }
 
-    # 强制使用 Qwen 模型：DashScope 的 enable_search 仅对 Qwen 生效。
+    # DashScope enable_search only works with Qwen models.
     if not model.lower().startswith("qwen"):
         logger.warning(
             "DashScope search model '%s' is not a Qwen model; forcing to %s for enable_search",
@@ -140,7 +144,7 @@ def search(
         if images:
             result = _convert_html_images_to_markdown(result)
 
-        # 检测搜索是否真实触发。
+        # Detect whether live search actually executed.
         no_search_phrases = [
             "无法访问互联网",
             "无法联网",
@@ -181,7 +185,7 @@ def search(
             preview = result[:2000] if len(result) <= 2000 else result[:2000] + " ... [truncated]"
             logger.info("DashScope search result:\n%s", preview)
 
-        # 内部截断：防止过大的搜索结果撑爆上下文。
+        # Internal truncation prevents oversized search results from blowing up context.
         hint = ""
         if len(result) > _MAX_WEB_SEARCH_CHARS:
             head = int(_MAX_WEB_SEARCH_CHARS * 0.4)
@@ -237,7 +241,7 @@ def _is_dashscope_configured(creds: dict) -> bool:
     base_url = creds.get("base_url", "")
     if not api_key:
         return False
-    # DashScope key 前缀或 base_url 域名识别。
+    # Detect by DashScope key prefix or base_url domain.
     if api_key.startswith("sk-dashscope") or "dashscope" in base_url.lower():
         return True
     return False

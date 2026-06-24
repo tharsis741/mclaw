@@ -1,4 +1,13 @@
-"""Skill metadata utility helpers."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Read, validate, and match Skill metadata.
+
+The helpers centralize frontmatter parsing, platform compatibility checks, and
+filesystem discovery for Skills so prompt assembly and slash commands share the
+same metadata interpretation.
+"""
 
 from __future__ import annotations
 

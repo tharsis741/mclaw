@@ -1,7 +1,14 @@
-"""M-Claw Agent Core — conversation loop with tool calling.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Handles multi-turn chat with LLM providers, tool call dispatch,
-retry with jittered backoff, and session persistence.
+"""Core conversation loop for M-Claw agent sessions.
+
+This module coordinates provider calls, tool dispatch, memory refresh, context
+compression, session persistence, checkpoint integration, and streaming
+response handling. It intentionally centralizes the turn lifecycle; future
+refactors should split responsibilities only after tool-call and persistence
+tests cover the current behavior.
 """
 
 import json
@@ -58,8 +65,9 @@ def _redact_log_secrets(value: Any) -> Any:
         return redacted
     return value
 
+
 class MClaw:
-    """Core agent that manages the conversation loop with an LLM."""
+    """Stateful agent facade for one conversation session."""
 
     def __init__(
         self,
@@ -82,7 +90,7 @@ class MClaw:
         event_callback: Callable = None,
         print_fn: Callable = None,
         workspace: str = None,
-        # 子代理隔离标记。
+        # Subagent isolation flags.
         skip_memory: bool = False,
         skip_context_files: bool = False,
         skip_skills: bool = False,
@@ -109,7 +117,7 @@ class MClaw:
         self._status_callback = status_callback
         self._event_callback = event_callback
 
-        # 子代理隔离标记。
+        # Subagent isolation flags.
         self._skip_memory = skip_memory
         self._skip_context_files = skip_context_files
         self._skip_skills = skip_skills
@@ -119,7 +127,7 @@ class MClaw:
         self._interrupted = False
         self._is_anthropic = api_mode == "anthropic_messages"
 
-        # 记忆子系统。
+        # Memory subsystem.
         self._memory_manager: Optional[MemoryManager] = None
         self._memory_store = None  # BuiltinMemoryProvider sets this
         self._recalled_memory: str = ""  # per-turn prefetch, injected at API-call time only
@@ -136,17 +144,13 @@ class MClaw:
         self._turns_since_memory_review: int = 0
         self._turns_since_evolution_review: int = 0
 
-        # 主动记忆提示计数器。
-
-        # 主动 Skill 创建提示计数器，按工具调用迭代统计。
-
-        # token 使用量跟踪。
+        # Token usage tracking.
         self.session_input_tokens = 0
         self.session_output_tokens = 0
         self.session_api_calls = 0
         self.session_user_messages = 0
 
-        # 文件系统 checkpoint。它是透明基础设施，不暴露给模型。
+        # Filesystem checkpointing is transparent infrastructure, not model context.
         self._checkpoint_mgr = self._build_checkpoint_manager()
         self._checkpoint_turn_id: Optional[str] = None
         self._checkpoint_message_id_before_turn: Optional[int] = None
@@ -155,7 +159,7 @@ class MClaw:
         self._last_checkpoint_targets: List[str] = []
         self._last_checkpoint_attempt: Dict[str, Any] = {}
 
-        # 上下文压缩器。
+        # Context compressor.
         compression_cfg = self.config.get("compression", {}) if isinstance(self.config, dict) else {}
         auxiliary_cfg = self.config.get("auxiliary", {}) if isinstance(self.config, dict) else {}
         auxiliary_compression_cfg = auxiliary_cfg.get("compression", {}) if isinstance(auxiliary_cfg, dict) else {}
@@ -214,17 +218,17 @@ class MClaw:
         else:
             self.context_compressor = None
 
-        # 工具定义。
+        # Tool definitions.
         self.tools: List[dict] = []
         self.valid_tool_names: Set[str] = set()
         self._discover_tools()
 
-        # 初始化记忆子系统；provider 配置决定暴露哪些 target 和工具。
+        # Initialize memory subsystem; provider config controls exposed targets and tools.
         if not self._skip_memory:
             self._init_memory()
             self._sync_memory_tool_schema()
 
-        # 构建客户端：空 base_url 必须转成 None/NOT_GIVEN。
+        # Build clients: empty base_url must become None/NOT_GIVEN.
         # 60s HTTP timeout: long enough for most APIs, short enough that a hung
         # request releases quickly when the user presses Ctrl+C.
         _HTTP_TIMEOUT = 60.0
@@ -245,7 +249,7 @@ class MClaw:
             )
             self.anthropic_client = None
 
-        # 在数据库中创建会话。
+        # Create the session record in the database.
         if self._session_db:
             self._session_db.create_session(
                 session_id=self.session_id,
@@ -320,8 +324,8 @@ class MClaw:
         try:
             from mclaw.agent.builtin_memory_provider import BuiltinMemoryProvider
             from mclaw.tools.memory_tool import MemoryStore, _DEFAULT_MEMORY_LIMIT, _DEFAULT_USER_LIMIT
-            # 加载配置中的记忆上限。优先使用 CLI 传入的合并运行时配置，
-            # 以确保项目级 .mclaw.yaml 生效。
+            # Load configured memory limits. Prefer the merged runtime config
+            # passed by the CLI so project-level .mclaw.yaml is honored.
             try:
                 cfg = self.config or {}
                 if not cfg:
@@ -415,24 +419,24 @@ class MClaw:
 
         flush_system = build_memory_flush_system_prompt()
 
-        # 从最近 N 轮用户/assistant 交互中构造刷新消息。
+        # Build flush messages from the most recent user/assistant exchanges.
         flush_msgs = []
         for msg in msgs[-8:]:
             if msg.get("role") in ("user", "assistant"):
                 flush_msgs.append(msg)
 
-        # 保存原始工具状态。
+        # Save original tool state.
         original_tools = self.tools
         original_valid = self.valid_tool_names
 
         def _run_flush():
             try:
-                # 仅保留 memory 工具。
+                # Keep only memory tools during the flush call.
                 memory_schema = self._memory_manager.get_all_tool_schemas()
                 self.tools = memory_schema
                 self.valid_tool_names = self._memory_manager.get_all_tool_names()
 
-                # 使用刷新提示词执行一次 API 调用。
+                # Run one API call with the flush prompt.
                 if self._is_anthropic:
                     api_model = self._normalize_anthropic_model(self.model)
                     max_output = self._get_anthropic_max_output(api_model)
@@ -455,8 +459,8 @@ class MClaw:
                     )
                     _, tool_calls, _, _ = self._parse_openai(response)
 
-                # 直接解析 tool_calls，直接调用 memory handlers.
-                # 不经过 handle_function_calls()，不依赖 LLM 的第二次决策
+                # Parse tool_calls directly and invoke memory handlers without
+                # handle_function_calls(), avoiding a second LLM decision.
                 if tool_calls:
                     from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES, handle_memory_tool_call
 
@@ -496,11 +500,11 @@ class MClaw:
         else:
             _run_flush()
 
-        # 无论成功或超时都恢复工具状态。
+        # Restore tool state whether the flush succeeded or timed out.
         self.tools = original_tools
         self.valid_tool_names = original_valid
 
-    # ── 后台记忆审查 ───────────────────────────────
+    # Background memory and Skill review.
 
     def _spawn_background_review(
         self,
@@ -508,11 +512,12 @@ class MClaw:
         review_memory: bool = False,
         review_skills: bool = False,
     ) -> None:
-        """启动后台线程，审查当前会话是否需要沉淀记忆或技能。
+        """Start a background review thread for memory and Skill evolution.
 
-        主回复返回后，后台线程会创建一个独立的 MClaw 审查实例，
-        与父实例共享记忆存储，并独立判断是否需要写入记忆或创建技能。
-        审查过程不会污染主会话历史。
+        After the main reply returns, the worker creates an isolated MClaw
+        review instance that shares memory storage with the parent and decides
+        independently whether to write memory or create Skills. The review does
+        not mutate the main conversation history.
         """
         spawn_background_review(
             self,
@@ -522,7 +527,7 @@ class MClaw:
         )
         return
 
-    # ── 刷新记忆快照 ───────────────────────────────────────────────
+    # Memory snapshot refresh.
 
     def _refresh_memory_snapshot(self) -> None:
         """Reload memory files and re-freeze the snapshot (e.g. after compression)."""
@@ -694,7 +699,7 @@ class MClaw:
                 self.model, self.provider, self.base_url,
             )
 
-        # 使用新模型名称重建系统提示词并更新对话。
+        # Rebuild the system prompt with the new model name and update messages.
         new_sys = self._build_system_prompt()
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = new_sys
@@ -718,7 +723,7 @@ class MClaw:
             except Exception as e:
                 logger.debug("Memory build_system_prompt failed: %s", e)
 
-        # 根据 valid_tool_names 构建 available_toolsets。
+        # Build available_toolsets from valid_tool_names.
         from mclaw.tools.dispatch import get_toolset_for_tool
         avail_toolsets: set = set()
         for t in self.valid_tool_names:
@@ -755,11 +760,11 @@ class MClaw:
         self._memory_changed_in_turn = False
         self._skills_changed_in_turn = False
 
-        # 子代理传入 None 时，不继承父代理完整历史。
+        # Subagents pass None when they should not inherit the parent history.
         messages = list(conversation_history if conversation_history is not None else [])
 
-        # 新会话开始时重置上一轮 token 计数，避免重任务后的残留统计
-        # 触发不必要的预防性压缩。
+        # Reset prior token counts for fresh sessions so heavy previous tasks
+        # do not trigger unnecessary preventive compression.
         if self.context_compressor and conversation_history is None:
             self.context_compressor.last_prompt_tokens = 0
             self.context_compressor.last_completion_tokens = 0
@@ -786,7 +791,7 @@ class MClaw:
         # Background review counters are advanced only after this user turn completes.
         _should_review_memory = False
 
-        # 为当前轮预取相关记忆，仅在 API 调用时注入。
+        # Prefetch relevant memory for this turn; inject it only at API-call time.
         if self._memory_manager:
             try:
                 self._recalled_memory = self._memory_manager.prefetch_all(
@@ -834,20 +839,20 @@ class MClaw:
 
             api_call_count += 1
 
-            # 子代理诊断：记录每轮 API 迭代，方便定位卡住的位置。
+            # Subagent diagnostics: log each API iteration to locate stalls.
             if getattr(self, "_delegate_depth", 0) > 0:
                 logger.info(
                     "[subagent-%s] API iteration %d/%d",
                     getattr(self, "session_id", "?")[-6:], api_call_count, self.max_iterations
                 )
 
-            # 下一次 API 调用前清理本轮压缩断路标记。
+            # Clear the per-turn compression circuit breaker before the next API call.
             if self.context_compressor:
                 self.context_compressor._compressed_this_turn = False
 
-            # ── 预防性压缩：估算上下文过大时，在发送 API 前先压缩。 ──
-            # last_prompt_tokens 只反映上一轮 API 调用；历史消息会持续增长，
-            # 因此这里必须估算当前 messages。
+            # Preventive compression: estimate current context before the API call.
+            # last_prompt_tokens only reflects the previous API call, while
+            # message history keeps growing.
             if self.context_compressor:
                 cc = self.context_compressor
                 if not cc._compressed_this_turn:
@@ -855,7 +860,7 @@ class MClaw:
                     logger.info("[LOOP] estimating tokens for preventive compression")
                     estimated = estimate_messages_tokens(messages)
                     logger.info("[LOOP] estimated=%d last_prompt=%d last_completion=%d", estimated, cc.last_prompt_tokens, cc.last_completion_tokens)
-                    # 检查时使用估算值和上次真实用量中的较大值。
+                    # Check against the larger of the estimate and last real usage.
                     real_tokens = cc.last_prompt_tokens + cc.last_completion_tokens
                     check_tokens = max(estimated, real_tokens)
                     if check_tokens >= cc.threshold_tokens:
@@ -882,7 +887,7 @@ class MClaw:
                     interrupted = True
                     break
                 try:
-                    # API 调用前记录完整消息列表，便于排查上下文增长问题。
+                    # Log the full message list before API calls to diagnose context growth.
                     try:
                         import json as _json
                         _msgs_log = []
@@ -922,7 +927,7 @@ class MClaw:
                     break
                 except Exception as e:
                     err_str = str(e).lower()
-                    # 上下文溢出：先压缩再重试，每轮最多一次。
+                    # Context overflow: compress once, then retry.
                     is_context_limit = (
                         ("context" in err_str and "limit" in err_str)
                         or "2013" in str(e)
@@ -930,7 +935,7 @@ class MClaw:
                         or "entity too large" in err_str
                     )
                     if is_context_limit and self.context_compressor and retry_count == 0:
-                        # 压缩后重试一次，不计入普通重试预算。
+                        # Retry once after compression without consuming normal retry budget.
                         self._emit_status("Context overflow — compressing and retrying...")
                         self.flush_memories()
                         messages = self.context_compressor.compress(messages)
@@ -977,8 +982,8 @@ class MClaw:
             self._track_usage(response)
             self.session_api_calls += 1
 
-            # 将真实 token 用量反馈给压缩器，使后续决策基于 API 实测值，
-            # 而不是可能不准确的估算值。
+            # Feed real token usage back into the compressor so later decisions
+            # use measured API values instead of rough estimates.
             usage = getattr(response, "usage", None)
             if usage and self.context_compressor:
                 self.context_compressor.update_from_response({
@@ -1011,7 +1016,7 @@ class MClaw:
 
             # ── Tool calls present → dispatch and continue ──
             if tool_calls:
-                # 写入会话数据库；这与 API messages 列表相互独立。
+                # Persist to session DB independently from the API messages list.
                 if self._session_db:
                     self._session_db.append_message(
                         self.session_id, "assistant",
@@ -1020,10 +1025,9 @@ class MClaw:
                         turn_id=self._checkpoint_turn_id,
                     )
 
-                # _execute_tool_calls appends the assistant message internally,
-                # 因此不要在这里再次追加，避免 messages 列表重复。
-                # delegate_task 进入非阻塞模式时会返回 pending_delegate=True。
-                # was started in non-blocking mode — check it to avoid unnecessary work.
+                # _execute_tool_calls appends the assistant message internally, so
+                # do not append it again here. Non-blocking delegate_task returns
+                # pending metadata that is checked below to avoid unnecessary work.
                 pending_result = self._execute_tool_calls(
                     tool_calls,
                     messages,
@@ -1032,8 +1036,8 @@ class MClaw:
                 )
                 logger.info("[POST-TOOL] _execute_tool_calls returned, pending=%s", pending_result is not None)
                 if pending_result is not None:
-                    # delegate_task 已以非阻塞模式启动，立即返回给 TUI 轮询。
-                    # 提前返回前恢复工具，避免工具被永久禁用。
+                    # delegate_task started in non-blocking mode; return for TUI polling.
+                    # Restore tools before returning so they are not left disabled.
                     if disable_tools:
                         self.tools = original_tools
                     pending_result["assistant_rounds"] = assistant_rounds
@@ -1048,8 +1052,8 @@ class MClaw:
                     final_response_recorded = True
                     break
 
-                # 每轮工具调用后裁剪旧工具结果，避免 read_file/terminal 等大输出
-                # 在消息历史中无限累积。
+                # Prune old tool results after each tool batch so large read_file
+                # or terminal output does not accumulate unbounded in history.
                 if self.context_compressor:
                     logger.info("[POST-TOOL] pruning context before next iteration")
                     messages, _pruned = self.context_compressor.prune(messages)
@@ -1058,7 +1062,7 @@ class MClaw:
                 logger.info("[POST-TOOL] continuing to next API iteration")
                 continue
 
-            # ── 无工具调用，进入最终回复 ──
+            # No tool calls: enter final response handling.
             final_response = assistant_content or ""
             if self._stream_callback and not final_response:
                 final_response = ""
@@ -1111,8 +1115,9 @@ class MClaw:
                         _should_review_skills = True
                         self._turns_since_evolution_review = 0
 
-        # 后台记忆/技能审查在当前回复完成后触发，不与用户任务竞争。
-        # 子代理是临时实例，不能再启动后台线程，避免与父代理竞争或形成嵌套代理。
+        # Background memory/Skill reviews start after the reply completes so
+        # they do not compete with the user task. Subagents are temporary and
+        # must not spawn nested background reviews.
         if (_should_review_memory or _should_review_skills) and getattr(self, "_delegate_depth", 0) == 0:
             try:
                 if _should_review_memory and _should_review_skills:
@@ -1129,7 +1134,7 @@ class MClaw:
             except Exception:
                 pass  # background review is best-effort
 
-        # 如果工具被禁用过，则恢复工具。
+        # Restore tools if this turn temporarily disabled them.
         if disable_tools:
             self.tools = original_tools
 
@@ -1154,7 +1159,7 @@ class MClaw:
         if self.tools:
             kwargs["tools"] = self.tools
 
-        # MiniMax 扩展思考字段：将 reasoning 与用户可见内容分离。
+        # MiniMax extended reasoning field keeps reasoning separate from visible content.
         if self.provider in ("minimax", "minimax-cn"):
             kwargs["extra_body"] = {"reasoning_split": True}
 
@@ -1164,8 +1169,8 @@ class MClaw:
             logger.info("[_call_openai] streaming returned")
             return result
 
-        # 非流式路径：通过 watchdog 线程实现硬超时。
-        # httpx/openai timeout 在半开 TCP、负载均衡 keep-alive 等边界情况可能失效。
+        # Non-streaming path uses a watchdog thread for hard timeout enforcement.
+        # httpx/openai timeouts can fail on half-open TCP or load-balancer keep-alive edges.
         logger.info("[_call_openai] entering non-streaming path")
         result_container: list = [None]
         def _run():
@@ -1207,7 +1212,7 @@ class MClaw:
             clean = {k: v for k, v in msg.items() if not k.startswith("_")}
             clean.pop("finish_reason", None)
             api_msgs.append(clean)
-        # 将召回记忆注入 system message，仅 API 调用时生效。
+        # Inject recalled memory into the system message only for this API call.
         if self._recalled_memory and api_msgs and api_msgs[0].get("role") == "system":
             base = api_msgs[0].get("content", "")
             api_msgs[0]["content"] = f"{base}\n\n{self._recalled_memory}" if base else self._recalled_memory
@@ -1229,7 +1234,7 @@ class MClaw:
         _create_start = time.monotonic()
         logger.info("[_openai_streaming] starting create() watchdog")
 
-        # create() watchdog，与 _call_openai 非流式路径使用相同保护原因。
+        # create() watchdog uses the same protection as the non-streaming path.
         stream = None
         create_exc: list = [None]
         def _run_create():
@@ -1240,7 +1245,7 @@ class MClaw:
                     stream = self.client.chat.completions.create(**kwargs)
                     return
                 except openai.APITimeoutError as exc:
-                    # 超时不应重试：服务端未在限定时间内响应。
+                    # Do not retry timeouts: the server did not respond within the limit.
                     create_exc[0] = exc
                     return
                 except openai.RateLimitError as exc:
@@ -1256,7 +1261,7 @@ class MClaw:
                     create_exc[0] = exc
                     return
                 except (openai.BadRequestError, openai.APIError):
-                    # 降级方案：部分供应商不支持 stream_options。
+                    # Fallback for providers that do not support stream_options.
                     try:
                         kwargs.pop("stream_options", None)
                         stream = self.client.chat.completions.create(**kwargs)
@@ -1350,7 +1355,7 @@ class MClaw:
                 logger.info("[_openai_streaming] interrupted; closing stream")
                 break
 
-            # 全局流式生命周期保护。
+            # Global streaming lifecycle guard.
             now = time.monotonic()
             elapsed = now - stream_start
             if elapsed > SAFETY_TIMEOUT:
@@ -1373,7 +1378,7 @@ class MClaw:
             except _queue.Empty:
                 continue
 
-            # 生产者已结束并发送哨兵值。
+            # Producer finished and sent the sentinel value.
             if chunk is None:
                 break
 
@@ -1400,7 +1405,7 @@ class MClaw:
                 if _finish_reason_at is None:
                     _finish_reason_at = time.monotonic()
 
-            # 记录当前 chunk 是否携带有效 payload。
+            # Track whether the current chunk carried a meaningful payload.
             _had_meaningful = False
 
             if delta and delta.content:
@@ -1415,7 +1420,7 @@ class MClaw:
                 reasoning_chunks.append(delta.reasoning_content)
             elif delta and hasattr(delta, "reasoning_details") and delta.reasoning_details:
                 _had_meaningful = True
-                # 部分供应商会以 detail 对象列表发送 reasoning。
+                # Some providers send reasoning as a list of detail objects.
                 for detail in delta.reasoning_details:
                     if hasattr(detail, "text") and detail.text:
                         reasoning_chunks.append(detail.text)
@@ -1454,9 +1459,9 @@ class MClaw:
 
         logger.info("[_openai_streaming] consumer loop exited")
 
-        # 关闭底层 HTTP 响应以释放连接。
-        # 生产者线程可能仍阻塞在 ``for chunk in stream``；
-        # 关闭 stream 可解除阻塞，让线程退出。
+        # Close the underlying HTTP response to release the connection. The
+        # producer thread may still be blocked in ``for chunk in stream``; closing
+        # the stream can unblock it and let the thread exit.
         logger.info("[_openai_streaming] closing stream")
         try:
             stream.close()
@@ -1473,8 +1478,8 @@ class MClaw:
             len("".join(content_chunks)),
         )
 
-        # 如果流在收到任何 payload 前停滞，则按超时处理，
-        # 让调用方明确知道服务端未正常响应。
+        # Treat a stream that stalls before any payload as a timeout, so callers
+        # know the server did not respond normally.
         if (
             not self._interrupted
             and not content_chunks
@@ -1485,7 +1490,7 @@ class MClaw:
             logger.error("[STREAM] Stall timeout with zero content — treating as timeout")
             raise openai.APITimeoutError(request=None)
 
-        # 构造统一 response 对象。
+        # Build a normalized response object.
         class _Msg:
             pass
         msg = _Msg()
@@ -1516,7 +1521,7 @@ class MClaw:
             pass
         resp = _Response()
         resp.choices = [choice]
-        # 如果供应商未在流式响应中返回 usage，则进行本地估算。
+        # Estimate usage locally if the provider omitted it from the stream.
         # (skip estimation when interrupted — partial output gives bad estimates)
         if usage is None and not self._interrupted:
             usage = self._estimate_streaming_usage(
@@ -1641,7 +1646,7 @@ class MClaw:
                 conv.append({"role": "assistant", "content": content_blocks})
             else:
                 conv.append({"role": msg["role"], "content": msg.get("content", "")})
-        # 将召回记忆注入 system，仅 API 调用时生效。
+        # Inject recalled memory into system only for this API call.
         if self._recalled_memory:
             system = f"{system}\n\n{self._recalled_memory}" if system else self._recalled_memory
         return system, conv
@@ -1801,7 +1806,7 @@ class MClaw:
         is_subagent = getattr(self, "_delegate_depth", 0) > 0
         _sid_tail = self.session_id[-6:] if self.session_id else "?"
 
-        # 设置本次调用上下文，让 session_search 等工具可访问 SessionDB。
+        # Set per-call context so tools such as session_search can access SessionDB.
         set_tool_context(session_db=self._session_db, session_id=self.session_id)
 
         if self._interrupted:
@@ -1823,8 +1828,8 @@ class MClaw:
         checkpoint_mgr = self._get_checkpoint_manager()
         checkpoint_mgr.new_turn()
 
-        # 批量调度：写工具走带 CheckpointManager 的串行路径。
-        # 只读批处理会在 handle_function_calls 内自动选择并发路径。
+        # Batch dispatch: write tools take the serialized CheckpointManager path.
+        # Read-only batches choose the concurrent path inside handle_function_calls.
         if self._tool_callback:
             for tc in tool_calls:
                 fn = tc.get("function", {})
@@ -1834,7 +1839,7 @@ class MClaw:
                     args = {}
                 self._tool_callback(fn.get("name", ""), args)
 
-        # 过滤被禁用的工具。
+        # Filter disabled tools.
         disabled = set(getattr(self, "config", {}).get("tools", {}).get("disabled", []))
         filtered_calls = []
         has_install_prepare = False
@@ -1877,7 +1882,7 @@ class MClaw:
         logger.info("[TOOL DISPATCH START] tools=%s count=%d", tool_names, len(tool_calls))
         self._emit_status(f"Running {len(tool_calls)} tool(s)...")
 
-        # 诊断日志：子代理调度前记录每个工具名称，避免污染父代理日志。
+        # Subagent diagnostics: log tool names before dispatch without polluting parent logs.
         if is_subagent:
             logger.info("[subagent-%s] dispatching tools: %s", _sid_tail, tool_names)
 
@@ -1917,8 +1922,8 @@ class MClaw:
                 except Exception:
                     pass
 
-        # 只有 skill_manage 真正成功后才重置技能审查计数。
-        # 计数可能在执行前已预重置，这里按执行结果做最终校正。
+        # Reset the Skill review counter only after skill_manage truly succeeds.
+        # The counter may have been pre-reset before execution; this is the final correction.
         if getattr(self, "_evolution_review_round", 0) > 0 and "skill_manage" in self.valid_tool_names:
             for tc, result in zip(tool_calls, results):
                 fn = tc.get("function", {})
@@ -1955,7 +1960,7 @@ class MClaw:
             "evolution_update",
         }
 
-        # 按调用顺序追加工具结果。
+        # Append tool results in call order.
         for i, tc in enumerate(tool_calls):
             result = results[i] if i < len(results) else json.dumps(
                 {"error": "No result returned"}
@@ -2000,17 +2005,17 @@ class MClaw:
                     operation_id=getattr(self, "_tool_operation_ids", {}).get(tc["id"]),
                 )
 
-        # 工具执行后更新 prompt token 估算，
-        # 让压缩器和状态栏反映当前真实消息规模。
+        # Update prompt-token estimates after tool execution so the compressor
+        # and status bar reflect the current message size.
         if self.context_compressor:
             from mclaw.agent.context_compressor import estimate_messages_tokens
             estimated = estimate_messages_tokens(messages)
             self.context_compressor.last_prompt_tokens = estimated
             logger.info("[TOKEN ESTIMATE POST-TOOLS] estimated=%d", estimated)
 
-        # 检查是否有子代理正在后台运行（pending 模式）。
-        # 先写入本轮父代理的 assistant tool call 和所有 tool results，再交给 TUI 轮询；
-        # 这里不会注入子代理内部运行历史，只保存 delegate_task 返回的 pending 元数据。
+        # Check whether a subagent is running in pending mode. The parent turn's
+        # assistant tool call and tool results are already stored before the TUI
+        # starts polling; subagent internals are not injected here.
         if pending_delegate_data:
             self.messages = messages
             return {
@@ -2060,7 +2065,7 @@ class MClaw:
 
         prompt_t = max(1, estimate_messages_tokens(messages))
 
-        # 完成态：响应中包含 content 和 tool calls。
+        # Completion state includes content and tool calls.
         comp_text = ""
         if response_msg is not None:
             content = getattr(response_msg, "content", None) or ""
@@ -2099,7 +2104,7 @@ class MClaw:
         return obj
 
     def _track_usage(self, response):
-        # 记录完整响应对象，便于检查 usage、model、choices 等字段。
+        # Log the full response object for usage, model, choices, and related fields.
         try:
             resp_dict = self._obj_to_dict(response)
             logger.info("[API RESPONSE] %s", json.dumps(_redact_log_secrets(resp_dict), ensure_ascii=False, default=str))

@@ -1,4 +1,13 @@
-"""Configuration management for M-Claw."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Load, merge, validate, and persist M-Claw configuration.
+
+User-level config from M-Claw home may be overlaid with project `.mclaw.yaml`.
+Project config is intentionally constrained so a repository cannot force local
+security-sensitive settings or enable desktop GUI behavior for every checkout.
+"""
 
 import copy
 import os
@@ -78,8 +87,8 @@ def load_project_config(path: Path) -> dict:
 
     config = raw if isinstance(raw, dict) else {}
     _check_forbidden_fields(config)
-    # 项目配置可以调整 pet 视觉效果，但不能强制每个检出用户打开桌面 GUI。
-    # 是否启用运行时 pet 仍由用户配置控制。
+    # Project config may tune pet visuals, but cannot force desktop GUI startup
+    # for every checkout. Runtime enablement remains controlled by user config.
     try:
         pet_cfg = config.get("display", {}).get("pet", {})
         if isinstance(pet_cfg, dict):

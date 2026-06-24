@@ -1,4 +1,14 @@
-"""Tool discovery, schema collection, and dispatch for M-Claw.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Discover tools, collect schemas, and dispatch model tool calls.
+
+This module is the boundary between model-emitted tool calls and registered
+Python handlers. It imports tool modules, builds the enabled schema set,
+enforces per-call policy, chooses concurrent dispatch only for safe read-only
+batches, wraps write tools with checkpoint/file-safety handling, and truncates
+oversized results before they enter conversation history.
 """
 
 import asyncio
@@ -18,8 +28,7 @@ from mclaw.tools.toolsets import resolve_toolset, resolve_multiple_toolsets, val
 
 logger = logging.getLogger(__name__)
 
-# ── 单次调用上下文：SessionDB 和当前 session_id ────────────────────────
-# Set by core.py before calling handle_function_calls; retrieved by tools.
+# Per-call context set by core.py before handle_function_calls and read by tools.
 _current_session_db: ContextVar[Any] = ContextVar("current_session_db", default=None)
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
 _tool_whitelist: ContextVar[Optional[Set[str]]] = ContextVar("tool_whitelist", default=None)
@@ -82,10 +91,10 @@ def _policy_error(tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
 
 # ── Tool classification for concurrent dispatch ──────────────────────────────
 
-# 绝不并行执行的工具，需要保持顺序语义。
+# Tools that must remain serial because their semantics depend on order.
 _NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
 
-# 允许并发执行的只读工具。
+# Read-only tools that may run concurrently after path-overlap checks.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "read_file", "search_files",
     "skill_view", "skill_tree", "skills_list", "skill_search", "vision_analyze",
@@ -93,10 +102,10 @@ _PARALLEL_SAFE_TOOLS = frozenset({
     "read", "grep", "glob",
 })
 
-# 读写路径的工具需要进行路径重叠检测。
+# Path-scoped tools need overlap checks before concurrent dispatch.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch", "edit_file", "delete_file", "skill_manage"})
 
-# 执行前会触发 checkpoint 快照的写工具。
+# Write tools that trigger a checkpoint snapshot before execution.
 _WRITE_SNAPSHOT_TOOLS = frozenset({"write_file", "patch", "edit_file", "delete_file", "skill_manage"})
 
 _DESTRUCTIVE_TERMINAL_PATTERNS = re.compile(
@@ -151,7 +160,6 @@ _CONCURRENT_TOOL_TIMEOUTS = {
 _discovery_done = False
 _discovery_lock = threading.Lock()
 
-# 异步工具处理器的桥接函数。
 _worker_loop = None
 _worker_loop_lock = threading.Lock()
 
@@ -191,7 +199,7 @@ def _discover_tools():
             return
         _discovery_done = True
 
-    # 导入工具模块；每个模块会在模块级调用 registry.register()。
+    # Tool modules register themselves at import time.
     _tool_modules = [
         "mclaw.tools.file_tools",
         "mclaw.tools.secret_tool",
@@ -788,7 +796,7 @@ def _truncate_json_value(obj, excess):
         return obj, 0
 
     if isinstance(obj, dict):
-        # 优先截断最长的直接字符串字段。
+        # Trim the longest direct string field first.
         string_items = [
             (k, v) for k, v in obj.items() if isinstance(v, str) and len(v) > 100
         ]
@@ -800,7 +808,7 @@ def _truncate_json_value(obj, excess):
                 obj[k] = new_v
                 return obj, trimmed
 
-        # 没有直接长字符串时，递归处理嵌套结构。
+        # If no direct string is large enough, recurse into nested structures.
         for k, v in list(obj.items()):
             if isinstance(v, (dict, list)):
                 new_v, trimmed = _truncate_json_value(v, excess)
@@ -824,11 +832,11 @@ def _truncate_json_value(obj, excess):
 
 
 def _extract_json_object(s: str) -> Optional[dict]:
-    """从可能包含垃圾后缀的字符串中提取第一个 JSON 对象。
+    """Extract the first JSON object from a string with possible trailing junk.
 
-    LLM 有时会在 JSON 闭括号后追加换行/control 字符，导致 json.loads
-    抛出 JSONDecodeError。此函数用 json.JSONDecoder.raw_decode 只解析
-    第一个合法 JSON 对象，忽略后续垃圾。
+    Some providers append newlines or control characters after the closing
+    brace. ``raw_decode`` lets us parse the first valid object and ignore the
+    remaining suffix instead of failing the whole tool call.
     """
     if not s:
         return None
@@ -868,7 +876,7 @@ def _dispatch_single(
             if extracted is not None:
                 arguments = extracted
 
-    # 第 0 层：可用性门禁，阻止幻觉工具名。
+    # Layer 0: availability gate to block hallucinated tool names.
     if tool_name not in tool_names:
         from mclaw.tools.registry import tool_error
         return tool_error(
@@ -889,7 +897,7 @@ def _dispatch_single(
         return safety_error
     operation = _maybe_checkpoint_before_tool(tool_name, arguments_with_call, checkpoint_manager, parent_agent)
 
-    # 第 1 层：内置工具；提供 manager 时包含 memory 路由。
+    # Layer 1: direct builtins, including memory when a manager is provided.
     builtin_result = _invoke_tool_builtin(tool_name, arguments, memory_manager, parent_agent)
     if builtin_result is not None:
         _finalize_operation(operation, builtin_result, _tool_result_success(builtin_result), parent_agent)
@@ -903,9 +911,9 @@ def _dispatch_single(
         _finalize_operation(operation, result, False, parent_agent)
         return result
 
-    # ── Result size guard ──
-    # 工具返回异常大 payload 时，在进入对话上下文前截断。
-    # 这是工具内部限制之后的最后一道防线，防止异常工具撑爆上下文。
+    # Final result-size guard before tool output enters conversation history.
+    # Individual tools should limit themselves first; this catches abnormal
+    # payloads that would otherwise blow up context.
     max_size = registry.get_max_result_size(tool_name)
     if max_size is not None and isinstance(result, str) and len(result) > max_size:
         # Try structured truncation for JSON so we don't break parseability.
@@ -933,7 +941,7 @@ def _dispatch_single(
                 parsed["_limit"] = max_size
             result = json.dumps(parsed, ensure_ascii=False)
 
-            # 如果仍然过大，则退回最小错误 JSON。
+            # Fall back to a minimal error JSON if structured trimming is still too large.
             if len(result) > max_size:
                 result = json.dumps({
                     "_truncated": True,
@@ -945,7 +953,7 @@ def _dispatch_single(
                     ),
                 }, ensure_ascii=False)
         else:
-            # 纯文本按最后一个换行截断，保持输出整洁。
+            # For plain text, cut at the last newline when possible.
             truncated = result[:max_size]
             last_nl = truncated.rfind("\n")
             if last_nl > max_size // 2:
@@ -956,8 +964,8 @@ def _dispatch_single(
                 f"exceeds limit of {max_size:,}. Use more specific parameters.]"
             )
 
-    # 执行非读取工具时重置连续读取计数。
-    # we only warn/block on *truly consecutive* reads.
+    # Reset consecutive-read tracking after any non-read tool so warnings only
+    # apply to truly consecutive repeated reads.
     if tool_name not in ("read_file", "search_files"):
         try:
             from mclaw.tools.read_tracker import notify_other_tool_call
@@ -993,13 +1001,13 @@ def handle_function_calls(
     use_concurrent = _should_parallelize_tool_batch(calls)
 
     if use_concurrent:
-        # 并发路径：只读工具不做 checkpoint。
-        # memory 工具不会进入 _PARALLEL_SAFE_TOOLS，因此正常不会走到这里。
+        # Concurrent path: read-only tools do not checkpoint. Memory tools are
+        # excluded from _PARALLEL_SAFE_TOOLS, so they should not reach here.
         _tool_names = [c.get("function", {}).get("name", "?") for c in calls]
         logger.info("[TOOL CONCURRENT START] tools=%s", _tool_names)
         results: list = [None] * len(calls)
-        # 使用 daemon 线程而不是 ThreadPoolExecutor，避免 shutdown(wait=True)
-        # 等待卡住的 worker 导致整个子代理死锁。
+        # Use daemon threads instead of ThreadPoolExecutor to avoid
+        # shutdown(wait=True) waiting forever on a stuck worker.
         _tool_threads: list[tuple[threading.Thread, int]] = []
         for i, call in enumerate(calls):
             ctx = copy_context()
@@ -1035,13 +1043,14 @@ def handle_function_calls(
         logger.info("[TOOL CONCURRENT END]")
         return results
 
-    # 串行路径：写工具通过调用方 manager 做 checkpoint。
+    # Serial path: write tools checkpoint through the caller-provided manager.
     results = []
     for i, call in enumerate(calls):
         func = call.get("function", {})
         tname = func.get("name", "?")
         logger.debug("Serial tool %d/%d: %s", i + 1, len(calls), tname)
-        # 使用带超时的线程包装工具调用，避免单个卡死工具长期阻塞 agent 循环。
+        # Wrap each tool call with a timeout so one stuck tool cannot block the
+        # agent loop indefinitely.
         tool_result = [None]
         ctx = copy_context()
         def _run():

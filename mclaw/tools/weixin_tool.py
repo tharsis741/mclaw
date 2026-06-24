@@ -1,4 +1,12 @@
-"""Weixin channel tools."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Function-call tools for Weixin outbound channel sessions.
+
+These tools send files and text through the Weixin target bound to the active
+agent session. They validate the session binding before attempting delivery.
+"""
 
 from __future__ import annotations
 

@@ -1,6 +1,12 @@
-"""M-Claw interactive TUI — prompt_toolkit chat interface with Rich rendering.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Provides: slash commands, streaming output, status bar, session management.
+"""Interactive prompt_toolkit chat application for M-Claw.
+
+This module owns the terminal user interface around agent turns: slash commands,
+streaming renderers, session locking and resume, input history, pet
+notifications, and subagent progress buffering.
 """
 
 import logging
@@ -327,7 +333,7 @@ class InteractiveChat:
         self._spinner_text = ""
         self._stream_text = ""
         self._stream_started = False
-        self._active_tools: set[str] = set()   # 当前并发工具名称。
+        self._active_tools: set[str] = set()   # Currently concurrent tool names.
         self._pending_key_setup: Optional[dict] = None
         self._pending_skill_import_confirmation: Optional[dict] = None
         self._pending_secret_request: Optional[dict] = None
@@ -379,7 +385,7 @@ class InteractiveChat:
         # Subagent state
         self.subtask_manager = None
         self._subagent_status_fragments: list = []
-        # 事件缓冲区：用于解决 subtask_manager 创建前进度事件已到达的竞态条件
+        # Event buffer for progress events that arrive before subtask_manager exists.
         self._pending_subagent_events: list = []
 
         # Session DB
@@ -416,7 +422,7 @@ class InteractiveChat:
         history_dir.mkdir(parents=True, exist_ok=True)
         self._history_file = history_dir / "chat_history"
 
-        # 用于 slash 命令发现的 Skill 注册表。
+        # Skill registry used for slash-command discovery.
         self.skill_registry = get_skill_registry()
         self.skill_registry.refresh()
 
@@ -557,11 +563,12 @@ class InteractiveChat:
     def _delegate_progress_callback(self, event: SubtaskEvent):
         """Relay subagent progress events to the SubtaskManager.
 
-        如果 subtask_manager 尚未创建（竞态条件：daemon 线程在 chat() 创建
-        subtask_manager 之前就开始发送事件），则将事件暂存到缓冲区，稍后重放。
+        If subtask_manager is not ready yet, buffer events and replay them
+        later. This covers the race where the daemon thread starts emitting
+        progress before chat() has created the manager.
         """
         if not hasattr(self, "subtask_manager") or self.subtask_manager is None:
-            # 暂存事件，最多保留最近 50 个，防止内存无限增长
+            # Keep only the most recent progress events to bound memory growth.
             self._pending_subagent_events.append(event)
             if len(self._pending_subagent_events) > 50:
                 self._pending_subagent_events.pop(0)
@@ -3043,18 +3050,18 @@ class InteractiveChat:
 
             if self._agent_running:
                 if double_tap:
-                    # 强制退出：跳过 flush
+                    # Force exit: skip flush.
                     self._force_exit_no_flush = True
                     self._should_exit = True
                     event.app.exit()
                 else:
-                    # 第一次：只中断当前任务，保留交互循环继续接收下一条输入。
+                    # First tap: interrupt only the current task and keep the loop alive.
                     self._last_interrupt_at = now
                     if self.agent:
                         self.agent.interrupt()
                     self._get_runtime_renderer().interrupted(self._sym("⚡"), leading_newline=True)
             else:
-                # 空闲时 Ctrl+C：优雅退出
+                # Ctrl+C while idle exits gracefully.
                 self._should_exit = True
                 event.app.exit()
 

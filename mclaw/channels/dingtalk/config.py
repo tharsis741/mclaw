@@ -1,4 +1,12 @@
-"""DingTalk channel configuration."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Load and validate DingTalk channel configuration.
+
+Configuration is read from M-Claw config/env sources and normalized into the
+runtime settings required by Stream Mode and outbound delivery.
+"""
 
 from __future__ import annotations
 

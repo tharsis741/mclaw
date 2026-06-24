@@ -1,4 +1,12 @@
-"""Disk-backed Weixin context_token cache."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Disk-backed Weixin context_token cache.
+
+The cache persists peer context tokens across process restarts while keeping
+storage format and expiry behavior local to the Weixin channel.
+"""
 
 from __future__ import annotations
 
@@ -56,4 +64,3 @@ class ContextTokenStore:
             if key.startswith(prefix)
         }
         _write_json_atomic(self._path(account_id), payload)
-

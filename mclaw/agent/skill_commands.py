@@ -1,4 +1,13 @@
-"""CLI helpers for Skills slash commands."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Format Skill slash-command data for the CLI.
+
+This module turns Skill registry payloads into compact terminal text while
+keeping registry access, description wrapping, and display fallback behavior
+outside the interactive TUI class.
+"""
 
 from __future__ import annotations
 

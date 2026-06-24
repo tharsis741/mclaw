@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 xlsx_pack.py — Pack a working directory back into a valid xlsx file.
 

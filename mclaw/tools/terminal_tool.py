@@ -1,4 +1,14 @@
-"""Terminal tool — executes shell commands with session snapshot injection."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Register the terminal tool and constrain shell execution by runtime policy.
+
+The terminal tool preserves per-session cwd/env state, supports background
+processes through the process registry, scopes authorized secrets into command
+environments, and blocks shell mutations against managed Skill storage. Child
+agents are forced into their delegation workspace before commands execute.
+"""
 
 import json
 import os
@@ -20,6 +30,7 @@ _IS_WINDOWS = _platform_mod.system() == "Windows"
 DEFAULT_TIMEOUT = 180
 DEFAULT_MAX_TIMEOUT = 600
 MAX_RESULT_SIZE_CHARS = 50000
+
 
 @dataclass
 class RuntimeTerminalSession:
@@ -242,7 +253,7 @@ def set_current_session(session_id: str | None) -> None:
     """
     global _current_session_id
     if _current_session_id is not None and _current_session_id in _env_registry:
-        # 清理前检查是否仍有活跃后台进程。
+        # Do not clean up a session environment while background processes are active.
         try:
             from mclaw.tools.process_registry import process_registry
             if process_registry.has_active_processes(_current_session_id):
@@ -382,8 +393,8 @@ def terminal_tool(
 
         effective_task_id = task_id or _current_session_id or ""
 
-        # 未指定 workdir 时继承当前会话环境的 cwd 和 env，
-        # 确保后台进程与前台命令使用相同工作目录和环境快照。
+        # Without an explicit workdir, inherit the current session cwd/env so
+        # background and foreground commands share the same environment snapshot.
         session_env = _env_registry.get(_current_session_id) if _current_session_id else None
         # Explicit workdir takes priority; fall back to session_env.cwd only when not specified.
         bg_cwd = session_env.cwd if session_env else None
@@ -453,8 +464,8 @@ def terminal_tool(
             "session_id": proc_session.id,
             "pid": proc_session.pid,
             "status": "running",
-            # 注意：此处没有 exit_code，因为进程仍在运行。
-            # 使用 process(action="poll", session_id=...) 检查退出状态。
+            # No exit_code is available while the process is still running.
+            # Use process(action="poll", session_id=...) to inspect exit state.
         }
         if check_interval:
             # Store watcher info on session for checkpoint persistence; consumed by CLI loop.
@@ -566,7 +577,7 @@ def _handle_terminal(args: dict, **kwargs) -> str:
     cfg = cfg or {}
     effective_timeout = _resolve_timeout(args.get("timeout"), cfg if isinstance(cfg, dict) else {})
 
-    # 子代理强制使用 runtime-approved delegation 工作目录
+    # Child agents must execute from the runtime-approved delegation workspace.
     delegation_dir = None
     if parent_agent is not None and getattr(parent_agent, "_delegate_depth", 0) > 0:
         delegation_dir = getattr(parent_agent, "_delegation_dir", None)
@@ -574,7 +585,8 @@ def _handle_terminal(args: dict, **kwargs) -> str:
             delegation_dir = str(delegation_dir)
             effective_workdir = delegation_dir
 
-            # ── 路径检查：绝对路径必须通过 runtime PathPolicy 且位于 delegation 目录内 ──
+            # Absolute paths must pass Runtime PathPolicy and remain inside
+            # the delegation directory.
             abs_paths = extract_absolute_paths(command)
             runtime = RuntimeManager.current(cfg if isinstance(cfg, dict) else None)
             for abs_path in abs_paths:

@@ -1,4 +1,12 @@
-"""Runtime process helpers."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Process spawning, cleanup, and environment helpers for runtimes.
+
+The helpers sanitize subprocess environments, select process profiles, and
+terminate process trees in a way that works across local runtime backends.
+"""
 
 from __future__ import annotations
 

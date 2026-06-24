@@ -1,4 +1,12 @@
-"""Outbound Weixin media item builders."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Build outbound Weixin media payload descriptors.
+
+The builders normalize local file paths and media metadata before the channel
+runtime sends them through Weixin-specific APIs.
+"""
 
 from __future__ import annotations
 

@@ -1,11 +1,17 @@
-"""Context compressor — automatic conversation summarization when context grows large.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-M-Claw compressor with:
-  - Tool output pruning before LLM summarization (cheap pre-pass)
-  - Token-budget tail protection instead of fixed message count
-  - Structured summary template (Goal, Progress, Decisions, Files, Next Steps)
-  - Head+tail content truncation (preserves beginning and end of messages)
-  - Real token tracking via update_from_response() + last_completion_tokens
+"""Conversation compaction for long-running M-Claw sessions.
+
+This module owns context-window pressure management for the agent loop. It
+prunes stale tool output, protects recent turns by token budget, summarizes
+middle turns through the active model provider, and repairs tool-call/result
+pairs so compressed histories remain valid API messages.
+
+The compressor keeps a running summary across compactions and uses real API
+usage when available. That keeps decisions tied to provider behavior rather
+than only to local token estimates.
 """
 
 import logging
@@ -16,7 +22,7 @@ from mclaw.prompts.compression import build_context_compression_prompt
 
 logger = logging.getLogger(__name__)
 
-# 压缩上下文摘要前缀。
+# Prefix attached to generated context summaries.
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION] Earlier turns in this conversation were compacted "
     "to save context space. The summary below describes work that was "
@@ -25,28 +31,28 @@ SUMMARY_PREFIX = (
     "from where things left off, and avoid repeating work:"
 )
 
-# 裁剪旧工具结果时使用的占位文本。
+# Placeholder used when old tool results are pruned.
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 
-# 摘要 token 预算。
+# Summary token budget controls.
 _MIN_SUMMARY_TOKENS = 2000
 _SUMMARY_RATIO = 0.20
 _SUMMARY_TOKENS_CEILING = 12_000
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
-# 内容截断上限。
+# Content truncation limits.
 _CONTENT_MAX = 6000       # total chars per message body
 _CONTENT_HEAD = 4000      # chars kept from the start
 _CONTENT_TAIL = 1500      # chars kept from the end
-_TOOL_ARGS_MAX = 1500    # 工具调用参数最大字符数。
-_TOOL_ARGS_HEAD = 1200   # 从工具参数开头保留的字符数。
+_TOOL_ARGS_MAX = 1500     # max chars kept from tool-call arguments
+_TOOL_ARGS_HEAD = 1200    # chars kept from the start of tool-call arguments
 
 
 def estimate_tokens_rough(text: str) -> int:
     if not text:
         return 0
     # Chinese chars ≈ 1 token each; ASCII ≈ 0.25 tokens each.
-    # 对代码密集内容，这比简单使用 len/2 或 len/4 更准确。
+    # This is more stable for code-heavy content than len/2 or len/4.
     chinese = sum(1 for c in text if "一" <= c <= "鿿")
     ascii_chars = len(text) - chinese
     return max(1, chinese + int(ascii_chars / 4))
@@ -144,8 +150,8 @@ class ContextCompressor:
         self._previous_summary: Optional[str] = None
         self._context_probed: bool = False
 
-        # 熔断标记：防止同一轮内多次压缩。
-        # 压缩后置位，由调用方在下一次 API 调用前清除。
+        # Circuit breaker: one compaction per turn. The caller clears it
+        # before the next API call.
         self._compressed_this_turn: bool = False
 
         if not quiet_mode:
@@ -263,10 +269,6 @@ class ContextCompressor:
             protect_tail_tokens=self.tail_token_budget,
         )
 
-    # ------------------------------------------------------------------
-    # 工具输出裁剪：低成本预处理。
-    # ------------------------------------------------------------------
-
     def _prune_old_tool_results(
         self, messages: List[Dict], protect_tail_count: int,
         protect_tail_tokens: int,
@@ -282,7 +284,7 @@ class ContextCompressor:
         result = [m.copy() for m in messages]
         pruned = 0
 
-        # 确定裁剪边界。
+        # Find the oldest message that should still be protected.
         accumulated = 0
         boundary = len(result)
         min_protect = min(protect_tail_count, len(result) - 1)
@@ -338,7 +340,7 @@ class ContextCompressor:
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
                 continue
 
-            # assistant 消息：保留工具调用名称和参数。
+            # Assistant messages keep tool-call names and arguments.
             if role == "assistant":
                 if len(content) > _CONTENT_MAX:
                     content = content[:_CONTENT_HEAD] + "\n...[truncated]...\n" + content[-_CONTENT_TAIL:]
@@ -361,16 +363,12 @@ class ContextCompressor:
                 parts.append(f"[ASSISTANT]: {content}")
                 continue
 
-            # user 和其他角色。
+            # User and other roles.
             if len(content) > _CONTENT_MAX:
                 content = content[:_CONTENT_HEAD] + "\n...[truncated]...\n" + content[-_CONTENT_TAIL:]
             parts.append(f"[{role.upper()}]: {content}")
 
         return "\n\n".join(parts)
-
-    # ------------------------------------------------------------------
-    # 基于 token 预算裁剪尾部。
-    # ------------------------------------------------------------------
 
     def _find_tail_cut_by_tokens(
         self, messages: List[Dict], head_end: int,
@@ -404,23 +402,19 @@ class ContextCompressor:
             accumulated += msg_tokens
             cut_idx = i
 
-        # 至少保护 min_tail 条尾部消息。
+        # Always protect at least min_tail recent messages.
         fallback_cut = n - min_tail
         if cut_idx > fallback_cut:
             cut_idx = fallback_cut
 
-        # 如果预算会保护全部内容，则强制在头部之后切分。
+        # If the budget would protect everything, force a cut after the head.
         if cut_idx <= head_end:
             cut_idx = max(fallback_cut, head_end + 1)
 
-        # 对齐边界，避免拆开工具调用组。
+        # Align boundaries so tool-call groups stay intact.
         cut_idx = self._align_boundary_backward(messages, cut_idx)
 
         return max(cut_idx, head_end + 1)
-
-    # ------------------------------------------------------------------
-    # 边界对齐辅助函数。
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _align_boundary_forward(messages: List[Dict], idx: int) -> int:
@@ -445,10 +439,6 @@ class ContextCompressor:
         if check >= 0 and messages[check].get("role") == "assistant" and messages[check].get("tool_calls"):
             idx = check
         return idx
-
-    # ------------------------------------------------------------------
-    # 摘要生成：支持迭代更新。
-    # ------------------------------------------------------------------
 
     def _compute_summary_budget(self, turns_to_summarize: List[Dict]) -> int:
         """Scale summary token budget with the amount of content being compressed."""
@@ -486,7 +476,7 @@ class ContextCompressor:
             _summarize_elapsed = time.monotonic() - _summarize_start
             logger.info("[_generate_summary] summarization API returned in %.2fs, got_summary=%s", _summarize_elapsed, bool(summary))
             if summary:
-                # 存储迭代摘要前移除摘要前缀。
+                # Store the rolling summary without duplicating the public prefix.
                 stored = summary.replace(SUMMARY_PREFIX, "").strip()
                 self._previous_summary = stored
             return summary
@@ -595,14 +585,10 @@ class ContextCompressor:
         summary = content.strip()
         return f"{SUMMARY_PREFIX}\n{summary}"
 
-    # ------------------------------------------------------------------
-    # 工具调用和工具结果的成对完整性。
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _sanitize_tool_pairs(messages: List[Dict]) -> List[Dict]:
         """Remove orphaned tool results and insert stubs for missing results."""
-        # 收集仍保留的调用 ID。
+        # Collect call IDs that survived compression.
         surviving_call_ids = set()
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -611,7 +597,7 @@ class ContextCompressor:
                     if tc_id:
                         surviving_call_ids.add(tc_id)
 
-        # 收集当前存在的结果 ID。
+        # Collect result IDs still present in the message list.
         present_result_ids = set()
         for msg in messages:
             if msg.get("role") == "tool":
@@ -619,7 +605,7 @@ class ContextCompressor:
                 if tid:
                     present_result_ids.add(tid)
 
-        # 1. 移除孤立工具结果。
+        # Remove tool results whose assistant call was summarized away.
         orphaned_results = present_result_ids - surviving_call_ids
         if orphaned_results:
             messages = [
@@ -664,10 +650,6 @@ class ContextCompressor:
 
         return messages
 
-    # ------------------------------------------------------------------
-    # 主压缩入口。
-    # ------------------------------------------------------------------
-
     def compress(self, messages: List[Dict]) -> List[Dict]:
         """Compress conversation history.
 
@@ -680,7 +662,7 @@ class ContextCompressor:
 
         logger.info("[COMPRESSION START] messages=%d threshold=%d", n, self.threshold_tokens)
 
-        # 阶段 1：裁剪旧工具结果，作为低成本预处理。
+        # Phase 1: prune old tool results as a cheap pre-pass.
         logger.info("[COMPRESSION] Phase 1: pruning old tool results")
         messages, pruned_count = self._prune_old_tool_results(
             messages,
@@ -694,10 +676,10 @@ class ContextCompressor:
         logger.info("[COMPRESSION] Phase 2: determining boundaries")
         compress_start = self._align_boundary_forward(messages, self.protect_first_n)
 
-        # 使用 token 预算保护尾部消息。
+        # Protect the tail by token budget instead of fixed message count.
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
-        # 向后对齐：如果 compress_end 落在工具结果上，
-        # 则回退边界，避免拆开 tool_call/result 对。
+        # If the boundary lands on a tool result, move it backward so the
+        # tool_call/result pair is summarized together.
         compress_end = self._align_boundary_backward(messages, compress_end)
 
         if compress_start >= compress_end:
@@ -732,7 +714,7 @@ class ContextCompressor:
                 )
             compressed.append(msg)
 
-        # 如果 LLM 摘要失败，插入静态降级摘要。
+        # If model summarization fails, insert a static fallback marker.
         if not summary:
             logger.warning("Summary generation failed — inserting static fallback context marker")
             n_dropped = compress_end - compress_start
@@ -742,7 +724,7 @@ class ContextCompressor:
                 f"removed to free context space but could not be summarized."
             )
 
-        # 选择不会与相邻消息形成连续同角色的 role。
+        # Choose a summary role that avoids adjacent same-role messages.
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
         first_tail_role = messages[compress_end].get("role", "user") if compress_end < n else "user"
 
@@ -764,7 +746,7 @@ class ContextCompressor:
         self.compression_count += 1
         self._compressed_this_turn = True
 
-        # 阶段 5：修复工具调用/结果配对。
+        # Phase 5: repair tool-call/result pairs.
         logger.info("[COMPRESSION] Phase 5: sanitizing tool pairs")
         compressed = self._sanitize_tool_pairs(compressed)
 
@@ -776,8 +758,8 @@ class ContextCompressor:
         )
         logger.info("[COMPRESSION END] compression #%d complete", self.compression_count)
 
-        # 压缩后重置文件去重状态，因为原始读取内容已被摘要替代。
-        # 已被摘要替代，因此模型后续需要重新看到完整内容。
+        # Reset file-read dedup after compaction: original read contents may
+        # have been summarized away, so a later read should be allowed.
         try:
             from mclaw.tools.read_tracker import reset_file_dedup
             reset_file_dedup(task_id=self.session_id or None)

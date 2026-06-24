@@ -1,4 +1,13 @@
-"""Operation-first rollback coordinator."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Coordinate operation-first filesystem rollback.
+
+RollbackCoordinator restores files, creates conflict backups, updates chat
+context, and records audit state while keeping journal inspection separate from
+the UI and tool layers.
+"""
 
 from __future__ import annotations
 

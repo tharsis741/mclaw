@@ -1,4 +1,8 @@
-"""Shared M-Claw TUI building blocks."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared Rich-based building blocks for M-Claw TUI panels."""
 
 from __future__ import annotations
 

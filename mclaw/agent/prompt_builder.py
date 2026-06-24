@@ -1,4 +1,14 @@
-"""System prompt assembly — identity, platform hints, tool guidance."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Assemble the system prompt from identity, runtime context, and tool rules.
+
+The builder keeps user-visible prompt text in Chinese while the Python module
+documents the assembly flow in English. Skill guidance uses progressive
+disclosure: the system prompt lists installed Skills, and detailed instructions
+are loaded only when the model needs a specific Skill.
+"""
 
 import hashlib
 import json
@@ -14,8 +24,6 @@ from mclaw.platform import get_platform_info
 from mclaw.agent.skill_utils import get_disabled_skill_names
 
 logger = logging.getLogger(__name__)
-
-# ── Skills prompt two-layer cache ──────────────────────────────────────────
 
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
@@ -455,7 +463,7 @@ def build_system_prompt(
     """
     sections = []
 
-    # 1. 身份设定：SOUL.md 或默认设定。
+    # 1. Identity: SOUL.md, stored default, or built-in default.
     if soul_md:
         sections.append(soul_md)
     else:
@@ -479,10 +487,10 @@ def build_system_prompt(
     if hint:
         sections.append(hint)
 
-    # 3. 环境上下文。
+    # 3. Runtime environment context.
     sections.append("# Environment\n" + _build_platform_block(model=model, config=config))
 
-    # 4. 工具使用规则和可用工具名称。
+    # 4. Tool-use rules and available tool names.
     tool_guidance_parts: List[str] = []
     if tool_names or available_tool_names:
         tool_guidance_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
@@ -496,7 +504,7 @@ def build_system_prompt(
         if delegation_prompt:
             sections.append(delegation_prompt)
 
-    # 5. 记忆规则和记忆块。
+    # 5. Memory rules and recalled memory block.
     memory_tool_names = {"memory_read", "memory_add", "memory_replace", "memory_remove"}
     if tool_names is None or bool(memory_tool_names & set(tool_names)) or memory_block:
         memory_parts = [MEMORY_GUIDANCE]

@@ -1,4 +1,8 @@
-﻿"""Thread-safe controller for the optional animated desktop pet sidecar."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Thread-safe controller for the optional animated desktop pet sidecar."""
 
 from __future__ import annotations
 

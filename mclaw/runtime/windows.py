@@ -1,4 +1,13 @@
-"""Windows host runtime."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Windows host runtime implementation.
+
+The runtime selects PowerShell-oriented shell, path, process, search, and
+optional feature profiles while preserving Windows-specific capability checks
+inside the runtime layer.
+"""
 
 from __future__ import annotations
 

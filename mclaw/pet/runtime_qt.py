@@ -1,4 +1,8 @@
-﻿"""PySide6 desktop pet sidecar runtime.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""PySide6 desktop pet sidecar runtime.
 
 This module is imported only inside the sidecar process.
 """

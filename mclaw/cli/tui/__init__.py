@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """M-Claw terminal UI rendering primitives."""
 
 from .theme import ACCENT_COLOR, ACCENT_DIM, ACCENT_LIGHT, BANNER_TEXT_COLOR, TUI_BRAND_TITLE, select_box

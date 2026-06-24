@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 xlsx_shift_rows.py — Shift all row references in an unpacked xlsx working directory
 after inserting or deleting rows.

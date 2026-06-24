@@ -1,4 +1,12 @@
-"""DingTalk Stream Mode runtime."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Run the DingTalk Stream Mode channel loop.
+
+The runtime wires configuration, SDK callbacks, deduplication, session routing,
+and outbound target registration around the shared channel runner.
+"""
 
 from __future__ import annotations
 

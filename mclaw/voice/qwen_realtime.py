@@ -1,4 +1,8 @@
-"""Qwen realtime ASR backend."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Qwen realtime ASR backend for streaming voice transcription."""
 
 from __future__ import annotations
 

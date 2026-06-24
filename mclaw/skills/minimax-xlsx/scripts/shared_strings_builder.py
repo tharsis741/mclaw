@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 shared_strings_builder.py — Generate a valid sharedStrings.xml from a list of strings.
 

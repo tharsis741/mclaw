@@ -1,4 +1,13 @@
-"""Helpers for extracting local absolute paths from model/tool text."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Extract local absolute paths from model and tool text.
+
+The extractor handles quoted paths, extension-aware unquoted file paths, and a
+fallback path scan for simple directory references. It favors avoiding false
+"file not found" reports over greedily consuming surrounding prose.
+"""
 
 from __future__ import annotations
 
@@ -47,7 +56,7 @@ def _extend_to_existing_path(text: str, start: int, initial: str) -> str:
     """Extend an unquoted simple path to the longest existing path on disk.
 
     Regex can only safely capture an unquoted path up to the first whitespace.
-    For paths such as `D:/work/M-Robots OS 3.0 资料`, continue scanning the
+    For paths such as `D:/work/M-Robots OS 3.0 Materials`, continue scanning the
     current text segment and keep the longest prefix that actually exists.
     This is intentionally existence-based so normal prose after the path is not
     swallowed merely because it looks path-like.
@@ -85,8 +94,8 @@ def extract_absolute_paths(text: str) -> List[str]:
     paths: list[str] = []
     primary_paths: list[str] = []
 
-    # 带引号路径可能是目录也可能是文件，捕获到闭合引号为止。
-    # quote. This handles command snippets such as cd "D:/path with spaces".
+    # Quoted paths may be files or directories; capture until the closing quote.
+    # This handles command snippets such as cd "D:/path with spaces".
     quote_pattern = r'["“”\']((?:[A-Za-z]:[\\/]|/)[^"“”\']+)["“”\']'
     for match in re.finditer(quote_pattern, text):
         path = match.group(1)
@@ -95,7 +104,7 @@ def extract_absolute_paths(text: str) -> List[str]:
 
     ext_alt = "|".join(re.escape(ext) for ext in PATH_EXTENSIONS)
 
-    # 未加引号的文件路径允许包含空格，并在已知扩展名处停止。
+    # Unquoted file paths may contain spaces; stop at known file extensions.
     win_file = rf'[A-Za-z]:[\\/][^\r\n<>|?*]*?\.(?:{ext_alt})(?=$|[\s"”’\'`,，。；;!?)\]])'
     unix_file = rf'/(?:[^\r\n<>|?*]*?)\.(?:{ext_alt})(?=$|[\s"”’\'`,，。；;!?)\]])'
     for match in re.finditer(win_file, text, flags=re.IGNORECASE):
@@ -109,15 +118,14 @@ def extract_absolute_paths(text: str) -> List[str]:
         paths.append(path)
         primary_paths.append(path)
 
-    # 未加引号目录或无空格简单路径的降级提取。
+    # Fallback for unquoted directories or simple paths without spaces.
     win_simple_path = r'[A-Za-z]:[\\/][^\s"\'`<>|?*]+'
     unix_simple_path = r'/[^\s"\'`<>|?*]+'
     for match in re.finditer(win_simple_path, text):
         simple = _clean_path(match.group(0))
         simple = _extend_to_existing_path(text, match.start(), simple)
-        # 如果扩展名感知匹配已经捕获了包含空格的更长路径，
-        # 简单降级规则会捕获其前缀，因此需要丢弃。
-        # 丢弃该前缀可避免误报“文件不存在”。
+        # Extension-aware matches may already have captured a longer path with
+        # spaces. Drop the simple-prefix match to avoid false not-found reports.
         if any(_clean_path(path).startswith(simple + " ") for path in primary_paths):
             continue
         paths.append(simple)

@@ -1,4 +1,8 @@
-﻿"""Event types shared between M-Claw and the optional pet sidecar."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Event types shared between M-Claw and the optional pet sidecar."""
 
 from __future__ import annotations
 

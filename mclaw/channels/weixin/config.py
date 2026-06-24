@@ -1,4 +1,12 @@
-"""Weixin channel configuration."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Load and validate Weixin channel configuration.
+
+The module normalizes config/env values used by long polling, outbound message
+delivery, and optional media handling.
+"""
 
 from __future__ import annotations
 

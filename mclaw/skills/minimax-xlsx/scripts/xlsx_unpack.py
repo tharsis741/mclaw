@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 xlsx_unpack.py — Unpack an xlsx file into a working directory for XML editing.
 

@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Browser Tool — 8 sub-tools for web browsing via Playwright.
 
 Sessions are managed per-agent-turn and auto-cleaned after inactivity.

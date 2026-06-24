@@ -1,4 +1,13 @@
-"""Linux/POSIX host runtime."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Linux and POSIX host runtime implementation.
+
+The runtime selects shell, path, process, search, and optional feature profiles
+for non-Windows hosts while keeping platform capability checks local to this
+module.
+"""
 
 from __future__ import annotations
 

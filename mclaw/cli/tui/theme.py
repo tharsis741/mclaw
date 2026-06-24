@@ -1,4 +1,8 @@
-"""Shared M-Claw TUI theme tokens."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared color, border, and brand tokens for the M-Claw TUI."""
 
 from rich import box as rich_box
 

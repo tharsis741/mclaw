@@ -1,4 +1,12 @@
-"""Search layer for external skills."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Search layer for external Skill discovery.
+
+The module wraps remote Skill search responses into internal result objects so
+the CLI and agent can present consistent Skill metadata.
+"""
 from __future__ import annotations
 
 import logging

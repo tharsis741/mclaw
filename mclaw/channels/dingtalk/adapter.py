@@ -1,4 +1,12 @@
-"""DingTalk channel adapter."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Adapt DingTalk SDK callbacks into normalized channel messages.
+
+The adapter keeps vendor event parsing separate from session routing and agent
+execution so the runtime can operate on channel-neutral payloads.
+"""
 
 from __future__ import annotations
 

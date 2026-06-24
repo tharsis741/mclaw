@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Small helper for task-scoped auxiliary LLM calls.
 
 Auxiliary tasks such as session_search should be configurable independently,

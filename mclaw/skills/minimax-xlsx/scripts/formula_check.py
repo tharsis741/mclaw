@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# SPDX-License-Identifier: MIT
 """
 formula_check.py — Static formula validator for xlsx files.
 

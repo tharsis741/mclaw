@@ -1,14 +1,16 @@
-"""Context length resolution with 8-level fallback + runtime error probe.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Resolution order:
-  0. config explicit override
-  1. persistent cache in M-Claw home context_length_cache.yaml
-  2. custom endpoint /models metadata (only for truly custom endpoints)
-  3. Anthropic /v1/models API
-  4. models.dev registry (core — 4000+ models)
-  5. hardcoded DEFAULT_CONTEXT_LENGTHS fuzzy match
-  6. Error probe (runtime parse from API error) — caller invokes this after overflow error
-  7. default 128K fallback
+"""Resolve model context windows from cache, providers, and fallbacks.
+
+The agent needs a conservative context length before it can decide when to
+compact history. This module resolves that value from explicit config,
+persistent cache, provider APIs, the models.dev registry, fuzzy built-in
+defaults, and finally a 128K fallback.
+
+Runtime overflow errors are parsed separately so callers can update cached
+limits after a provider reports a more precise value.
 """
 
 from __future__ import annotations
@@ -29,26 +31,26 @@ CONTEXT_PROBE_TIERS = [128_000, 64_000, 32_000, 16_000, 8_000]
 DEFAULT_FALLBACK_CONTEXT = 128_000
 
 DEFAULT_CONTEXT_LENGTHS = {
-    # Anthropic 模型。
+    # Anthropic models.
     "claude-opus-4-6": 1_000_000,
     "claude-sonnet-4-6": 1_000_000,
     "claude": 200_000,
-    # OpenAI 模型。
+    # OpenAI models.
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
     "gpt-4-turbo": 128_000,
     "gpt-4": 128_000,
     "gpt-3.5-turbo": 16_384,
-    # Google 模型。
+    # Google models.
     "gemini": 1_048_576,
     "gemma": 8_192,
-    # DeepSeek 模型。
+    # DeepSeek models.
     "deepseek": 128_000,
-    # Meta 模型。
+    # Meta models.
     "llama": 131_072,
-    # Qwen 模型。
+    # Qwen models.
     "qwen": 131_072,
-    # MiniMax：当前内置模型上下文长度按 204,800 处理。
+    # MiniMax built-ins are treated as 204,800-token contexts.
     "minimax-m1-256k": 204_800,
     "minimax-m1-128k": 204_800,
     "minimax-m1-80k": 204_800,
@@ -62,11 +64,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     "minimax-m2.7": 204_800,
     "minimax-m2.7-highspeed": 204_800,
     "minimax": 204_800,
-    # GLM 模型。
+    # GLM models.
     "glm": 202_752,
-    # Kimi 模型。
+    # Kimi models.
     "kimi": 262_144,
-    # 本地/Ollama 模型。
+    # Local/Ollama models.
     "llama3.1:8b": 131_072,
     "llama3.1:70b": 131_072,
     "qwen2.5:14b": 131_072,
@@ -171,7 +173,7 @@ def get_model_context_length(
         return cached
 
     # Level 2: custom endpoint /models (only when base_url looks custom)
-    # 跳过已知供应商，避免不必要的 API 调用。
+    # Skip known providers to avoid unnecessary API calls.
     if base_url:
         known_hostnames = [
             "openai.com", "anthropic.com", "openrouter.ai",
@@ -229,13 +231,14 @@ def get_model_context_length(
             return ctx
 
     # Level 5: hardcoded DEFAULT_CONTEXT_LENGTHS fuzzy match
-    # 按 key 长度倒序匹配，优先命中最具体的 key。
+    # Match the longest keys first so specific variants win.
     for key, length in sorted(DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: -len(x[0])):
         if key in model_lower:
             save_context_length(model, base_url, length)
             return length
 
-    # 第 6 层：错误探测，调用方应在溢出后调用 parse_context_limit_from_error。
-    # 第 7 层：默认降级值。
+    # Level 6 is the runtime error probe; callers invoke
+    # parse_context_limit_from_error after overflow failures.
+    # Level 7: default fallback.
     save_context_length(model, base_url, DEFAULT_FALLBACK_CONTEXT)
     return DEFAULT_FALLBACK_CONTEXT

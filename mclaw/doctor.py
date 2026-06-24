@@ -1,4 +1,12 @@
-"""Runtime diagnostics for M-Claw."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Runtime diagnostics for M-Claw installations.
+
+Doctor checks local environment, dependency, browser, runtime, and integration
+state so setup issues can be reported before an agent turn fails.
+"""
 
 from __future__ import annotations
 

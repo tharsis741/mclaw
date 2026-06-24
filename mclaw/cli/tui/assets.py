@@ -1,4 +1,8 @@
-"""Shared M-Claw terminal visual assets."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Shared terminal visual assets for the M-Claw TUI."""
 
 MCLAW_LOGO = r"""
 [bold #6CB4EE]███╗   ███╗       ██████╗██╗      █████╗ ██╗    ██╗[/]

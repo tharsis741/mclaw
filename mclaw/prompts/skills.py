@@ -1,4 +1,8 @@
-"""Skill runtime prompt builders."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Prompt builders for Skill discovery, usage, and evolution flows."""
 
 from __future__ import annotations
 

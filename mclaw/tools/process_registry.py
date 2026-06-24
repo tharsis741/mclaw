@@ -1,4 +1,13 @@
-"""Background process registry for local backend."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Track background terminal processes across session restarts.
+
+The registry owns spawned process metadata, bounded output capture, optional
+PTY handles, watcher state, and checkpoint persistence. It keeps long-running
+terminal tasks observable after the foreground tool call has returned.
+"""
 
 from __future__ import annotations
 
@@ -666,13 +675,13 @@ class ProcessRegistry:
             return {"status": "already_exited", "exit_code": session.exit_code}
         try:
             if session._pty is not None:
-                # PTY 模式：通过 pty 句柄结束进程。
+                # PTY mode: terminate through the PTY handle first.
                 try:
                     session._pty.terminate(force=True)
                 except Exception:
                     pass
             elif session.process and session.pid:
-                # Windows 和 Unix 都通过平台封装结束进程树。
+                # Fall back to the platform process-tree killer on Windows and Unix.
                 kill_process_tree(session.pid)
             elif session.detached and session.pid_scope == "host" and session.pid:
                 if not self._is_host_pid_alive(session.pid):
@@ -715,7 +724,7 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
-        # PTY 模式。
+        # PTY mode.
         if session._pty is not None:
             try:
                 raw = data.encode("utf-8") if isinstance(data, str) else data
@@ -744,7 +753,7 @@ class ProcessRegistry:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
         if session.exited:
             return {"status": "already_exited", "error": "Process has already finished"}
-        # PTY 模式。
+        # PTY mode.
         if session._pty is not None:
             try:
                 session._pty.sendeof()
@@ -920,8 +929,8 @@ class ProcessRegistry:
             recovered += 1
             logger.info("Recovered detached process: %s (pid=%d)", session_id, pid)
 
-        # 恢复后始终重写 checkpoint，以清除失效 PID；
-        # 重启后只保留仍存活的恢复会话。
+        # Always rewrite the checkpoint after restore so stale PIDs are
+        # removed and only still-running recovered sessions remain.
         self._write_checkpoint()
         return recovered
 
@@ -929,9 +938,7 @@ class ProcessRegistry:
 process_registry = ProcessRegistry()
 
 
-# ---------------------------------------------------------------------------
-# 工具 schema 和处理器。
-# ---------------------------------------------------------------------------
+# Tool schema and handlers.
 
 PROCESS_SCHEMA = {
     "type": "function",
@@ -1001,9 +1008,9 @@ def _handle_process(args: dict, **kw: Any) -> str:
     session_id = str(sid) if sid is not None else ""
 
     if action == "list":
-        # 这里不要按 task_id 过滤：list 应展示所有进程；
-        # checkpoint 恢复的进程仍带旧 session 的 task_id，
-        # 否则重启后会不可见。
+        # Do not filter by task_id here: list should show all processes.
+        # Checkpoint-restored processes still carry their old task_id and
+        # would disappear after restart if we filtered them out.
         return _json.dumps(
             {"processes": process_registry.list_sessions(task_id=None)},
             ensure_ascii=False,

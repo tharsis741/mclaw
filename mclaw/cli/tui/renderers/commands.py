@@ -1,4 +1,8 @@
-"""Plain slash-command output rendering."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Render plain slash-command output through shared panel models."""
 
 from __future__ import annotations
 

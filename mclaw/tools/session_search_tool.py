@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Cross-session recall tool backed by SessionDB FTS5.
 
 Recent-session browsing returns cheap metadata. Keyword search returns focused

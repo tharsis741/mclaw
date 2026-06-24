@@ -1,4 +1,12 @@
-"""Map Weixin peers to M-Claw sessions."""
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Map Weixin peers to M-Claw sessions.
+
+The router keeps stable peer-to-session bindings so private chat messages can
+resume the correct agent conversation across channel events.
+"""
 
 from __future__ import annotations
 
@@ -61,4 +69,3 @@ class WeixinSessionRouter:
         else:
             basis = f"user:{source.user_id or source.chat_id}"
         return f"weixin:{_hash(account, 12)}:{basis}"
-

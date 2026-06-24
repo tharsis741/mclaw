@@ -1,6 +1,11 @@
-"""Tavily Search Backend — web search via Tavily API.
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-Provides a thin synchronous wrapper around https://api.tavily.com/search.
+"""Tavily web-search backend.
+
+Provides a thin synchronous wrapper around https://api.tavily.com/search and
+formats the answer plus sources into lightweight Markdown for the agent.
 """
 
 from __future__ import annotations
@@ -48,12 +53,12 @@ def search(
             "_hint": "Set TAVILY_API_KEY in the M-Claw home .env file.",
         }
 
-    # 将搜索策略映射为 Tavily search_depth 和 max_results。
+    # Map search strategy to Tavily search_depth and max_results.
     if strategy == "turbo":
         search_depth = "basic"
         max_results = 5
     else:
-        # max / agent 策略使用更深搜索和更多结果。
+        # max / agent strategies use deeper search and more results.
         search_depth = "advanced"
         max_results = 10
 
@@ -66,12 +71,12 @@ def search(
         "include_raw_content": False,
     }
 
-    # 将 freshness 映射为 Tavily time_range。
+    # Map freshness to Tavily time_range.
     _FRESHNESS_MAP = {7: "week", 30: "month", 180: "month", 365: "year"}
     if freshness in _FRESHNESS_MAP:
         payload["time_range"] = _FRESHNESS_MAP[freshness]
 
-    # 将 sites 映射为 include_domains。
+    # Map sites to include_domains.
     if sites:
         domains = [s.strip() for s in sites.split(",") if s.strip()]
         if domains:
@@ -118,7 +123,7 @@ def search(
     answer = data.get("answer", "")
     sources = data.get("results", [])
 
-    # 构建轻量 Markdown 输出。
+    # Build lightweight Markdown output.
     lines: list[str] = []
     if answer:
         lines.append(answer)

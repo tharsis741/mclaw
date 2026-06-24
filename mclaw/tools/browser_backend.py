@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Browser Backend — Playwright wrapper for headless Chromium automation.
 
 Provides a synchronous API over Playwright's async internals. Each session
@@ -42,7 +46,7 @@ def _browser_executable_path() -> str:
                 return found
     return ""
 
-# JS 片段：标记交互元素并返回元数据。
+# JavaScript snippet that tags interactive elements and returns metadata.
 _SNAPSHOT_JS = """
 (() => {
     // Clear old refs
@@ -401,7 +405,7 @@ class BrowserBackend:
         lines: List[str] = []
         ref_map: Dict[str, Any] = {}
 
-        # 提取标题作为页面上下文。
+        # Include headings as page context.
         for h in headings[:8]:
             indent = "  " * (h["level"] - 1)
             lines.append(f"{indent}#{h['level']} {h['text']}")

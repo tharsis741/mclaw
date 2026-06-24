@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """Authentication and provider resolution for M-Claw.
 
 Resolves API credentials from environment variables, M-Claw home .env,
@@ -310,9 +314,10 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
 }
 
 
-# ── 默认供应商模型降级列表 ──
-# 在线 /models API 不可用时使用的后备模型列表，覆盖网络错误、超时和鉴权失败。
-# 每个供应商列出 2-5 个较稳定、常用的模型。
+# Default provider model fallbacks.
+# Used when the online /models API is unavailable due to network errors,
+# timeouts, or authentication failures. Each provider lists a small set of
+# stable, commonly used models.
 
 DEFAULT_PROVIDER_MODELS: Dict[str, List[str]] = {
     "openai": [
@@ -431,8 +436,8 @@ def detect_provider_for_model(model_name: str) -> Optional[str]:
 
     if "/" in model_name:
         prefix = lower.split("/")[0]
-        # OpenRouter 使用 provider/model 格式，例如 anthropic/claude-3.5-sonnet。
-        # 只有前缀像已知上游供应商时，才推测为 openrouter。
+        # OpenRouter uses provider/model names, such as anthropic/claude-3.5-sonnet.
+        # Infer openrouter only when the prefix looks like a known upstream provider.
         known_orgs = {
             "anthropic", "openai", "google", "meta-llama", "mistralai",
             "microsoft", "nousresearch", "qwen", "deepseek",
@@ -704,9 +709,9 @@ def resolve_provider(
     user_providers = _configured_providers(config)
     configured_fallbacks = _fallback_provider_entries(config)
 
-    # --- 显式 provider 优先级最高 ---
-    # 覆盖 --provider CLI 参数和 config.yaml 中的 active_provider。
-    # 该值由 /model --global 设置；仅在供应商有有效密钥时使用。
+    # Explicit provider has the highest priority.
+    # This covers the --provider CLI argument and config.yaml active_provider,
+    # which is set by /model --global and only used when the provider has a key.
     if provider and provider in user_providers:
         resolved = _resolve_user_provider(provider, config) or {}
         resolved_key = api_key or resolved.get("api_key", "")
@@ -779,7 +784,7 @@ def resolve_provider(
             "provider_profile": "",
         }
 
-    # 根据模型名称自动检测。
+    # Auto-detect from model name.
     if model:
         detected = detect_provider_for_model(model)
         if detected and detected in user_providers:
@@ -806,7 +811,7 @@ def resolve_provider(
                     "provider_profile": _resolve_config_profile(detected, config),
                 }
 
-    # 降级顺序：显式配置优先，其次用户接入方，最后预置接入方。
+    # Fallback order: explicit config first, then user providers, then built-ins.
     fallback_order: list[dict[str, str]] = []
     seen_fallbacks: set[str] = set()
     for entry in configured_fallbacks:

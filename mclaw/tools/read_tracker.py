@@ -1,10 +1,14 @@
-"""按任务隔离的文件读取去重与循环检测。
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-设计目标：
-  - 去重：文件未变化时，按 path/offset/limit/mtime 跳过重复读取。
-  - 连续读取保护：同一读取连续重复 4 次后阻止，避免模型陷入读取循环。
-  - 压缩后重置：上下文压缩会移除原始读取内容，需要允许再次读取。
-  - 非读取工具后重置：只统计真正连续的重复读取。
+"""Task-scoped file-read deduplication and loop detection.
+
+Design goals:
+  - Deduplicate unchanged reads by path, offset, limit, and mtime.
+  - Block repeated identical reads after four consecutive attempts.
+  - Reset after context compression because original read output was summarized.
+  - Reset after non-read tools so only truly consecutive repeated reads count.
 """
 
 import logging
@@ -34,9 +38,9 @@ def _get_task_data(task_id: str) -> dict:
 
 
 def check_dedup(path: str, offset: int, limit: int, task_id: str = "default") -> Optional[str]:
-    """如果同一区间已读取且文件未变化，返回提示模型复用已有内容的消息。
+    """Return a reuse hint when an unchanged file region was already read.
 
-    文件新增、变化或从未读取时返回 None。
+    Returns None when the file is new, changed, or not previously read.
     """
     try:
         resolved = str(Path(path).expanduser().resolve())
@@ -66,10 +70,10 @@ def check_dedup(path: str, offset: int, limit: int, task_id: str = "default") ->
 
 
 def record_read(path: str, offset: int, limit: int, task_id: str = "default") -> Tuple[int, bool]:
-    """记录一次读取并返回连续重复次数和是否需要阻止。
+    """Record a read and return consecutive repeat count plus block decision.
 
-    consecutive_count 表示同一读取连续重复次数。
-    should_block 在连续重复次数达到 4 次时为 True。
+    The count tracks identical consecutive reads. should_block becomes True
+    after the fourth identical consecutive read.
     """
     try:
         resolved = str(Path(path).expanduser().resolve())
@@ -102,9 +106,9 @@ def record_read(path: str, offset: int, limit: int, task_id: str = "default") ->
 
 
 def notify_other_tool_call(task_id: str = "default"):
-    """非读取工具执行后重置连续读取计数。
+    """Reset consecutive read count after a non-read tool executes.
 
-    这样只会对真正连续的重复读取告警或阻止。
+    This keeps warnings and blocking scoped to truly consecutive repeated reads.
     """
     with _READ_TRACKER_LOCK:
         task_data = _READ_TRACKER.get(task_id)
@@ -114,9 +118,10 @@ def notify_other_tool_call(task_id: str = "default"):
 
 
 def reset_file_dedup(task_id: str = None):
-    """上下文压缩后清空读取去重缓存。
+    """Clear read deduplication cache after context compression.
 
-    原始读取内容已经被摘要替换，模型再次读取同一文件时需要拿到完整内容。
+    Original read content has been replaced by summaries, so rereading the same
+    file should return complete content again.
     """
     with _READ_TRACKER_LOCK:
         if task_id:
@@ -130,7 +135,7 @@ def reset_file_dedup(task_id: str = None):
 
 
 def get_read_files_summary(task_id: str = "default") -> list:
-    """返回本任务已读取文件摘要，用于上下文保留和诊断。"""
+    """Return read-file summaries for context retention and diagnostics."""
     with _READ_TRACKER_LOCK:
         task_data = _READ_TRACKER.get(task_id, {})
         read_history = task_data.get("read_history", set())

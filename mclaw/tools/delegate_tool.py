@@ -1,13 +1,16 @@
-﻿"""Delegate Tool — 子代理架构
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
 
-在独立线程中 spawn 子 MClaw 实例，拥有：
-  - 隔离的对话历史（无父代理历史继承）
-  - 受限的工具集（DEFAULT_DELEGATE_TOOLSETS - DELEGATE_BLOCKED_TOOLS）
-  - 轻量的系统提示词（直接注入，不走9层构建）
-  - 深度限制（MAX_DELEGATE_DEPTH=2）
+"""Delegated subagent execution with isolated runtime state.
 
-父代理的上下文只看到 delegation call 和最终 summary，
-不暴露子代理的中间 tool calls 或推理过程。
+The delegate tool spawns child ``MClaw`` instances for independent subtasks.
+Each child receives a self-contained prompt, a restricted toolset, its own
+runtime workspace, and no inherited conversation history from the parent.
+
+The parent context only receives the delegation call and final summaries.
+Intermediate child tool calls stay out of the parent message history so large
+exploration tasks do not contaminate or bloat the main conversation.
 """
 
 from __future__ import annotations
@@ -29,18 +32,16 @@ from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
 
-# ── 常量 ──────────────────────────────────────────────────────────────────
-
 DELEGATE_BLOCKED_TOOLS = frozenset([
-    "delegate_task",    # 禁止递归代理
-    "memory",           # 旧记忆工具名，保留为防御项
+    "delegate_task",    # prevent recursive delegation
+    "memory",           # legacy memory tool name kept as defense in depth
     "memory_read",
     "memory_add",
     "memory_replace",
     "memory_remove",
-    "session_search",    # 禁止跨 session 搜索（破坏隔离）
-    "skill_manage",     # 禁止修改共享技能库
-    "skill_search",     # 禁止子代理发现/安装外部 Skill
+    "session_search",   # cross-session search breaks isolation
+    "skill_manage",     # children must not mutate shared Skill storage
+    "skill_search",     # children must not discover or install external Skills
 ])
 
 _BLOCKED_TOOLSET_NAMES = frozenset(["delegation", "memory"])
@@ -57,8 +58,8 @@ ALLOWED_DELEGATE_TOOLSETS = frozenset([
 
 MAX_CONCURRENT_CHILDREN = 5
 MAX_DELEGATE_DEPTH = 2
-DEFAULT_MAX_ITERATIONS = 10  # 子代理迭代上限。预注入目录树后 3-5 轮即可完成分析，10 轮是硬上限防止无限探索。
-MAX_SUMMARY_CHARS = 800  # 子代理摘要上限，保留有效信息
+DEFAULT_MAX_ITERATIONS = 10  # hard cap after workspace preloading limits exploration
+MAX_SUMMARY_CHARS = 800  # keep child summaries concise but useful
 MAX_WORKSPACE_COPY_FILES = 300
 MAX_WORKSPACE_COPY_BYTES = 30 * 1024 * 1024
 DELEGATION_COPY_EXCLUDES = frozenset({
@@ -78,10 +79,8 @@ DELEGATION_COPY_EXCLUDES = frozenset({
     ".turbo",
 })
 
-# ── 进度回调 ───────────────────────────────────────────────────────────
-
 class SubtaskEvent:
-    """子代理进度事件，线程安全传递"""
+    """Thread-safe progress event emitted by a child agent."""
     def __init__(
         self,
         task_index: int,
@@ -103,16 +102,11 @@ SUBAGENT_TOOL_CALL = "tool_call"
 SUBAGENT_COMPLETED = "completed"
 SUBAGENT_ERROR = "error"
 
-# 进度回调类型
 ProgressCallback = Callable[[SubtaskEvent], None]
-
-# ── 模块级队列（供 TUI 轮询）────────────────────────────────────────────
 
 _subagent_results: Queue = Queue()
 _subagent_result_stash: dict[str, Dict[str, Any]] = {}
 _subagent_result_stash_lock = threading.Lock()
-
-# ── Prompt 构建 ──────────────────────────────────────────────────────────
 
 def _build_child_system_prompt(
     goal: str,
@@ -121,7 +115,7 @@ def _build_child_system_prompt(
     workspace_path: Optional[str] = None,
     max_iterations: int = 10,
 ) -> str:
-    """构建子代理的轻量系统提示词（不继承父代理提示词）"""
+    """Build the lightweight child prompt without inheriting the parent prompt."""
     parts = [
         "你是一个子代理，负责完成父代理委托的独立任务。",
         "",
@@ -157,7 +151,7 @@ def _build_child_system_prompt(
 
 
 def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """从父代理获取最佳本地工作区路径提示"""
+    """Return the best local workspace hint available from the parent agent."""
     candidates = [
         os.getenv("TERMINAL_CWD"),
         getattr(parent_agent, "terminal_cwd", None),
@@ -176,7 +170,7 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
 
 
 def _extract_paths_from_text(text: str) -> List[str]:
-    """从文本中提取绝对文件路径（支持 Windows 和 Unix）。"""
+    """Extract absolute Windows or Unix paths from free-form text."""
     return [p for p in extract_absolute_paths(text) if os.path.isabs(os.path.normpath(p))]
 
 
@@ -197,7 +191,7 @@ def _workspace_preparation_summary(child: Any) -> Dict[str, Any]:
 
 
 def _generate_dir_tree(path: str, max_depth: int = 4, max_files_per_dir: int = 30) -> str:
-    """为子代理生成精简目录树，避免子代理反复 list_directory 探索。"""
+    """Generate a compact directory tree to reduce blind child exploration."""
     root = Path(path)
     if not root.exists() or not root.is_dir():
         return ""
@@ -211,7 +205,7 @@ def _generate_dir_tree(path: str, max_depth: int = 4, max_files_per_dir: int = 3
             entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
         except OSError:
             return
-        # 限制每级目录显示数量，防止大目录刷屏
+        # Cap each directory so large trees do not flood the prompt.
         shown = entries[:max_files_per_dir]
         for i, entry in enumerate(shown):
             is_last = (i == len(shown) - 1)
@@ -274,7 +268,7 @@ def _prepare_delegation_workspace(
     context: Optional[str],
     child_delegation_dir: Path,
 ) -> tuple[str, Optional[str], str, Dict[str, Any]]:
-    """将 goal/context 中引用的外部文件/目录复制到子代理 workspace，并改写路径。
+    """Copy referenced external paths into the child workspace and rewrite paths.
 
     Returns:
         (new_goal, new_context, workspace_path, preparation_report)
@@ -284,7 +278,7 @@ def _prepare_delegation_workspace(
 
     text = f"{goal or ''} {context or ''}"
     paths = _extract_paths_from_text(text)
-    # 最长优先，避免部分替换
+    # Replace longer paths first to avoid partial substitutions.
     paths = sorted(paths, key=len, reverse=True)
 
     preparation: Dict[str, Any] = {
@@ -308,7 +302,7 @@ def _prepare_delegation_workspace(
             logger.warning("[delegate] external path not found for subagent copy: %s", original)
             continue
 
-        # 若已被父目录拷贝覆盖则跳过
+        # Skip paths already covered by a copied parent directory.
         is_covered = False
         for covered in covered_norms:
             if norm == covered or norm.startswith(covered + os.sep):
@@ -321,7 +315,7 @@ def _prepare_delegation_workspace(
             })
             continue
 
-        # 跳过 mclaw 系统目录
+        # Skip M-Claw internal runtime paths.
         lower = norm.lower()
         if ".mclaw" in lower:
             skip = False
@@ -401,7 +395,7 @@ def _prepare_delegation_workspace(
         new_goal = new_goal.replace(original, replacement)
         if new_context:
             new_context = new_context.replace(original, replacement)
-        # 同时处理正斜杠变体（JSON 转义常见）
+        # Also replace forward-slash variants, which commonly appear in JSON.
         if "\\" in original:
             forward = original.replace("\\", "/")
             new_goal = new_goal.replace(forward, replacement)
@@ -427,7 +421,7 @@ def _prepare_delegation_workspace(
             )
         new_context = (new_context or "") + "\n".join(prep_lines)
 
-    # ── 预注入目录树，消除子代理盲目探索 ──
+    # Preload a directory tree so children can jump straight to relevant files.
     dir_tree = _generate_dir_tree(str(workspace))
     if dir_tree:
         tree_block = (
@@ -439,11 +433,8 @@ def _prepare_delegation_workspace(
 
     return new_goal, new_context or None, str(workspace), preparation
 
-
-# ── 工具集过滤 ────────────────────────────────────────────────────────────
-
 def _strip_blocked_toolsets(toolsets: List[str]) -> List[str]:
-    """移除被屏蔽的工具集名称（工具集级别过滤）"""
+    """Remove blocked toolset names from a requested child toolset list."""
     return [
         t for t in toolsets
         if t in ALLOWED_DELEGATE_TOOLSETS and t not in _BLOCKED_TOOLSET_NAMES
@@ -451,7 +442,7 @@ def _strip_blocked_toolsets(toolsets: List[str]) -> List[str]:
 
 
 def _filter_blocked_tools(tool_names: List[str]) -> List[str]:
-    """直接按工具名称过滤被禁止的工具（最终安全防线）"""
+    """Filter individual blocked tool names as the final safety barrier."""
     return [t for t in tool_names if t not in DELEGATE_BLOCKED_TOOLS]
 
 
@@ -460,11 +451,11 @@ def _resolve_child_toolsets(
     parent_enabled: Optional[List[str]],
     parent_available_toolsets: Optional[List[str]],
 ) -> List[str]:
-    """计算子代理的工具集
+    """Resolve the effective child toolsets.
 
-    优先级：
-      1. 显式指定的 toolsets（父代理调用时传入），但只允许 ALLOWED_DELEGATE_TOOLSETS
-      2. 未显式指定时固定使用 DEFAULT_DELEGATE_TOOLSETS
+    Priority:
+      1. Explicit requested toolsets, limited to ALLOWED_DELEGATE_TOOLSETS.
+      2. DEFAULT_DELEGATE_TOOLSETS when no explicit toolsets are requested.
     """
     desired = list(DEFAULT_DELEGATE_TOOLSETS)
     if requested_toolsets:
@@ -485,9 +476,6 @@ def _resolve_child_toolsets(
 
     return effective
 
-
-# ── 子代理构建 ────────────────────────────────────────────────────────────
-
 def _build_child_agent(
     task_index: int,
     goal: str,
@@ -496,16 +484,17 @@ def _build_child_agent(
     max_iterations: int,
     parent_agent,
 ) -> "MClaw":
-    """在主线程上构建子 MClaw 实例（线程安全的构造）"""
+    """Construct a child MClaw instance on the main thread."""
     from mclaw.agent.core import MClaw
     from mclaw.tools.dispatch import get_tool_definitions, get_toolset_for_tool
 
     logger.info("[subagent-%d] 构建中, depth=%d", task_index, getattr(parent_agent, "_delegate_depth", 0) + 1)
 
-    # ── 1. 解析父代理工具集信息 ──
+    # Resolve parent toolset information.
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
 
-    # 从 valid_tool_names 反推 parent_available_toolsets。子代理不能通过 delegation 获取父代理未暴露的能力。
+    # Infer parent_available_toolsets from valid_tool_names. Delegation must
+    # not grant capabilities the parent could not access.
     parent_available_toolsets: Optional[List[str]] = None
     try:
         parent_available = set()
@@ -517,7 +506,7 @@ def _build_child_agent(
     except Exception:
         parent_available_toolsets = None
 
-    # ── 2. 计算子代理工具集 ──
+    # Compute the child toolset.
     child_toolsets = _resolve_child_toolsets(
         requested_toolsets=toolsets,
         parent_enabled=parent_enabled,
@@ -526,18 +515,18 @@ def _build_child_agent(
     if not child_toolsets:
         raise ValueError("No delegate toolsets are available under the parent agent's current tool permissions.")
 
-    # ── 3. 获取工具定义并过滤被禁止的工具 ──
+    # Load tool definitions and remove blocked tools.
     parent_config = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
     all_tool_defs, all_tool_names = get_tool_definitions(
         enabled_toolsets=child_toolsets,
         config=parent_config if isinstance(parent_config, dict) else None,
     )
 
-    # 工具名称级别过滤（最终安全防线）
+    # Tool-name filtering is the final safety barrier.
     safe_tool_names = _filter_blocked_tools(list(all_tool_names))
     safe_tool_defs = [t for t in all_tool_defs if t["function"]["name"] in safe_tool_names]
 
-    # ── 4. 预创建 session_id 与 runtime 工作目录（prompt 构建前需要 workspace）──
+    # Pre-create the session id and runtime workspace before prompt assembly.
     child_session_id = f"delegate_{getattr(parent_agent, 'session_id', 'unknown')}_{task_index}_{uuid.uuid4().hex[:6]}"
     from mclaw.runtime.manager import RuntimeManager
 
@@ -548,17 +537,17 @@ def _build_child_agent(
     child_delegation_dir = delegation_root / child_session_id
     child_delegation_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── 4.5 复制外部文件到 workspace 并改写 goal/context ──
+    # Copy external files into the child workspace and rewrite goal/context.
     prepared_goal, prepared_context, workspace_path, workspace_preparation = _prepare_delegation_workspace(
         goal, context, child_delegation_dir
     )
 
-    # ── 5. 构建子代理提示词 ──
+    # Build the child prompt.
     child_prompt = _build_child_system_prompt(
         prepared_goal, prepared_context, workspace_path=workspace_path, max_iterations=max_iterations
     )
 
-    # ── 6. 获取父代理认证信息 ──
+    # Inherit parent provider credentials unless delegation overrides them.
     parent_api_key = getattr(parent_agent, "api_key", None) or ""
     parent_base_url = getattr(parent_agent, "base_url", None) or ""
     parent_model = getattr(parent_agent, "model", None) or ""
@@ -597,18 +586,18 @@ def _build_child_agent(
                 exc,
             )
 
-    # ── 7. 创建子代理实例 ──
+    # Create the child agent.
     child = MClaw(
         model=child_model,
         api_key=child_api_key,
         base_url=child_base_url,
         api_mode=child_api_mode,
         provider=child_provider,
-        system_prompt=child_prompt,          # 直接注入轻量提示词
-        skip_memory=True,                     # 禁用记忆系统
-        skip_context_files=True,              # 不加载 SOUL.md
-        skip_skills=True,                     # 不注册 skills 工具
-        enabled_toolsets=child_toolsets,      # 受限工具集
+        system_prompt=child_prompt,          # inject lightweight prompt directly
+        skip_memory=True,                    # disable the memory subsystem
+        skip_context_files=True,             # do not load SOUL.md
+        skip_skills=True,                    # do not register Skill tools
+        enabled_toolsets=child_toolsets,     # restricted toolset
         max_iterations=max_iterations,
         session_db=getattr(parent_agent, "_session_db", None),
         session_id=child_session_id,
@@ -617,8 +606,8 @@ def _build_child_agent(
         config=parent_config,
     )
 
-    # ── 7.5 复用父代理的 context compressor 配置，避免子代理重复查询网络（models.dev 等）
-    # 子代理使用与父代理相同的模型，因此 context_length 完全一致。
+    # Reuse context compressor metadata to avoid duplicate network lookups.
+    # Children use the same model as the parent unless overridden above.
     parent_compressor = getattr(parent_agent, "context_compressor", None)
     if parent_compressor and child.context_compressor:
         child.context_compressor.context_length = parent_compressor.context_length
@@ -626,21 +615,21 @@ def _build_child_agent(
         child.context_compressor.last_prompt_tokens = parent_compressor.last_prompt_tokens
         child.context_compressor.last_completion_tokens = parent_compressor.last_completion_tokens
 
-    # ── 8. 手动设置过滤后的工具定义（不走 _discover_tools） ──
+    # Install the already-filtered tool definitions without rediscovery.
     child.tools = safe_tool_defs
     child.valid_tool_names = set(safe_tool_names)
 
-    # ── 9. 设置代理深度 ──
+    # Set child depth for recursive-delegation enforcement.
     parent_depth = getattr(parent_agent, "_delegate_depth", 0)
     child._delegate_depth = parent_depth + 1
 
-    # ── 10. 挂载 runtime 工作目录与 delegation 目录 ──
+    # Attach runtime and delegation workspace paths.
     child._runtime_workspace_dir = child_runtime_workspace
     child._delegation_dir = child_delegation_dir
     child._prepared_goal = prepared_goal
     child._workspace_preparation = workspace_preparation
 
-    # ── 11. 继承父代理的回调函数 ──
+    # Inherit parent callbacks for streaming/status plumbing.
     child._print_fn = getattr(parent_agent, "_print_fn", print)
     child._stream_callback = getattr(parent_agent, "_stream_callback", None)
     child._tool_callback = getattr(parent_agent, "_tool_callback", None)
@@ -654,9 +643,6 @@ def _build_child_agent(
 
     return child
 
-
-# ── 子代理运行 ────────────────────────────────────────────────────────────
-
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -664,7 +650,7 @@ def _run_single_child(
     parent_agent,
     progress_callback: ProgressCallback = None,
 ) -> Dict[str, Any]:
-    """在线程中运行子代理并收集结果，支持进度回调"""
+    """Run one child agent and collect its result."""
     child_start = time.monotonic()
 
     logger.info(
@@ -672,8 +658,9 @@ def _run_single_child(
         task_index, child._delegate_depth, goal
     )
 
-    # 设置进度回调：relay 子代理的工具调用到 progress_callback
-    # 注意：不调用父代理的 _tool_callback，避免子代理的工具调用显示在父 TUI
+    # Relay child tool calls to progress_callback without invoking the
+    # parent's _tool_callback; child tool calls should not render in the
+    # parent TUI as normal parent actions.
     if progress_callback:
         def _relay_tool(tool_name: str, args: dict):
             progress_callback(SubtaskEvent(
@@ -683,14 +670,14 @@ def _run_single_child(
 
         child._tool_callback = _relay_tool
 
-        # 发送 started 事件
+        # Emit a started event.
         progress_callback(SubtaskEvent(
             task_index, SUBAGENT_STARTED,
             {"goal": goal[:100], "depth": child._delegate_depth}
         ))
 
     try:
-        # 运行子代理（无父对话历史，conversation_history=None）
+        # Run the child without parent conversation history.
         logger.info("[subagent-%d] entering run_conversation", task_index)
         effective_goal = getattr(child, "_prepared_goal", None) or goal
         result = child.run_conversation(user_message=effective_goal)
@@ -718,11 +705,11 @@ def _run_single_child(
             task_index, duration, status, exit_reason
         )
 
-        # 获取 token 统计
+        # Collect token statistics.
         input_tokens = getattr(child, "session_input_tokens", 0) or 0
         output_tokens = getattr(child, "session_output_tokens", 0) or 0
 
-        # 截断过长的 summary
+        # Truncate oversized summaries before returning them to the parent.
         if len(summary) > MAX_SUMMARY_CHARS:
             summary = summary[:MAX_SUMMARY_CHARS] + "……[内容已截断]"
 
@@ -748,7 +735,7 @@ def _run_single_child(
         if status == "failed":
             entry["error"] = result.get("error", "子代理未产生响应")
 
-        # 发送 completed 事件
+        # Emit a completed event.
         if progress_callback:
             progress_callback(SubtaskEvent(
                 task_index, SUBAGENT_COMPLETED,
@@ -761,7 +748,7 @@ def _run_single_child(
         duration = round(time.monotonic() - child_start, 2)
         logger.error("[subagent-%d] 异常: %s", task_index, exc)
 
-        # 发送 error 事件
+        # Emit an error event.
         if progress_callback:
             progress_callback(SubtaskEvent(
                 task_index, SUBAGENT_ERROR,
@@ -778,12 +765,9 @@ def _run_single_child(
             "duration_seconds": duration,
         }
 
-
-# ── 后台运行 ──────────────────────────────────────────────────────────────
-
-# 子代理硬性墙钟超时，单位秒；即使 HTTP timeout 为 120s，也要防止
-# 单个卡死任务无限阻塞父代理。单个子任务可能多次调用 API。
-# 浏览器重任务需要更长时间：导航、快照、滚动和 API 延迟都会累积。
+# Hard wall-clock timeout for each delegated task. HTTP timeouts are not enough:
+# one child may make several API calls, and browser-heavy work can accumulate
+# navigation, snapshot, scrolling, and provider latency.
 _SUBAGENT_MAX_WALL_TIME = 300  # 5 minutes
 
 
@@ -795,13 +779,13 @@ def _run_all_children_background(
     task_id: str,
     start_time: float,
 ) -> None:
-    """在 daemon 线程中运行所有子代理（并行 + 单个超时），完成后放入队列"""
+    """Run all children in a daemon thread and queue their final results."""
     results: List[Dict[str, Any]] = []
     goal_map = {i: task["goal"] for i, task, _child in children}
 
-    # 注意：不使用 `with ThreadPoolExecutor(...)`，因为它会在 __exit__ 调用
-    # shutdown(wait=True)。当 worker 线程卡在 API 调用时，这会阻塞 daemon
-    # 线程 indefinitely，导致 _subagent_results.put() 永远不会执行。
+    # Avoid ``with ThreadPoolExecutor(...)`` because __exit__ calls
+    # shutdown(wait=True). If a worker blocks in an API call, that would block
+    # this daemon thread and prevent _subagent_results.put() from ever running.
     executor = ThreadPoolExecutor(max_workers=min(len(children), MAX_CONCURRENT_CHILDREN))
     try:
         futures = {}
@@ -816,8 +800,9 @@ def _run_all_children_background(
             )
             futures[fut] = i
 
-        # 并行等待所有子代理，全局硬超时。用 wait(FIRST_COMPLETED) 循环
-        # 避免顺序遍历 futures 导致的总超时 = num_children * timeout。
+        # Wait for all children under one global wall-clock deadline. The
+        # FIRST_COMPLETED loop avoids serial future timeouts multiplying by
+        # child count.
         from concurrent.futures import wait, FIRST_COMPLETED
 
         pending = set(futures.keys())
@@ -850,7 +835,7 @@ def _run_all_children_background(
                         ))
                 results.append(entry)
 
-        # 标记剩余未完成的为超时
+        # Mark remaining children as timed out.
         for future in pending:
             idx = futures[future]
             future.cancel()
@@ -875,9 +860,8 @@ def _run_all_children_background(
                 ))
             results.append(entry)
     finally:
-        # shutdown(wait=False) 立即返回，不阻塞 daemon 线程等待 worker 完成。
-        # 已经卡住的工作线程会继续在后台运行直到 API 超时或完成，但不会影响
-        # 主流程。
+        # Return immediately. Stuck workers may continue until their API call
+        # times out, but they no longer block the parent flow.
         executor.shutdown(wait=False)
 
     results.sort(key=lambda r: r["task_index"])
@@ -895,7 +879,7 @@ def _run_all_children_background(
 
 
 def get_pending_results(timeout: float = 0.05) -> Optional[Dict]:
-    """从队列中非阻塞获取子代理结果（供 TUI 调用）"""
+    """Return queued child results without blocking the TUI for long."""
     try:
         return _subagent_results.get(timeout=timeout)
     except Empty:
@@ -903,7 +887,7 @@ def get_pending_results(timeout: float = 0.05) -> Optional[Dict]:
 
 
 def get_pending_result_for_task(task_id: str, timeout: float = 0.05) -> Optional[Dict]:
-    """获取指定 task_id 的子代理结果，不匹配的结果会暂存而不是丢弃。"""
+    """Return results for one task id and stash unmatched results."""
     if not task_id:
         return get_pending_results(timeout=timeout)
 
@@ -947,25 +931,22 @@ def get_pending_result_for_task(task_id: str, timeout: float = 0.05) -> Optional
 
     return result
 
-
-# ── 主入口函数 ────────────────────────────────────────────────────────────
-
 def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     parent_agent=None,
 ) -> str:
-    """Spawn 一个或多个子代理处理委托任务
+    """Spawn one or more isolated child agents for delegated tasks.
 
-    模型侧只支持 tasks 数组；单任务也使用 tasks=[{...}]。
-    tasks 最多 5 个并行。
+    The model-facing API always uses a tasks array, including a single task.
+    At most MAX_CONCURRENT_CHILDREN tasks run in parallel.
 
-    返回 JSON 格式结果数组。
+    Returns a JSON string with child results or pending-task metadata.
     """
-    # ── 1. 验证 parent_agent ──
+    # Validate parent_agent.
     if parent_agent is None:
         return tool_error("delegate_task 需要 parent_agent 上下文")
 
-    # ── 2. 深度检查 ──
+    # Enforce maximum delegation depth.
     parent_depth = getattr(parent_agent, "_delegate_depth", 0)
     if parent_depth >= MAX_DELEGATE_DEPTH:
         logger.warning(
@@ -980,7 +961,7 @@ def delegate_task(
             "success": False,
         }, ensure_ascii=False)
 
-    # ── 3. 规范化参数 ──
+    # Normalize configuration.
     parent_config = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
     delegation_cfg = parent_config.get("delegation", {}) if isinstance(parent_config, dict) else {}
     configured_max_iter = delegation_cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
@@ -990,7 +971,7 @@ def delegate_task(
         configured_max_iter = DEFAULT_MAX_ITERATIONS
     effective_max_iter = configured_max_iter
 
-    # ── 4. 解析任务列表 ──
+    # Parse task list.
     if not isinstance(tasks, list):
         return tool_error("delegate_task 需要 tasks 数组；单任务也使用 tasks=[{goal, context?, toolsets?}]")
     if len(tasks) > MAX_CONCURRENT_CHILDREN:
@@ -1002,7 +983,7 @@ def delegate_task(
     if not task_list:
         return tool_error("任务列表为空")
 
-    # ── 5. 验证每个任务都有 goal ──
+    # Validate that every task has a goal.
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
             return tool_error(f"任务 {i} 必须是对象")
@@ -1015,7 +996,7 @@ def delegate_task(
 
     logger.info("delegate_task 处理 %d 个任务", len(task_list))
 
-    # ── 6. 构建所有子代理（在主线程上，线程安全） ──
+    # Build all child agents on the main thread.
     children = []
     try:
         for i, task in enumerate(task_list):
@@ -1035,17 +1016,17 @@ def delegate_task(
             "success": False,
         }, ensure_ascii=False)
 
-    # ── 7. 获取进度回调（非阻塞模式标志）──
+    # A progress callback means the TUI expects non-blocking execution.
     progress_callback: Optional[ProgressCallback] = getattr(
         parent_agent, "_delegate_progress_callback", None
     )
 
-    # ── 8. 运行子代理 ──
+    # Run child agents.
     start_time = time.time()
     task_id = str(uuid.uuid4())[:8]
 
     if progress_callback is not None:
-        # 非阻塞模式：启动 daemon 线程，立即返回
+        # Non-blocking mode: start a daemon thread and return immediately.
         thread = threading.Thread(
             target=_run_all_children_background,
             args=(task_list, children, parent_agent, progress_callback, task_id, start_time),
@@ -1077,12 +1058,12 @@ def delegate_task(
     goal_map = {i: task["goal"] for i, task, _child in children}
 
     if len(children) == 1:
-        # 单任务：直接运行（无线程池开销）
+        # Single task: run directly to avoid thread-pool overhead.
         _, _, child = children[0]
         result = _run_single_child(0, children[0][1]["goal"], child, parent_agent)
         results.append(result)
     else:
-        # 批量：并发运行（带 wall-clock 超时）
+        # Batch mode: run concurrently with wall-clock timeouts.
         with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_CHILDREN) as executor:
             futures = {}
             for i, task, child in children:
@@ -1095,8 +1076,8 @@ def delegate_task(
                 )
                 futures[future] = i
 
-            # 直接用 future.result(timeout) 等待，不用 as_completed，
-            # 避免 worker 线程永远挂住时 as_completed 无限阻塞。
+            # Wait with future.result(timeout) rather than as_completed so one
+            # stuck worker cannot block forever.
             for future, idx in futures.items():
                 try:
                     entry = future.result(timeout=_SUBAGENT_MAX_WALL_TIME)
@@ -1113,7 +1094,7 @@ def delegate_task(
                     }
                 results.append(entry)
 
-        # 按 task_index 排序，保证结果顺序与输入一致
+        # Preserve input order in the returned results.
         results.sort(key=lambda r: r["task_index"])
 
     total_duration = round(time.monotonic() - overall_start, 2)
@@ -1132,9 +1113,6 @@ def delegate_task(
             for _i, _task, child in children
         ],
     }, ensure_ascii=False)
-
-
-# ── Schema ────────────────────────────────────────────────────────────────
 
 DELEGATE_TASK_SCHEMA = {
     "type": "function",
@@ -1204,9 +1182,6 @@ DELEGATE_TASK_SCHEMA = {
         },
     },
 }
-
-
-# ── 注册 ────────────────────────────────────────────────────────────────
 
 registry.register(
     name="delegate_task",
