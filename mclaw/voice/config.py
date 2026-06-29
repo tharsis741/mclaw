@@ -6,11 +6,9 @@
 
 from __future__ import annotations
 
-import importlib.util
 from typing import Any, Dict
 
 from mclaw.cli.config import get_env_value, load_config, mask_api_key
-from mclaw.platform import audio_input_available
 
 CN_REALTIME_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 INTL_REALTIME_URL = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
@@ -21,6 +19,10 @@ DEFAULT_ASR_CONFIG: Dict[str, Any] = {
     "backend": "qwen_realtime",
     "model": "qwen3-asr-flash-realtime",
     "websocket_url": "",
+    "force_ipv4": "auto",
+    "ca_bundle": "auto",
+    "recorder_backend": "auto",
+    "arecord_device": "auto",
     "region": "cn",
     "language": "zh",
     "sample_rate": 16000,
@@ -34,6 +36,8 @@ DEFAULT_ASR_CONFIG: Dict[str, Any] = {
     "wake_words": ["小爪", "老麦"],
     "dedupe_seconds": 1.5,
     "allow_voice_slash_commands": False,
+    "min_audio_rms": 1,
+    "min_voice_chunks": 1,
     "push_to_talk_key": "f8",
     "push_to_talk_behavior": "tap_once",
 }
@@ -49,9 +53,14 @@ def _authorized_env_value(name: str) -> str:
         return ""
 
 
-def _resolve_enabled(value: Any) -> tuple[bool, str]:
+def _resolve_enabled(value: Any, config: dict | None = None) -> tuple[bool, str]:
     if isinstance(value, str) and value.strip().lower() == "auto":
-        return audio_input_available() and importlib.util.find_spec("sounddevice") is not None, "auto"
+        try:
+            from mclaw.voice.recorder import AudioRecorder
+
+            return AudioRecorder.input_available(config or {}), "auto"
+        except Exception:
+            return False, "auto"
     if isinstance(value, bool):
         return value, "on" if value else "off"
     if isinstance(value, (int, float)):
@@ -113,7 +122,7 @@ def resolve_asr_config(parent_agent=None, config: dict | None = None) -> Dict[st
     raw_asr = auxiliary.get("asr", {})
     asr_cfg = raw_asr if isinstance(raw_asr, dict) else {}
     result = _deep_merge(DEFAULT_ASR_CONFIG, asr_cfg)
-    enabled, enabled_mode = _resolve_enabled(result.get("enabled"))
+    enabled, enabled_mode = _resolve_enabled(result.get("enabled"), result)
     result["enabled"] = enabled
     result["enabled_mode"] = enabled_mode
 

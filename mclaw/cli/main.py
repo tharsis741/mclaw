@@ -33,6 +33,44 @@ def _setup_logging(level: str = "INFO"):
     logging.getLogger("openai").setLevel(logging.WARNING)
 
 
+def _format_cli_help() -> str:
+    return """M-CLAW 命令指引
+
+核心命令
+  mclaw                         启动交互式 Agent Runtime
+  mclaw resume [session_id]      恢复最近会话，或按 ID/前缀恢复指定会话
+  mclaw setup                   配置模型、工具、通道和可选能力
+  mclaw doctor                  检查运行环境、依赖、凭据、工具和通道配置
+  mclaw help                    显示这份帮助
+
+通道命令
+  mclaw weixin login            微信 iLink Bot 扫码登录
+  mclaw weixin                  启动微信私聊网关
+  mclaw dingtalk login          配置钉钉 Stream 网关凭据
+  mclaw dingtalk check          检查钉钉依赖和配置
+  mclaw dingtalk                启动钉钉 Stream 网关
+
+推荐流程
+  1. mclaw setup
+  2. mclaw doctor
+  3. mclaw
+"""
+
+
+class _MClawArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        msg = str(message or "")
+        if "invalid choice" in msg:
+            print_plain("未知命令。")
+        elif "unrecognized arguments:" in msg:
+            unknown = msg.split("unrecognized arguments:", 1)[1].strip()
+            print_plain(f"未知参数：{unknown}")
+        else:
+            print_plain(f"命令参数无效：{msg}")
+        print_plain("运行 `mclaw help` 查看可用命令。")
+        raise SystemExit(2)
+
+
 def _prompt_secret(prompt: str) -> str:
     """Prompt for a secret; echo one '*' per typed character when interactive."""
     if os.name != "nt":
@@ -408,14 +446,14 @@ def _run_chat(args):
 
     config["_launch_cwd"] = os.getcwd()
 
-    model = args.model or config.get("model", "")
-    provider_name = args.provider or config.get("active_provider", "")
+    model = getattr(args, "model", "") or config.get("model", "")
+    provider_name = getattr(args, "provider", "") or config.get("active_provider", "")
 
     resolved = resolve_provider(
         model=model,
         provider=provider_name,
-        base_url=args.base_url,
-        api_key=args.api_key,
+        base_url=getattr(args, "base_url", ""),
+        api_key=getattr(args, "api_key", ""),
         config=config,
     )
 
@@ -430,7 +468,7 @@ def _run_chat(args):
 
     if not resolved["model"]:
         print_plain(color(
-            "\n  未指定模型。请运行 mclaw setup，或使用 /model <模型名> --provider <接入方> --global 保存。\n",
+            "\n  未指定模型。请运行 mclaw setup 配置默认模型。\n",
             Colors.RED,
         ))
         sys.exit(1)
@@ -467,17 +505,17 @@ def _run_weixin(args):
         print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
-    model = args.model or config.get("model", "")
-    provider_name = args.provider or config.get("active_provider", "")
+    model = getattr(args, "model", "") or config.get("model", "")
+    provider_name = getattr(args, "provider", "") or config.get("active_provider", "")
     resolved = resolve_provider(
         model=model,
         provider=provider_name,
-        base_url=args.base_url,
-        api_key=args.api_key,
+        base_url=getattr(args, "base_url", ""),
+        api_key=getattr(args, "api_key", ""),
         config=config,
     )
     if not resolved["api_key"]:
-        print_plain(color("\n  未找到 API 密钥。请先配置模型供应商或传入 --api-key。\n", Colors.RED))
+        print_plain(color("\n  未找到 API 密钥。请先运行 mclaw setup 配置模型供应商。\n", Colors.RED))
         sys.exit(1)
     if not resolved["model"]:
         resolved["model"] = "openai/gpt-4o-mini"
@@ -617,17 +655,17 @@ def _run_dingtalk(args):
         print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
-    model = args.model or config.get("model", "")
-    provider_name = args.provider or config.get("active_provider", "")
+    model = getattr(args, "model", "") or config.get("model", "")
+    provider_name = getattr(args, "provider", "") or config.get("active_provider", "")
     resolved = resolve_provider(
         model=model,
         provider=provider_name,
-        base_url=args.base_url,
-        api_key=args.api_key,
+        base_url=getattr(args, "base_url", ""),
+        api_key=getattr(args, "api_key", ""),
         config=config,
     )
     if not resolved["api_key"]:
-        print_plain(color("\n  未找到 API 密钥。请先配置模型供应商或传入 --api-key。\n", Colors.RED))
+        print_plain(color("\n  未找到 API 密钥。请先运行 mclaw setup 配置模型供应商。\n", Colors.RED))
         sys.exit(1)
     if not resolved["model"]:
         resolved["model"] = "openai/gpt-4o-mini"
@@ -979,7 +1017,7 @@ def _run_dingtalk_check(_args):
     if not requirements.get("robot_api"):
         print_plain(color("\n  Robot API incomplete: 媒体下载和 Thinking/Done reaction 不可用。", Colors.DIM))
     if not agent_api_key_ok:
-        print_plain(color("  Agent provider missing: 请先配置模型供应商 API key，或传入 --api-key。", Colors.DIM))
+        print_plain(color("  Agent provider missing: 请先运行 mclaw setup 配置模型供应商 API key。", Colors.DIM))
     print_plain()
     if getattr(_args, "strict", False) and not ready:
         sys.exit(1)
@@ -2064,26 +2102,21 @@ def main():
     BootstrapPathResolver.ensure_env()
     load_mclaw_dotenv()
 
-    parser = argparse.ArgumentParser(
+    if len(sys.argv) > 1 and sys.argv[1] == "help":
+        print_plain(_format_cli_help())
+        return
+
+    parser = _MClawArgumentParser(
         prog="mclaw",
         description="M-Claw — 跨平台桌面 CLI AI 智能体",
+        add_help=False,
     )
-    parser.add_argument("--model", "-m", default="", help="使用的模型 (如 gpt-4o-mini)")
-    parser.add_argument("--provider", "-p", default="", help="接入方 key 或自定义接入方名称")
-    parser.add_argument("--base-url", default="", help="自定义 OpenAI 兼容接口地址")
-    parser.add_argument("--api-key", default="", help="API 密钥 (覆盖环境变量)")
-    parser.add_argument(
-        "--resume", "-r",
-        nargs="?",
-        const=RESUME_LATEST_SESSION,
-        default="",
-        help="恢复之前的会话；不带值时恢复最新会话，带值时通过 ID 或前缀恢复",
-    )
-    parser.add_argument("--log-level", default="INFO", help="日志级别")
-
     subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("help", help=argparse.SUPPRESS)
+    resume_parser = subparsers.add_parser("resume", help="恢复历史会话")
+    resume_parser.add_argument("session_id", nargs="?", default=RESUME_LATEST_SESSION, help="可选会话 ID 或前缀")
     subparsers.add_parser("setup", help="运行初始设置向导")
-    subparsers.add_parser("doctor", help="Run runtime dependency diagnostics")
+    subparsers.add_parser("doctor", help="检查运行环境、依赖、工具和通道配置")
     subparsers.add_parser("chat", help="启动交互式对话（默认）")
     weixin_parser = subparsers.add_parser("weixin", help="启动微信私聊网关")
     weixin_subparsers = weixin_parser.add_subparsers(dest="weixin_command")
@@ -2107,9 +2140,14 @@ def main():
     dingtalk_send_file_parser.add_argument("--conversation-id", default="", help="群聊 Stream conversation_id")
     dingtalk_send_file_parser.add_argument("--staff-id", default="", help="私聊目标 senderStaffId/userId")
     args = parser.parse_args()
-    _setup_logging(args.log_level)
+    _setup_logging("INFO")
 
-    if args.command == "setup":
+    if args.command == "help":
+        print_plain(_format_cli_help())
+    elif args.command == "resume":
+        args.resume = getattr(args, "session_id", None) or RESUME_LATEST_SESSION
+        _run_chat(args)
+    elif args.command == "setup":
         _run_setup(args)
     elif args.command == "doctor":
         from mclaw.doctor import format_doctor, run_doctor

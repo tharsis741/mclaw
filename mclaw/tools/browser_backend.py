@@ -12,7 +12,6 @@ JavaScript that tags interactive elements with data-mclaw-ref IDs.
 from __future__ import annotations
 
 import logging
-import os
 import queue
 import shutil
 import threading
@@ -34,17 +33,6 @@ _MAX_SNAPSHOT_CHARS = 8_000
 def _default_downloads_dir() -> Path:
     return get_mclaw_home() / "downloads"
 
-
-def _browser_executable_path() -> str:
-    env_value = os.environ.get("MCLAW_BROWSER_EXECUTABLE_PATH", "").strip().strip('"')
-    if env_value:
-        return env_value
-    if os.name != "nt":
-        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"):
-            found = shutil.which(name)
-            if found:
-                return found
-    return ""
 
 # JavaScript snippet that tags interactive elements and returns metadata.
 _SNAPSHOT_JS = """
@@ -227,16 +215,12 @@ class BrowserBackend:
                 raise RuntimeError(
                     "playwright package is required. Install it with:\n"
                     "  pip install playwright\n"
-                    "  playwright install chromium"
+                    "  python -m playwright install chromium"
                 ) from exc
 
             self._playwright = sync_playwright().start()
             try:
-                executable_path = _browser_executable_path()
-                launch_kwargs = {"headless": self._headless}
-                if executable_path:
-                    launch_kwargs["executable_path"] = executable_path
-                self._browser = self._playwright.chromium.launch(**launch_kwargs)
+                self._browser = self._playwright.chromium.launch(headless=self._headless)
             except Exception as exc:
                 try:
                     if self._playwright:
@@ -245,8 +229,7 @@ class BrowserBackend:
                     logger.debug("Error stopping Playwright after launch failure", exc_info=True)
                 self._playwright = None
                 raise RuntimeError(
-                    "Failed to launch Chromium. Run 'playwright install chromium' first, "
-                    "or set MCLAW_BROWSER_EXECUTABLE_PATH to a system Chromium/Chrome binary.\n"
+                    "Failed to launch Chromium. Run 'python -m playwright install chromium' first.\n"
                     f"Error: {exc}"
                 ) from exc
             self._started = True

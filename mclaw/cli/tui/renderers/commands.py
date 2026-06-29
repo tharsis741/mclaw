@@ -304,6 +304,8 @@ class CommandsRenderer:
             ("Provider", cfg.get("provider")),
             ("Backend", cfg.get("backend")),
             ("Model", cfg.get("model")),
+            ("Recorder", cfg.get("recorder_backend")),
+            ("arecord device", cfg.get("arecord_device")),
             ("Key", f"{cfg.get('api_key')} ({cfg.get('key_source') or 'not configured'})"),
             ("PTT key", f"{cfg.get('push_to_talk_key')} ({cfg.get('push_to_talk_behavior')})"),
         ]

@@ -342,30 +342,9 @@ def _has_chromium_browser(root: "Path") -> bool:
     return any(root.glob("chromium-*")) or any(root.glob("chrome-*")) or any(root.glob("**/chrome.exe"))
 
 
-def _find_browser_executable(config: dict | None = None) -> tuple[bool, str]:
-    import os
-    import shutil
-    from pathlib import Path
-
-    env_value = os.environ.get("MCLAW_BROWSER_EXECUTABLE_PATH", "").strip().strip('"')
-    if env_value:
-        path = Path(env_value)
-        return path.exists() and path.is_file(), f"{env_value}; source=env MCLAW_BROWSER_EXECUTABLE_PATH"
-    if os.name != "nt":
-        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"):
-            found = shutil.which(name)
-            if found:
-                return True, f"{found}; source=system PATH"
-    return False, ""
-
-
 def _find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, str]:
     import os
     from pathlib import Path
-
-    exe_ok, exe_detail = _find_browser_executable(config)
-    if exe_ok:
-        return True, exe_detail
 
     env_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip().strip('"')
     if env_value:
@@ -390,7 +369,7 @@ def _find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, st
         seen.add(key)
         if root.exists():
             return _has_chromium_browser(root), f"{root}; chromium={'yes' if _has_chromium_browser(root) else 'no'}; source=default cache"
-    return False, "not found in MCLAW_BROWSER_EXECUTABLE_PATH, PLAYWRIGHT_BROWSERS_PATH, system PATH, or default cache"
+    return False, "not found in PLAYWRIGHT_BROWSERS_PATH or default Playwright cache"
 
 
 def diagnose_browser_requirements(config: dict | None = None) -> dict:
@@ -408,7 +387,7 @@ def diagnose_browser_requirements(config: dict | None = None) -> dict:
         return {
             "available": False,
             "reason": detail,
-            "fix": "Run playwright install chromium, or set MCLAW_BROWSER_EXECUTABLE_PATH/PLAYWRIGHT_BROWSERS_PATH.",
+            "fix": "Run python -m playwright install chromium.",
         }
     return {"available": True, "reason": detail, "fix": ""}
 

@@ -13,7 +13,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,6 +26,15 @@ class CheckResult:
     detail: str
     fix: str = ""
     severity: str = "error"
+
+
+@dataclass
+class DoctorLine:
+    section: str
+    name: str
+    status: str
+    detail: str
+    fix: str = ""
 
 
 def _load_config() -> dict:
@@ -176,24 +184,7 @@ def _has_chromium_browser(root: Path) -> bool:
     return any(root.glob("chromium-*")) or any(root.glob("chrome-*")) or any(root.glob("**/chrome.exe"))
 
 
-def _find_browser_executable(config: dict | None = None) -> tuple[bool, str]:
-    env_value = os.environ.get("MCLAW_BROWSER_EXECUTABLE_PATH", "").strip().strip('"')
-    if env_value:
-        path = Path(env_value)
-        return path.exists() and path.is_file(), f"{env_value}; source=env MCLAW_BROWSER_EXECUTABLE_PATH"
-    if os.name != "nt":
-        for name in ("chromium", "chromium-browser", "google-chrome", "google-chrome-stable", "microsoft-edge"):
-            found = shutil.which(name)
-            if found:
-                return True, f"{found}; source=system PATH"
-    return False, ""
-
-
 def _find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, str]:
-    exe_ok, exe_detail = _find_browser_executable(config)
-    if exe_ok:
-        return True, exe_detail
-
     env_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip().strip('"')
     if env_value:
         root = Path(env_value)
@@ -217,7 +208,7 @@ def _find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, st
         seen.add(key)
         if root.exists():
             return _has_chromium_browser(root), f"{root}; chromium={'yes' if _has_chromium_browser(root) else 'no'}; source=default cache"
-    return False, "not found in MCLAW_BROWSER_EXECUTABLE_PATH, PLAYWRIGHT_BROWSERS_PATH, system PATH, or default cache"
+    return False, "not found in PLAYWRIGHT_BROWSERS_PATH or default Playwright cache"
 
 def _exists_env_path(name: str) -> tuple[bool, str]:
     value = os.environ.get(name, "").strip().strip('"')
@@ -239,14 +230,155 @@ def _check_sqlite_fts5() -> CheckResult:
             conn.execute("CREATE VIRTUAL TABLE mclaw_fts_check USING fts5(content)")
         finally:
             conn.close()
-        return CheckResult("sqlite3 + FTS5", True, "available")
+        return CheckResult("local storage", True, "ready")
     except Exception as exc:
         return CheckResult(
-            "sqlite3 + FTS5",
+            "local storage",
             False,
             f"unavailable: {type(exc).__name__}: {exc}",
-            "Install a Python build with sqlite3 and SQLite FTS5 support.",
+            "Install a Python build with SQLite FTS5 support.",
         )
+
+
+def _append_module_group_check(
+    results: list[CheckResult],
+    name: str,
+    modules: tuple[str, ...],
+    *,
+    detail: str = "ready",
+    missing_detail: str = "not ready",
+    fix: str = "Run pip install -e . in the M-Claw source directory.",
+    severity: str = "error",
+) -> None:
+    missing = [module for module in modules if not _module_available(module)]
+    if missing:
+        results.append(CheckResult(name, False, missing_detail, fix, severity=severity))
+        return
+    results.append(CheckResult(name, True, detail, severity=severity))
+
+
+def _append_runtime_module_checks(results: list[CheckResult]) -> None:
+    _append_module_group_check(
+        results,
+        "model client",
+        ("openai", "httpx", "pydantic"),
+        detail="ready",
+        missing_detail="not ready; install project dependencies",
+    )
+    _append_module_group_check(
+        results,
+        "command interface",
+        ("yaml",),
+        detail="ready",
+        missing_detail="not ready; install project dependencies",
+    )
+    _append_module_group_check(
+        results,
+        "tui",
+        ("rich", "prompt_toolkit"),
+        detail="ready",
+        missing_detail="not ready; install project dependencies",
+    )
+    results.append(_check_sqlite_fts5())
+    _append_module_group_check(
+        results,
+        "desktop companion",
+        ("PySide6", "shiboken6"),
+        detail="ready",
+        missing_detail="not installed; desktop companion optional",
+        severity="warn",
+    )
+    _append_module_group_check(
+        results,
+        "multimodal services",
+        ("dashscope",),
+        detail="ready",
+        missing_detail="not installed; vision and speech services optional",
+        severity="warn",
+    )
+    _append_module_group_check(
+        results,
+        "voice device",
+        ("sounddevice",),
+        detail="ready",
+        missing_detail="not installed; voice input optional",
+        severity="warn",
+    )
+
+
+def _append_tool_diagnostics(results: list[CheckResult], diagnostics: list[dict]) -> None:
+    unavailable = [item for item in diagnostics if not item.get("available")]
+    if not unavailable:
+        results.append(CheckResult("tool diagnostics", True, f"all registered tools available ({len(diagnostics)})"))
+        return
+
+    grouped: dict[tuple[str, str, str], list[str]] = {}
+    for item in unavailable:
+        tool_name = str(item.get("tool") or "")
+        reason = str(item.get("reason") or "unavailable")
+        fix_text = str(item.get("fix") or "Check tool configuration and dependencies.")
+        severity = "warn" if tool_name.startswith("browser_") else "error"
+        grouped.setdefault((reason, fix_text, severity), []).append(tool_name)
+
+    for (reason, fix_text, severity), tool_names in grouped.items():
+        tools = sorted(name for name in tool_names if name)
+        if len(tools) == 1:
+            results.append(CheckResult(f"tool {tools[0]}", False, reason, fix_text, severity=severity))
+            continue
+        label = "toolset browser" if all(name.startswith("browser_") for name in tools) else f"tools ({len(tools)})"
+        shown = ", ".join(tools[:8])
+        if len(tools) > 8:
+            shown += f", +{len(tools) - 8} more"
+        results.append(CheckResult(label, False, f"{reason}; affected={shown}", fix_text, severity=severity))
+
+
+def _append_weixin_checks(results: list[CheckResult], cfg: dict | None) -> None:
+    try:
+        from mclaw.channels.weixin.config import WeixinConfig
+    except Exception as exc:
+        results.append(
+            CheckResult(
+                "weixin channel",
+                False,
+                f"failed to import diagnostics: {type(exc).__name__}: {exc}",
+                "Check mclaw.channels.weixin imports.",
+            )
+        )
+        return
+
+    config = WeixinConfig.from_config(cfg or {})
+    configured = bool(config.enabled or config.account_id or config.token)
+    if not configured:
+        results.append(CheckResult("weixin channel", True, "not configured; optional"))
+        return
+
+    errors = config.validate()
+    missing = []
+    for module in ("httpx", "qrcode"):
+        if not _module_available(module):
+            missing.append(module)
+
+    detail_parts = [
+        f"account_id={'yes' if config.account_id else 'no'}",
+        f"token={'yes' if config.token else 'no'}",
+        f"dm_policy={config.dm_policy}",
+        f"session_scope={config.session_scope}",
+        f"base_url={config.base_url or 'unset'}",
+    ]
+    if missing:
+        detail_parts.append("missing=" + ",".join(missing))
+    if errors:
+        detail_parts.append("config_errors=" + "; ".join(errors))
+
+    ok = not missing and not errors
+    results.append(
+        CheckResult(
+            "weixin channel",
+            ok,
+            "; ".join(detail_parts),
+            "Run mclaw weixin login, then mclaw weixin. Install M-Claw dependencies with: pip install -e .",
+        )
+    )
 
 
 def _append_dingtalk_checks(results: list[CheckResult], cfg: dict | None) -> None:
@@ -407,28 +539,13 @@ def run_doctor() -> list[CheckResult]:
             "playwright browsers",
             True,
             browser_detail,
-            "Run playwright install chromium, or set MCLAW_BROWSER_EXECUTABLE_PATH.",
+            "Run python -m playwright install chromium.",
         )
     )
 
-    for module in ("openai", "httpx", "pydantic", "rich", "prompt_toolkit", "yaml"):
-        available = _module_available(module)
-        results.append(CheckResult(f"main module {module}", available, "importable" if available else "missing", f"Install Python package: {module}"))
+    _append_runtime_module_checks(results)
 
-    results.append(_check_sqlite_fts5())
-
-    for module in ("PySide6", "shiboken6", "dashscope", "sounddevice"):
-        available = _module_available(module)
-        results.append(
-            CheckResult(
-                f"optional module {module}",
-                available,
-                "importable" if available else "missing; optional capability may be unavailable",
-                f"Install Python package {module} when using the related capability.",
-                severity="warn",
-            )
-        )
-
+    _append_weixin_checks(results, cfg)
     _append_dingtalk_checks(results, cfg)
 
     try:
@@ -447,32 +564,267 @@ def run_doctor() -> list[CheckResult]:
             pass
 
         diagnostics = registry.get_tool_diagnostics(tool_names=tool_names, config=cfg)
-        unavailable = [item for item in diagnostics if not item.get("available")]
-        if unavailable:
-            for item in unavailable:
-                detail = item.get("reason") or "unavailable"
-                fix_text = item.get("fix") or "Check tool configuration and dependencies."
-                tool_name = str(item.get("tool") or "")
-                severity = "warn" if tool_name.startswith("browser_") else "error"
-                results.append(CheckResult(f"tool {tool_name}", False, detail, fix_text, severity=severity))
-        else:
-            results.append(CheckResult("tool diagnostics", True, f"all registered tools available ({len(diagnostics)})"))
+        _append_tool_diagnostics(results, diagnostics)
     except Exception as exc:
         results.append(CheckResult("tool diagnostics", False, f"failed: {type(exc).__name__}: {exc}", "Check tool registry imports."))
 
     return results
 
 
-def format_doctor(results: list[CheckResult]) -> str:
-    lines = ["M-Claw runtime doctor"]
+def _doctor_detail(item: CheckResult) -> str:
+    detail = str(item.detail or "")
+    name = str(item.name or "").lower()
+    if name == "runtime mode":
+        return f"{detail} mode" if detail else "ready"
+    if name == "playwright browsers":
+        if "not found" in detail or "path does not exist" in detail or "chromium=no" in detail:
+            return "not installed; optional for browser tools"
+        if "source=default cache" in detail:
+            return "ready; source=default cache"
+        return "ready"
+    if name == "desktop gui" or name == "audio input":
+        return "ready" if detail == "available" else detail
+    if name == "secret allowlist":
+        if detail == "not created yet":
+            return "not initialized; will be created when needed"
+        if "invalid JSON" in detail:
+            return "invalid configuration"
+        return "ready"
+    if name.startswith("feature "):
+        if detail.startswith("enabled;"):
+            if "allowlist=ok" in detail:
+                return "configured; secret scope ready"
+            if "allowlist=missing" in detail:
+                return "configured; secret scope missing"
+            if "missing credentials" in detail:
+                return "missing credentials"
+            return "enabled"
+        if detail.startswith("not enabled; credentials present"):
+            return "optional; credentials present"
+        if detail.startswith("not enabled"):
+            return "optional; not configured"
+    if name == "tool diagnostics" and detail.startswith("all registered tools available"):
+        return detail.replace("registered", "enabled")
+    if name in {"weixin channel", "dingtalk channel"}:
+        if detail.startswith("not configured"):
+            return "optional; not configured"
+        if "missing=" in detail or "config_errors=" in detail:
+            return "configuration incomplete"
+        if "token=yes" in detail or "client_secret=yes" in detail:
+            return "configured"
+    if name.startswith("runtime feature ") and detail.startswith("state="):
+        parts = dict(
+            part.split("=", 1)
+            for part in detail.split("; ")
+            if "=" in part
+        )
+        state = parts.get("state", detail)
+        reason = parts.get("reason", "").strip()
+        if state == "enabled":
+            if reason in {"", "PySide6 dependency probe", "Playwright dependency probe"}:
+                return "enabled"
+            if reason == "git available":
+                return "enabled; checkpoint backend available"
+        return state if not reason else f"{state}; {reason}"
+    return detail
+
+
+def _select_checks(
+    results: list[CheckResult],
+    names: tuple[str, ...] = (),
+    prefixes: tuple[str, ...] = (),
+) -> list[CheckResult]:
+    exact = {name.lower() for name in names}
+    lowered_prefixes = tuple(prefix.lower() for prefix in prefixes)
+    selected: list[CheckResult] = []
     for item in results:
-        mark = "OK" if item.ok else ("WARN" if item.severity == "warn" else "FAIL")
-        lines.append(f"[{mark}] {item.name}: {item.detail}")
-        if not item.ok and item.fix:
-            lines.append(f"      fix: {item.fix}")
-    failed = sum(1 for item in results if not item.ok and item.severity != "warn")
-    warnings = sum(1 for item in results if not item.ok and item.severity == "warn")
-    lines.append(f"Summary: {len(results) - failed - warnings}/{len(results)} checks passed; warnings={warnings}; failures={failed}")
+        lower = item.name.lower()
+        if lower in exact or any(lower.startswith(prefix) for prefix in lowered_prefixes):
+            selected.append(item)
+    return selected
+
+
+def _line_status(checks: list[CheckResult]) -> str:
+    if not checks:
+        return "WARN"
+    if any(not item.ok and item.severity != "warn" for item in checks):
+        return "FAIL"
+    if any(not item.ok and item.severity == "warn" for item in checks):
+        return "WARN"
+    return "OK"
+
+
+def _first_unhealthy(checks: list[CheckResult]) -> CheckResult | None:
+    for item in checks:
+        if not item.ok and item.severity != "warn":
+            return item
+    for item in checks:
+        if not item.ok:
+            return item
+    return None
+
+
+def _runtime_feature_state(item: CheckResult | None) -> str:
+    if item is None:
+        return ""
+    detail = str(item.detail or "")
+    if not detail.startswith("state="):
+        rendered = _doctor_detail(item)
+        return "enabled" if rendered.startswith("enabled") else rendered
+    parts = dict(part.split("=", 1) for part in detail.split("; ") if "=" in part)
+    return parts.get("state", "")
+
+
+def _first_check(checks: list[CheckResult], name: str) -> CheckResult | None:
+    lower = name.lower()
+    for item in checks:
+        if item.name.lower() == lower:
+            return item
+    return None
+
+
+def _enabled_detail(checks: list[CheckResult]) -> str:
+    feature = next((item for item in checks if item.name.lower().startswith("runtime feature ")), None)
+    state = _runtime_feature_state(feature)
+    if state == "enabled":
+        return "enabled"
+    return state or "not enabled"
+
+
+def _pet_detail(checks: list[CheckResult]) -> str:
+    feature = _first_check(checks, "runtime feature pet")
+    state = _runtime_feature_state(feature)
+    if state and state != "enabled":
+        return "not configured"
+    return "ready"
+
+
+def _browser_tools_detail(checks: list[CheckResult]) -> str:
+    browser_runtime = _first_check(checks, "playwright browsers")
+    if browser_runtime is not None and _doctor_detail(browser_runtime).startswith("not installed"):
+        return "not configured"
+    return _enabled_detail(checks)
+
+
+def _configured_detail(checks: list[CheckResult]) -> str:
+    if not checks:
+        return "not checked"
+    detail = _doctor_detail(checks[0])
+    if detail.startswith("configured"):
+        return "configured"
+    if detail.startswith("optional; not configured"):
+        return "not configured"
+    if detail.startswith("optional; credentials present"):
+        return "not configured"
+    return detail
+
+
+def _channel_detail(checks: list[CheckResult]) -> str:
+    if not checks:
+        return "not checked"
+    detail = _doctor_detail(checks[0])
+    if detail.startswith("optional; not configured"):
+        return "not configured"
+    return detail
+
+
+def _doctor_line(
+    section: str,
+    name: str,
+    checks: list[CheckResult],
+    ok_detail: str | object,
+) -> DoctorLine:
+    status = _line_status(checks)
+    if status == "OK":
+        detail = ok_detail(checks) if callable(ok_detail) else str(ok_detail)
+        return DoctorLine(section, name, status, detail)
+    unhealthy = _first_unhealthy(checks)
+    if unhealthy is None:
+        return DoctorLine(section, name, status, "not checked")
+    return DoctorLine(section, name, status, _doctor_detail(unhealthy), unhealthy.fix)
+
+
+def _product_doctor_lines(results: list[CheckResult]) -> list[DoctorLine]:
+    lines: list[DoctorLine] = []
+    mapped: set[int] = set()
+
+    def add(section: str, name: str, checks: list[CheckResult], detail: str | object) -> None:
+        mapped.update(id(item) for item in checks)
+        lines.append(_doctor_line(section, name, checks, detail))
+
+    add("核心运行时", "Agent Runtime", _select_checks(results, ("runtime mode", "runtime")), "ready")
+    add("核心运行时", "Command Interface", _select_checks(results, ("command interface",)), "ready")
+    add("核心运行时", "Local Storage", _select_checks(results, ("local storage",)), "ready")
+    add("核心运行时", "TUI", _select_checks(results, ("tui",)), "ready")
+    add("核心运行时", "Pet", _select_checks(results, ("runtime feature pet", "desktop companion", "desktop gui")), _pet_detail)
+    add("核心运行时", "Model Client", _select_checks(results, ("model client",)), "ready")
+
+    add("工具能力", "File Operation", _select_checks(results, ("runtime feature file",)), _enabled_detail)
+    add("工具能力", "Terminal", _select_checks(results, ("runtime feature terminal",)), _enabled_detail)
+    add("工具能力", "Vision Analysis", _select_checks(results, ("feature 视觉分析",)), _configured_detail)
+    add("工具能力", "Web Search", _select_checks(results, ("feature 网页搜索",)), _configured_detail)
+    add(
+        "工具能力",
+        "Browser Tools",
+        _select_checks(
+            results,
+            ("runtime feature browser_tool", "playwright browsers", "toolset browser"),
+            ("tool browser_",),
+        ),
+        _browser_tools_detail,
+    )
+
+    add("IM通道", "Weixin", _select_checks(results, ("weixin channel",)), _channel_detail)
+    add("IM通道", "DingTalk", _select_checks(results, ("dingtalk channel",)), _channel_detail)
+
+    for item in results:
+        if id(item) in mapped or item.ok:
+            continue
+        lines.append(
+            DoctorLine(
+                "其他",
+                item.name,
+                _line_status([item]),
+                _doctor_detail(item),
+                item.fix,
+            )
+        )
+
+    return lines
+
+
+def format_doctor(results: list[CheckResult]) -> str:
+    product_lines = _product_doctor_lines(results)
+    failed = sum(1 for item in product_lines if item.status == "FAIL")
+    warnings = sum(1 for item in product_lines if item.status == "WARN")
+    passed = len(product_lines) - failed - warnings
+    state = "可运行" if failed == 0 and warnings == 0 else ("可运行，存在警告" if failed == 0 else "需要修复")
+
+    lines = [
+        "M-CLAW 运行环境诊断",
+        "",
+        "总览",
+        f"  状态      {state}",
+        f"  检查项    {passed}/{len(product_lines)} 就绪",
+        f"  警告      {warnings}",
+        f"  失败      {failed}",
+    ]
+
+    section_order = ["核心运行时", "工具能力", "IM通道", "其他"]
+    grouped: dict[str, list[DoctorLine]] = {section: [] for section in section_order}
+    for item in product_lines:
+        grouped.setdefault(item.section, []).append(item)
+
+    for section in section_order:
+        items = grouped.get(section) or []
+        if not items:
+            continue
+        lines.extend(["", section])
+        for item in items:
+            lines.append(f"  {item.status:<5} {item.name:<22} {item.detail}")
+            if item.status != "OK" and item.fix:
+                lines.append(f"        修复: {item.fix}")
+
     return "\n".join(lines)
 
 

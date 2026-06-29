@@ -7,6 +7,75 @@
 from __future__ import annotations
 
 import base64
+import os
+import socket
+from typing import Any
+
+
+_ORIGINAL_GETADDRINFO = None
+_FORCED_IPV4_GETADDRINFO = False
+
+
+def _truthy(value: Any, *, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "on", "y"}:
+            return True
+        if text in {"0", "false", "no", "off", "n"}:
+            return False
+        if text == "auto":
+            return default
+    return default
+
+
+def _is_kaihong_runtime() -> bool:
+    try:
+        from mclaw.runtime.manager import RuntimeManager
+
+        return RuntimeManager.detect() == "kaihong"
+    except Exception:
+        return False
+
+
+def _configure_ca_bundle(config: dict) -> None:
+    bundle = str(config.get("ca_bundle") or "").strip()
+    if bundle.lower() == "auto":
+        bundle = ""
+    if not bundle:
+        try:
+            import certifi
+
+            bundle = certifi.where()
+        except Exception:
+            bundle = ""
+    if not bundle or not os.path.exists(bundle):
+        return
+    os.environ.setdefault("SSL_CERT_FILE", bundle)
+    os.environ.setdefault("REQUESTS_CA_BUNDLE", bundle)
+
+
+def _ensure_dashscope_address_family(config: dict) -> None:
+    global _FORCED_IPV4_GETADDRINFO, _ORIGINAL_GETADDRINFO
+
+    force_ipv4 = _truthy(config.get("force_ipv4"), default=_is_kaihong_runtime())
+    if not force_ipv4 or _FORCED_IPV4_GETADDRINFO:
+        return
+
+    _ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+    def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 - socket API name
+        infos = _ORIGINAL_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
+        ipv4_infos = [info for info in infos if info[0] == socket.AF_INET]
+        return ipv4_infos or infos
+
+    socket.getaddrinfo = getaddrinfo_ipv4
+    _FORCED_IPV4_GETADDRINFO = True
 
 
 class QwenRealtimeASRBackend:
@@ -37,6 +106,8 @@ class QwenRealtimeASRBackend:
         if not api_key:
             raise RuntimeError("DashScope/Qwen API key is not configured.")
         dashscope.api_key = api_key
+        _configure_ca_bundle(self.config)
+        _ensure_dashscope_address_family(self.config)
 
         backend = self
 

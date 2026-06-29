@@ -92,7 +92,10 @@ class RuntimeAsrCommandCoordinator:
     def handle_push_to_talk_key(self) -> None:
         try:
             service = self.hooks.ensure_asr_service()
-        except RuntimeError:
+        except RuntimeError as exc:
+            self.hooks.stop_asr_service()
+            self.hooks.set_asr_status_text("error")
+            self.hooks.render_error(f"ASR push-to-talk 不可用: {exc}")
             return
 
         if getattr(service, "listen_mode", "") != "push_to_talk":
@@ -103,13 +106,18 @@ class RuntimeAsrCommandCoordinator:
             })
             try:
                 service = self.hooks.ensure_asr_service()
-            except RuntimeError:
+            except RuntimeError as exc:
+                self.hooks.stop_asr_service()
+                self.hooks.set_asr_status_text("error")
+                self.hooks.render_error(f"ASR push-to-talk 不可用: {exc}")
                 return
 
         if service.toggle_push_to_talk():
             self.hooks.set_input_mode("asr")
             return
 
+        self.hooks.stop_asr_service()
+        self.hooks.set_asr_status_text("error")
         self.hooks.render_error(f"ASR push-to-talk 不可用: {getattr(service, 'last_error', '')}")
 
     def show_status(self) -> None:

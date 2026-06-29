@@ -31,11 +31,25 @@ def env_float(name: str, default: float) -> float:
     return value if math.isfinite(value) and value > 0 else default
 
 
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 BASE_LINEAR_SPEED_CM_S = env_float("ROBOT_DOG_LINEAR_SPEED_CM_S", 10.0)
 BASE_TURN_DEG_S = env_float("ROBOT_DOG_TURN_DEG_S", 15.0)
 LINEAR_DURATION_SCALE = env_float("ROBOT_DOG_LINEAR_DURATION_SCALE", 0.83)
 TURN_DURATION_SCALE = env_float("ROBOT_DOG_TURN_DURATION_SCALE", 0.58)
 HTTP_TIMEOUT_SECONDS = env_float("ROBOT_DOG_HTTP_TIMEOUT_SECONDS", 30.0)
+SEQUENCE_SETTLE_SECONDS = env_float("ROBOT_DOG_SEQUENCE_SETTLE_SECONDS", 1.0)
+SEQUENCE_ACTION_SETTLE_SECONDS = env_float("ROBOT_DOG_SEQUENCE_ACTION_SETTLE_SECONDS", 0.5)
+MAX_SEQUENCE_ACTIONS = env_int("ROBOT_DOG_MAX_SEQUENCE_ACTIONS", 20)
 
 
 def normalize_base_url(host: str | None) -> str:
@@ -154,6 +168,18 @@ def actions(base_url: str) -> dict[str, Any]:
     return request_json(base_url, "GET", "/actions")
 
 
+def available_action_names(base_url: str) -> set[str]:
+    payload = actions(base_url)
+    values = payload.get("actions", [])
+    if not isinstance(values, list):
+        raise SystemExit("Actions response is not a list")
+    names: set[str] = set()
+    for item in values:
+        if isinstance(item, dict) and item.get("name"):
+            names.add(str(item["name"]))
+    return names
+
+
 def run_action(base_url: str, name: str, wait: bool = True) -> dict[str, Any]:
     return request_json(base_url, "POST", "/api/action", {"name": name, "wait": wait})
 
@@ -220,6 +246,104 @@ def photo(base_url: str, *, output: str | None = None, timeout: float = 5.0) -> 
     }
 
 
+def require_ok(result: dict[str, Any], context: str) -> dict[str, Any]:
+    if result.get("ok") is False:
+        raise SystemExit(json.dumps({"ok": False, "step": context, "result": result}, ensure_ascii=False, indent=2))
+    return result
+
+
+def stop_quietly(base_url: str) -> dict[str, Any]:
+    try:
+        return stop(base_url)
+    except SystemExit as exc:
+        return {"ok": False, "error": str(getattr(exc, "code", exc))}
+
+
+def run_sequence(
+    base_url: str,
+    names: list[str],
+    *,
+    settle_seconds: float = SEQUENCE_SETTLE_SECONDS,
+    action_settle_seconds: float = SEQUENCE_ACTION_SETTLE_SECONDS,
+    final_home: bool = True,
+) -> dict[str, Any]:
+    cleaned = [str(name).strip() for name in names if str(name).strip()]
+    if not cleaned:
+        raise SystemExit("sequence requires at least one action name")
+    if len(cleaned) > MAX_SEQUENCE_ACTIONS:
+        raise SystemExit(f"sequence exceeds {MAX_SEQUENCE_ACTIONS} actions")
+    if not math.isfinite(settle_seconds) or settle_seconds < 0:
+        raise SystemExit("settle seconds must be a non-negative number")
+    if settle_seconds > 5:
+        raise SystemExit("settle seconds must not exceed 5")
+    if not math.isfinite(action_settle_seconds) or action_settle_seconds < 0:
+        raise SystemExit("action settle seconds must be a non-negative number")
+    if action_settle_seconds > 5:
+        raise SystemExit("action settle seconds must not exceed 5")
+
+    available = available_action_names(base_url)
+    missing = [name for name in cleaned if name not in available]
+    if missing:
+        raise SystemExit(
+            json.dumps(
+                {"ok": False, "error": "unknown action names", "missing": missing, "available": sorted(available)},
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+    steps: list[dict[str, Any]] = []
+
+    def settle() -> None:
+        if settle_seconds > 0:
+            time.sleep(settle_seconds)
+
+    def action_settle() -> None:
+        if action_settle_seconds > 0:
+            time.sleep(action_settle_seconds)
+
+    try:
+        for index, name in enumerate(cleaned, start=1):
+            home_result = require_ok(go_home(base_url), f"home before {name}")
+            steps.append({"index": index, "type": "home", "before": name, "result": home_result})
+            settle()
+            action_result = require_ok(run_action(base_url, name, wait=True), f"action {name}")
+            steps.append({"index": index, "type": "action", "name": name, "result": action_result})
+            action_settle()
+        if final_home:
+            final_home_result = require_ok(go_home(base_url), "final home")
+            steps.append({"type": "home", "final": True, "result": final_home_result})
+        return {
+            "ok": True,
+            "mode": "safe_sequence",
+            "actions": cleaned,
+            "count": len(cleaned),
+            "settle_seconds": settle_seconds,
+            "action_settle_seconds": action_settle_seconds,
+            "final_home": final_home,
+            "steps": steps,
+        }
+    except KeyboardInterrupt:
+        stop_quietly(base_url)
+        raise
+    except SystemExit as exc:
+        stop_result = stop_quietly(base_url)
+        raise SystemExit(
+            json.dumps(
+                {
+                    "ok": False,
+                    "mode": "safe_sequence",
+                    "actions": cleaned,
+                    "error": str(getattr(exc, "code", exc)),
+                    "steps": steps,
+                    "stop": stop_result,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Control a PuppyPi robot dog over HTTP.")
     parser.add_argument("--host", help="Robot host or URL, for example 192.168.1.138 or 192.168.1.138:8082")
@@ -237,6 +361,12 @@ def build_parser() -> argparse.ArgumentParser:
     action = sub.add_parser("action")
     action.add_argument("name")
     action.add_argument("--wait", action=argparse.BooleanOptionalAction, default=True)
+
+    sequence = sub.add_parser("sequence", aliases=["routine"])
+    sequence.add_argument("names", nargs="+")
+    sequence.add_argument("--settle", type=float, default=SEQUENCE_SETTLE_SECONDS)
+    sequence.add_argument("--action-settle", type=float, default=SEQUENCE_ACTION_SETTLE_SECONDS)
+    sequence.add_argument("--no-final-home", action="store_true")
 
     forward_cmd = sub.add_parser("forward")
     forward_cmd.add_argument("--meters", type=float, required=True)
@@ -271,6 +401,16 @@ def main(argv: list[str] | None = None) -> int:
         print_json(go_home(base_url))
     elif args.command == "action":
         print_json(run_action(base_url, args.name, wait=args.wait))
+    elif args.command in ("sequence", "routine"):
+        print_json(
+            run_sequence(
+                base_url,
+                args.names,
+                settle_seconds=args.settle,
+                action_settle_seconds=args.action_settle,
+                final_home=not args.no_final_home,
+            )
+        )
     elif args.command == "forward":
         print_json(forward(base_url, args.meters))
     elif args.command == "backward":

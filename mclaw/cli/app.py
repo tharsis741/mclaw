@@ -6,7 +6,7 @@
 
 This module owns the terminal user interface around agent turns: slash commands,
 streaming renderers, session locking and resume, input history, pet
-notifications, and subagent progress buffering.
+notifications, ASR controls, and subagent progress buffering.
 """
 
 import logging
@@ -340,6 +340,8 @@ class InteractiveChat:
         self._input_mode = "keyboard"
         self._asr_service = None
         self._asr_status_text = "off"
+        self._asr_ptt_lock = threading.Lock()
+        self._asr_ptt_inflight = False
         self._ptt_key = self._resolve_push_to_talk_key()
         self.pet = PetController.from_config(self.config, session_id=self.session_id)
         self._last_chat_result: dict | None = None
@@ -2124,7 +2126,26 @@ class InteractiveChat:
         self._get_asr_command_coordinator().handle_asr_once()
 
     def _handle_push_to_talk_key(self):
-        self._get_asr_command_coordinator().handle_push_to_talk_key()
+        with self._asr_ptt_lock:
+            if self._asr_ptt_inflight:
+                self._set_asr_status("starting")
+                return
+            self._asr_ptt_inflight = True
+        self._set_asr_status("starting")
+
+        def _run_push_to_talk():
+            try:
+                self._get_asr_command_coordinator().handle_push_to_talk_key()
+            except Exception as exc:
+                logger.exception("ASR push-to-talk failed")
+                self._asr_status_text = f"error {exc}"
+                if self._app:
+                    self._app.invalidate()
+            finally:
+                with self._asr_ptt_lock:
+                    self._asr_ptt_inflight = False
+
+        threading.Thread(target=_run_push_to_talk, name="mclaw-asr-ptt", daemon=True).start()
 
     def _show_asr_status(self):
         self._get_asr_command_coordinator().show_status()
@@ -2135,7 +2156,10 @@ class InteractiveChat:
 
         def _stop_asr_service() -> None:
             if self._asr_service is not None:
-                self._asr_service.stop()
+                try:
+                    self._asr_service.stop()
+                finally:
+                    self._asr_service = None
 
         return RuntimeAsrCommandCoordinator(
             RuntimeAsrCommandHooks(
@@ -2143,7 +2167,7 @@ class InteractiveChat:
                 ensure_asr_service=self._ensure_asr_service,
                 stop_asr_service=_stop_asr_service,
                 set_input_mode=lambda mode: setattr(self, "_input_mode", mode),
-                set_asr_status_text=lambda status: setattr(self, "_asr_status_text", status),
+                set_asr_status_text=self._set_asr_status,
                 push_to_talk_label=self._push_to_talk_label,
                 resolve_status_config=lambda: mask_asr_status(resolve_asr_config(config=self.config)),
                 get_service_status=lambda: self._asr_service.status() if self._asr_service is not None else {},

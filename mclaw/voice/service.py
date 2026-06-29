@@ -17,6 +17,20 @@ from typing import Callable, Optional
 from mclaw.voice.filters import TranscriptFilter
 
 
+def _pcm16_rms(pcm_bytes: bytes) -> int:
+    usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
+    if usable <= 0:
+        return 0
+    samples = memoryview(pcm_bytes[:usable]).cast("h")
+    if not samples:
+        return 0
+    total = 0
+    for sample in samples:
+        value = int(sample)
+        total += value * value
+    return int((total / len(samples)) ** 0.5)
+
+
 class VoiceInputService:
     def __init__(
         self,
@@ -40,6 +54,7 @@ class VoiceInputService:
         self._audio_queue = None
         self._audio_worker = None
         self._audio_stop = None
+        self._sent_audio_chunks = 0
 
     def update_config(self, config: dict):
         self.config = config or {}
@@ -54,6 +69,7 @@ class VoiceInputService:
             self.last_error = "DashScope/Qwen API key is not configured."
             self._status("error")
             return False
+        self._stop_audio_session()
         self.running = True
         self.last_error = ""
         if self.listen_mode == "wake_word":
@@ -127,8 +143,12 @@ class VoiceInputService:
     def _start_audio_session(self) -> bool:
         try:
             self._stop_audio_session()
+            self._sent_audio_chunks = 0
             from mclaw.voice.qwen_realtime import QwenRealtimeASRBackend
             from mclaw.voice.recorder import AudioRecorder
+
+            if not AudioRecorder.input_available(self.config):
+                raise RuntimeError("No audio input device detected by configured recorder backends.")
 
             backend_config = dict(self.config)
             backend_config["enable_server_vad"] = self.listen_mode in ("wake_word", "once")
@@ -150,6 +170,7 @@ class VoiceInputService:
         except Exception as exc:
             self.last_error = str(exc)
             self.recording = False
+            self.running = False
             self._stop_audio_session()
             self._status("error")
             return False
@@ -187,10 +208,14 @@ class VoiceInputService:
             self._drain_audio_queue()
             self._finishing_manual = bool(commit)
             try:
+                min_chunks = int(self.config.get("min_voice_chunks") or 0)
+                should_commit = bool(commit) and self._sent_audio_chunks >= min_chunks
                 if hasattr(backend, "finish"):
-                    backend.finish(commit=commit, timeout=int(self.config.get("manual_commit_timeout") or 10))
+                    backend.finish(commit=should_commit, timeout=int(self.config.get("manual_commit_timeout") or 10))
                 else:
                     backend.close()
+                if commit and not should_commit:
+                    self._status("push_to_talk no speech")
             except Exception as exc:
                 self._handle_backend_error(str(exc))
             finally:
@@ -217,11 +242,20 @@ class VoiceInputService:
         audio_queue = self._audio_queue
         if audio_queue is None:
             return
+        if not self._is_voice_audio(pcm_bytes):
+            return
         try:
             audio_queue.put_nowait(pcm_bytes)
+            self._sent_audio_chunks += 1
         except queue.Full:
             # Dropping a chunk is preferable to blocking PortAudio's callback.
             pass
+
+    def _is_voice_audio(self, pcm_bytes: bytes) -> bool:
+        threshold = int(self.config.get("min_audio_rms") or 0)
+        if threshold <= 0:
+            return True
+        return _pcm16_rms(pcm_bytes) >= threshold
 
     def _handle_backend_error(self, message: str):
         self.last_error = message
