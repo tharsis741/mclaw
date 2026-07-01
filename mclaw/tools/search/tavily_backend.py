@@ -11,7 +11,6 @@ formats the answer plus sources into lightweight Markdown for the agent.
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import requests
 
@@ -23,13 +22,16 @@ _TAVILY_API_URL = "https://api.tavily.com/search"
 def search(
     query: str,
     strategy: str,
-    freshness: Optional[int],
-    sites: Optional[str],
+    freshness: int | None,
+    sites: str | None,
     images: bool,
     creds: dict,
     timeout: float,
 ) -> dict:
     """Search the web using the Tavily API.
+
+    This adapter converts the router's common SearchRequest fields into Tavily
+    payload options and returns the same response envelope as other backends.
 
     Args:
         query: Search query string.
@@ -53,7 +55,7 @@ def search(
             "_hint": "Set TAVILY_API_KEY in the M-Claw home .env file.",
         }
 
-    # Map search strategy to Tavily search_depth and max_results.
+    # Map M-Claw's strategy names onto Tavily's depth/result-count knobs.
     if strategy == "turbo":
         search_depth = "basic"
         max_results = 5
@@ -71,12 +73,13 @@ def search(
         "include_raw_content": False,
     }
 
-    # Map freshness to Tavily time_range.
+    # Tavily has coarse time windows, so several requested freshness values
+    # intentionally collapse to the nearest supported range.
     _FRESHNESS_MAP = {7: "week", 30: "month", 180: "month", 365: "year"}
     if freshness in _FRESHNESS_MAP:
         payload["time_range"] = _FRESHNESS_MAP[freshness]
 
-    # Map sites to include_domains.
+    # Domain filters are provider-side allowlists, not post-filtered results.
     if sites:
         domains = [s.strip() for s in sites.split(",") if s.strip()]
         if domains:
@@ -92,7 +95,7 @@ def search(
             "success": False,
             "results": f"Tavily search timed out after {timeout:.1f}s.",
             "_backend": "tavily",
-            "_hint": "Retry or increase timeout in auxiliary.web_search.timeout config.",
+            "_hint": "Retry or increase timeout in auxiliary.web_search.tavily_timeout config.",
         }
     except requests.HTTPError as exc:
         logger.warning("Tavily search HTTP error: %s", exc)
@@ -123,7 +126,8 @@ def search(
     answer = data.get("answer", "")
     sources = data.get("results", [])
 
-    # Build lightweight Markdown output.
+    # Build lightweight Markdown output so callers can preserve citations
+    # without needing to understand Tavily's raw JSON shape.
     lines: list[str] = []
     if answer:
         lines.append(answer)

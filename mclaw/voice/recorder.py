@@ -2,11 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Microphone recorder used by M-Claw voice input flows.
-
-Recorder selection prefers PortAudio/sounddevice on desktop systems and can
-fall back to ALSA arecord on Kaihong-style runtimes when available.
-"""
+"""Microphone recorder for voice input."""
 
 from __future__ import annotations
 
@@ -86,6 +82,8 @@ def _is_kaihong_runtime() -> bool:
 
 
 class AudioRecorder:
+    """Select and expose the available microphone capture backend."""
+
     def __init__(self, config: dict):
         self.config = config or {}
         self._impl = self._select_recorder(self.config)
@@ -99,6 +97,7 @@ class AudioRecorder:
 
     @staticmethod
     def input_available(config: dict | None = None) -> bool:
+        """Probe configured backends without starting a long-lived capture."""
         config = config or {}
         backend = _recorder_backend(config)
         if backend in {"sounddevice", "portaudio"}:
@@ -109,6 +108,7 @@ class AudioRecorder:
 
     @staticmethod
     def _select_recorder(config: dict):
+        """Prefer explicit backend selection, then fall back by capability probe."""
         backend = _recorder_backend(config)
         if backend in {"sounddevice", "portaudio"}:
             return SounddeviceAudioRecorder(config)
@@ -129,16 +129,19 @@ def _recorder_backend(config: dict) -> str:
 
 
 class SounddeviceAudioRecorder:
+    """PortAudio/sounddevice recorder used on desktop-like runtimes."""
+
     def __init__(self, config: dict):
         self.config = config or {}
         self.running = False
         self._stream = None
 
     def start(self, on_audio_chunk):
+        """Start an InputStream whose callback must stay non-blocking."""
         try:
             import sounddevice as sd
         except ImportError as exc:
-            raise RuntimeError("Install voice dependencies with: pip install -e .[voice]") from exc
+            raise RuntimeError("Install M-Claw dependencies from the source directory: pip install -e .") from exc
         if self.running:
             return
 
@@ -206,6 +209,8 @@ class SounddeviceAudioRecorder:
 
 
 class ArecordAudioRecorder:
+    """ALSA arecord backend used for Kaihong and other minimal Linux runtimes."""
+
     def __init__(self, config: dict):
         self.config = config or {}
         self.running = False
@@ -215,6 +220,7 @@ class ArecordAudioRecorder:
         self._stderr_tail = deque(maxlen=20)
 
     def start(self, on_audio_chunk):
+        """Start arecord and stream stdout chunks from a background reader thread."""
         if self.running:
             return
 
@@ -279,6 +285,7 @@ class ArecordAudioRecorder:
 
     @staticmethod
     def input_available(config: dict | None = None) -> bool:
+        """Allow auto selection only on Kaihong, unless arecord was requested."""
         config = config or {}
         if _recorder_backend(config) == "auto" and not _is_kaihong_runtime():
             return False
@@ -286,6 +293,7 @@ class ArecordAudioRecorder:
 
     @staticmethod
     def resolve_device(config: dict | None = None) -> str:
+        """Return an explicit ALSA device or the first detected capture device."""
         config = config or {}
         configured = str(config.get("arecord_device") or config.get("alsa_device") or "").strip()
         if configured and configured.lower() != "auto":
@@ -328,6 +336,7 @@ class ArecordAudioRecorder:
         return " ".join(item for item in self._stderr_tail if item).strip()
 
     def stop(self):
+        """Terminate the capture process and join reader threads best-effort."""
         process = self._process
         self._process = None
         self.running = False
@@ -356,6 +365,7 @@ class ArecordAudioRecorder:
 
 
 def _arecord_capture_devices(config: dict | None = None) -> list[tuple[int, int, str]]:
+    """Discover ALSA capture devices from arecord output and procfs fallback."""
     if shutil.which("arecord") is None:
         return []
     devices: list[tuple[int, int, str]] = []
@@ -395,6 +405,7 @@ def _arecord_capture_devices(config: dict | None = None) -> list[tuple[int, int,
 
 
 def _arecord_env(config: dict | None = None) -> dict[str, str]:
+    """Build the capture environment, installing Kaihong's minimal ALSA config."""
     env = os.environ.copy()
     configured = str((config or {}).get("alsa_config_path") or env.get("ALSA_CONFIG_PATH") or "").strip()
     if configured:
@@ -408,6 +419,7 @@ def _arecord_env(config: dict | None = None) -> dict[str, str]:
 
 
 def _ensure_kaihong_alsa_config() -> str:
+    """Materialize the ALSA config required by Kaihong's stripped-down runtime."""
     home = Path(os.environ.get("MCLAW_HOME") or "/data/local/tmp/.mclaw")
     config_path = home / "runtime" / "alsa" / "asound.conf"
     try:
@@ -421,6 +433,7 @@ def _ensure_kaihong_alsa_config() -> str:
 
 
 def _explain_arecord_failure(message: str, device: str) -> str:
+    """Add device-holder diagnostics to common ALSA busy failures."""
     if "resource busy" not in (message or "").lower():
         return message or "process exited"
     device_path = _capture_device_path(device)
@@ -440,6 +453,7 @@ def _capture_device_path(device: str) -> str:
 
 
 def _device_fd_owners(device_path: str) -> list[str]:
+    """Inspect procfs for processes that currently hold the capture device."""
     owners: list[str] = []
     seen: set[str] = set()
     proc = Path("/proc")

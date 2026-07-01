@@ -2,11 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Read, validate, and match Skill metadata.
+"""Read and normalize Skill metadata shared by agent and CLI flows.
 
-The helpers centralize frontmatter parsing, platform compatibility checks, and
-filesystem discovery for Skills so prompt assembly and slash commands share the
-same metadata interpretation.
+The helpers keep frontmatter parsing, platform gates, disabled-name config,
+index discovery, and safe placeholder rendering in one place so Skill
+semantics stay consistent outside the excluded Skill content tree.
 """
 
 from __future__ import annotations
@@ -14,13 +14,15 @@ from __future__ import annotations
 import os
 import re
 import sys
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Set, Tuple
 
 import yaml
 
 from mclaw.cli.config import load_config
-from mclaw.constants import get_mclaw_home
+
+logger = logging.getLogger(__name__)
 
 PLATFORM_MAP = {
     "macos": "darwin",
@@ -51,12 +53,8 @@ def parse_frontmatter(content: str) -> Tuple[Dict[str, Any], str]:
         parsed = yaml.safe_load(yaml_content)
         if isinstance(parsed, dict):
             frontmatter = parsed
-    except Exception:
-        for line in yaml_content.strip().split("\n"):
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            frontmatter[key.strip()] = value.strip()
+    except yaml.YAMLError as exc:
+        logger.debug("Skill frontmatter YAML parse failed: %s", exc)
 
     return frontmatter, body
 
@@ -79,6 +77,7 @@ def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
 
 
 def _normalize_string_set(values: Any) -> Set[str]:
+    """Normalize scalar or sequence config fields into canonical name sets."""
     if values is None:
         return set()
     if isinstance(values, str):
@@ -87,7 +86,11 @@ def _normalize_string_set(values: Any) -> Set[str]:
 
 
 def get_disabled_skill_names(platform: str | None = None, config: dict | None = None) -> Set[str]:
-    """Read disabled Skill names from config."""
+    """Read disabled Skill names, honoring platform-specific overrides first.
+
+    Config loading is lazy so tests and registry callers can inject an already
+    loaded config; unreadable config falls back to no disabled entries.
+    """
     if config is None:
         try:
             config = load_config()
@@ -108,7 +111,7 @@ def get_disabled_skill_names(platform: str | None = None, config: dict | None = 
 
 
 def iter_skill_index_files(skills_dir: Path, filename: str = "SKILL.md"):
-    """Yield immediate-child skill index files only."""
+    """Yield only immediate-child Skill index files, excluding nested assets."""
     if not skills_dir.exists():
         return
     matches = []
@@ -123,7 +126,7 @@ def iter_skill_index_files(skills_dir: Path, filename: str = "SKILL.md"):
 
 
 def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
-    """Extract conditional activation metadata from frontmatter."""
+    """Extract conditional activation metadata from the mclaw namespace."""
     metadata = frontmatter.get("metadata")
     if not isinstance(metadata, dict):
         metadata = {}
@@ -139,7 +142,7 @@ def extract_skill_conditions(frontmatter: Dict[str, Any]) -> Dict[str, List]:
 
 
 def render_skill_vars(content: str, skill_dir: Path, skill_name: str = "") -> str:
-    """Render safe Skill text variables."""
+    """Render the small whitelist of placeholders allowed in Skill text."""
     replacements = {
         "{{SKILL_DIR}}": str(skill_dir.resolve()),
         "{{SKILL_NAME}}": skill_name or skill_dir.name,

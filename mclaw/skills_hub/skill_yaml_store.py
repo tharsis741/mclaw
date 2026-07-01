@@ -17,10 +17,14 @@ from mclaw.skills_hub.schema import validate_skill_yaml
 
 
 def now_iso() -> str:
+    """Return the local timestamp format used by Skill sidecars."""
+
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def extract_short_description(skill_md: str, fallback: str) -> str:
+    """Derive a short sidecar description from SKILL.md frontmatter."""
+
     frontmatter, _ = parse_frontmatter(skill_md or "")
     description = str(frontmatter.get("description") or "").strip().strip("'\"")
     return description or fallback
@@ -37,6 +41,8 @@ def build_skill_yaml(
     created_at: str | None = None,
     updated_at: str | None = None,
 ) -> dict[str, Any]:
+    """Build and validate the canonical mclaw_skill.yaml payload."""
+
     ts = created_at or now_iso()
     data = {
         "schema_version": 1,
@@ -56,6 +62,8 @@ def build_skill_yaml(
 
 
 def read_skill_yaml(skill_dir: Path) -> dict[str, Any]:
+    """Read a Skill metadata sidecar and validate it against the directory name."""
+
     path = skill_dir / "mclaw_skill.yaml"
     data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else None
     expected_name = str((data or {}).get("name") or skill_dir.name)
@@ -65,6 +73,8 @@ def read_skill_yaml(skill_dir: Path) -> dict[str, Any]:
 
 
 def write_skill_yaml(skill_dir: Path, data: dict[str, Any]) -> None:
+    """Validate and persist the mclaw_skill.yaml sidecar for one Skill."""
+
     expected_name = str(data.get("name") or skill_dir.name)
     if skill_dir.name != "skill":
         expected_name = skill_dir.name
@@ -74,6 +84,8 @@ def write_skill_yaml(skill_dir: Path, data: dict[str, Any]) -> None:
 
 
 def touch_skill_yaml(skill_dir: Path, *, actor: str) -> dict[str, Any]:
+    """Update modification metadata after a managed Skill content change."""
+
     data = read_skill_yaml(skill_dir)
     data["updated_at"] = now_iso()
     data["updated_by"] = actor
@@ -82,6 +94,8 @@ def touch_skill_yaml(skill_dir: Path, *, actor: str) -> dict[str, Any]:
 
 
 def mark_enabled(skill_dir: Path, *, actor: str = "install") -> dict[str, Any]:
+    """Mark a prepared Skill as enabled after it has moved into the active root."""
+
     data = read_skill_yaml(skill_dir)
     data["status"] = "enabled"
     data["updated_at"] = now_iso()

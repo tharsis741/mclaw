@@ -37,6 +37,7 @@ class RuntimeModelCommandCoordinator:
         self.hooks = hooks
 
     def handle_model_switch(self, raw_args: str) -> None:
+        """Resolve `/model` input and either apply it or request credentials."""
         raw_args = str(raw_args or "").strip()
         if not raw_args:
             self.hooks.render_model_status(
@@ -45,23 +46,27 @@ class RuntimeModelCommandCoordinator:
             )
             return
 
-        model_name, explicit_provider, explicit_profile, is_global = self.hooks.parse_model_flags(raw_args)
+        try:
+            model_name, explicit_provider, explicit_profile, is_global = self.hooks.parse_model_flags(raw_args)
+        except ValueError as exc:
+            self.hooks.render_model_error(str(exc) or "模型命令参数无效。")
+            return
+
         result = self.hooks.switch_model(
             model_input=model_name,
             current_provider=self.hooks.current_provider(),
-            current_model=self.hooks.current_model(),
             current_base_url=self.hooks.current_base_url(),
             current_api_key=self.hooks.current_api_key(),
             explicit_provider=explicit_provider,
             explicit_profile=explicit_profile,
-            is_global=is_global,
             print_fn=self.hooks.print_fn,
             user_providers=self.hooks.user_providers(),
-            prompt_for_missing_key=False,
         )
 
         if not getattr(result, "success", False):
             if getattr(result, "needs_api_key", False):
+                # Prompt ownership stays with the host UI; this coordinator only
+                # records enough context to retry the same switch after key entry.
                 self.hooks.remember_pending_key_setup({
                     "model": model_name,
                     "provider": getattr(result, "target_provider", ""),

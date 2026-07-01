@@ -2,13 +2,13 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Schema validation for Skill 2.0 sidecars and drafting manifests."""
+"""Schema validation for Skill package sidecars and drafting manifests."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from mclaw.skills_hub.paths import validate_skill_name
+from mclaw.skills_hub.paths import validate_drafting_id, validate_skill_name
 
 EVOLUTION_SECTIONS = (
     "adaptation_summary",
@@ -18,20 +18,8 @@ EVOLUTION_SECTIONS = (
 )
 SOURCE_TYPES = {"agent_created", "github", "clawhub", "local", "bundled"}
 ACTORS = {"install", "main_agent", "background_review", "bundled"}
-
-
-class SkillSchemaError(ValueError):
-    """Raised when a Skill 2.0 sidecar is invalid."""
-
-
-def is_chinese_text(text: str) -> bool:
-    return any("\u4e00" <= ch <= "\u9fff" for ch in str(text or ""))
-
-
-def validate_skill_yaml(data: dict[str, Any], *, dir_name: str | None = None) -> dict[str, Any]:
-    if not isinstance(data, dict):
-        raise SkillSchemaError("mclaw_skill.yaml must be a mapping.")
-    allowed = {
+SKILL_YAML_FIELDS = frozenset(
+    {
         "schema_version",
         "name",
         "short_description",
@@ -42,7 +30,38 @@ def validate_skill_yaml(data: dict[str, Any], *, dir_name: str | None = None) ->
         "updated_by",
         "status",
     }
-    extra = sorted(set(data) - allowed)
+)
+MANIFEST_FIELDS = frozenset(
+    {
+        "schema_version",
+        "drafting_id",
+        "skill_name",
+        "source",
+        "status",
+        "created_at",
+        "updated_at",
+        "security_review_path",
+        "package_path",
+        "user_intent",
+        "dependency_hints",
+    }
+)
+
+
+class SkillSchemaError(ValueError):
+    """Raised when a Skill package sidecar is invalid."""
+
+
+def is_chinese_text(text: str) -> bool:
+    """Return whether text contains Chinese characters for local description policy."""
+    return any("\u4e00" <= ch <= "\u9fff" for ch in str(text or ""))
+
+
+def validate_skill_yaml(data: dict[str, Any], *, dir_name: str | None = None) -> dict[str, Any]:
+    """Validate the enabled/prepared Skill metadata sidecar."""
+    if not isinstance(data, dict):
+        raise SkillSchemaError("mclaw_skill.yaml must be a mapping.")
+    extra = sorted(set(data) - SKILL_YAML_FIELDS)
     if extra:
         raise SkillSchemaError(f"Unsupported mclaw_skill.yaml fields: {', '.join(extra)}")
     if data.get("schema_version") != 1:
@@ -75,6 +94,7 @@ def validate_skill_yaml(data: dict[str, Any], *, dir_name: str | None = None) ->
 
 
 def validate_evolution(data: dict[str, Any]) -> dict[str, list[str]]:
+    """Validate and dedupe the mutable Skill evolution note sections."""
     if not isinstance(data, dict):
         raise SkillSchemaError("skill_evolution.json must be an object.")
     extra = sorted(set(data) - set(EVOLUTION_SECTIONS))
@@ -90,10 +110,15 @@ def validate_evolution(data: dict[str, Any]) -> dict[str, list[str]]:
 
 
 def validate_manifest(data: dict[str, Any]) -> dict[str, Any]:
+    """Validate an install drafting manifest before confirmation actions use it."""
     if not isinstance(data, dict):
         raise SkillSchemaError("import_manifest.yaml must be a mapping.")
+    extra = sorted(set(data) - MANIFEST_FIELDS)
+    if extra:
+        raise SkillSchemaError(f"Unsupported import_manifest.yaml fields: {', '.join(extra)}")
     if data.get("schema_version") != 1:
         raise SkillSchemaError("manifest schema_version must be 1.")
+    validate_drafting_id(str(data.get("drafting_id") or ""))
     if str(data.get("status") or "") not in {"prepared", "blocked"}:
         raise SkillSchemaError("manifest status must be prepared or blocked.")
     validate_skill_name(str(data.get("skill_name") or ""))
@@ -104,4 +129,13 @@ def validate_manifest(data: dict[str, Any]) -> dict[str, Any]:
     source = data.get("source")
     if not isinstance(source, dict) or str(source.get("type") or "") not in SOURCE_TYPES:
         raise SkillSchemaError("manifest source is invalid.")
+    if "original" not in source:
+        raise SkillSchemaError("manifest source.original is required.")
+    for field in ("created_at", "updated_at"):
+        if not str(data.get(field) or "").strip():
+            raise SkillSchemaError(f"manifest {field} is required.")
+    if not isinstance(data.get("user_intent", ""), str):
+        raise SkillSchemaError("manifest user_intent must be a string.")
+    if not isinstance(data.get("dependency_hints"), list):
+        raise SkillSchemaError("manifest dependency_hints must be a list.")
     return data

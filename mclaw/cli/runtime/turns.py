@@ -51,6 +51,7 @@ class RuntimeTurnCoordinator:
         self.hooks = hooks
 
     def on_idle(self) -> None:
+        """Run background maintenance hooks while no agent turn is active."""
         if not self.runtime.agent_running:
             self.hooks.drain_pet_commands()
             self.hooks.pump_background_watchers()
@@ -58,6 +59,11 @@ class RuntimeTurnCoordinator:
             self.hooks.pump_scheduler()
 
     def handle_input(self, user_input: str) -> None:
+        """Route submitted text through pending prompts before starting a turn.
+
+        Secret, scheduler, Skill confirmation, and key-setup continuations own
+        the next input before slash commands or normal agent turns can run.
+        """
         if self.hooks.has_pending_secret_request():
             self.hooks.handle_secret_request(user_input)
             return

@@ -25,10 +25,12 @@ from mclaw.runtime.shell import ShellProfile
 
 
 def _feature_from_module(module: str) -> FeatureState:
+    """Map an import probe to a runtime feature availability state."""
     return FeatureState.ENABLED if importlib.util.find_spec(module) else FeatureState.AVAILABLE_WITH_INSTALL
 
 
 class WindowsRuntime(Runtime):
+    """Runtime profile for Windows hosts and PowerShell-first command execution."""
     kind = "windows"
 
     def __init__(self) -> None:
@@ -59,6 +61,7 @@ class WindowsRuntime(Runtime):
 
     @staticmethod
     def _shell_profile() -> ShellProfile:
+        """Prefer PowerShell, falling back to cmd when no PowerShell is available."""
         pwsh = shutil.which("pwsh") or shutil.which("powershell.exe")
         if pwsh:
             return ShellProfile(

@@ -2,10 +2,10 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the DingTalk Stream Mode channel loop.
+"""DingTalk Stream Mode runtime orchestration.
 
-The runtime wires configuration, SDK callbacks, deduplication, session routing,
-and outbound target registration around the shared channel runner.
+This module wires configuration, the Stream client, the adapter, session
+routing, and the shared agent runner into one long-lived channel process.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 class DingTalkRuntime:
+    """Own the DingTalk channel lifecycle and reconnect loop."""
+
     def __init__(
         self,
         *,
@@ -43,7 +45,6 @@ class DingTalkRuntime:
         adapter: DingTalkAdapter | None = None,
         runtime_lock: DingTalkRuntimeLock | None = None,
     ) -> None:
-        self.root_config = config
         self.dingtalk_config = DingTalkConfig.from_config(config)
         self.session_db = session_db or SessionDB()
         self.client = client or DingTalkClient(self.dingtalk_config)
@@ -78,6 +79,7 @@ class DingTalkRuntime:
         self._stop_event: asyncio.Event | None = None
 
     async def start(self) -> None:
+        """Validate config, acquire the bot lock, and start the stream task."""
         errors = self.dingtalk_config.validate()
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -96,6 +98,7 @@ class DingTalkRuntime:
             raise
 
     async def stop(self) -> None:
+        """Stop the stream loop, interrupt active turns, close clients, and release state."""
         if self._stopping:
             return
         self._stopping = True
@@ -111,6 +114,7 @@ class DingTalkRuntime:
                 logger.info("dingtalk runtime interrupted %d active session(s)", interrupted)
             close_task: asyncio.Task | None = None
             try:
+                # Start client close before cancelling the stream task to unblock SDK waits.
                 close_task = asyncio.create_task(self.client.close())
             except RuntimeError:
                 close_task = None
@@ -139,6 +143,7 @@ class DingTalkRuntime:
             self._stopping = False
 
     async def _stream_loop(self) -> None:
+        """Run the Stream client with bounded reconnect backoff until stopped."""
         backoff_idx = 0
         while self._running:
             try:
@@ -165,6 +170,7 @@ class DingTalkRuntime:
                 backoff_idx += 1
 
     async def run_forever(self) -> None:
+        """Start the runtime and keep it alive until the stream task exits."""
         try:
             await self.start()
             while self._stream_task and not self._stream_task.done():

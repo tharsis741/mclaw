@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reusable prompt_toolkit selection prompts."""
+"""Reusable prompt_toolkit selection prompts for setup and trust gates."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from mclaw.cli.tui.console import MClawConsole
 
 
 def prompt_workspace_risk_confirmation(workspace: str) -> bool:
-    """Ask whether M-Claw may access the current workspace."""
+    """Ask whether M-Claw may access the current workspace before startup continues."""
     selected = {"index": 0}
 
     console = MClawConsole()
@@ -86,17 +86,19 @@ def prompt_workspace_risk_confirmation(workspace: str) -> bool:
 
 
 def _compact_select_description(description: str, limit: int = 64) -> str:
+    """Keep metadata descriptions narrow enough for non-fullscreen prompts."""
     text = " ".join(str(description or "").split())
     if len(text) <= limit:
         return text
     return text[: max(0, limit - 3)].rstrip() + "..."
 
 
-def _builtin_skill_description(name: str, description: str) -> str:
+def _builtin_skill_description(description: str) -> str:
     return _compact_select_description(description)
 
 
 def _multi_select_item_fragments(item: dict, *, checked: bool, current: bool) -> StyleAndTextTuples:
+    """Build one prompt_toolkit row with separate style spans for cursor and checkbox state."""
     prefix = ">" if current else " "
     category = f" [{item['category']}]" if item["category"] else ""
     desc = f" - {item['description']}" if item["description"] else ""
@@ -123,7 +125,6 @@ def prompt_builtin_skill_selection(skills: list[dict]) -> list[str]:
                 "id": str(item.get("name") or "").strip(),
                 "label": str(item.get("name") or "").strip(),
                 "description": _builtin_skill_description(
-                    str(item.get("name") or "").strip(),
                     str(item.get("short_description") or "").strip(),
                 ),
                 "category": str(item.get("category") or "").strip(),
@@ -143,7 +144,7 @@ def prompt_multi_select(
     default_selected: list[str] | None = None,
     max_visible_items: int = 20,
 ) -> list[str]:
-    """Generic compact multi-select prompt used by setup."""
+    """Run a compact keyboard-driven multi-select prompt and return selected ids."""
     normalized = [
         {
             "id": str(item.get("id") or item.get("name") or "").strip(),
@@ -166,6 +167,7 @@ def prompt_multi_select(
         visible_count = max(1, min(max_visible_items, len(normalized)))
         if len(normalized) > visible_count:
             half = visible_count // 2
+            # Keep the current row near the middle while clamping to the item bounds.
             start = max(0, min(selected["index"] - half, len(normalized) - visible_count))
             end = start + visible_count
             result.append(("class:hint", f"显示 {start + 1}-{end} / {len(normalized)}，↑/↓ 查看全部\n\n"))

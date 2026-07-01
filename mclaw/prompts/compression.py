@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prompt builders for summarizing and compressing conversation context."""
+"""Context compression prompt builders.
+
+The prompt shape is kept separate from the compressor so tests and future
+providers can reuse the same handoff-summary contract without importing runtime
+state.
+"""
 
 from __future__ import annotations
 

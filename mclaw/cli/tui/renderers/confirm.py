@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Interactive confirmation prompt rendering."""
+"""Render interactive confirmations for security-sensitive CLI flows."""
 
 from __future__ import annotations
 
@@ -21,6 +21,8 @@ from mclaw.cli.tui.panel_renderer import render_panel_model
 
 
 class ConfirmRenderer:
+    """Build confirmation panels while keeping input collection outside the renderer."""
+
     def __init__(
         self,
         *,
@@ -35,17 +37,13 @@ class ConfirmRenderer:
         self._panel_sink = panel_sink
 
     def render_skill_import_confirmation(self, confirmation: dict) -> None:
+        """Show Skill import review details with a risk-toned confirmation panel."""
         skill_name = confirmation.get("skill_name") or confirmation.get("name") or "(unknown)"
         risk = confirmation.get("risk_level") or "unknown"
         security_review = confirmation.get("security_review")
         if not isinstance(security_review, dict):
             security_review = {}
-        summary = _localized_summary(
-            confirmation.get("summary")
-            or security_review.get("summary")
-            or "Skill 包已准备好启用。",
-            skill_name=str(skill_name),
-        )
+        summary = confirmation.get("summary") or security_review.get("summary") or "Skill 包已准备好启用。"
         findings = confirmation.get("findings")
         if not isinstance(findings, list):
             findings = security_review.get("findings")
@@ -97,6 +95,7 @@ class ConfirmRenderer:
         )
 
     def render_secret_request(self, request: dict) -> None:
+        """Show scoped credential requests without exposing secret values to model output."""
         needs = request.get("needs") if isinstance(request, dict) else None
         if isinstance(needs, list):
             needs = [item for item in needs if isinstance(item, dict)]
@@ -112,34 +111,34 @@ class ConfirmRenderer:
             purpose = str(item.get("purpose") or item.get("provider") or "").strip()
             state = str(item.get("state") or "").strip()
             if state == "authorize":
-                state_label = "Authorize existing key"
+                state_label = "授权已保存的密钥"
             elif state == "refresh":
-                state_label = "Replace existing key"
+                state_label = "替换已保存的密钥"
             else:
-                state_label = "Enter missing key"
+                state_label = "输入缺失密钥"
             requested.append((env_var, state_label, purpose, state))
         needs_input = any(state != "authorize" for _env_var, _state_label, _purpose, state in requested)
 
-        rows = [("Scope", required_for)]
+        rows = [("作用域", required_for)]
         for index, (env_var, state_label, purpose, _state) in enumerate(requested, 1):
             value = state_label if not purpose else f"{state_label} - {purpose}"
-            rows.append((f"Secret {index}", f"{env_var} ({value})"))
+            rows.append((f"凭据 {index}", f"{env_var} ({value})"))
 
         commands = (
-            [("Paste value", "Single key"), ("KEY=value; KEY2=value", "Multiple keys"), ("/skip / Esc", "Skip")]
+            [("粘贴密钥", "单个密钥"), ("KEY=value; KEY2=value", "多个密钥"), ("/skip / Esc", "跳过")]
             if needs_input
-            else [("Y / Enter", "Authorize all keys"), ("N / Esc", "Skip")]
+            else [("Y / Enter", "授权全部密钥"), ("N / Esc", "跳过")]
         )
         panel = PanelModel(
-            title="Secret request",
+            title="凭据请求",
             namespace="confirmation",
             tone="warning",
             blocks=(
-                text_block("M-Claw needs a scoped secret. Plaintext will not be returned to the model."),
+                text_block("M-Claw 需要作用域受限的凭据，明文不会返回给模型。"),
                 spacer_block(),
                 key_value_block(rows),
                 spacer_block(),
-                section_block("Action"),
+                section_block("操作"),
                 command_block(commands),
             ),
         )
@@ -159,17 +158,3 @@ def _risk_tone(risk: str) -> str:
         "存疑": "warning",
         "危险": "danger",
     }.get(str(risk), "warning")
-
-
-def _localized_summary(summary: object, *, skill_name: str) -> str:
-    text = str(summary or "").strip()
-    if text == "Skill package is prepared for enablement.":
-        return "Skill 包已准备好启用。"
-    if (
-        text.startswith("Prepared Skill '")
-        and text.endswith("for enablement. Security review saved in drafting package.")
-    ):
-        return f"Skill '{skill_name}' 已准备好启用，安全审查已保存到草稿包。"
-    if text == "Security policy blocked this Skill.":
-        return "安全策略已拒绝安装该 Skill。"
-    return text

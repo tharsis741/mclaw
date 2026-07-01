@@ -2,7 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Schedule parsing and next-run calculation."""
+"""Schedule parsing and next-run calculation.
+
+Trigger state is kept as small serializable dictionaries. This module is the
+only layer that interprets those dictionaries into timezone-aware datetimes.
+"""
 
 from __future__ import annotations
 
@@ -34,8 +38,9 @@ _WEEKDAYS = {
 
 
 def parse_schedule(raw: dict[str, Any], *, default_timezone: str) -> ScheduleSpec:
+    """Validate user-facing schedule input and return a persisted trigger spec."""
     data = raw or {}
-    trigger_type = str(data.get("type") or data.get("trigger_type") or "").strip().lower()
+    trigger_type = str(data.get("trigger_type") or "").strip().lower()
     timezone = str(data.get("timezone") or default_timezone or "Asia/Shanghai").strip()
     _zone(timezone)
     if trigger_type not in {"once", "daily", "weekly", "monthly", "interval", "cron"}:
@@ -72,16 +77,17 @@ def parse_schedule(raw: dict[str, Any], *, default_timezone: str) -> ScheduleSpe
         return ScheduleSpec("monthly", f"{day} {time_text}", timezone, {"day": day, "hour": hour, "minute": minute})
 
     if trigger_type == "interval":
-        every = str(data.get("every") or data.get("interval") or "").strip().lower()
+        every = str(data.get("every") or "").strip().lower()
         seconds = _parse_interval_seconds(every)
         return ScheduleSpec("interval", every, timezone, {"seconds": seconds})
 
-    expr = str(data.get("expr") or data.get("expression") or "").strip()
+    expr = str(data.get("expression") or "").strip()
     parsed = _parse_cron(expr)
     return ScheduleSpec("cron", expr, timezone, parsed)
 
 
 def next_run_after(spec: ScheduleSpec, after: datetime) -> datetime | None:
+    """Return the first run strictly after ``after`` in the spec timezone."""
     tz = _zone(spec.timezone)
     current = _as_tz(after, tz)
     parsed = spec.parsed or {}
@@ -135,6 +141,7 @@ def next_run_after(spec: ScheduleSpec, after: datetime) -> datetime | None:
         cron = parsed if parsed else _parse_cron(spec.expression)
         candidate = (current + timedelta(minutes=1)).replace(second=0, microsecond=0)
         deadline = candidate + timedelta(days=366 * 5)
+        # Bound cron expansion so impossible expressions fail closed.
         while candidate <= deadline:
             if _cron_matches(candidate, cron):
                 return candidate
@@ -145,6 +152,7 @@ def next_run_after(spec: ScheduleSpec, after: datetime) -> datetime | None:
 
 
 def humanize_schedule(spec: ScheduleSpec) -> str:
+    """Return compact display text for scheduler CLI and channel status output."""
     tz = spec.timezone
     parsed = spec.parsed or {}
     if spec.trigger_type == "once":
@@ -161,6 +169,7 @@ def humanize_schedule(spec: ScheduleSpec) -> str:
 
 
 def preview_next_runs(spec: ScheduleSpec, *, after: datetime, count: int = 3) -> list[datetime]:
+    """Calculate a finite preview without mutating persisted scheduler state."""
     result: list[datetime] = []
     cursor = after
     for _ in range(count):
@@ -216,15 +225,15 @@ def _parse_weekday(value: Any) -> int:
     if isinstance(value, int):
         if 0 <= value <= 6:
             return value
-        if 1 <= value <= 7:
+        if value == 7:
             return value - 1
     text = str(value or "").strip().lower()
     if text.isdigit():
         num = int(text)
-        if 0 <= num <= 6:
-            return num
         if 1 <= num <= 7:
             return num - 1
+        if num == 0:
+            return 0
     if text in _WEEKDAYS:
         return _WEEKDAYS[text]
     raise ScheduleParseError(f"invalid weekday: {value}")
@@ -287,9 +296,15 @@ def _parse_cron_field(field: str, low: int, high: int, *, normalize_dow: bool = 
             start, end = low, high
         elif "-" in item:
             start_text, end_text = item.split("-", 1)
-            start, end = int(start_text), int(end_text)
+            try:
+                start, end = int(start_text), int(end_text)
+            except ValueError as exc:
+                raise ScheduleParseError(f"invalid cron range: {item}") from exc
         else:
-            start = end = int(item)
+            try:
+                start = end = int(item)
+            except ValueError as exc:
+                raise ScheduleParseError(f"invalid cron value: {item}") from exc
         if start < low or end > high or start > end:
             raise ScheduleParseError(f"cron value out of range: {item}")
         for value in range(start, end + 1, step):
@@ -315,4 +330,5 @@ def _cron_matches(value: datetime, cron: dict[str, Any]) -> bool:
         return dow_match
     if cron.get("dow_any"):
         return dom_match
+    # Match common cron semantics: restricted day fields are alternatives.
     return dom_match or dow_match

@@ -15,6 +15,7 @@ from mclaw.constants import get_mclaw_home
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    """Load dotenv content while tolerating legacy non-UTF-8 files."""
     try:
         load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
     except UnicodeDecodeError:
@@ -24,21 +25,19 @@ def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
 def load_mclaw_dotenv(
     *,
     mclaw_home: str | os.PathLike | None = None,
-    project_env: str | os.PathLike | None = None,
 ) -> list[Path]:
-    """Load M-Claw environment files with user config taking precedence."""
+    """Load the M-Claw home .env file into the process environment.
+
+    The home file intentionally overrides existing process values so every
+    entrypoint sees the same persisted credentials after setup or key updates.
+    """
     loaded: list[Path] = []
 
     home_path = Path(mclaw_home).expanduser() if mclaw_home else get_mclaw_home()
     user_env = home_path / ".env"
-    project_env_path = Path(project_env) if project_env else None
 
     if user_env.exists():
         _load_dotenv_with_fallback(user_env, override=True)
         loaded.append(user_env)
-
-    if project_env_path and project_env_path.exists():
-        _load_dotenv_with_fallback(project_env_path, override=not loaded)
-        loaded.append(project_env_path)
 
     return loaded

@@ -2,11 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Load and validate DingTalk channel configuration.
-
-Configuration is read from M-Claw config/env sources and normalized into the
-runtime settings required by Stream Mode and outbound delivery.
-"""
+"""DingTalk channel configuration."""
 
 from __future__ import annotations
 
@@ -21,6 +17,7 @@ _DINGTALK_REQUIRED_FOR = "channel:dingtalk"
 
 
 def _authorized_secret_env(name: str, get_raw) -> str:
+    """Read DingTalk secrets only when the runtime scope has been authorized."""
     try:
         from mclaw.runtime.features import authorized_env_value
 
@@ -58,6 +55,7 @@ def _coerce_list(value: Any) -> list[str]:
 
 
 def _coerce_str_map(value: Any) -> dict[str, str]:
+    """Normalize named conversation aliases into open conversation ids."""
     if not isinstance(value, dict):
         return {}
     result: dict[str, str] = {}
@@ -85,6 +83,8 @@ def _coerce_float(value: Any, default: float) -> float:
 
 @dataclass
 class DingTalkConfig:
+    """Resolved DingTalk channel settings from config and scoped environment."""
+
     enabled: bool = False
     client_id: str = ""
     client_secret: str = ""
@@ -92,7 +92,6 @@ class DingTalkConfig:
     dm_policy: str = "open"
     group_policy: str = "mention_only"
     require_mention: bool = True
-    allow_from: list[str] = field(default_factory=list)
     allowed_users: list[str] = field(default_factory=list)
     allowed_chats: list[str] = field(default_factory=list)
     free_response_chats: list[str] = field(default_factory=list)
@@ -113,6 +112,7 @@ class DingTalkConfig:
 
     @classmethod
     def from_config(cls, config: dict | None) -> "DingTalkConfig":
+        """Build a config object from channels.dingtalk and authorized env vars."""
         root = config or {}
         channels = root.get("channels", {}) if isinstance(root.get("channels"), dict) else {}
         raw = channels.get("dingtalk", {}) if isinstance(channels.get("dingtalk"), dict) else {}
@@ -132,7 +132,6 @@ class DingTalkConfig:
                 raw.get("require_mention") if raw.get("require_mention") is not None else env("DINGTALK_REQUIRE_MENTION"),
                 True,
             ),
-            allow_from=_coerce_list(raw.get("allow_from") if raw.get("allow_from") is not None else env("DINGTALK_ALLOWED_USERS")),
             allowed_users=_coerce_list(raw.get("allowed_users") if raw.get("allowed_users") is not None else env("DINGTALK_ALLOWED_USERS")),
             allowed_chats=_coerce_list(raw.get("allowed_chats") if raw.get("allowed_chats") is not None else env("DINGTALK_ALLOWED_CHATS")),
             free_response_chats=_coerce_list(raw.get("free_response_chats") if raw.get("free_response_chats") is not None else env("DINGTALK_FREE_RESPONSE_CHATS")),
@@ -152,14 +151,15 @@ class DingTalkConfig:
             media_cache_dir=str(raw.get("media_cache_dir") or env("DINGTALK_MEDIA_CACHE_DIR") or "").strip(),
             media_download_timeout_seconds=_coerce_float(raw.get("media_download_timeout_seconds"), 60.0),
             media_max_bytes=_coerce_int(raw.get("media_max_bytes"), 100 * 1024 * 1024),
-            toolsets=list(raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]),
+            toolsets=_coerce_list(raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]),
         )
 
     def allowed_user_set(self) -> set[str]:
-        values = self.allowed_users or self.allow_from
-        return {item.lower() for item in values if item}
+        """Return normalized allowlist values for inbound user checks."""
+        return {item.lower() for item in self.allowed_users if item}
 
     def validate(self) -> list[str]:
+        """Return user-facing configuration errors without exposing secrets."""
         errors: list[str] = []
         if not self.client_id:
             errors.append(f"DINGTALK_CLIENT_ID is required in {display_mclaw_path('.env')}")

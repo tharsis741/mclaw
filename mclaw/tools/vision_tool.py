@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Vision Tool — analyse images via Qwen vision models."""
+"""Vision Tool — analyze images via Qwen vision models."""
 
 from __future__ import annotations
 
@@ -12,21 +12,15 @@ import os
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional
 
 from mclaw.tools.registry import registry, tool_error
 from mclaw.tools.vision.client import call_vision_llm as _call_vision_llm
 from mclaw.tools.vision.config import (
     MAX_IMAGE_SIZE_BYTES as _MAX_IMAGE_SIZE_BYTES,
-    authorized_env_value as _authorized_env_value,
-    effective_config as _effective_config,
-    env_value as _env_value,
-    resolve_download_timeout as _resolve_download_timeout,
     resolve_timeout as _resolve_timeout,
 )
 from mclaw.tools.vision.credentials import (
     diagnose_vision_credentials,
-    feature_env_configured as _feature_env_configured,
     resolve_vision_credentials,
 )
 from mclaw.tools.vision.image_io import _download_image_sync, _is_safe_url
@@ -40,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 
 def _build_messages(data_url: str, question: str) -> list[dict]:
+    """Build the multimodal chat payload expected by Qwen-compatible clients."""
     full_prompt = (
         "先客观描述图片中与问题相关的内容，再回答下面的问题。\n\n"
         f"问题：{question}"
@@ -60,9 +55,14 @@ def vision_analyze(
     question: str,
     parent_agent=None,
 ) -> str:
-    """Analyse an image from a URL or local path."""
-    temp_image_path: Optional[Path] = None
-    compressed_image_path: Optional[Path] = None
+    """Analyze an image from a URL or local path.
+
+    Remote images are downloaded through SSRF-safe helpers and local images are
+    read in place. Temporary downloads and compression artifacts are cleaned up
+    after the model call.
+    """
+    temp_image_path: Path | None = None
+    compressed_image_path: Path | None = None
     should_cleanup = True
     model_for_error = "unresolved"
 
@@ -72,7 +72,7 @@ def vision_analyze(
         if not question or not isinstance(question, str):
             return tool_error("question is required", success=False)
 
-        logger.info("Vision analyse: %s", image_url[:80])
+        logger.info("Vision analyze: %s", image_url[:80])
 
         local_path = Path(os.path.expanduser(image_url))
         if local_path.is_file():
@@ -168,12 +168,12 @@ def vision_analyze(
         logger.info("Vision analysis completed (%d chars)", len(analysis))
         return json.dumps({
             "success": True,
-            "analysis": analysis or "The image could not be analysed.",
+            "analysis": analysis or "The image could not be analyzed.",
         }, ensure_ascii=False)
 
     except Exception as exc:
         err_str = str(exc).lower()
-        logger.exception("Vision analyse error: %s", exc)
+        logger.exception("Vision analyze error: %s", exc)
 
         if any(h in err_str for h in ("402", "insufficient", "payment required", "credits", "billing")):
             analysis = (
@@ -192,7 +192,7 @@ def vision_analyze(
         else:
             analysis = (
                 "There was a problem with the request and the image could not be "
-                f"analysed. Error: {exc}"
+                f"analyzed. Error: {exc}"
             )
 
         return json.dumps({
@@ -221,10 +221,12 @@ def vision_analyze(
 
 
 def diagnose_vision_requirements(config: dict | None = None) -> dict:
+    """Expose registry diagnostics for the currently configured vision provider."""
     return diagnose_vision_credentials(config=config)
 
 
 def check_vision_requirements(config: dict | None = None) -> bool:
+    """Return whether a supported vision provider has authorized credentials."""
     diagnostics = diagnose_vision_requirements(config=config)
     return bool(diagnostics.get("available"))
 
@@ -234,7 +236,7 @@ VISION_ANALYZE_SCHEMA = {
     "function": {
         "name": "vision_analyze",
         "description": (
-            "Analyse an image using Qwen vision. Provide either an "
+            "Analyze an image using Qwen vision. Provide either an "
             "HTTP/HTTPS URL or a local file path. The tool downloads remote "
             "images, validates and optionally compresses them, then sends the "
             "image to a Qwen vision-capable model.\n\n"
@@ -247,7 +249,7 @@ VISION_ANALYZE_SCHEMA = {
                 "image_url": {
                     "type": "string",
                     "description": (
-                        "Image URL (http/https) or local file path to analyse. "
+                        "Image URL (http/https) or local file path to analyze. "
                         "Examples: 'https://example.com/photo.jpg' or '/home/user/screenshot.png'"
                     ),
                 },
@@ -266,6 +268,7 @@ VISION_ANALYZE_SCHEMA = {
 
 
 def _handle_vision_analyze(args: dict, **kw) -> str:
+    """Registry wrapper that forwards parent agent context for config/secrets."""
     return vision_analyze(
         image_url=args.get("image_url", ""),
         question=args.get("question", ""),
@@ -280,7 +283,7 @@ registry.register(
     handler=_handle_vision_analyze,
     check_fn=check_vision_requirements,
     diagnose_fn=diagnose_vision_requirements,
-    description="分析图片内容（支持URL和本地路径）",
+    description="Analyze images from URL or local path",
     emoji="👁️",
     max_result_size_chars=10_000,
 )

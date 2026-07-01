@@ -24,6 +24,7 @@ def normalize_workspace_path(path: str | os.PathLike[str]) -> str:
 
 
 def workspace_compare_key(path: str | os.PathLike[str]) -> str:
+    """Return the normalized comparison key used for duplicate trust entries."""
     normalized = normalize_workspace_path(path)
     if os.name == "nt":
         return os.path.normcase(normalized)
@@ -31,6 +32,7 @@ def workspace_compare_key(path: str | os.PathLike[str]) -> str:
 
 
 def get_trusted_workspaces(config: dict) -> list[str]:
+    """Read trusted workspace paths from config without mutating malformed data."""
     security = config.get("security", {}) if isinstance(config, dict) else {}
     values = security.get("trusted_workspaces", []) if isinstance(security, dict) else []
     if not isinstance(values, list):
@@ -39,11 +41,13 @@ def get_trusted_workspaces(config: dict) -> list[str]:
 
 
 def is_workspace_trusted(config: dict, workspace: str | os.PathLike[str]) -> bool:
+    """Check whether a workspace matches a trusted entry after path normalization."""
     target = workspace_compare_key(workspace)
     return any(workspace_compare_key(item) == target for item in get_trusted_workspaces(config))
 
 
 def trust_workspace(config: dict, workspace: str | os.PathLike[str]) -> None:
+    """Add a normalized workspace entry to config, preserving existing entries."""
     security = config.setdefault("security", {})
     if not isinstance(security, dict):
         security = {}
@@ -66,8 +70,8 @@ def ensure_workspace_trusted(
     config: dict | None = None,
     prompt: Callable[[str], bool],
 ) -> bool:
-    """Ensure the current workspace is trusted before starting local agent access."""
-    user_config = load_config()
+    """Ensure local agent access starts only after an explicit workspace trust gate."""
+    user_config = load_config(strict=True)
     if is_workspace_trusted(user_config, workspace):
         if config is not None:
             trust_workspace(config, workspace)

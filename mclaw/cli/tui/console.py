@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
 from rich.console import Console
+
+logger = logging.getLogger(__name__)
 
 
 def configure_text_output() -> None:
@@ -23,8 +26,8 @@ def configure_text_output() -> None:
             kernel32 = ctypes.windll.kernel32
             kernel32.SetConsoleOutputCP(65001)
             kernel32.SetConsoleCP(65001)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Windows console UTF-8 codepage setup failed: %s", exc)
 
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
@@ -32,8 +35,8 @@ def configure_text_output() -> None:
             continue
         try:
             reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Stream UTF-8 reconfigure failed: %s", exc)
 
 
 class MClawConsole:
@@ -69,7 +72,8 @@ def cprint(text: str):
 
     try:
         print_formatted_text(ANSI(text))
-    except Exception:
+    except Exception as exc:
+        logger.debug("prompt_toolkit ANSI print failed: %s", exc)
         print(text)
 
 

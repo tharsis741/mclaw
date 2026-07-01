@@ -11,16 +11,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple
 
-TRUSTED_REPOS = {"openai/skills", "anthropics/skills"}
-
 TRUST_BUNDLED = "bundled"
-TRUST_TRUSTED = "trusted"
 TRUST_COMMUNITY = "community"
 TRUST_AGENT_CREATED = "agent_created"
 
 INSTALL_POLICY = {
     TRUST_BUNDLED: ("allow", "allow", "allow"),
-    TRUST_TRUSTED: ("allow", "allow", "block"),
     TRUST_COMMUNITY: ("allow", "ask", "block"),
     TRUST_AGENT_CREATED: ("allow", "allow", "ask"),
 }
@@ -35,6 +31,8 @@ RISK_LABELS = {
 
 @dataclass
 class Finding:
+    """One matched guard pattern in a Skill package."""
+
     pattern_id: str
     severity: str
     category: str
@@ -46,6 +44,8 @@ class Finding:
 
 @dataclass
 class ScanResult:
+    """Aggregate guard verdict plus findings for install policy checks."""
+
     skill_name: str
     source: str
     trust_level: str
@@ -89,16 +89,16 @@ def risk_label(verdict: str) -> str:
 
 
 def _detect_trust_level(source: str) -> str:
+    """Map source metadata into the trust tiers used by install policy."""
     if source == TRUST_BUNDLED:
         return TRUST_BUNDLED
-    if source in TRUSTED_REPOS:
-        return TRUST_TRUSTED
     if source == TRUST_AGENT_CREATED:
         return TRUST_AGENT_CREATED
     return TRUST_COMMUNITY
 
 
 def scan_skill(skill_dir: Path, source: str = "community") -> ScanResult:
+    """Scan text files in a Skill package for known injection/exfiltration patterns."""
     trust_level = _detect_trust_level(source)
     verdict = "safe"
     findings: List[Finding] = []
@@ -144,6 +144,11 @@ def scan_skill(skill_dir: Path, source: str = "community") -> ScanResult:
 
 
 def should_allow_install(result: ScanResult) -> tuple[bool | None, str]:
+    """Apply source-trust policy to a scanner verdict.
+
+    The tri-state return lets callers distinguish automatic allow, automatic
+    block, and user-confirmation-required outcomes.
+    """
     policy = INSTALL_POLICY.get(result.trust_level, INSTALL_POLICY[TRUST_COMMUNITY])
     action = policy[VERDICT_INDEX[result.verdict]]
     if action == "allow":
@@ -154,6 +159,7 @@ def should_allow_install(result: ScanResult) -> tuple[bool | None, str]:
 
 
 def format_scan_report(result: ScanResult) -> str:
+    """Render a compact human-readable scanner report for audit context."""
     lines = [
         f"Skill: {result.skill_name}",
         f"Source: {result.source}",

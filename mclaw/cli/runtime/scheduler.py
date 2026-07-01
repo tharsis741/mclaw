@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Runtime coordinator for local scheduler TUI control plane."""
+"""Runtime coordinator for the local scheduler control plane.
+
+This module keeps the interactive scheduler wizard, target manager, run history
+views, and periodic engine ticks in one state machine. It does not execute
+runs directly; it translates TUI choices into store, engine, and delivery calls.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +27,8 @@ from mclaw.tools.toolsets import validate_toolset
 
 @dataclass
 class SchedulerDraft:
+    """Mutable wizard state collected before a scheduler job is persisted."""
+
     delivery: DeliverySpec = field(default_factory=lambda: DeliverySpec(target_id="local"))
     schedule: ScheduleSpec | None = None
     name: str = ""
@@ -32,6 +39,8 @@ class SchedulerDraft:
 
 
 class RuntimeSchedulerCoordinator:
+    """Owns scheduler TUI state and bridges user input to scheduler services."""
+
     def __init__(
         self,
         *,
@@ -79,6 +88,7 @@ class RuntimeSchedulerCoordinator:
         self._last_render_kind: str = "info"
 
     def pump(self) -> None:
+        """Advance scheduler ticks and refresh pending target-pairing flows."""
         scheduler_cfg = self.config.get("scheduler", {}) if isinstance(self.config, dict) else {}
         if scheduler_cfg.get("enabled", True):
             now = self.now()
@@ -96,9 +106,11 @@ class RuntimeSchedulerCoordinator:
                     self._render_pairing_wait()
 
     def has_pending_input(self) -> bool:
+        """Return whether the scheduler owns the next user input turn."""
         return self._state is not None
 
     def handle_command(self, args: str = "") -> None:
+        """Enter the scheduler dashboard, creation wizard, or target manager."""
         raw = (args or "").strip().lower()
         if raw == "new":
             self.render_schedule_new_wizard()
@@ -108,6 +120,7 @@ class RuntimeSchedulerCoordinator:
             self.render_schedule_dashboard()
 
     def handle_input(self, text: str) -> None:
+        """Dispatch one TUI input line according to the active scheduler state."""
         value = (text or "").strip()
         state = self._state
         self._error = ""
@@ -175,6 +188,7 @@ class RuntimeSchedulerCoordinator:
             self._rerender_current()
 
     def render_schedule_dashboard(self) -> None:
+        """Render the scheduler overview and make visible jobs selectable."""
         jobs = self.store.list_jobs(include_paused=True)
         targets = self.store.list_targets(enabled_only=False)
         if self._job_page_offset >= len(jobs):
@@ -215,6 +229,7 @@ class RuntimeSchedulerCoordinator:
         self._render("M-Claw Scheduler", "\n".join(lines))
 
     def render_schedule_new_wizard(self) -> None:
+        """Start a fresh job draft and render the creation wizard entry point."""
         self._draft = SchedulerDraft(workdir=self.workspace, enabled_toolsets=self._default_toolsets())
         self._state = "new_overview"
         self._render(
@@ -235,6 +250,7 @@ class RuntimeSchedulerCoordinator:
         )
 
     def render_target_manager(self) -> None:
+        """Render configured delivery targets and expose target management actions."""
         targets = self.store.list_targets(enabled_only=False)
         self._target_map = [target.id for target in targets]
         lines = ["输出方式", ""]
@@ -256,6 +272,7 @@ class RuntimeSchedulerCoordinator:
         self._render("投递目标", "\n".join(lines))
 
     def render_pairing_wait(self, code: str) -> None:
+        """Attach the UI to an existing pairing code and show wait state."""
         self._pairing_code = code
         self._last_pairing_status = "waiting"
         self._render_pairing_wait()
@@ -663,6 +680,7 @@ class RuntimeSchedulerCoordinator:
         spec = parse_schedule(raw, default_timezone=str(scheduler_cfg.get("default_timezone") or "Asia/Shanghai"))
         assert self._draft is not None
         self._draft.schedule = spec
+        # Preview uses the trigger timezone so creation feedback matches runtime scheduling.
         now_dt = datetime.fromtimestamp(self.now(), ZoneInfo(spec.timezone))
         previews = preview_next_runs(spec, after=now_dt, count=3)
         lines = ["下 3 次执行："]
@@ -949,6 +967,7 @@ class RuntimeSchedulerCoordinator:
         )
 
     def _create_pairing(self, requested_type: str, *, target_manager_flow: bool = False) -> None:
+        """Create a short-lived target binding request and move into wait UI."""
         now = self.now()
         code = new_pairing_code()
         pairing = SchedulerTargetPairing(
@@ -967,6 +986,7 @@ class RuntimeSchedulerCoordinator:
         self._render_pairing_wait(target_manager_flow=target_manager_flow)
 
     def _render_pairing_wait(self, *, target_manager_flow: bool | None = None) -> None:
+        """Render binding instructions while a channel adapter owns completion."""
         if target_manager_flow is None:
             target_manager_flow = self._pairing_target_manager_flow
         pairing = self.store.get_pairing(self._pairing_code)
@@ -1150,6 +1170,7 @@ class RuntimeSchedulerCoordinator:
         )
 
     def _create_job_from_draft(self, *, enabled: bool) -> SchedulerJob:
+        """Persist the collected draft as a scheduler job with first run time."""
         assert self._draft and self._draft.schedule
         now = self.now()
         next_run = next_run_after(self._draft.schedule, datetime.fromtimestamp(now, ZoneInfo(self._draft.schedule.timezone)))
@@ -1186,20 +1207,21 @@ class RuntimeSchedulerCoordinator:
 
     def _schedule_raw_from_input(self, state: str, value: str) -> dict[str, Any]:
         if state == "new_schedule_daily":
-            return {"type": "daily", "time": value}
+            return {"trigger_type": "daily", "time": value}
         if state == "new_schedule_weekly":
             weekday, _, time_text = value.partition(" ")
-            return {"type": "weekly", "weekday": weekday, "time": time_text.strip()}
+            return {"trigger_type": "weekly", "weekday": weekday, "time": time_text.strip()}
         if state == "new_schedule_monthly":
             day, _, time_text = value.partition(" ")
-            return {"type": "monthly", "day": day, "time": time_text.strip()}
+            return {"trigger_type": "monthly", "day": day, "time": time_text.strip()}
         if state == "new_schedule_interval":
-            return {"type": "interval", "every": value}
+            return {"trigger_type": "interval", "every": value}
         if state == "new_schedule_once":
-            return {"type": "once", "at": value}
-        return {"type": "cron", "expr": value}
+            return {"trigger_type": "once", "at": value}
+        return {"trigger_type": "cron", "expression": value}
 
     def _default_toolsets(self) -> list[str]:
+        """Return configured toolsets filtered through registry validation."""
         configured = list(self.config.get("toolsets") or ["mclaw-required"])
         for name in self.available_toolsets():
             if name not in configured:
@@ -1208,12 +1230,13 @@ class RuntimeSchedulerCoordinator:
         return result or ["mclaw-required"]
 
     def _draft_job_stub(self) -> SchedulerJob:
+        """Build a disposable job used for delivery target test sends."""
         now = self.now()
         return SchedulerJob(
             id="job_test",
             name="M-CLAW 定时任务测试",
             enabled=True,
-            schedule=parse_schedule({"type": "interval", "every": "1d"}, default_timezone="Asia/Shanghai"),
+            schedule=parse_schedule({"trigger_type": "interval", "every": "1d"}, default_timezone="Asia/Shanghai"),
             prompt="M-CLAW 定时任务测试!",
             enabled_toolsets=["mclaw-required"],
             workdir=self.workspace,

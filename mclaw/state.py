@@ -34,6 +34,7 @@ DEFAULT_DB_PATH = get_mclaw_home() / "state.db"
 
 
 def _normalize_workspace_path(path: str | os.PathLike[str] | None) -> str | None:
+    """Return a stable display path for workspace-scoped session lookups."""
     if path is None:
         return None
     raw = str(path).strip()
@@ -48,6 +49,7 @@ def _normalize_workspace_path(path: str | os.PathLike[str] | None) -> str | None
 
 
 def _workspace_key(path: str | os.PathLike[str] | None) -> str | None:
+    """Normalize workspace identity using host-specific path comparison rules."""
     normalized = _normalize_workspace_path(path)
     if not normalized:
         return None
@@ -254,6 +256,7 @@ class SessionDB:
     _CHECKPOINT_EVERY_N_WRITES = 50
 
     def __init__(self, db_path: Path = None):
+        """Open the session database and initialize schema in WAL mode."""
         self.db_path = db_path or DEFAULT_DB_PATH
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -312,6 +315,7 @@ class SessionDB:
             pass
 
     def close(self):
+        """Close the shared connection without blocking another active operation."""
         acquired = self._lock.acquire(blocking=False)
         if not acquired:
             logger.warning("SessionDB.close() skipped: lock held by another thread")
@@ -328,6 +332,7 @@ class SessionDB:
             self._lock.release()
 
     def _init_schema(self):
+        """Create or upgrade the durable schema used by sessions and schedulers."""
         cursor = self._conn.cursor()
         cursor.executescript(SCHEMA_SQL)
 
@@ -473,6 +478,7 @@ class SessionDB:
         user_id: str = None, parent_session_id: str = None,
         workspace: str = None,
     ) -> str:
+        """Create a session row while preserving existing metadata on re-entry."""
         normalized_workspace = _normalize_workspace_path(workspace)
         workspace_key = _workspace_key(normalized_workspace)
 
@@ -529,6 +535,7 @@ class SessionDB:
         billing_provider: Optional[str] = None, billing_base_url: Optional[str] = None,
         billing_mode: Optional[str] = None, absolute: bool = False,
     ) -> None:
+        """Record token and billing totals as either deltas or absolute snapshots."""
         if absolute:
             sql = """UPDATE sessions SET
                    input_tokens = ?, output_tokens = ?,
@@ -575,6 +582,7 @@ class SessionDB:
         model: str = None,
         workspace: str = None,
     ) -> None:
+        """Create a minimal session placeholder used by late-bound callers."""
         normalized_workspace = _normalize_workspace_path(workspace)
         workspace_key = _workspace_key(normalized_workspace)
 
@@ -624,6 +632,7 @@ class SessionDB:
         return int(row["count"] if isinstance(row, sqlite3.Row) else row[0])
 
     def recompute_session_counts(self, session_id: str) -> None:
+        """Rebuild derived message/tool counters after soft invalidation changes."""
         def _do(conn):
             row = conn.execute(
                 "SELECT COUNT(*) AS message_count, "
@@ -643,7 +652,7 @@ class SessionDB:
                 try:
                     parsed = json.loads(raw)
                     tool_call_count += len(parsed) if isinstance(parsed, list) else 1
-                except Exception:
+                except (json.JSONDecodeError, TypeError):
                     tool_call_count += 1
             conn.execute(
                 "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -652,41 +661,6 @@ class SessionDB:
 
         self._execute_write(_do)
 
-    def delete_messages_after(self, session_id: str, message_id: Optional[int]) -> int:
-        """Delete session messages after a marker and recompute counters."""
-        def _do(conn):
-            if message_id is None:
-                cursor = conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-            else:
-                cursor = conn.execute(
-                    "DELETE FROM messages WHERE session_id = ? AND id > ?",
-                    (session_id, int(message_id)),
-                )
-            deleted = cursor.rowcount
-            rows = conn.execute(
-                "SELECT tool_calls FROM messages WHERE session_id = ? AND tool_calls IS NOT NULL AND tool_calls != ''",
-                (session_id,),
-            ).fetchall()
-            tool_call_count = 0
-            for item in rows:
-                raw = item["tool_calls"] if isinstance(item, sqlite3.Row) else item[0]
-                try:
-                    parsed = json.loads(raw)
-                    tool_call_count += len(parsed) if isinstance(parsed, list) else 1
-                except Exception:
-                    tool_call_count += 1
-            message_count = conn.execute(
-                "SELECT COUNT(*) FROM messages WHERE session_id = ?",
-                (session_id,),
-            ).fetchone()[0]
-            conn.execute(
-                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                (message_count, tool_call_count, session_id),
-            )
-            return deleted
-
-        return self._execute_write(_do)
-
     def invalidate_messages_after(
         self,
         session_id: str,
@@ -694,21 +668,20 @@ class SessionDB:
         rollback_id: str = None,
         reason: str = "rollback",
         mode: str = "soft",
-        rollback_mode: str = None,
         checkpoint_hash: str = None,
         operation_id: str = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Soft-invalidate messages after a marker and keep an audit record.
 
-        Unlike delete_messages_after(), this preserves transcript evidence while
-        excluding invalidated messages from normal conversation and search APIs.
-        A missing marker is intentionally a no-op; clearing an entire session
-        should be an explicit, separate operation.
+        Invalidated messages remain available for audit and restore operations,
+        but are excluded from normal conversation and search APIs. A missing
+        marker is intentionally a no-op; clearing an entire session should be an
+        explicit, separate operation.
         """
         if message_id is None:
             return {"rollback_id": None, "invalidated": 0, "message_ids": []}
-        mode = rollback_mode or mode or "soft"
+        mode = mode or "soft"
         if rollback_id is None:
             rollback_id = f"ctxrb_{int(time.time() * 1000)}"
         now = time.time()
@@ -765,7 +738,6 @@ class SessionDB:
         rollback_id: str = None,
         reason: str = "rollback",
         mode: str = "soft",
-        rollback_mode: str = None,
         checkpoint_hash: str = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
@@ -783,12 +755,11 @@ class SessionDB:
                 rollback_id=rollback_id,
                 reason=reason,
                 mode=mode,
-                rollback_mode=rollback_mode,
                 checkpoint_hash=checkpoint_hash,
                 operation_id=operation_id,
                 metadata=metadata,
             )
-        mode = rollback_mode or mode or "soft"
+        mode = mode or "soft"
         if rollback_id is None:
             rollback_id = f"ctxrb_{int(time.time() * 1000)}"
         now = time.time()
@@ -857,7 +828,7 @@ class SessionDB:
             raw_ids = row["invalidated_message_ids"] if isinstance(row, sqlite3.Row) else row[1]
             try:
                 message_ids = [int(v) for v in json.loads(raw_ids or "[]")]
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 message_ids = []
             if not message_ids:
                 conn.execute("UPDATE context_rollbacks SET restored_at = ? WHERE id = ?", (time.time(), rollback_id))
@@ -891,7 +862,7 @@ class SessionDB:
             try:
                 parsed = json.loads(raw)
                 tool_call_count += len(parsed) if isinstance(parsed, list) else 1
-            except Exception:
+            except (json.JSONDecodeError, TypeError):
                 tool_call_count += 1
         conn.execute(
             "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
@@ -899,6 +870,7 @@ class SessionDB:
         )
 
     def resolve_session_id(self, session_id_or_prefix: str, workspace: str = None) -> Optional[str]:
+        """Resolve an exact ID or unambiguous prefix within an optional workspace."""
         workspace_key = _workspace_key(workspace)
         if workspace_key:
             with self._lock:
@@ -933,6 +905,7 @@ class SessionDB:
         include_children: bool = False,
         workspace: str = None,
     ) -> Optional[str]:
+        """Return the most recently active root session for filters."""
         where_clauses = []
         params = []
         if source:
@@ -966,6 +939,7 @@ class SessionDB:
 
     @staticmethod
     def sanitize_title(title: Optional[str]) -> Optional[str]:
+        """Normalize user-visible titles before enforcing uniqueness."""
         if not title:
             return None
         cleaned = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', title)
@@ -993,6 +967,7 @@ class SessionDB:
         limit: int = 20, offset: int = 0, include_children: bool = False,
         workspace: str = None,
     ) -> List[Dict[str, Any]]:
+        """List sessions with preview and activity fields for CLI displays."""
         where_clauses = []
         params = []
         if not include_children:
@@ -1048,6 +1023,7 @@ class SessionDB:
         codex_reasoning_items: Any = None, turn_id: str = None,
         operation_id: str = None,
     ) -> int:
+        """Persist one conversation message and update session counters atomically."""
         reasoning_details_json = json.dumps(reasoning_details) if reasoning_details else None
         codex_items_json = json.dumps(codex_reasoning_items) if codex_reasoning_items else None
         tool_calls_json = json.dumps(tool_calls) if tool_calls else None
@@ -1093,6 +1069,7 @@ class SessionDB:
         return result
 
     def get_messages_as_conversation(self, session_id: str, include_invalidated: bool = False) -> List[Dict[str, Any]]:
+        """Return messages in provider-facing conversation shape."""
         where = "session_id = ?" if include_invalidated else "session_id = ? AND invalidated_at IS NULL"
         with self._lock:
             rows = self._conn.execute(
@@ -1133,6 +1110,7 @@ class SessionDB:
 
     @staticmethod
     def _sanitize_fts5_query(query: str) -> str:
+        """Relax user search text into a query shape accepted by SQLite FTS5."""
         _quoted_parts: list = []
         def _preserve_quoted(m: re.Match) -> str:
             _quoted_parts.append(m.group(0))
@@ -1153,6 +1131,7 @@ class SessionDB:
         exclude_sources: List[str] = None, role_filter: List[str] = None,
         limit: int = 20, offset: int = 0, workspace: str = None,
     ) -> List[Dict[str, Any]]:
+        """Search active messages and attach a small neighboring-message context."""
         if not query or not query.strip():
             return []
         query = self._sanitize_fts5_query(query)
@@ -1189,8 +1168,8 @@ class SessionDB:
         with self._lock:
             try:
                 matches = [dict(row) for row in self._conn.execute(sql, params).fetchall()]
-            except sqlite3.OperationalError:
-                return []
+            except sqlite3.OperationalError as exc:
+                raise RuntimeError(f"Session FTS search failed: {exc}") from exc
         for match in matches:
             try:
                 with self._lock:
@@ -1217,9 +1196,11 @@ class SessionDB:
             return self._conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
 
     def delete_session(self, session_id: str) -> bool:
+        """Delete a session and detach children that referenced it as parent."""
         def _do(conn):
             if conn.execute("SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)).fetchone()[0] == 0:
                 return False
+            conn.execute("DELETE FROM context_rollbacks WHERE session_id = ?", (session_id,))
             conn.execute("UPDATE sessions SET parent_session_id = NULL WHERE parent_session_id = ?", (session_id,))
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
@@ -1227,6 +1208,7 @@ class SessionDB:
         return self._execute_write(_do)
 
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Return a full session export, including invalidated audit messages."""
         session = self.get_session(session_id)
         if not session:
             return None

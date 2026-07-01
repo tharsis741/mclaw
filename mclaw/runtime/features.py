@@ -12,6 +12,7 @@ from typing import Any
 
 
 class FeatureState(str, Enum):
+    """Availability state exposed by runtime capability checks."""
     ENABLED = "enabled"
     DISABLED = "disabled"
     AVAILABLE_WITH_INSTALL = "available_with_install"
@@ -21,6 +22,7 @@ class FeatureState(str, Enum):
 
 @dataclass(frozen=True)
 class RuntimeFeature:
+    """Resolved runtime capability with an operator-facing reason."""
     name: str
     state: FeatureState
     reason: str = ""
@@ -108,6 +110,7 @@ def runtime_features(
     browser_tool: FeatureState = FeatureState.UNKNOWN,
     reasons: dict[str, str] | None = None,
 ) -> RuntimeFeatures:
+    """Build the standard runtime capability matrix for one host profile."""
     reasons = reasons or {}
     states = {
         "terminal": terminal,
@@ -128,6 +131,7 @@ def runtime_features(
 
 @dataclass(frozen=True)
 class FeatureSpec:
+    """Declarative dependency contract for optional tools and runtime features."""
     name: str
     kind: str
     display_name: str = ""
@@ -204,6 +208,7 @@ def _has_value(get_value, env_var: str) -> bool:
 
 
 def is_feature_configured(spec: FeatureSpec, get_value) -> bool:
+    """Return whether config/env values satisfy a feature's dependency contract."""
     if spec.requires and not all(_has_value(get_value, env_var) for env_var in spec.requires):
         return False
     if spec.requires_any:
@@ -212,6 +217,7 @@ def is_feature_configured(spec: FeatureSpec, get_value) -> bool:
 
 
 def configured_env_vars(spec: FeatureSpec, get_value) -> list[str]:
+    """Return the concrete env vars that currently satisfy a feature spec."""
     if not is_feature_configured(spec, get_value):
         return []
     values: list[str] = []
@@ -279,6 +285,7 @@ def is_feature_authorized(spec: FeatureSpec, get_value) -> bool:
 
 
 def secret_requests_for_feature(spec: FeatureSpec, get_value) -> list[dict[str, str]]:
+    """Build model-safe secret request descriptors for missing feature credentials."""
     if is_feature_configured(spec, get_value):
         return []
 

@@ -41,6 +41,7 @@ class RuntimeSessionCommandCoordinator:
         self.hooks = hooks
 
     def handle_resume(self, raw_args: str) -> None:
+        """Restore a session and replace the live agent context with its history."""
         session_ref = str(raw_args or "").strip()
         if not session_ref:
             self.hooks.render_notice("M-Claw 会话", "用法: /resume <会话ID或前缀>", "", "warning")
@@ -52,6 +53,8 @@ class RuntimeSessionCommandCoordinator:
             return
 
         if resolved != self.hooks.current_session_id() and self.hooks.switch_session_lock:
+            # Session locks move before state mutation so two TUIs cannot attach
+            # to the same persisted conversation.
             if not self.hooks.switch_session_lock(resolved):
                 return
 
@@ -72,6 +75,7 @@ class RuntimeSessionCommandCoordinator:
         )
 
     def handle_title(self, raw_args: str) -> None:
+        """Show or update the title stored with the current session."""
         title = str(raw_args or "").strip()
         session_id = self.hooks.current_session_id()
         if title:
@@ -90,7 +94,12 @@ class RuntimeSessionCommandCoordinator:
         else:
             self.hooks.render_notice("M-Claw 会话标题", "暂无标题。用法: /title <名称>", "", "warning")
 
-    def handle_save(self) -> None:
+    def handle_save(self, raw_args: str = "") -> None:
+        """Export the current session through the host persistence hooks."""
+        if str(raw_args or "").strip():
+            self.hooks.render_notice("M-Claw 会话导出", "用法: /save", "", "warning")
+            return
+
         session_id = self.hooks.current_session_id()
         export = self.hooks.export_session(session_id)
         if not export:

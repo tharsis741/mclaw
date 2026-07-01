@@ -20,6 +20,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class PlatformInfo:
+    """Snapshot of host and runtime facts exposed to diagnostics and prompts."""
     os_name: str
     os_release: str
     python_version: str
@@ -36,11 +37,8 @@ class PlatformInfo:
     runtime_mode: str
 
 
-def _runtime_mode() -> str:
-    return "source"
-
-
 def is_wsl() -> bool:
+    """Detect Windows Subsystem for Linux without requiring WSL-specific APIs."""
     if sys.platform != "linux":
         return False
     try:
@@ -54,12 +52,14 @@ def is_wsl() -> bool:
 
 
 def gui_available() -> bool:
+    """Return whether desktop GUI features can plausibly start on this host."""
     if sys.platform == "win32" or sys.platform == "darwin":
         return True
     return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
 
 def audio_input_available() -> bool:
+    """Return whether local audio capture is likely available for ASR."""
     if sys.platform == "win32" or sys.platform == "darwin":
         return True
     if Path("/proc/asound/cards").exists():
@@ -72,6 +72,7 @@ def audio_input_available() -> bool:
 
 
 def get_platform_info(config: dict | None = None) -> PlatformInfo:
+    """Build platform diagnostics from host probes and the active runtime."""
     from mclaw.runtime.manager import RuntimeManager
 
     runtime = RuntimeManager.current(config)

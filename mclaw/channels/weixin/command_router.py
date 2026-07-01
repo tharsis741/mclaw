@@ -11,13 +11,18 @@ from dataclasses import dataclass
 
 @dataclass
 class CommandResult:
+    """Result of a Weixin-local slash command handled before the agent turn."""
+
     handled: bool = False
     text: str = ""
     action: str = ""
 
 
 class WeixinCommandRouter:
+    """Handle channel-local commands that should not enter the agent loop."""
+
     def parse(self, text: str) -> tuple[str, str]:
+        """Split a slash command into its command name and raw argument string."""
         stripped = (text or "").strip()
         if not stripped.startswith("/"):
             return "", stripped
@@ -25,10 +30,11 @@ class WeixinCommandRouter:
         return head.strip().lower(), tail.strip()
 
     def handle(self, text: str, *, status: str = "idle") -> CommandResult:
+        """Handle supported Weixin commands and leave unknown text for the agent."""
         command, _args = self.parse(text)
         if not command:
             return CommandResult()
-        if command in {"help", "mclaw"}:
+        if command == "help":
             return CommandResult(
                 handled=True,
                 action="help",
@@ -47,4 +53,3 @@ class WeixinCommandRouter:
         if command == "stop":
             return CommandResult(handled=True, action="stop", text="")
         return CommandResult(handled=False)
-

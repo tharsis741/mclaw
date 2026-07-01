@@ -10,7 +10,6 @@ and config.yaml providers dict. Supports built-in and user-defined providers.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
 
 from mclaw.cli.config import get_env_value
 from mclaw.constants import OPENROUTER_BASE_URL
@@ -20,20 +19,22 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ProviderConfig:
+    """Built-in provider metadata used for credential and endpoint resolution."""
+
     name: str
     display_name: str
-    api_key_env_vars: List[str]
+    api_key_env_vars: list[str]
     base_url: str
     base_url_env_var: str = ""
     api_mode: str = "chat_completions"
     key_url: str = ""
-    model_prefixes: List[str] = field(default_factory=list)
-    aliases: List[str] = field(default_factory=list)
+    model_prefixes: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
 
 
-# ── Built-in Provider Registry ──
+# Built-in provider registry.
 
-PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
+PROVIDER_REGISTRY: dict[str, ProviderConfig] = {
     "openrouter": ProviderConfig(
         name="openrouter",
         display_name="OpenRouter",
@@ -78,7 +79,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         base_url="https://api.deepseek.com/v1",
         base_url_env_var="DEEPSEEK_BASE_URL",
         key_url="https://platform.deepseek.com/api_keys",
-        model_prefixes=["deepseek"],
+        model_prefixes=["deepseek-chat", "deepseek-reasoner", "deepseek-v", "deepseek-r", "deepseek-coder"],
     ),
     "baidu": ProviderConfig(
         name="baidu",
@@ -174,7 +175,7 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         base_url="https://bedrock-mantle.us-east-1.api.aws/v1",
         base_url_env_var="BEDROCK_BASE_URL",
         key_url="https://console.aws.amazon.com/bedrock/",
-        model_prefixes=["amazon", "anthropic", "meta", "mistral", "openai"],
+        model_prefixes=["amazon.", "anthropic.", "meta.", "mistral.", "openai."],
         aliases=["amazon", "aws", "bedrock", "amazon bedrock"],
     ),
     "together": ProviderConfig(
@@ -314,12 +315,10 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
 }
 
 
-# Default provider model fallbacks.
-# Used when the online /models API is unavailable due to network errors,
-# timeouts, or authentication failures. Each provider lists a small set of
-# stable, commonly used models.
+# Curated setup choices used when the models.dev catalog is unavailable.
+# Each provider lists a small set of stable, commonly used models.
 
-DEFAULT_PROVIDER_MODELS: Dict[str, List[str]] = {
+DEFAULT_PROVIDER_MODELS: dict[str, list[str]] = {
     "openai": [
         "gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
         "gpt-4", "gpt-3.5-turbo",
@@ -407,22 +406,16 @@ DEFAULT_PROVIDER_MODELS: Dict[str, List[str]] = {
     "yi": [
         "yi-lightning", "yi-large",
     ],
-    "azure": [
-        "gpt-4o", "gpt-4o-mini", "gpt-4-turbo",
-    ],
-    "ollama": [
-        "llama3.1:8b", "llama3.1:70b", "qwen2.5:14b", "mistral:7b",
-    ],
 }
 
 
-# ── Model-to-Provider detection ──
+# Model-to-provider detection.
 
-def detect_provider_for_model(model_name: str) -> Optional[str]:
+def detect_provider_for_model(model_name: str) -> str | None:
     """Infer which provider a model belongs to from its name.
 
-    Pure prefix matching via PROVIDER_REGISTRY — no hardcoded catalog.
-    Falls back to 'openrouter' for slash-format names (e.g. 'anthropic/claude-3.5-sonnet').
+    Uses registry prefixes for direct providers and a small namespace allowlist
+    for OpenRouter-style names such as ``anthropic/claude-3.5-sonnet``.
     Returns provider key or None.
     """
     if not model_name:
@@ -447,50 +440,11 @@ def detect_provider_for_model(model_name: str) -> Optional[str]:
     return None
 
 
-def get_provider_models(provider: str) -> List[str]:
-    """Get available model list for a provider.
-
-    Flow: live API → DEFAULT_PROVIDER_MODELS fallback.
-    Used by Setup and /model command.
-    """
-    config = PROVIDER_REGISTRY.get(provider)
-    if not config:
-        return []
-    try:
-        models = _fetch_provider_models_live(provider, config)
-        if models:
-            return models
-    except Exception:
-        pass
-    return DEFAULT_PROVIDER_MODELS.get(provider, [])
-
-
-def _fetch_provider_models_live(provider: str, config: ProviderConfig) -> List[str] | None:
-    """Call provider's /models endpoint. Returns None on any failure."""
-    if not config.base_url:
-        return None
-    api_key = resolve_api_key(provider)
-    try:
-        import requests
-        resp = requests.get(
-            f"{config.base_url.rstrip('/')}/models",
-            timeout=5,
-            headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
-        )
-        if resp.status_code == 200:
-            data = resp.json()
-            if "data" in data:
-                return [m["id"] for m in data["data"] if m.get("id")]
-    except Exception:
-        pass
-    return None
-
-
-def resolve_api_key(provider_name: str) -> Optional[str]:
-    """Resolve API key for a provider from env vars / .env."""
+def resolve_api_key(provider_name: str) -> str | None:
+    """Resolve a built-in provider key from its ordered environment aliases."""
     config = PROVIDER_REGISTRY.get(provider_name)
     if not config:
-        return get_env_value("OPENAI_API_KEY")
+        return None
     for env_var in config.api_key_env_vars:
         val = get_env_value(env_var)
         if val:
@@ -498,33 +452,11 @@ def resolve_api_key(provider_name: str) -> Optional[str]:
     return None
 
 
-def resolve_api_key_with_env_var(provider_name: str, config: dict | None = None) -> tuple[str, str]:
-    """Resolve a provider key and report the env var that supplied it."""
-    user_provider = _resolve_user_provider(provider_name, config)
-    if user_provider:
-        env_var = str(
-            (_configured_providers(config).get(provider_name) or {}).get("api_key_env")
-            or (_configured_providers(config).get(provider_name) or {}).get("env_var")
-            or ""
-        ).strip()
-        return str(user_provider.get("api_key") or ""), env_var
-
-    provider_cfg = PROVIDER_REGISTRY.get(provider_name)
-    if not provider_cfg:
-        return "", ""
-
-    for env_var in provider_cfg.api_key_env_vars:
-        value = get_env_value(env_var)
-        if value:
-            return value, env_var
-    return "", ""
-
-
 def resolve_base_url(provider_name: str) -> str:
-    """Resolve base URL for a provider."""
+    """Resolve a built-in provider base URL, honoring provider-specific overrides."""
     config = PROVIDER_REGISTRY.get(provider_name)
     if not config:
-        return "https://api.openai.com/v1"
+        return ""
     if config.base_url_env_var:
         override = get_env_value(config.base_url_env_var)
         if override:
@@ -532,27 +464,29 @@ def resolve_base_url(provider_name: str) -> str:
     return config.base_url
 
 
-def _configured_providers(config: dict | None = None) -> Dict[str, dict]:
+def _configured_providers(config: dict | None = None) -> dict[str, dict]:
+    """Return the user-defined provider map without normalizing its entries."""
     if not isinstance(config, dict):
         return {}
     providers = config.get("providers", {})
     return providers if isinstance(providers, dict) else {}
 
 
-def _resolve_user_provider(provider_name: str, config: dict | None = None) -> Optional[Dict]:
+def _resolve_user_provider(provider_name: str, config: dict | None = None) -> dict[str, str] | None:
+    """Resolve a user-defined provider exactly from config and its env var."""
     providers = _configured_providers(config)
     provider_cfg = providers.get(provider_name)
     if not isinstance(provider_cfg, dict):
         return None
 
-    env_var = str(provider_cfg.get("api_key_env") or provider_cfg.get("env_var") or "")
+    env_var = str(provider_cfg.get("api_key_env") or "")
     api_key = ""
     if env_var:
         api_key = get_env_value(env_var) or ""
 
     base_url = str(provider_cfg.get("base_url") or "").rstrip("/")
     api_mode = str(provider_cfg.get("api_mode") or "chat_completions")
-    model = str(provider_cfg.get("model") or provider_cfg.get("default_model") or "")
+    model = str(provider_cfg.get("model") or "")
     return {
         "provider": provider_name,
         "model": model,
@@ -578,12 +512,13 @@ def _resolve_config_profile(provider_name: str, config: dict | None = None) -> s
         profile = find_provider_profile(provider_name, profile_id)
         if profile and profile.callable:
             return profile.id
-    except Exception:
+    except Exception as exc:
+        logger.debug("Provider profile resolution failed for %s: %s", provider_name, exc)
         return ""
     return ""
 
 
-def _fallback_provider_entries(config: dict | None = None) -> List[Dict[str, str]]:
+def _fallback_provider_entries(config: dict | None = None) -> list[dict[str, str]]:
     """Return strict fallback provider entries.
 
     Expected config shape:
@@ -600,7 +535,7 @@ def _fallback_provider_entries(config: dict | None = None) -> List[Dict[str, str
     if not isinstance(raw_entries, list):
         return []
 
-    entries: List[Dict[str, str]] = []
+    entries: list[dict[str, str]] = []
     for raw in raw_entries:
         if not isinstance(raw, dict):
             continue
@@ -634,38 +569,13 @@ def _configured_model_for_provider(config: dict | None, provider_name: str) -> s
     return ""
 
 
-def get_provider_status(provider_name: str) -> Dict:
-    """Check if a provider has credentials configured.
-
-    Returns: {"configured": bool, "api_key": str, "base_url": str, "display_name": str}
-    """
-    pcfg = PROVIDER_REGISTRY.get(provider_name)
-    if not pcfg:
-        return {"configured": False, "api_key": "", "base_url": "", "display_name": provider_name}
-
-    key = resolve_api_key(provider_name)
-    url = resolve_base_url(provider_name)
-    return {
-        "configured": bool(key),
-        "api_key": key or "",
-        "base_url": url,
-        "display_name": pcfg.display_name,
-        "key_url": pcfg.key_url,
-        "api_mode": pcfg.api_mode,
-        "primary_key_env": pcfg.api_key_env_vars[0] if pcfg.api_key_env_vars else "",
-    }
-
-
-def list_configured_providers() -> List[Dict]:
-    """Return all providers that have credentials set."""
+def list_configured_providers() -> list[dict]:
+    """Return configured custom and built-in providers that currently have keys."""
     result = []
-    try:
-        from mclaw.cli.config import load_config
-        config = load_config()
-        user_providers = _configured_providers(config)
-    except Exception:
-        config = {}
-        user_providers = {}
+    from mclaw.cli.config import load_config
+
+    config = load_config(strict=True)
+    user_providers = _configured_providers(config)
 
     for pname, pcfg in user_providers.items():
         resolved = _resolve_user_provider(pname, {"providers": user_providers}) or {}
@@ -701,17 +611,20 @@ def resolve_provider(
     base_url: str = "",
     api_key: str = "",
     config: dict | None = None,
-) -> Dict:
-    """Resolve the active provider based on config and available keys.
+) -> dict:
+    """Resolve the active provider using explicit config before fallbacks.
 
-    Returns dict with: provider, model, api_key, base_url, api_mode
+    Resolution favors user-selected custom providers, then built-in providers,
+    environment-only custom endpoints, model-name inference, and finally the
+    configured fallback list. Returns a dict with provider, model, api_key,
+    base_url, api_mode, and provider_profile.
     """
+    provider = str(provider or "").strip()
     user_providers = _configured_providers(config)
     configured_fallbacks = _fallback_provider_entries(config)
 
-    # Explicit provider has the highest priority.
-    # This covers the --provider CLI argument and config.yaml active_provider,
-    # which is set by /model --global and only used when the provider has a key.
+    # Explicit provider selection has the highest priority.
+    # This covers runtime overrides and config.yaml active_provider.
     if provider and provider in user_providers:
         resolved = _resolve_user_provider(provider, config) or {}
         resolved_key = api_key or resolved.get("api_key", "")
@@ -742,10 +655,15 @@ def resolve_provider(
                 "provider_profile": profile_id,
             }
 
-    # --- Custom Anthropic endpoint: MCLAW_ANTHROPIC_BASE_URL ---
-    anthropic_custom_url = get_env_value("MCLAW_ANTHROPIC_BASE_URL") or ""
+    # Custom Anthropic-compatible endpoint from M-Claw environment.
+    if provider == "custom_anthropic":
+        anthropic_custom_url = base_url or get_env_value("MCLAW_ANTHROPIC_BASE_URL") or ""
+    elif not provider:
+        anthropic_custom_url = get_env_value("MCLAW_ANTHROPIC_BASE_URL") or ""
+    else:
+        anthropic_custom_url = ""
     anthropic_custom_key = api_key or get_env_value("MCLAW_ANTHROPIC_API_KEY") or get_env_value("ANTHROPIC_API_KEY") or ""
-    if anthropic_custom_url and not base_url:
+    if anthropic_custom_url:
         return {
             "provider": "custom_anthropic",
             "model": model,
@@ -755,8 +673,11 @@ def resolve_provider(
             "provider_profile": "",
         }
 
-    # --- Custom OpenAI endpoint: explicit args or MCLAW_* env vars ---
-    custom_url = base_url or get_env_value("MCLAW_BASE_URL") or ""
+    # Custom OpenAI-compatible endpoint from explicit args or M-Claw environment.
+    if provider in ("", "custom"):
+        custom_url = base_url or get_env_value("MCLAW_BASE_URL") or ""
+    else:
+        custom_url = ""
     custom_key = api_key or get_env_value("MCLAW_API_KEY") or ""
 
     if custom_url:
@@ -771,7 +692,7 @@ def resolve_provider(
             "provider_profile": "",
         }
 
-    # --- OPENAI_BASE_URL override ---
+    # OpenAI-compatible endpoint configured through the standard OpenAI env var.
     openai_base_override = get_env_value("OPENAI_BASE_URL")
     if openai_base_override and not provider:
         key = get_env_value("OPENAI_API_KEY") or ""

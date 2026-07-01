@@ -2,7 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Single-instance lock for a DingTalk bot."""
+"""Single-instance lock for a DingTalk bot.
+
+The Stream Mode client owns one long-lived gateway connection per bot, so a
+local lock prevents duplicate runtimes from consuming the same bot stream.
+"""
 
 from __future__ import annotations
 
@@ -17,16 +21,20 @@ from mclaw.constants import get_mclaw_home
 
 
 class DingTalkRuntimeLockError(RuntimeError):
+    """Raised when another live process already owns the DingTalk bot lock."""
+
     pass
 
 
 def _is_process_alive(pid: int) -> bool:
+    """Best-effort liveness check used to decide whether a lock is stale."""
     if pid <= 0:
         return False
     if os.name == "nt":
         try:
             import ctypes
 
+            # Windows lacks os.kill(pid, 0); PROCESS_QUERY_LIMITED_INFORMATION is enough.
             process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
             if not process:
                 return False
@@ -47,6 +55,8 @@ def _lock_name(client_id: str) -> str:
 
 
 class DingTalkRuntimeLock:
+    """Filesystem lock guarding one DingTalk bot runtime instance."""
+
     def __init__(self, *, client_id: str, root: Path | None = None) -> None:
         self.client_id = client_id
         self.root = root or (get_mclaw_home() / "dingtalk" / "locks")
@@ -54,6 +64,7 @@ class DingTalkRuntimeLock:
         self._acquired = False
 
     def acquire(self) -> None:
+        """Create the lock file atomically or reject a live existing owner."""
         self.root.mkdir(parents=True, exist_ok=True)
         payload = {
             "pid": os.getpid(),
@@ -70,6 +81,7 @@ class DingTalkRuntimeLock:
         self._acquired = True
 
     def release(self) -> None:
+        """Release only a lock file still owned by this process."""
         if not self._acquired:
             return
         try:
@@ -80,6 +92,7 @@ class DingTalkRuntimeLock:
             self._acquired = False
 
     def _handle_existing_lock(self) -> None:
+        """Remove stale locks while preserving active-runtime protection."""
         data = self._read_lock()
         pid = int(data.get("pid") or 0)
         if pid and _is_process_alive(pid):
@@ -90,6 +103,7 @@ class DingTalkRuntimeLock:
         self.path.unlink(missing_ok=True)
 
     def _read_lock(self) -> dict[str, Any]:
+        """Read lock metadata, treating malformed lock files as stale."""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}

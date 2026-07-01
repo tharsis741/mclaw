@@ -36,6 +36,7 @@ class RuntimeAsrCommandCoordinator:
         self.hooks = hooks
 
     def handle_asr_mode(self, raw_args: str = "") -> None:
+        """Start continuous ASR in the requested listen mode."""
         mode = str(raw_args or "").strip().split()[0].lower() if raw_args else ""
         if mode not in {"", "wake_word", "push_to_talk"}:
             self.hooks.render_notice("用法: /asr-mode [wake_word|push_to_talk]", "warning")
@@ -69,12 +70,14 @@ class RuntimeAsrCommandCoordinator:
         self.hooks.render_error(f"ASR 启动失败: {getattr(service, 'last_error', '')}")
 
     def handle_keyboard_mode(self) -> None:
+        """Stop ASR capture and return the interactive input mode to keyboard."""
         self.hooks.stop_asr_service()
         self.hooks.set_input_mode("keyboard")
         self.hooks.set_asr_status_text("off")
         self.hooks.render_success("已切回 keyboard-mode。")
 
     def handle_asr_once(self) -> None:
+        """Start a one-shot ASR capture without requiring wake-word activation."""
         self.hooks.sync_asr_config({"listen_mode": "once", "require_wake_word": False})
         try:
             service = self.hooks.ensure_asr_service()
@@ -90,6 +93,7 @@ class RuntimeAsrCommandCoordinator:
         self.hooks.render_error(f"ASR once 启动失败: {getattr(service, 'last_error', '')}")
 
     def handle_push_to_talk_key(self) -> None:
+        """Toggle push-to-talk capture, reconfiguring ASR if another mode is active."""
         try:
             service = self.hooks.ensure_asr_service()
         except RuntimeError as exc:
@@ -121,6 +125,7 @@ class RuntimeAsrCommandCoordinator:
         self.hooks.render_error(f"ASR push-to-talk 不可用: {getattr(service, 'last_error', '')}")
 
     def show_status(self) -> None:
+        """Render ASR runtime status from host configuration and service state."""
         self.hooks.render_asr_status(
             self.hooks.resolve_status_config(),
             self.hooks.get_service_status(),

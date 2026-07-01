@@ -11,6 +11,7 @@ agents are forced into their delegation workspace before commands execute.
 """
 
 import json
+import logging
 import os
 import platform as _platform_mod
 import re
@@ -25,6 +26,8 @@ from mclaw.skills_hub.paths import get_skill_drafting_dir
 from mclaw.tools.path_extract import extract_absolute_paths
 from mclaw.tools.registry import registry
 
+logger = logging.getLogger(__name__)
+
 _IS_WINDOWS = _platform_mod.system() == "Windows"
 
 DEFAULT_TIMEOUT = 180
@@ -34,13 +37,11 @@ MAX_RESULT_SIZE_CHARS = 50000
 
 @dataclass
 class RuntimeTerminalSession:
+    """Per-session terminal state preserved across foreground commands."""
     cwd: str = ""
     timeout: int = DEFAULT_TIMEOUT
     env: dict[str, str] = field(default_factory=dict)
     scoped_secret_keys: set[str] = field(default_factory=set)
-
-    def cleanup(self) -> None:
-        return None
 
 
 _env_registry: dict[str, RuntimeTerminalSession] = {}
@@ -52,6 +53,7 @@ _REDIRECT_TARGET_RE = re.compile(
 
 
 def _resolve_guard_path(path_value: str, cwd: str = "") -> Path | None:
+    """Resolve a command path candidate for safety checks without executing it."""
     value = str(path_value or "").strip().strip("\"'")
     if not value:
         return None
@@ -69,6 +71,7 @@ def _resolve_guard_path(path_value: str, cwd: str = "") -> Path | None:
 
 
 def _is_path_within(path: Path, root: Path) -> bool:
+    """Return whether path is equal to or nested under root without prefix leaks."""
     try:
         return path == root or path.is_relative_to(root)
     except ValueError:
@@ -84,6 +87,7 @@ def _is_path_within(path: Path, root: Path) -> bool:
 
 
 def _protected_skill_roots() -> list[Path]:
+    """Return Skill storage roots that terminal mutations must not touch."""
     roots: list[Path] = []
     for root in (get_skills_dir(), get_skill_drafting_dir()):
         resolved = _resolve_guard_path(str(root))
@@ -103,6 +107,7 @@ def _skill_store_terminal_error_message(root: Path) -> str:
 
 
 def _shell_tokens(command: str) -> list[str]:
+    """Tokenize enough shell syntax to identify mutation operands conservatively."""
     tokens: list[str] = []
     for match in _SHELL_TOKEN_RE.finditer(command):
         token = next((group for group in match.groups() if group), "")
@@ -113,6 +118,7 @@ def _shell_tokens(command: str) -> list[str]:
 
 
 def _command_name(token: str) -> str:
+    """Normalize an executable token for cross-shell verb matching."""
     cleaned = str(token or "").strip().strip("\"'").replace("\\", "/")
     name = cleaned.rsplit("/", 1)[-1].lower()
     if name.endswith(".exe"):
@@ -121,6 +127,7 @@ def _command_name(token: str) -> str:
 
 
 def _operands_after(tokens: list[str], index: int) -> list[str]:
+    """Collect non-option operands until the next simple shell separator."""
     operands: list[str] = []
     for token in tokens[index + 1:]:
         cleaned = str(token or "").strip().strip("\"'")
@@ -145,6 +152,7 @@ def _first_verb_operands(tokens: list[str], verbs: set[str]) -> tuple[int, list[
 
 
 def _redirection_targets(command: str) -> list[str]:
+    """Extract output redirection targets that imply filesystem mutation."""
     targets: list[str] = []
     for match in _REDIRECT_TARGET_RE.finditer(command or ""):
         target = next((group for group in match.groups() if group), "")
@@ -253,14 +261,14 @@ def set_current_session(session_id: str | None) -> None:
     """
     global _current_session_id
     if _current_session_id is not None and _current_session_id in _env_registry:
-        # Do not clean up a session environment while background processes are active.
+        # Active background processes retain their session environment.
         try:
             from mclaw.tools.process_registry import process_registry
             if process_registry.has_active_processes(_current_session_id):
                 _current_session_id = session_id
                 return
         except ImportError:
-            pass
+            logger.debug("Process registry unavailable during terminal session switch", exc_info=True)
         cleanup_session(_current_session_id)
     _current_session_id = session_id
 
@@ -271,6 +279,7 @@ def _get_or_create_env(
     env_vars: dict | None = None,
     scoped_secret_keys: set[str] | None = None,
 ) -> RuntimeTerminalSession:
+    """Create or update the active session environment snapshot."""
     global _env_registry, _current_session_id
 
     if _current_session_id is None:
@@ -292,14 +301,15 @@ def _get_or_create_env(
 
 
 def cleanup_session(session_id: str | None = None) -> None:
+    """Drop terminal cwd/env state for a finished session."""
     global _env_registry, _current_session_id
     sid = session_id or _current_session_id
     if sid and sid in _env_registry:
-        _env_registry[sid].cleanup()
         del _env_registry[sid]
 
 
 def _truncate_output(output: str, limit: int = MAX_RESULT_SIZE_CHARS) -> str:
+    """Keep command output bounded while preserving both beginning and end."""
     if len(output) <= limit:
         return output
     head_chars = int(limit * 0.4)
@@ -325,6 +335,7 @@ def _coerce_timeout(value) -> int | None:
 
 
 def _resolve_timeout(requested, config: dict | None = None) -> int:
+    """Clamp requested timeout between configured terminal minimum and hard max."""
     cfg = config or {}
     terminal_cfg = cfg.get("terminal", {}) if isinstance(cfg, dict) else {}
     if not isinstance(terminal_cfg, dict):
@@ -341,8 +352,7 @@ def _resolve_timeout(requested, config: dict | None = None) -> int:
     effective = min(effective, hard_max)
 
     if requested is not None and effective != requested_timeout:
-        import logging
-        logging.getLogger(__name__).info(
+        logger.info(
             "[terminal] timeout normalized: requested=%r config_min=%s hard_max=%s effective=%s",
             requested,
             config_min,
@@ -403,7 +413,7 @@ def terminal_tool(
         bg_env_vars = dict(session_env.env) if session_env and session_env.env else {}
         bg_env_vars.update(scoped_env)
 
-        # PTY support: try ptyprocess/winpty; fall back silently to pipe mode.
+        # PTY support is optional; pipe mode remains the portable execution path.
         use_pty = False
         pty_disabled_reason = None
         if pty:
@@ -448,7 +458,7 @@ def terminal_tool(
                 try:
                     process_registry.kill_process(proc_session.id)
                 except Exception:
-                    pass
+                    logger.debug("Failed to kill background process after metadata persist failure", exc_info=True)
                 return json.dumps(
                     {
                         "output": "",
@@ -497,7 +507,7 @@ def terminal_tool(
                         try:
                             process_registry.kill_process(proc_session.id)
                         except Exception:
-                            pass
+                            logger.debug("Failed to kill background process after watcher persist failure", exc_info=True)
                         return json.dumps(
                             {
                                 "output": "",
@@ -570,6 +580,7 @@ def terminal_tool(
 
 
 def _handle_terminal(args: dict, **kwargs) -> str:
+    """Registry handler that applies parent-agent delegation before execution."""
     parent_agent = kwargs.get("parent_agent")
     effective_workdir = args.get("workdir")
     command = args.get("command") or ""
@@ -613,8 +624,13 @@ def _handle_terminal(args: dict, **kwargs) -> str:
                                 f"\n允许的目录: {delegation_dir}"
                             ),
                         }, ensure_ascii=False)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    return json.dumps({
+                        "error": (
+                            "Delegation path validation failed for absolute path "
+                            f"{abs_path}: {exc}"
+                        ),
+                    }, ensure_ascii=False)
 
     return terminal_tool(
         command=command,
@@ -669,7 +685,10 @@ TERMINAL_TOOL_SCHEMA = {
                 },
                 "pty": {
                     "type": "boolean",
-                    "description": "Pseudo-terminal (not fully supported in M-Claw yet).",
+                    "description": (
+                        "Run a background command with a pseudo-terminal when the runtime dependency is available; "
+                        "otherwise pipe mode is used."
+                    ),
                     "default": False,
                 },
                 "notify_on_complete": {
@@ -698,7 +717,7 @@ registry.register(
     toolset="terminal",
     schema=TERMINAL_TOOL_SCHEMA,
     handler=_handle_terminal,
-    description="执行终端命令行",
+    description="Execute terminal commands",
     emoji="💻",
     max_result_size_chars=MAX_RESULT_SIZE_CHARS,
 )

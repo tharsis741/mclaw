@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Dataclass models for scheduler jobs, runs, targets, and pairings."""
+"""Dataclass models for scheduler jobs, runs, targets, and pairings.
+
+These classes define the stable scheduler state shape shared by CLI commands,
+channel adapters, and the persistence layer. Coercion is centralized here so
+JSON imports and SQLite rows reject malformed state in the same way.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +15,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +27,15 @@ ConcurrencyPolicy = Literal["skip", "queue", "parallel", "replace"]
 TargetType = Literal["local", "dingtalk_group", "dingtalk_private", "weixin_private"]
 RouteStatus = Literal["ready", "needs_route", "disabled"]
 PairingStatus = Literal["waiting", "bound", "expired", "cancelled", "failed"]
+
+_TRIGGER_TYPES = frozenset(("once", "daily", "weekly", "monthly", "interval", "cron"))
+_JOB_STATUSES = frozenset(("idle", "claimed", "running", "paused", "error"))
+_RUN_STATUSES = frozenset(("queued", "running", "succeeded", "failed", "skipped", "cancelled", "delivery_failed"))
+_SESSION_POLICIES = frozenset(("task_thread", "new_session"))
+_CONCURRENCY_POLICIES = frozenset(("skip", "queue", "parallel", "replace"))
+_TARGET_TYPES = frozenset(("local", "dingtalk_group", "dingtalk_private", "weixin_private"))
+_ROUTE_STATUSES = frozenset(("ready", "needs_route", "disabled"))
+_PAIRING_STATUSES = frozenset(("waiting", "bound", "expired", "cancelled", "failed"))
 
 
 def _json_dumps(value: Any) -> str:
@@ -53,7 +68,116 @@ def _row_get(row: Any, key: str, default: Any = None) -> Any:
         return getattr(row, key, default)
 
 
+def _mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    return value
+
+
+def _coerce_enum(value: Any, allowed: frozenset[str], default: str, *, field: str) -> str:
+    text = str(default if value is None or value == "" else value).strip()
+    if text not in allowed:
+        allowed_text = ", ".join(sorted(allowed))
+        raise ValueError(f"{field} must be one of: {allowed_text}")
+    return text
+
+
+def _coerce_bool(value: Any, default: bool, *, field: str) -> bool:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if value in (0, 1):
+            return bool(value)
+        raise ValueError(f"{field} must be a boolean")
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"1", "true", "yes", "y", "on"}:
+            return True
+        if text in {"0", "false", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{field} must be a boolean")
+
+
+def _coerce_int(value: Any, default: int, *, field: str, min_value: int | None = None) -> int:
+    if value is None or value == "":
+        result = default
+    elif isinstance(value, bool):
+        raise ValueError(f"{field} must be an integer")
+    else:
+        try:
+            result = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be an integer") from exc
+    if min_value is not None and result < min_value:
+        raise ValueError(f"{field} must be >= {min_value}")
+    return result
+
+
+def _coerce_float(value: Any, default: float, *, field: str, min_value: float | None = None) -> float:
+    if value is None or value == "":
+        result = float(default)
+    elif isinstance(value, bool):
+        raise ValueError(f"{field} must be a number")
+    else:
+        try:
+            result = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field} must be a number") from exc
+    if min_value is not None and result < min_value:
+        raise ValueError(f"{field} must be >= {min_value:g}")
+    return result
+
+
+def _coerce_optional_float(value: Any, *, field: str, min_value: float | None = None) -> float | None:
+    if value is None or value == "":
+        return None
+    return _coerce_float(value, 0, field=field, min_value=min_value)
+
+
+def _coerce_mapping(value: Any, *, field: str) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"{field} must be an object")
+    return dict(value)
+
+
+def _coerce_list(value: Any, *, field: str) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{field} must be a list")
+    return list(value)
+
+
+def _coerce_string_list(value: Any, *, field: str) -> list[str]:
+    return [str(item) for item in _coerce_list(value, field=field)]
+
+
+def _coerce_dict_list(value: Any, *, field: str) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    for index, item in enumerate(_coerce_list(value, field=field)):
+        if not isinstance(item, dict):
+            raise ValueError(f"{field}[{index}] must be an object")
+        result.append(dict(item))
+    return result
+
+
+def _coerce_timezone(value: Any, default: str, *, field: str) -> str:
+    text = str(default if value is None or value == "" else value).strip()
+    try:
+        ZoneInfo(text)
+    except Exception as exc:
+        raise ValueError(f"{field} must be a valid IANA timezone") from exc
+    return text
+
+
 def normalize_chat_type(value: str | None) -> str:
+    """Return the canonical chat scope name used by scheduler target routing."""
     raw = str(value or "").strip().lower()
     if raw == "dm":
         return "private"
@@ -62,6 +186,8 @@ def normalize_chat_type(value: str | None) -> str:
 
 @dataclass
 class ScheduleSpec:
+    """Serializable trigger configuration after user input has been parsed."""
+
     trigger_type: TriggerType
     expression: str
     timezone: str
@@ -77,12 +203,14 @@ class ScheduleSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ScheduleSpec":
-        raw = data or {}
+        raw = _mapping(data, field="schedule")
+        if "type" in raw or "schedule_expr" in raw:
+            raise ValueError("schedule dict must use trigger_type and expression")
         return cls(
-            trigger_type=str(raw.get("trigger_type") or raw.get("type") or "once"),  # type: ignore[arg-type]
-            expression=str(raw.get("expression") or raw.get("schedule_expr") or ""),
-            timezone=str(raw.get("timezone") or "Asia/Shanghai"),
-            parsed=dict(raw.get("parsed") or {}),
+            trigger_type=_coerce_enum(raw.get("trigger_type"), _TRIGGER_TYPES, "once", field="schedule.trigger_type"),  # type: ignore[arg-type]
+            expression=str(raw.get("expression") or ""),
+            timezone=_coerce_timezone(raw.get("timezone"), "Asia/Shanghai", field="schedule.timezone"),
+            parsed=_coerce_mapping(raw.get("parsed"), field="schedule.parsed"),
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -96,15 +224,17 @@ class ScheduleSpec:
     @classmethod
     def from_row(cls, row: Any) -> "ScheduleSpec":
         return cls(
-            trigger_type=str(_row_get(row, "trigger_type", "once")),  # type: ignore[arg-type]
+            trigger_type=_coerce_enum(_row_get(row, "trigger_type", "once"), _TRIGGER_TYPES, "once", field="schedule.trigger_type"),  # type: ignore[arg-type]
             expression=str(_row_get(row, "schedule_expr", "") or ""),
-            timezone=str(_row_get(row, "timezone", "Asia/Shanghai") or "Asia/Shanghai"),
-            parsed=_json_loads(_row_get(row, "schedule_parsed_json", "{}"), {}),
+            timezone=_coerce_timezone(_row_get(row, "timezone", "Asia/Shanghai"), "Asia/Shanghai", field="schedule.timezone"),
+            parsed=_coerce_mapping(_json_loads(_row_get(row, "schedule_parsed_json", "{}"), {}), field="schedule.parsed"),
         )
 
 
 @dataclass
 class SchedulerTarget:
+    """Delivery destination known to the scheduler and outbound adapters."""
+
     id: str
     type: TargetType
     display_name: str
@@ -138,21 +268,21 @@ class SchedulerTarget:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SchedulerTarget":
-        raw = data or {}
+        raw = _mapping(data, field="target")
         return cls(
             id=str(raw.get("id") or ""),
-            type=str(raw.get("type") or "local"),  # type: ignore[arg-type]
+            type=_coerce_enum(raw.get("type"), _TARGET_TYPES, "local", field="target.type"),  # type: ignore[arg-type]
             display_name=str(raw.get("display_name") or ""),
             account_id=str(raw.get("account_id") or ""),
             chat_id=str(raw.get("chat_id") or ""),
             chat_type=normalize_chat_type(raw.get("chat_type")),
-            route_metadata=dict(raw.get("route_metadata") or {}),
-            capabilities=dict(raw.get("capabilities") or {}),
-            route_status=str(raw.get("route_status") or "ready"),  # type: ignore[arg-type]
+            route_metadata=_coerce_mapping(raw.get("route_metadata"), field="target.route_metadata"),
+            capabilities=_coerce_mapping(raw.get("capabilities"), field="target.capabilities"),
+            route_status=_coerce_enum(raw.get("route_status"), _ROUTE_STATUSES, "ready", field="target.route_status"),  # type: ignore[arg-type]
             source=str(raw.get("source") or "binding"),
-            first_seen_at=float(raw.get("first_seen_at") or 0),
-            last_seen_at=float(raw.get("last_seen_at") or 0),
-            enabled=bool(raw.get("enabled", True)),
+            first_seen_at=_coerce_float(raw.get("first_seen_at"), 0, field="target.first_seen_at", min_value=0),
+            last_seen_at=_coerce_float(raw.get("last_seen_at"), 0, field="target.last_seen_at", min_value=0),
+            enabled=_coerce_bool(raw.get("enabled"), True, field="target.enabled"),
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -176,23 +306,25 @@ class SchedulerTarget:
     def from_row(cls, row: Any) -> "SchedulerTarget":
         return cls(
             id=str(_row_get(row, "id", "") or ""),
-            type=str(_row_get(row, "type", "local")),  # type: ignore[arg-type]
+            type=_coerce_enum(_row_get(row, "type", "local"), _TARGET_TYPES, "local", field="target.type"),  # type: ignore[arg-type]
             display_name=str(_row_get(row, "display_name", "") or ""),
             account_id=str(_row_get(row, "account_id", "") or ""),
             chat_id=str(_row_get(row, "chat_id", "") or ""),
             chat_type=normalize_chat_type(_row_get(row, "chat_type", "")),
-            route_metadata=_json_loads(_row_get(row, "route_metadata_json", "{}"), {}),
-            capabilities=_json_loads(_row_get(row, "capabilities_json", "{}"), {}),
-            route_status=str(_row_get(row, "route_status", "ready")),  # type: ignore[arg-type]
+            route_metadata=_coerce_mapping(_json_loads(_row_get(row, "route_metadata_json", "{}"), {}), field="target.route_metadata"),
+            capabilities=_coerce_mapping(_json_loads(_row_get(row, "capabilities_json", "{}"), {}), field="target.capabilities"),
+            route_status=_coerce_enum(_row_get(row, "route_status", "ready"), _ROUTE_STATUSES, "ready", field="target.route_status"),  # type: ignore[arg-type]
             source=str(_row_get(row, "source", "binding") or "binding"),
-            first_seen_at=float(_row_get(row, "first_seen_at", 0) or 0),
-            last_seen_at=float(_row_get(row, "last_seen_at", 0) or 0),
-            enabled=bool(_row_get(row, "enabled", 1)),
+            first_seen_at=_coerce_float(_row_get(row, "first_seen_at", 0), 0, field="target.first_seen_at", min_value=0),
+            last_seen_at=_coerce_float(_row_get(row, "last_seen_at", 0), 0, field="target.last_seen_at", min_value=0),
+            enabled=_coerce_bool(_row_get(row, "enabled", 1), True, field="target.enabled"),
         )
 
 
 @dataclass
 class SchedulerTargetPairing:
+    """Short-lived channel binding request used before a target is routable."""
+
     code: str
     requested_type: TargetType
     status: PairingStatus
@@ -218,17 +350,17 @@ class SchedulerTargetPairing:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SchedulerTargetPairing":
-        raw = data or {}
+        raw = _mapping(data, field="pairing")
         return cls(
             code=str(raw.get("code") or ""),
-            requested_type=str(raw.get("requested_type") or "local"),  # type: ignore[arg-type]
-            status=str(raw.get("status") or "waiting"),  # type: ignore[arg-type]
+            requested_type=_coerce_enum(raw.get("requested_type"), _TARGET_TYPES, "local", field="pairing.requested_type"),  # type: ignore[arg-type]
+            status=_coerce_enum(raw.get("status"), _PAIRING_STATUSES, "waiting", field="pairing.status"),  # type: ignore[arg-type]
             display_name_hint=str(raw.get("display_name_hint") or ""),
             target_id=str(raw.get("target_id") or ""),
             error=str(raw.get("error") or ""),
-            expires_at=float(raw.get("expires_at") or 0),
-            created_at=float(raw.get("created_at") or 0),
-            updated_at=float(raw.get("updated_at") or 0),
+            expires_at=_coerce_float(raw.get("expires_at"), 0, field="pairing.expires_at", min_value=0),
+            created_at=_coerce_float(raw.get("created_at"), 0, field="pairing.created_at", min_value=0),
+            updated_at=_coerce_float(raw.get("updated_at"), 0, field="pairing.updated_at", min_value=0),
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -238,23 +370,31 @@ class SchedulerTargetPairing:
     def from_row(cls, row: Any) -> "SchedulerTargetPairing":
         return cls(
             code=str(_row_get(row, "code", "") or ""),
-            requested_type=str(_row_get(row, "requested_type", "local")),  # type: ignore[arg-type]
-            status=str(_row_get(row, "status", "waiting")),  # type: ignore[arg-type]
+            requested_type=_coerce_enum(_row_get(row, "requested_type", "local"), _TARGET_TYPES, "local", field="pairing.requested_type"),  # type: ignore[arg-type]
+            status=_coerce_enum(_row_get(row, "status", "waiting"), _PAIRING_STATUSES, "waiting", field="pairing.status"),  # type: ignore[arg-type]
             display_name_hint=str(_row_get(row, "display_name_hint", "") or ""),
             target_id=str(_row_get(row, "target_id", "") or ""),
             error=str(_row_get(row, "error", "") or ""),
-            expires_at=float(_row_get(row, "expires_at", 0) or 0),
-            created_at=float(_row_get(row, "created_at", 0) or 0),
-            updated_at=float(_row_get(row, "updated_at", 0) or 0),
+            expires_at=_coerce_float(_row_get(row, "expires_at", 0), 0, field="pairing.expires_at", min_value=0),
+            created_at=_coerce_float(_row_get(row, "created_at", 0), 0, field="pairing.created_at", min_value=0),
+            updated_at=_coerce_float(_row_get(row, "updated_at", 0), 0, field="pairing.updated_at", min_value=0),
         )
 
 
 @dataclass
 class DeliverySpec:
+    """Delivery and optional final-response export settings for a job."""
+
     target_id: str
     retry_count: int = 3
     final_response_path: str = ""
     final_response_filename_template: str = ""
+
+    def __post_init__(self) -> None:
+        self.target_id = str(self.target_id or "local")
+        self.retry_count = _coerce_int(self.retry_count, 3, field="delivery.retry_count", min_value=1)
+        self.final_response_path = str(self.final_response_path or "")
+        self.final_response_filename_template = str(self.final_response_filename_template or "")
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -266,10 +406,10 @@ class DeliverySpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "DeliverySpec":
-        raw = data or {}
+        raw = _mapping(data, field="delivery")
         return cls(
             target_id=str(raw.get("target_id") or "local"),
-            retry_count=int(raw.get("retry_count") or 3),
+            retry_count=_coerce_int(raw.get("retry_count"), 3, field="delivery.retry_count", min_value=1),
             final_response_path=str(raw.get("final_response_path") or ""),
             final_response_filename_template=str(raw.get("final_response_filename_template") or ""),
         )
@@ -283,7 +423,7 @@ class DeliverySpec:
             return cls.from_dict(row)
         return cls(
             target_id=str(_row_get(row, "target_id", "local") or "local"),
-            retry_count=int(_row_get(row, "retry_count", 3) or 3),
+            retry_count=_coerce_int(_row_get(row, "retry_count", 3), 3, field="delivery.retry_count", min_value=1),
             final_response_path=str(_row_get(row, "final_response_path", "") or ""),
             final_response_filename_template=str(_row_get(row, "final_response_filename_template", "") or ""),
         )
@@ -291,6 +431,8 @@ class DeliverySpec:
 
 @dataclass
 class SchedulerJob:
+    """Persisted recurring task definition plus scheduler-owned runtime state."""
+
     id: str
     name: str
     enabled: bool
@@ -336,27 +478,27 @@ class SchedulerJob:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SchedulerJob":
-        raw = data or {}
+        raw = _mapping(data, field="job")
         return cls(
             id=str(raw.get("id") or ""),
             name=str(raw.get("name") or ""),
-            enabled=bool(raw.get("enabled", True)),
+            enabled=_coerce_bool(raw.get("enabled"), True, field="job.enabled"),
             schedule=ScheduleSpec.from_dict(raw.get("schedule")),
             prompt=str(raw.get("prompt") or ""),
-            enabled_toolsets=[str(item) for item in (raw.get("enabled_toolsets") or [])],
+            enabled_toolsets=_coerce_string_list(raw.get("enabled_toolsets"), field="job.enabled_toolsets"),
             workdir=str(raw.get("workdir") or ""),
-            session_policy=str(raw.get("session_policy") or "task_thread"),  # type: ignore[arg-type]
+            session_policy=_coerce_enum(raw.get("session_policy"), _SESSION_POLICIES, "task_thread", field="job.session_policy"),  # type: ignore[arg-type]
             session_id=str(raw.get("session_id") or ""),
             delivery=DeliverySpec.from_dict(raw.get("delivery")),
-            max_iterations=int(raw.get("max_iterations") or 200),
-            timeout_seconds=int(raw.get("timeout_seconds") or 3600),
-            concurrency_policy=str(raw.get("concurrency_policy") or "skip"),  # type: ignore[arg-type]
-            next_run_at=raw.get("next_run_at"),
-            last_run_at=raw.get("last_run_at"),
-            failure_count=int(raw.get("failure_count") or 0),
-            created_at=float(raw.get("created_at") or 0),
-            updated_at=float(raw.get("updated_at") or 0),
-            status=str(raw.get("status") or "idle"),  # type: ignore[arg-type]
+            max_iterations=_coerce_int(raw.get("max_iterations"), 200, field="job.max_iterations", min_value=1),
+            timeout_seconds=_coerce_int(raw.get("timeout_seconds"), 3600, field="job.timeout_seconds", min_value=1),
+            concurrency_policy=_coerce_enum(raw.get("concurrency_policy"), _CONCURRENCY_POLICIES, "skip", field="job.concurrency_policy"),  # type: ignore[arg-type]
+            next_run_at=_coerce_optional_float(raw.get("next_run_at"), field="job.next_run_at", min_value=0),
+            last_run_at=_coerce_optional_float(raw.get("last_run_at"), field="job.last_run_at", min_value=0),
+            failure_count=_coerce_int(raw.get("failure_count"), 0, field="job.failure_count", min_value=0),
+            created_at=_coerce_float(raw.get("created_at"), 0, field="job.created_at", min_value=0),
+            updated_at=_coerce_float(raw.get("updated_at"), 0, field="job.updated_at", min_value=0),
+            status=_coerce_enum(raw.get("status"), _JOB_STATUSES, "idle", field="job.status"),  # type: ignore[arg-type]
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -388,28 +530,30 @@ class SchedulerJob:
         return cls(
             id=str(_row_get(row, "id", "") or ""),
             name=str(_row_get(row, "name", "") or ""),
-            enabled=bool(_row_get(row, "enabled", 1)),
+            enabled=_coerce_bool(_row_get(row, "enabled", 1), True, field="job.enabled"),
             schedule=ScheduleSpec.from_row(row),
             prompt=str(_row_get(row, "prompt", "") or ""),
-            enabled_toolsets=[str(item) for item in _json_loads(_row_get(row, "enabled_toolsets_json", "[]"), [])],
+            enabled_toolsets=_coerce_string_list(_json_loads(_row_get(row, "enabled_toolsets_json", "[]"), []), field="job.enabled_toolsets"),
             workdir=str(_row_get(row, "workdir", "") or ""),
-            session_policy=str(_row_get(row, "session_policy", "task_thread")),  # type: ignore[arg-type]
+            session_policy=_coerce_enum(_row_get(row, "session_policy", "task_thread"), _SESSION_POLICIES, "task_thread", field="job.session_policy"),  # type: ignore[arg-type]
             session_id=str(_row_get(row, "session_id", "") or ""),
             delivery=DeliverySpec.from_dict(_json_loads(_row_get(row, "delivery_json", "{}"), {})),
-            max_iterations=int(_row_get(row, "max_iterations", 200) or 200),
-            timeout_seconds=int(_row_get(row, "timeout_seconds", 3600) or 3600),
-            concurrency_policy=str(_row_get(row, "concurrency_policy", "skip")),  # type: ignore[arg-type]
-            next_run_at=_row_get(row, "next_run_at"),
-            last_run_at=_row_get(row, "last_run_at"),
-            failure_count=int(_row_get(row, "failure_count", 0) or 0),
-            created_at=float(_row_get(row, "created_at", 0) or 0),
-            updated_at=float(_row_get(row, "updated_at", 0) or 0),
-            status=str(_row_get(row, "status", "idle")),  # type: ignore[arg-type]
+            max_iterations=_coerce_int(_row_get(row, "max_iterations", 200), 200, field="job.max_iterations", min_value=1),
+            timeout_seconds=_coerce_int(_row_get(row, "timeout_seconds", 3600), 3600, field="job.timeout_seconds", min_value=1),
+            concurrency_policy=_coerce_enum(_row_get(row, "concurrency_policy", "skip"), _CONCURRENCY_POLICIES, "skip", field="job.concurrency_policy"),  # type: ignore[arg-type]
+            next_run_at=_coerce_optional_float(_row_get(row, "next_run_at"), field="job.next_run_at", min_value=0),
+            last_run_at=_coerce_optional_float(_row_get(row, "last_run_at"), field="job.last_run_at", min_value=0),
+            failure_count=_coerce_int(_row_get(row, "failure_count", 0), 0, field="job.failure_count", min_value=0),
+            created_at=_coerce_float(_row_get(row, "created_at", 0), 0, field="job.created_at", min_value=0),
+            updated_at=_coerce_float(_row_get(row, "updated_at", 0), 0, field="job.updated_at", min_value=0),
+            status=_coerce_enum(_row_get(row, "status", "idle"), _JOB_STATUSES, "idle", field="job.status"),  # type: ignore[arg-type]
         )
 
 
 @dataclass
 class SchedulerRun:
+    """Single execution attempt and its captured result metadata."""
+
     id: str
     job_id: str
     run_no: int
@@ -449,24 +593,24 @@ class SchedulerRun:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SchedulerRun":
-        raw = data or {}
+        raw = _mapping(data, field="run")
         return cls(
             id=str(raw.get("id") or ""),
             job_id=str(raw.get("job_id") or ""),
-            run_no=int(raw.get("run_no") or 0),
-            status=str(raw.get("status") or "queued"),  # type: ignore[arg-type]
+            run_no=_coerce_int(raw.get("run_no"), 0, field="run.run_no", min_value=0),
+            status=_coerce_enum(raw.get("status"), _RUN_STATUSES, "queued", field="run.status"),  # type: ignore[arg-type]
             claimed_by=str(raw.get("claimed_by") or ""),
-            scheduled_for=raw.get("scheduled_for"),
-            started_at=raw.get("started_at"),
-            finished_at=raw.get("finished_at"),
+            scheduled_for=_coerce_optional_float(raw.get("scheduled_for"), field="run.scheduled_for", min_value=0),
+            started_at=_coerce_optional_float(raw.get("started_at"), field="run.started_at", min_value=0),
+            finished_at=_coerce_optional_float(raw.get("finished_at"), field="run.finished_at", min_value=0),
             session_id=str(raw.get("session_id") or ""),
             output_path=str(raw.get("output_path") or ""),
             final_response=str(raw.get("final_response") or ""),
             error=str(raw.get("error") or ""),
-            delivery_result=dict(raw.get("delivery_result") or {}),
-            token_usage=dict(raw.get("token_usage") or {}),
-            tool_calls=list(raw.get("tool_calls") or []),
-            created_at=float(raw.get("created_at") or 0),
+            delivery_result=_coerce_mapping(raw.get("delivery_result"), field="run.delivery_result"),
+            token_usage=_coerce_mapping(raw.get("token_usage"), field="run.token_usage"),
+            tool_calls=_coerce_dict_list(raw.get("tool_calls"), field="run.tool_calls"),
+            created_at=_coerce_float(raw.get("created_at"), 0, field="run.created_at", min_value=0),
         )
 
     def to_row(self) -> dict[str, Any]:
@@ -494,18 +638,18 @@ class SchedulerRun:
         return cls(
             id=str(_row_get(row, "id", "") or ""),
             job_id=str(_row_get(row, "job_id", "") or ""),
-            run_no=int(_row_get(row, "run_no", 0) or 0),
-            status=str(_row_get(row, "status", "queued")),  # type: ignore[arg-type]
+            run_no=_coerce_int(_row_get(row, "run_no", 0), 0, field="run.run_no", min_value=0),
+            status=_coerce_enum(_row_get(row, "status", "queued"), _RUN_STATUSES, "queued", field="run.status"),  # type: ignore[arg-type]
             claimed_by=str(_row_get(row, "claimed_by", "") or ""),
-            scheduled_for=_row_get(row, "scheduled_for"),
-            started_at=_row_get(row, "started_at"),
-            finished_at=_row_get(row, "finished_at"),
+            scheduled_for=_coerce_optional_float(_row_get(row, "scheduled_for"), field="run.scheduled_for", min_value=0),
+            started_at=_coerce_optional_float(_row_get(row, "started_at"), field="run.started_at", min_value=0),
+            finished_at=_coerce_optional_float(_row_get(row, "finished_at"), field="run.finished_at", min_value=0),
             session_id=str(_row_get(row, "session_id", "") or ""),
             output_path=str(_row_get(row, "output_path", "") or ""),
             final_response=str(_row_get(row, "final_response", "") or ""),
             error=str(_row_get(row, "error", "") or ""),
-            delivery_result=_json_loads(_row_get(row, "delivery_result_json", "{}"), {}),
-            token_usage=_json_loads(_row_get(row, "token_usage_json", "{}"), {}),
-            tool_calls=_json_loads(_row_get(row, "tool_calls_json", "[]"), []),
-            created_at=float(_row_get(row, "created_at", 0) or 0),
+            delivery_result=_coerce_mapping(_json_loads(_row_get(row, "delivery_result_json", "{}"), {}), field="run.delivery_result"),
+            token_usage=_coerce_mapping(_json_loads(_row_get(row, "token_usage_json", "{}"), {}), field="run.token_usage"),
+            tool_calls=_coerce_dict_list(_json_loads(_row_get(row, "tool_calls_json", "[]"), []), field="run.tool_calls"),
+            created_at=_coerce_float(_row_get(row, "created_at", 0), 0, field="run.created_at", min_value=0),
         )

@@ -33,6 +33,7 @@ class SecretRequestError(ValueError):
 
 
 def allowlist_path():
+    """Return the scoped-secret allowlist path under MCLAW_HOME."""
     return get_mclaw_home() / ALLOWLIST_FILENAME
 
 
@@ -48,6 +49,7 @@ def _normalize_env_var(value: Any) -> str:
 
 
 def parse_scope(required_for: str) -> tuple[str, str]:
+    """Parse skill/tool/runtime/channel scope ids for secret authorization."""
     raw = str(required_for or "").strip()
     if ":" not in raw:
         raise SecretRequestError("required_for must use one of: skill:<name>, tool:<name>, runtime:<name>, channel:<name>")
@@ -55,12 +57,13 @@ def parse_scope(required_for: str) -> tuple[str, str]:
     kind = kind.strip().lower()
     scope_id = scope_id.strip()
     bucket = SCOPE_BUCKETS.get(kind)
-    if not bucket or not scope_id:
+    if not bucket or not scope_id or ":" in scope_id or any(ch.isspace() for ch in scope_id):
         raise SecretRequestError("required_for must use one of: skill:<name>, tool:<name>, runtime:<name>, channel:<name>")
     return bucket, scope_id
 
 
 def normalize_allowlist(data: Any) -> dict[str, Any]:
+    """Normalize persisted allowlist data and drop malformed entries."""
     if not isinstance(data, dict):
         return _blank_allowlist()
     normalized = _blank_allowlist()
@@ -91,6 +94,7 @@ def normalize_allowlist(data: Any) -> dict[str, Any]:
 
 
 def load_allowlist() -> dict[str, Any]:
+    """Load the allowlist, treating missing or invalid data as empty."""
     path = allowlist_path()
     if not path.exists():
         return _blank_allowlist()
@@ -104,6 +108,7 @@ def load_allowlist() -> dict[str, Any]:
 
 
 def save_allowlist(data: dict[str, Any]) -> None:
+    """Persist the allowlist atomically with best-effort private permissions."""
     get_mclaw_home().mkdir(parents=True, exist_ok=True)
     atomic_json_write(allowlist_path(), normalize_allowlist(data))
     try:
@@ -113,6 +118,7 @@ def save_allowlist(data: dict[str, Any]) -> None:
 
 
 def is_authorized(required_for: str, env_var: str) -> bool:
+    """Return whether a scope may receive one environment variable."""
     bucket, scope_id = parse_scope(required_for)
     env_name = _normalize_env_var(env_var)
     scopes = load_allowlist().get(bucket, {})
@@ -120,6 +126,7 @@ def is_authorized(required_for: str, env_var: str) -> bool:
 
 
 def authorize(required_for: str, env_vars: Iterable[str]) -> list[str]:
+    """Add environment variables to a scope allowlist without storing values."""
     bucket, scope_id = parse_scope(required_for)
     data = load_allowlist()
     current = list(data.setdefault(bucket, {}).setdefault(scope_id, []))
@@ -143,6 +150,7 @@ def authorized_env_vars(required_for: str) -> list[str]:
 
 
 def build_scoped_env(required_for: str | None) -> tuple[dict[str, str], set[str]]:
+    """Return only authorized secret values and their env names for subprocesses."""
     if not required_for:
         return {}, set()
     env: dict[str, str] = {}
@@ -185,11 +193,13 @@ def _normalize_secret_item(item: Any) -> dict[str, str]:
         return {"env_var": env_var, "provider": "", "purpose": ""}
     if not isinstance(item, dict):
         raise SecretRequestError("secrets must be strings or objects with env_var")
-    env_var = _normalize_env_var(item.get("env_var") or item.get("name"))
+    if not item.get("env_var"):
+        raise SecretRequestError("secret objects must include env_var")
+    env_var = _normalize_env_var(item.get("env_var"))
     return {
         "env_var": env_var,
         "provider": str(item.get("provider") or "").strip(),
-        "purpose": str(item.get("purpose") or item.get("reason") or "").strip(),
+        "purpose": str(item.get("purpose") or "").strip(),
     }
 
 
@@ -200,6 +210,11 @@ def secret_request_many(
     *,
     force_refresh: bool = False,
 ) -> dict[str, Any]:
+    """Coordinate secret prompts, storage, and scoped authorization.
+
+    Plaintext values can be saved through config helpers but are never returned
+    in the result payload; callers receive only env var names and status lists.
+    """
     bucket, _scope_id = parse_scope(required_for)
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()

@@ -13,9 +13,8 @@ from __future__ import annotations
 import json
 import logging
 import re
-import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from mclaw.tools.dispatch import get_current_session_id, get_session_db
 from mclaw.tools.registry import registry, tool_error
@@ -31,6 +30,7 @@ DEFAULT_LIMIT = 3
 MAX_LIMIT = 5
 
 _HIDDEN_SESSION_SOURCES = frozenset({"tool"})
+_ERROR_DETAIL_MAX_CHARS = 500
 
 
 def _coerce_limit(limit: Any) -> int:
@@ -42,6 +42,7 @@ def _coerce_limit(limit: Any) -> int:
 
 
 def _resolve_db(parent_agent: Any = None) -> Any:
+    """Prefer dispatch-scoped DB, then fall back to the parent agent handle."""
     db = get_session_db()
     if db is not None:
         return db
@@ -49,6 +50,7 @@ def _resolve_db(parent_agent: Any = None) -> Any:
 
 
 def _resolve_current_session_id(parent_agent: Any = None) -> str:
+    """Resolve the active session so recall can exclude the current thread tree."""
     current = get_current_session_id()
     if current:
         return current
@@ -62,7 +64,7 @@ def _resolve_workspace(parent_agent: Any = None) -> str:
 
 
 def _resolve_to_parent(session_id: str, db: Any) -> str:
-    """Walk a child/delegation/compression chain to the root session."""
+    """Walk a session parent chain to the root session."""
     visited = set()
     sid = session_id
     while sid and sid not in visited:
@@ -93,9 +95,9 @@ def _format_timestamp(ts: Any) -> str:
         return str(ts)
 
 
-def _build_conversation_text(messages: List[Dict[str, Any]]) -> str:
+def _build_conversation_text(messages: list[dict[str, Any]]) -> str:
     """Render stored messages into a compact transcript for summarization."""
-    parts: List[str] = []
+    parts: list[str] = []
     for msg in messages:
         role = str(msg.get("role") or "unknown").upper()
         content = msg.get("content") or ""
@@ -131,12 +133,13 @@ def _truncate_around_matches(
     query: str,
     max_chars: int = MAX_SESSION_TRANSCRIPT_CHARS,
 ) -> str:
+    """Keep summarization input centered on the first likely query match."""
     if not full_text or len(full_text) <= max_chars:
         return full_text
 
     text_lower = full_text.lower()
     terms = [t for t in re.split(r"\s+", query.lower().strip()) if t and t.upper() not in {"AND", "OR", "NOT"}]
-    positions: List[int] = []
+    positions: list[int] = []
 
     phrase = query.lower().strip().strip('"')
     if phrase:
@@ -162,7 +165,7 @@ def _truncate_around_matches(
     return prefix + full_text[start:end] + suffix
 
 
-def _first_user_title(messages: List[Dict[str, Any]]) -> Optional[str]:
+def _first_user_title(messages: list[dict[str, Any]]) -> str | None:
     for msg in messages:
         if msg.get("role") == "user":
             title = (msg.get("content") or "").strip()
@@ -176,6 +179,22 @@ def _fallback_summary(conversation_text: str) -> str:
     if len(preview) > MAX_FALLBACK_PREVIEW_CHARS:
         preview = preview[:MAX_FALLBACK_PREVIEW_CHARS] + "\n...[truncated preview]"
     return "[Raw preview: session summarization unavailable]\n" + preview
+
+
+def _safe_error_detail(exc: BaseException | str) -> str:
+    """Format exception text for tool output while redacting likely secrets."""
+    detail = str(exc)
+    if not isinstance(exc, str):
+        detail = f"{type(exc).__name__}: {detail or type(exc).__name__}"
+    detail = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s,;]+",
+        r"\1=<redacted>",
+        detail,
+    )
+    detail = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", detail)
+    if len(detail) > _ERROR_DETAIL_MAX_CHARS:
+        detail = detail[:_ERROR_DETAIL_MAX_CHARS] + "...[truncated]"
+    return detail
 
 
 def _for_log(text: str, max_chars: int = MAX_LOG_SUMMARY_CHARS) -> str:
@@ -192,9 +211,10 @@ def _strip_reasoning_blocks(text: str) -> str:
 def _summarize_conversation(
     conversation_text: str,
     query: str,
-    session_meta: Dict[str, Any],
+    session_meta: dict[str, Any],
     parent_agent: Any = None,
-) -> tuple[str, bool]:
+) -> tuple[str, bool, str | None]:
+    """Summarize a matched session, returning a preview fallback on LLM failure."""
     system_prompt = (
         "你在为当前 Agent 召回历史会话。围绕检索主题输出中文事实摘要。"
         "保留用户目标、已做操作、关键决定、命令、文件路径、错误、结果和未解决事项。"
@@ -233,9 +253,11 @@ def _summarize_conversation(
                 session_meta.get("source", "unknown"),
                 _for_log(summary),
             )
-            return summary, False
+            return summary, False, None
+        summary_error = "Auxiliary model returned an empty summary."
     except Exception as exc:
-        logger.warning("Session summarization unavailable: %s", exc)
+        summary_error = _safe_error_detail(exc)
+        logger.warning("Session summarization unavailable: %s", summary_error)
     fallback = _fallback_summary(conversation_text)
     logger.info(
         "session_search using fallback preview: query=%r source=%s preview_len=%d",
@@ -249,16 +271,17 @@ def _summarize_conversation(
         session_meta.get("source", "unknown"),
         _for_log(fallback),
     )
-    return fallback, True
+    return fallback, True, summary_error
 
 
 def _build_session_summary(
     db: Any,
     session_id: str,
     query: str,
-    match_info: Dict[str, Any],
+    match_info: dict[str, Any],
     parent_agent: Any = None,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
+    """Build one search result by loading, trimming, and summarizing a session."""
     session_meta = db.get_session(session_id) or {}
     messages = db.get_messages_as_conversation(session_id)
     if not messages:
@@ -266,7 +289,7 @@ def _build_session_summary(
 
     conversation_text = _build_conversation_text(messages)
     conversation_text = _truncate_around_matches(conversation_text, query)
-    summary, fallback = _summarize_conversation(conversation_text, query, session_meta, parent_agent)
+    summary, fallback, summary_error = _summarize_conversation(conversation_text, query, session_meta, parent_agent)
 
     entry = {
         "session_id": session_id,
@@ -279,6 +302,8 @@ def _build_session_summary(
     }
     if fallback:
         entry["summary_unavailable"] = True
+        if summary_error:
+            entry["summary_unavailable_reason"] = summary_error
     logger.info(
         "session_search built result: session_id=%s has_model_summary=%s summary_len=%d",
         session_id,
@@ -298,7 +323,8 @@ def _list_recent_sessions(
     limit: int,
     current_session_id: str,
     workspace: str = "",
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
+    """List recent session metadata while hiding tool-only and current-root sessions."""
     rows = db.list_sessions_rich(
         exclude_sources=list(_HIDDEN_SESSION_SOURCES),
         limit=limit + 5,
@@ -327,11 +353,11 @@ def _list_recent_sessions(
 
 def session_search(
     query: str = "",
-    role_filter: str = None,
+    role_filter: str | None = None,
     limit: int = DEFAULT_LIMIT,
     parent_agent: Any = None,
 ) -> str:
-    """Search past sessions by keyword or browse recent sessions."""
+    """Search past sessions by keyword or browse recent session metadata."""
     db = _resolve_db(parent_agent)
     if db is None:
         return tool_error("Session database not available.", success=False)
@@ -352,14 +378,26 @@ def session_search(
     query = str(query).strip()
     role_list = [r.strip() for r in role_filter.split(",") if r.strip()] if role_filter else None
 
-    raw_results = db.search_messages(
-        query=query,
-        role_filter=role_list,
-        exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-        limit=50,
-        offset=0,
-        workspace=workspace or None,
-    )
+    try:
+        raw_results = db.search_messages(
+            query=query,
+            role_filter=role_list,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=50,
+            offset=0,
+            workspace=workspace or None,
+        )
+    except Exception as exc:
+        detail = _safe_error_detail(exc)
+        logger.warning("Session search query failed: %s", detail, exc_info=True)
+        return tool_error(
+            "Session search failed while querying the session index.",
+            success=False,
+            mode="search",
+            query=query,
+            error_type=type(exc).__name__,
+            detail=detail,
+        )
 
     if not raw_results:
         return json.dumps({
@@ -373,7 +411,7 @@ def session_search(
         }, ensure_ascii=False)
 
     current_root = _resolve_to_parent(current_session_id, db) if current_session_id else None
-    seen_sessions: Dict[str, Dict[str, Any]] = {}
+    seen_sessions: dict[str, dict[str, Any]] = {}
     for result in raw_results:
         raw_sid = result.get("session_id", "")
         if not raw_sid:
@@ -386,23 +424,29 @@ def session_search(
         if len(seen_sessions) >= limit:
             break
 
-    summaries: List[Dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
+    partial_errors: list[dict[str, str]] = []
     for sid, match_info in seen_sessions.items():
         try:
             summary = _build_session_summary(db, sid, query, match_info, parent_agent)
             if summary:
                 summaries.append(summary)
         except Exception as exc:
-            logger.warning("Failed to summarize session %s: %s", sid, exc)
+            detail = _safe_error_detail(exc)
+            logger.warning("Failed to summarize session %s: %s", sid, detail, exc_info=True)
+            partial_errors.append({"session_id": sid, "error": detail})
 
-    return json.dumps({
+    payload: dict[str, Any] = {
         "success": True,
         "mode": "search",
         "query": query,
         "results": summaries,
         "count": len(summaries),
         "sessions_searched": len(seen_sessions),
-    }, ensure_ascii=False)
+    }
+    if partial_errors:
+        payload["partial_errors"] = partial_errors
+    return json.dumps(payload, ensure_ascii=False)
 
 
 SESSION_SEARCH_SCHEMA = {
@@ -460,7 +504,7 @@ registry.register(
         limit=args.get("limit", DEFAULT_LIMIT),
         parent_agent=kw.get("parent_agent"),
     ),
-    description="MClaw跨回话记忆",
+    description="Search past conversations",
     emoji="🕘",
     max_result_size_chars=MAX_TOOL_RESULT_CHARS,
 )

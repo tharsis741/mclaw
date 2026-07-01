@@ -11,7 +11,6 @@ import copy
 import json
 import logging
 import os
-import sys
 import threading
 from typing import Any
 
@@ -20,13 +19,9 @@ from mclaw.tools.dispatch import tool_dispatch_policy
 
 logger = logging.getLogger(__name__)
 
-MEMORY_REVIEW_PROMPT = background_prompts.MEMORY_REVIEW_PROMPT
-EVOLUTION_REVIEW_PROMPT = background_prompts.EVOLUTION_REVIEW_PROMPT
-COMBINED_REVIEW_PROMPT = background_prompts.COMBINED_REVIEW_PROMPT
-
 REVIEW_MEMORY_TOOL_WHITELIST = {"memory_read", "memory_add", "memory_replace", "memory_remove"}
 REVIEW_TOOL_WHITELIST = REVIEW_MEMORY_TOOL_WHITELIST | {"skills_list", "skill_tree", "skill_view", "skill_manage"}
-REVIEW_SKILL_ACTION_WHITELIST = {
+REVIEW_SKILL_ACTION_ORDER = (
     "create",
     "edit",
     "patch",
@@ -34,21 +29,11 @@ REVIEW_SKILL_ACTION_WHITELIST = {
     "write_file",
     "remove_file",
     "evolution_update",
+)
+REVIEW_SKILL_ACTION_WHITELIST = frozenset(REVIEW_SKILL_ACTION_ORDER)
+REVIEW_SKILL_ACTION_RANK = {
+    action: index for index, action in enumerate(REVIEW_SKILL_ACTION_ORDER)
 }
-
-
-def _review_agent_factory(parent: Any) -> Any:
-    """Return the active class/factory for the parent agent.
-
-    Tests and embedders sometimes patch the agent class on its defining module.
-    Resolving through the module preserves that hook while keeping this module
-    independent from mclaw.agent.core imports.
-    """
-    agent_cls = parent.__class__
-    module = sys.modules.get(getattr(agent_cls, "__module__", ""))
-    if module is not None:
-        return getattr(module, getattr(agent_cls, "__name__", ""), agent_cls)
-    return agent_cls
 
 
 def _prompt_for(review_memory: bool, review_skills: bool) -> str:
@@ -73,19 +58,11 @@ def _tool_name(tool_def: dict[str, Any]) -> str:
 
 
 def _restrict_review_agent_tools(review_agent: Any) -> None:
+    """Limit the cloned review agent to memory and Skill-evolution tools only."""
     tools = getattr(review_agent, "tools", []) or []
     if not isinstance(tools, list):
         tools = []
     filtered: list[dict[str, Any]] = []
-    action_order = [
-        "create",
-        "edit",
-        "patch",
-        "delete",
-        "write_file",
-        "remove_file",
-        "evolution_update",
-    ]
     for tool_def in tools:
         if not isinstance(tool_def, dict):
             continue
@@ -96,17 +73,16 @@ def _restrict_review_agent_tools(review_agent: Any) -> None:
         if name == "skill_manage":
             try:
                 properties = cloned["function"]["parameters"]["properties"]
-                properties["action"]["enum"] = [
-                    action for action in action_order if action in REVIEW_SKILL_ACTION_WHITELIST
-                ]
-            except Exception:
-                pass
+                properties["action"]["enum"] = list(REVIEW_SKILL_ACTION_ORDER)
+            except (KeyError, TypeError) as exc:
+                logger.debug("Could not narrow background review skill_manage schema: %s", exc)
         filtered.append(cloned)
     review_agent.tools = filtered
     review_agent.valid_tool_names = {_tool_name(tool_def) for tool_def in filtered}
 
 
 def _tool_result_signature(msg: dict[str, Any]) -> str:
+    """Build a stable signature for comparing tool results across snapshots."""
     content = msg.get("content", "")
     try:
         return json.dumps(json.loads(content), sort_keys=True, ensure_ascii=False)
@@ -119,15 +95,6 @@ def summarize_background_review_actions(
     prior_snapshot: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """Summarize successful Skill writes created by this review pass only."""
-    action_order = {
-        "create": 0,
-        "edit": 1,
-        "patch": 2,
-        "delete": 3,
-        "write_file": 4,
-        "remove_file": 5,
-        "evolution_update": 6,
-    }
     prior_tool_results = {
         _tool_result_signature(msg)
         for msg in (prior_snapshot or [])
@@ -147,9 +114,9 @@ def summarize_background_review_actions(
         if not data.get("success"):
             continue
         action = str(data.get("action") or "").strip()
-        if action not in action_order:
+        if action not in REVIEW_SKILL_ACTION_WHITELIST:
             continue
-        name = str(data.get("name") or data.get("skill_name") or "").strip()
+        name = str(data.get("name") or "").strip()
         if not name:
             continue
         actions_by_name.setdefault(name, set()).add(action)
@@ -159,29 +126,29 @@ def summarize_background_review_actions(
 
     def _status_label(actions: set[str]) -> str:
         if "delete" in actions:
-            return "\u5df2\u5220\u9664"
+            return "已删除"
         if "create" in actions and (actions - {"create"}):
-            return "\u5df2\u521b\u5efa\u5e76\u5b8c\u5584"
+            return "已创建并完善"
         if "create" in actions:
-            return "\u5df2\u521b\u5efa"
+            return "已创建"
         if "evolution_update" in actions:
-            return "\u5df2\u66f4\u65b0\u7ecf\u9a8c"
+            return "已更新经验"
         if actions & {"edit", "patch", "write_file", "remove_file"}:
-            return "\u5df2\u66f4\u65b0"
-        return "\u5df2\u4fdd\u5b58"
+            return "已更新"
+        return "已保存"
 
     skills = [
         {
             "name": name,
-            "actions": sorted(actions, key=lambda item: action_order[item]),
+            "actions": sorted(actions, key=lambda item: REVIEW_SKILL_ACTION_RANK[item]),
             "status": _status_label(actions),
         }
         for name, actions in sorted(actions_by_name.items())
     ]
-    summary = "\uff1b".join(f"{item['name']}\uff08{item['status']}\uff09" for item in skills)
+    summary = "；".join(f"{item['name']}（{item['status']}）" for item in skills)
     return {
         "summary": summary,
-        "text": f"\u6280\u80fd\u5df2\u4fdd\u5b58\uff1a{summary}",
+        "text": f"技能已保存：{summary}",
         "skills": skills,
     }
 
@@ -194,6 +161,10 @@ def spawn_background_review(
     review_skills: bool = False,
 ) -> None:
     """Start an isolated background review thread for memory and Skill evolution."""
+    if not review_memory and not review_skills:
+        logger.debug("Background review skipped: no review target requested")
+        return
+
     prompt = _prompt_for(review_memory, review_skills)
     session_id = getattr(parent, "session_id", None)
     logger.info(
@@ -214,7 +185,9 @@ def spawn_background_review(
                 review_skills,
             )
             with open(os.devnull, "w") as devnull, contextlib.redirect_stdout(devnull), contextlib.redirect_stderr(devnull):
-                review_agent = _review_agent_factory(parent)(
+                # The review runs as a cloned agent so background memory and
+                # Skill updates cannot mutate the parent's turn state directly.
+                review_agent = parent.__class__(
                     model=parent.model,
                     api_key=parent.api_key,
                     base_url=parent.base_url,
@@ -225,7 +198,6 @@ def spawn_background_review(
                     system_prompt=_parent_system_prompt(parent, messages_snapshot),
                     enabled_toolsets=parent.enabled_toolsets,
                     config=getattr(parent, "config", None),
-                    skip_context_files=True,
                 )
                 if hasattr(parent, "session_start"):
                     review_agent.session_start = parent.session_start
@@ -242,6 +214,8 @@ def spawn_background_review(
                     tool_whitelist=REVIEW_TOOL_WHITELIST,
                     action_whitelist={"skill_manage": REVIEW_SKILL_ACTION_WHITELIST},
                 ):
+                    # The dispatch policy is the final safety boundary: even if
+                    # the cloned agent keeps extra schemas, only review tools run.
                     review_agent.run_conversation(
                         user_message=prompt,
                         conversation_history=messages_snapshot,
@@ -267,8 +241,8 @@ def spawn_background_review(
                     if print_fn:
                         try:
                             print_fn(f"  {display_text}")
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.debug("Background skill review print callback failed: %s", exc)
                 else:
                     logger.info("Background skill review completed: nothing to save")
             logger.info(
@@ -287,4 +261,4 @@ def spawn_background_review(
                 except Exception as refresh_exc:
                     logger.debug("Background memory review snapshot refresh failed: %s", refresh_exc)
 
-    threading.Thread(target=_run_review, daemon=True).start()
+    threading.Thread(target=_run_review, daemon=True, name="mclaw-background-review").start()

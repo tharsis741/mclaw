@@ -11,14 +11,13 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
 
 from mclaw.tools.browser_backend import BrowserBackend
+from mclaw.tools.browser_requirements import check_browser_requirements, diagnose_browser_requirements
 from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -28,13 +27,14 @@ logger = logging.getLogger(__name__)
 _SESSION_TIMEOUT = 300.0  # seconds
 _CLEANUP_INTERVAL = 30.0
 
-_browser_sessions: Dict[str, "BrowserSession"] = {}
+_browser_sessions: dict[str, "BrowserSession"] = {}
 _sessions_lock = threading.Lock()
 _cleanup_started = False
 _REF_RE = re.compile(r"^e\d+$")
 
 
 class BrowserSession:
+    """Tool-level session wrapper with one backend and inactivity timestamp."""
     def __init__(self, session_id: str):
         self.session_id = session_id
         self.backend = BrowserBackend(headless=True)
@@ -54,6 +54,7 @@ class BrowserSession:
 
 
 def _get_or_create_session(session_id: str) -> BrowserSession:
+    """Return a cached browser session and refresh its inactivity timer."""
     with _sessions_lock:
         sess = _browser_sessions.get(session_id)
         if sess is None:
@@ -83,6 +84,7 @@ def _cleanup_loop() -> None:
 
 
 def _start_cleanup_if_needed() -> None:
+    """Start the daemon cleanup thread once for the process."""
     global _cleanup_started
     if _cleanup_started:
         return
@@ -111,11 +113,12 @@ def _resolve_session_id(parent_agent=None) -> str:
 
 
 def _strip_ref_prefix(ref: str) -> str:
-    """Allow '@e5' or 'e5' → 'e5'."""
+    """Normalize element refs such as '@e5' or 'e5' to 'e5'."""
     return ref.lstrip("@").strip()
 
 
-def _clean_ref(ref: str) -> tuple[Optional[str], Optional[str]]:
+def _clean_ref(ref: str) -> tuple[str | None, str | None]:
+    """Validate that a model-supplied ref came from the latest snapshot format."""
     if not ref or not isinstance(ref, str):
         return None, "ref is required"
     clean = _strip_ref_prefix(ref)
@@ -124,30 +127,18 @@ def _clean_ref(ref: str) -> tuple[Optional[str], Optional[str]]:
     return clean, None
 
 
-def _output_path_error(path: Optional[str], tool_name: str, parent_agent=None) -> Optional[str]:
+def _output_path_error(path: str | None, tool_name: str, parent_agent=None) -> str | None:
+    """Apply file-tool safety checks before browser tools write artifacts."""
     if not path:
         return None
     try:
         from mclaw.tools import file_operations as ops
+        from mclaw.tools.file_tools import _check_delegation_path, _skill_store_mutation_error
 
-        if ops._check_sensitive_path_write(path):
-            return f"File safety blocked {tool_name}: sensitive path is not writable: {path}"
-    except Exception as exc:
-        return f"File safety blocked {tool_name}: invalid path {path!r}: {exc}"
-
-    try:
-        from mclaw.tools.file_tools import (
-            FILE_WRITE_BLOCKED_PREFIXES,
-            _check_delegation_path,
-            _skill_store_mutation_error,
-        )
-
-        normalized = ops._normalize_path(path)
-        normalized_lower = normalized.lower()
-        for blocked_prefix in FILE_WRITE_BLOCKED_PREFIXES:
-            blocked = str(blocked_prefix).rstrip("/\\").lower()
-            if normalized_lower == blocked or normalized_lower.startswith(blocked + os.sep):
-                return f"File safety blocked {tool_name}: sensitive path is not writable: {path}"
+        try:
+            ops._checked_path(path, "write")
+        except PermissionError as exc:
+            return f"File safety blocked {tool_name}: {exc}"
 
         blocked = _skill_store_mutation_error(path, tool_name)
         if blocked:
@@ -156,7 +147,7 @@ def _output_path_error(path: Optional[str], tool_name: str, parent_agent=None) -
         if not safe:
             return err
     except Exception as exc:
-        logger.debug("Browser output path policy check failed: %s", exc)
+        return f"File safety blocked {tool_name}: invalid or unsafe output path {path!r}: {exc}"
     return None
 
 
@@ -211,7 +202,7 @@ def browser_snapshot(parent_agent=None) -> str:
 
 # ── 3. browser_screenshot ───────────────────────────────────────────────────
 
-def browser_screenshot(path: Optional[str] = None, parent_agent=None) -> str:
+def browser_screenshot(path: str | None = None, parent_agent=None) -> str:
     """Take a full-page screenshot."""
     err = _output_path_error(path, "browser_screenshot", parent_agent)
     if err:
@@ -309,9 +300,9 @@ def browser_press(key: str, parent_agent=None) -> str:
 # ── 8. browser_download ─────────────────────────────────────────────────────
 
 def browser_download(
-    url: Optional[str] = None,
-    path: Optional[str] = None,
-    ref: Optional[str] = None,
+    url: str | None = None,
+    path: str | None = None,
+    ref: str | None = None,
     parent_agent=None,
 ) -> str:
     """Download a file by direct URL, by clicking a ref, or by returning a queued click download."""
@@ -334,73 +325,6 @@ def browser_download(
     except Exception as e:
         logger.exception("browser_download error: %s", e)
         return tool_error(str(e), success=False)
-
-
-# ── Requirements check ──────────────────────────────────────────────────────
-
-def _has_chromium_browser(root: "Path") -> bool:
-    return any(root.glob("chromium-*")) or any(root.glob("chrome-*")) or any(root.glob("**/chrome.exe"))
-
-
-def _find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, str]:
-    import os
-    from pathlib import Path
-
-    env_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip().strip('"')
-    if env_value:
-        root = Path(env_value)
-        if not root.exists():
-            return False, f"{env_value}; path does not exist"
-        return _has_chromium_browser(root), f"{env_value}; chromium={'yes' if _has_chromium_browser(root) else 'no'}"
-
-    candidates: list[Path] = []
-    local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_appdata:
-        candidates.append(Path(local_appdata) / "ms-playwright")
-    candidates.append(Path.home() / ".cache" / "ms-playwright")
-    if os.name == "nt":
-        candidates.append(Path.home() / "AppData" / "Local" / "ms-playwright")
-
-    seen: set[str] = set()
-    for root in candidates:
-        key = os.path.normcase(str(root))
-        if key in seen:
-            continue
-        seen.add(key)
-        if root.exists():
-            return _has_chromium_browser(root), f"{root}; chromium={'yes' if _has_chromium_browser(root) else 'no'}; source=default cache"
-    return False, "not found in PLAYWRIGHT_BROWSERS_PATH or default Playwright cache"
-
-
-def diagnose_browser_requirements(config: dict | None = None) -> dict:
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
-        return {
-            "available": False,
-            "reason": "Playwright Python package is missing",
-            "fix": "Install playwright in the active Python environment.",
-        }
-
-    has_chromium, detail = _find_playwright_browsers_root(config)
-    if not has_chromium:
-        return {
-            "available": False,
-            "reason": detail,
-            "fix": "Run python -m playwright install chromium.",
-        }
-    return {"available": True, "reason": detail, "fix": ""}
-
-
-def check_browser_requirements(config: dict | None = None) -> bool:
-    """Return True if Playwright and a Chromium browser binary are available."""
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
-        return False
-
-    has_chromium, _ = _find_playwright_browsers_root(config)
-    return has_chromium
 
 
 # ── Registry ────────────────────────────────────────────────────────────────
@@ -430,7 +354,7 @@ _BROWSER_TOOLS = [
         "name": "browser_snapshot",
         "description": (
             "Capture an accessibility snapshot of the current page. Shows interactive "
-            "elements (links, buttons, inputs) with ref IDs like [3] link 'Login'.\n\n"
+            "elements (links, buttons, inputs) with ref IDs like [e3] link 'Login'.\n\n"
             "Use this to understand the page structure before clicking or typing."
         ),
         "params": {
@@ -445,7 +369,7 @@ _BROWSER_TOOLS = [
         "description": (
             "Take a full-page screenshot and save it to a file. Returns the file path.\n\n"
             "Use this when the user asks about visual aspects of a page (colors, layout, etc.) "
-            "or when you need to share what you see. The screenshot can then be analysed with vision_analyze."
+            "or when you need to share what you see. The screenshot can then be analyzed with vision_analyze."
         ),
         "params": {
             "type": "object",
@@ -464,7 +388,7 @@ _BROWSER_TOOLS = [
         "description": (
             "Click an element on the page by its ref ID. Ref IDs come from browser_snapshot "
             "or browser_navigate output (e.g. 'e5' or '@e5').\n\n"
-            "After clicking, the page may navigate — the result includes the new snapshot."
+            "After clicking, the page may navigate - the result includes the new snapshot."
         ),
         "params": {
             "type": "object",
@@ -547,9 +471,9 @@ _BROWSER_TOOLS = [
         "name": "browser_download",
         "description": (
             "Download a file. Modes:\n"
-            "1. Provide a direct download URL — the browser navigates to it and captures the file.\n"
-            "2. Provide a ref from browser_snapshot — the browser clicks it and waits for the download.\n"
-            "3. Omit URL/ref — return the latest download already captured by browser_click.\n\n"
+            "1. Provide a direct download URL - the browser navigates to it and captures the file.\n"
+            "2. Provide a ref from browser_snapshot - the browser clicks it and waits for the download.\n"
+            "3. Omit URL/ref - return the latest download already captured by browser_click.\n\n"
             "Returns the saved file path and size."
         ),
         "params": {
@@ -591,7 +515,7 @@ for _tool in _BROWSER_TOOLS:
         },
         handler=_tool["handler"],
         check_fn=check_browser_requirements,
-        description="浏览器自动化工具",
+        description=_tool["description"].split("\n", 1)[0],
         emoji=_tool["emoji"],
         max_result_size_chars=12_000,
         diagnose_fn=diagnose_browser_requirements,

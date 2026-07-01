@@ -15,6 +15,7 @@ from typing import Iterable
 
 @dataclass(frozen=True)
 class PathDecision:
+    """Result of classifying and authorizing a filesystem path."""
     original: str
     resolved: Path
     action: str
@@ -34,6 +35,7 @@ def _normcase(value: str) -> str:
 
 
 def is_relative_to(path: Path, root: Path) -> bool:
+    """Return whether path is within root, with a normcase fallback."""
     try:
         path.relative_to(root)
         return True
@@ -86,6 +88,7 @@ class PathPolicy:
             return Path(path).expanduser().absolute()
 
     def normalize(self, path_value: str | os.PathLike, base: str | os.PathLike | None = None) -> Path:
+        """Expand user/env syntax and resolve relative paths against a base."""
         value = os.path.expandvars(str(path_value or "")).strip().strip('"').strip("'")
         if not value:
             value = "."
@@ -104,6 +107,7 @@ class PathPolicy:
         return self.mclaw_home / "delegations"
 
     def session_root(self, session_id: str) -> Path:
+        """Return a sanitized per-session workspace under MCLAW_HOME."""
         safe = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in str(session_id or "session"))
         return self.mclaw_home / "workspace" / safe
 
@@ -117,10 +121,12 @@ class PathPolicy:
         return is_relative_to(path, self._resolve_root(root))
 
     def is_runtime_internal_path(self, path_value: str | os.PathLike) -> bool:
+        """Return whether a path belongs to logs, sessions, checkpoints, or processes."""
         path = self.normalize(path_value)
         return any(is_relative_to(path, root) for root in self._internal_roots)
 
     def classify(self, path: Path) -> str:
+        """Classify a resolved path into a policy scope."""
         workspace_roots = (self.workspace_root, self.delegation_root(), self.tmp_root, *self.workspace_roots)
         if any(is_relative_to(path, root) for root in workspace_roots):
             return "workspace"
@@ -154,6 +160,7 @@ class PathPolicy:
         base: str | os.PathLike | None = None,
         maintenance: bool = False,
     ) -> PathDecision:
+        """Authorize one path action under the runtime path policy."""
         path = self.normalize(path_value, base=base)
         action = str(action or "read").lower()
         scope = self.classify(path)

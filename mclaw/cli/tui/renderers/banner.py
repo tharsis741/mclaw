@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render startup branding and setup status for the M-Claw TUI."""
+"""Render the startup banner and enabled toolset summary for the CLI."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ from mclaw.cli.tui.theme import ACCENT_COLOR, ACCENT_DIM, ACCENT_LIGHT, BANNER_T
 
 
 class BannerRenderer:
+    """Build the branded startup panel without leaking Rich layout details upstream."""
+
     def __init__(
         self,
         *,
@@ -29,6 +31,7 @@ class BannerRenderer:
         self._logo = logo
 
     def _enabled_toolset_rows(self, agent) -> list[tuple[str, str, str, list[str]]]:
+        """Return enabled tools grouped by display toolset for the startup banner."""
         from mclaw.tools.registry import registry
         from mclaw.tools.toolsets import TOOLSETS
 
@@ -47,6 +50,7 @@ class BannerRenderer:
         for toolset in ordered_toolsets:
             raw_tools = grouped[toolset]
             meta = TOOLSETS.get(toolset, {})
+            # Keep declared tool ordering for known toolsets, then append registry-only tools.
             declared_tools = [
                 name for name in meta.get("tools", [])
                 if name in raw_tools
@@ -60,6 +64,7 @@ class BannerRenderer:
         return rows
 
     def render(self, *, model: str, provider: str, session_id: str, agent) -> None:
+        """Print startup context for the active model, session, workspace, and tools."""
         term_w = shutil.get_terminal_size().columns
         cc = MClawConsole()
         model_short = model.split("/")[-1] if "/" in model else model
@@ -78,8 +83,8 @@ class BannerRenderer:
                 logo_table.add_row(RichText.from_markup(logo_line))
 
             cc.print(logo_table)
-            cc.print(f"  [{ACCENT_LIGHT} bold]自进化多平台 AI Agent[/]")
-            cc.print(f"  [{ACCENT_DIM}]Cross-platform desktop CLI intelligent agent[/]")
+            cc.print(f"  [{ACCENT_LIGHT} bold]自进化空间智能体[/]")
+            cc.print(f"  [{ACCENT_DIM}]Self-Evolving Robot Intelligence[/]")
             cc.print("")
 
         content = Table.grid(pad_edge=False)

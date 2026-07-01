@@ -67,6 +67,7 @@ class AgentRunner:
         self._event_callbacks: dict[str, tuple[asyncio.AbstractEventLoop, AgentEventCallback]] = {}
 
     def get_status(self, session_id: str) -> str:
+        """Return the coarse execution state for a channel session."""
         if session_id in self._active_agents:
             return "running"
         if session_id in self._pending:
@@ -74,6 +75,7 @@ class AgentRunner:
         return "idle"
 
     def interrupt(self, session_id: str) -> bool:
+        """Cancel active work and discard queued input for one session."""
         self._pending.pop(session_id, None)
         agent = self._active_agents.get(session_id)
         if not agent:
@@ -83,6 +85,7 @@ class AgentRunner:
         return True
 
     def interrupt_all(self) -> int:
+        """Interrupt all active or queued channel sessions."""
         interrupted = 0
         for session_id in list(set(self._pending) | set(self._active_agents)):
             if self.interrupt(session_id):
@@ -111,6 +114,7 @@ class AgentRunner:
         loop: asyncio.AbstractEventLoop,
         callback: AgentEventCallback,
     ) -> None:
+        """Attach an async event sink for agent streaming callbacks."""
         self._event_callbacks[session_id] = (loop, callback)
 
     async def handle_message(
@@ -122,6 +126,7 @@ class AgentRunner:
         reply_callback: ReplyCallback,
         extra_system: str = "",
     ) -> AgentTurnResult:
+        """Serialize turns per session while coalescing one pending message."""
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         if lock.locked():
             self._pending[session_id] = message
@@ -155,16 +160,16 @@ class AgentRunner:
         conversation_history: list[dict] | None,
         extra_system: str = "",
     ) -> AgentTurnResult:
+        """Run one MClaw conversation turn on a worker thread."""
         agent = self._get_or_create_agent(session_id=session_id)
         self._active_agents[session_id] = agent
         try:
             result = await asyncio.to_thread(
                 agent.run_conversation,
-                message.text,
-                conversation_history,
-                False,
-                False,
-                extra_system,
+                user_message=message.text,
+                conversation_history=conversation_history,
+                disable_tools=False,
+                extra_system=extra_system,
             )
             return AgentTurnResult(
                 session_id=session_id,
@@ -183,6 +188,7 @@ class AgentRunner:
                 self._touch_agent(session_id, agent)
 
     def _get_or_create_agent(self, *, session_id: str) -> "MClaw":
+        """Return an existing session agent or create one bound to channel config."""
         from mclaw.agent.core import MClaw
 
         now = time.time()
@@ -212,6 +218,7 @@ class AgentRunner:
         return agent
 
     def _emit_agent_event(self, session_id: str, event: dict[str, Any]) -> None:
+        """Bridge synchronous agent callbacks back into the channel event loop."""
         bound = self._event_callbacks.get(session_id)
         if not bound:
             return
@@ -228,10 +235,12 @@ class AgentRunner:
             logger.warning("channel agent event callback failed session=%s: %s", session_id, exc)
 
     def _touch_agent(self, session_id: str, agent: "MClaw") -> None:
+        """Mark a cached agent as recently used."""
         self._agents[session_id] = (agent, time.time())
         self._agents.move_to_end(session_id)
 
     def _evict_idle(self, now: float) -> None:
+        """Drop inactive cached agents whose idle TTL has expired."""
         if self.cache_idle_ttl_seconds <= 0:
             return
         stale = [
@@ -242,6 +251,7 @@ class AgentRunner:
             self._agents.pop(sid, None)
 
     def _enforce_cache_cap(self) -> None:
+        """Keep the agent cache under its configured capacity."""
         checked = 0
         while len(self._agents) > self.max_cached_agents and checked < len(self._agents):
             sid, _ = next(iter(self._agents.items()))

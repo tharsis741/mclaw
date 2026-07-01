@@ -13,18 +13,23 @@ from dataclasses import dataclass
 
 @dataclass
 class FilterResult:
+    """Decision returned after transcript policy checks."""
+
     action: str
     text: str = ""
     reason: str = ""
 
 
 class TranscriptFilter:
+    """Apply wake-word, dedupe, interrupt, and slash-command policy to ASR text."""
+
     def __init__(self, config: dict):
         self.config = config or {}
         self._last_text = ""
         self._last_at = 0.0
 
     def process(self, text: str, mode: str | None = None) -> FilterResult:
+        """Classify one transcript before it enters the normal prompt path."""
         raw = (text or "").strip()
         if not raw:
             return FilterResult("discard", reason="empty")
@@ -86,4 +91,3 @@ class TranscriptFilter:
             "abort",
             "interrupt",
         }
-

@@ -4,8 +4,8 @@
 
 """Function-call tools for Weixin outbound channel sessions.
 
-These tools send files and text through the Weixin target bound to the active
-agent session. They validate the session binding before attempting delivery.
+The tools only operate when the active agent session has a channel outbound
+target bound by the Weixin runtime; direct CLI or non-Weixin calls fail closed.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from mclaw.tools.registry import registry, tool_error
 
 
 def weixin_send_file(file_path: str, caption: str = "", as_file: bool = False, parent_agent=None) -> str:
+    """Send a local file through the Weixin target bound to the current session."""
     if parent_agent is None:
         return tool_error("weixin_send_file requires an active Weixin agent session", success=False)
     session_id = str(getattr(parent_agent, "session_id", "") or "")
@@ -76,6 +77,7 @@ WEIXIN_SEND_FILE_SCHEMA = {
 
 
 def _handle_weixin_send_file(args: dict, **kw) -> str:
+    """Registry adapter that keeps tool arguments isolated from runtime kwargs."""
     return weixin_send_file(
         file_path=args.get("file_path", ""),
         caption=args.get("caption", ""),
@@ -89,7 +91,7 @@ registry.register(
     toolset="weixin",
     schema=WEIXIN_SEND_FILE_SCHEMA,
     handler=_handle_weixin_send_file,
-    description="向当前微信私聊发送本地文件附件",
+    description="Send a file to the current Weixin private chat",
     emoji="📎",
     max_result_size_chars=2000,
 )

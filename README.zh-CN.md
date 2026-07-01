@@ -2,7 +2,7 @@
   <img src="docs/assets/rich%20logo.png" alt="M-CLAW Rich Logo" width="100%">
 </p>
 
-<h2 align="center">基于 M-Robots OS 的机器人智能体运行时</h2>
+<h2 align="center">自进化空间智能体<br>Self-Evolving Robot Intelligence</h2>
 
 <p align="center">
   <a href="#安装与启动">快速开始</a> ·
@@ -78,6 +78,8 @@ M-Claw 当前已经包含：
 
 不同模型的实际可用能力取决于 Provider endpoint 与模型自身对工具调用、流式输出、视觉输入等能力的支持。
 
+首次启动建议通过 `mclaw setup` 配置默认模型和 Provider。CLI、微信网关和钉钉网关都会从当前配置解析可用模型、Provider、API Key 和自定义 endpoint；如果缺少模型或密钥，会提示继续配置，不会隐式注入内置默认模型。
+
 ## 智能体循环
 
 ```text
@@ -125,6 +127,8 @@ M-Claw 当前已经包含：
 | browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download` | 基于 Playwright 的浏览器自动化，支持导航、快照、点击、输入、滚动、截图和下载。 |
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
 | dingtalk | `dingtalk_send_text`, `dingtalk_send_file` | 在当前钉钉会话中发送文本或文件。 |
+
+联网搜索默认使用 `auto` 后端：配置 Tavily 密钥时优先使用 Tavily，否则使用 DashScope/Qwen；当 Tavily 调用失败且 DashScope 凭据可用时，运行时会自动降级到 DashScope。可在交互式界面中使用 `/search-backend dashscope|tavily|auto` 查看或切换后端。
 
 ## 三层记忆体系
 
@@ -200,6 +204,8 @@ M-Claw 支持以下交互入口：
 - **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word、push-to-talk 和一次性录音模式。
 - **Scheduler**：本地定时任务引擎，支持 due detection、queued run、并发策略、失败计数、输出文件和投递结果。
 - **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
+
+`/schedule` 支持一次性、每日、每周、每月、间隔和 cron 任务。每周任务的 weekday 可填写英文星期或数字：`1` 到 `7` 对应 Monday 到 Sunday，`0` 按 Monday 处理；每月任务的日期超过当月天数时，会在执行时落到当月最后一天。定时任务投递到微信或钉钉前，需要先完成 `mclaw weixin login` 或 `mclaw dingtalk login`，并保持对应网关进程运行。
 
 ## 命令入口
 

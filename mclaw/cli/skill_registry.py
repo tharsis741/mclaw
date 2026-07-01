@@ -22,6 +22,8 @@ _BUILTIN_COMMANDS = builtin_command_names()
 
 @dataclass
 class SkillMeta:
+    """Cached Skill metadata used by slash completion and dispatch."""
+
     name: str
     description: str
     category: str
@@ -56,9 +58,11 @@ class SkillRegistry:
         logger.debug("SkillRegistry refreshed: %d skills", len(self._skills))
 
     def list_skills(self):
+        """Return cached Skills in stable slash-completion order."""
         return sorted(self._skills.values(), key=lambda s: s.name)
 
     def get_skill(self, name: str) -> SkillMeta | None:
+        """Return a cached Skill by slash command name."""
         return self._skills.get(name)
 
     def invalidate(self) -> None:
@@ -67,6 +71,7 @@ class SkillRegistry:
 
     @property
     def builtin_commands(self):
+        """Return built-in command names reserved from Skill registration."""
         return _BUILTIN_COMMANDS
 
 

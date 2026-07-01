@@ -15,10 +15,12 @@ REQUIRED_STATES = {"idle", "running", "review", "waiting", "waving", "failed"}
 
 
 def bundled_assets_dir() -> Path:
+    """Return the directory that contains packaged pet asset bundles."""
     return Path(__file__).resolve().parent / "assets"
 
 
 def resolve_asset_dir(asset: str) -> Path:
+    """Resolve a bundled asset name or an explicit filesystem asset path."""
     if not asset or asset == "default":
         asset = "robot-dark"
     candidate = Path(asset)
@@ -28,6 +30,7 @@ def resolve_asset_dir(asset: str) -> Path:
 
 
 def load_pet_manifest(asset: str) -> Dict[str, Any]:
+    """Load and validate the manifest contract required by the pet runtime."""
     asset_dir = resolve_asset_dir(asset)
     manifest_path = asset_dir / "pet.json"
     if not manifest_path.exists():

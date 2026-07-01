@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Skill 2.0 manager tool.
+"""Skill package manager tool.
 
 All Skill writes go through the skills_hub service layer. This module only
 normalizes tool arguments, returns JSON, and exposes the tool schema.
@@ -19,17 +19,21 @@ from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
 
-WRITE_RESET_ACTIONS = {
+SKILL_MANAGE_ACTION_ORDER = (
     "create_scaffold",
     "create",
     "edit",
     "patch",
     "delete",
+    "validate",
     "write_file",
     "remove_file",
+    "security_review",
+    "install_prepare",
     "enable_drafting",
+    "cancel_drafting",
     "evolution_update",
-}
+)
 
 
 def _json(result: dict[str, Any]) -> str:
@@ -37,6 +41,7 @@ def _json(result: dict[str, Any]) -> str:
 
 
 def _normalize_initial_evolution(value: Any) -> dict[str, Any] | None:
+    """Validate optional initial evolution sections before store-layer writes."""
     if value is None:
         return None
     if not isinstance(value, dict):
@@ -63,7 +68,13 @@ def skill_manage(
     operation: str | None = None,
     actor: str = "main_agent",
 ) -> str:
-    """Manage Skill 2.0 packages."""
+    """Route model-callable Skill mutations through the service layer.
+
+    This public tool is the single JSON boundary for Skill writes, validation,
+    draft installation, security review, and evolution updates. Store and
+    install services enforce filesystem policy; the tool adds action routing,
+    audit actor propagation, and model-friendly error serialization.
+    """
     action = str(action or "").strip()
     try:
         if action == "create_scaffold":
@@ -127,8 +138,7 @@ def skill_manage(
             result = install_service.security_review(drafting_id or "")
         else:
             return tool_error(
-                "Unknown action. Use: create_scaffold, create, edit, patch, delete, validate, write_file, remove_file, "
-                "security_review, install_prepare, enable_drafting, cancel_drafting, evolution_update",
+                f"Unknown action. Use: {', '.join(SKILL_MANAGE_ACTION_ORDER)}",
                 success=False,
             )
         return _json(result)
@@ -153,21 +163,7 @@ SKILL_MANAGE_SCHEMA = {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": [
-                        "create_scaffold",
-                        "create",
-                        "edit",
-                        "patch",
-                        "delete",
-                        "validate",
-                        "write_file",
-                        "remove_file",
-                        "security_review",
-                        "install_prepare",
-                        "enable_drafting",
-                        "cancel_drafting",
-                        "evolution_update",
-                    ],
+                    "enum": list(SKILL_MANAGE_ACTION_ORDER),
                 },
                 "name": {"type": "string", "description": "Enabled Skill name."},
                 "skill_md": {
@@ -246,6 +242,7 @@ SKILL_MANAGE_SCHEMA = {
 
 
 def _handle_skill_manage(args: dict[str, Any], **kw) -> str:
+    """Resolve dispatch context before invoking the model-facing manage API."""
     actor = str(kw.get("execution_actor") or "main_agent")
     parent_agent = kw.get("parent_agent")
     if parent_agent is not None:
@@ -276,6 +273,6 @@ registry.register(
     toolset="skills",
     schema=SKILL_MANAGE_SCHEMA,
     handler=_handle_skill_manage,
-    description="管理 M-Claw Skill",
+    description="Manage M-Claw Skills",
     emoji="🧩",
 )

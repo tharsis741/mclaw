@@ -5,19 +5,20 @@
 """Voice input service lifecycle.
 
 The service is intentionally conservative: it exposes the CLI lifecycle now,
-while real recorder/backend implementations are lazy optional integrations.
+while recorder and backend implementations are initialized only when ASR starts.
 """
 
 from __future__ import annotations
 
 import queue
 import threading
-from typing import Callable, Optional
+from typing import Callable
 
 from mclaw.voice.filters import TranscriptFilter
 
 
 def _pcm16_rms(pcm_bytes: bytes) -> int:
+    """Compute an inexpensive RMS gate for signed 16-bit mono/stereo PCM."""
     usable = len(pcm_bytes) - (len(pcm_bytes) % 2)
     if usable <= 0:
         return 0
@@ -32,12 +33,14 @@ def _pcm16_rms(pcm_bytes: bytes) -> int:
 
 
 class VoiceInputService:
+    """Coordinate recorder, realtime ASR backend, transcript policy, and CLI hooks."""
+
     def __init__(
         self,
         config: dict,
         on_text: Callable[[str], None],
-        on_interrupt: Optional[Callable[[], None]] = None,
-        on_status: Optional[Callable[[str], None]] = None,
+        on_interrupt: Callable[[], None] | None = None,
+        on_status: Callable[[str], None] | None = None,
     ):
         self.config = config or {}
         self.on_text = on_text
@@ -57,11 +60,13 @@ class VoiceInputService:
         self._sent_audio_chunks = 0
 
     def update_config(self, config: dict):
+        """Replace runtime ASR settings without changing the current service state."""
         self.config = config or {}
         self.listen_mode = str(self.config.get("listen_mode") or self.listen_mode or "wake_word")
         self._filter = TranscriptFilter(self.config)
 
     def start(self, listen_mode: str | None = None):
+        """Enable voice input, starting continuous capture only for wake-word mode."""
         if listen_mode:
             self.listen_mode = listen_mode
             self.config["listen_mode"] = listen_mode
@@ -87,6 +92,7 @@ class VoiceInputService:
         self._status("off")
 
     def start_once(self):
+        """Capture a single utterance and stop after the first accepted transcript."""
         if not self.running:
             ok = self.start("once")
             if not ok:
@@ -96,6 +102,7 @@ class VoiceInputService:
         return self._start_audio_session()
 
     def toggle_push_to_talk(self):
+        """Toggle manual recording, committing buffered audio when recording stops."""
         if self.listen_mode != "push_to_talk":
             return False
         if not self.running:
@@ -108,6 +115,7 @@ class VoiceInputService:
         return self._start_audio_session()
 
     def handle_transcript(self, text: str):
+        """Route an accepted transcript to prompt submission or interrupt handling."""
         result = self._filter.process(text, mode=self.listen_mode)
         if result.action == "submit" and result.text:
             self.on_text(result.text)
@@ -141,6 +149,7 @@ class VoiceInputService:
             self.on_status(text)
 
     def _start_audio_session(self) -> bool:
+        """Create backend and recorder in order, then bridge audio through a queue."""
         try:
             self._stop_audio_session()
             self._sent_audio_chunks = 0
@@ -176,6 +185,7 @@ class VoiceInputService:
             return False
 
     def _stop_audio_session(self):
+        """Tear down recorder, worker, and backend for cancellation/off states."""
         recorder = self._recorder
         backend = self._backend
         self._recorder = None
@@ -194,6 +204,7 @@ class VoiceInputService:
         self.recording = False
 
     def _finish_audio_session(self, commit: bool = False):
+        """Stop capture and optionally commit queued audio for manual ASR turns."""
         recorder = self._recorder
         backend = self._backend
         self._recorder = None
@@ -223,6 +234,7 @@ class VoiceInputService:
         self.recording = False
 
     def _drain_audio_queue(self):
+        """Flush already accepted audio before committing a manual recording."""
         audio_queue = self._audio_queue
         backend = self._backend
         if audio_queue is None or backend is None:
@@ -239,6 +251,7 @@ class VoiceInputService:
                 break
 
     def _send_audio(self, pcm_bytes: bytes):
+        """Accept audio from recorder callbacks without blocking capture threads."""
         audio_queue = self._audio_queue
         if audio_queue is None:
             return
@@ -262,6 +275,7 @@ class VoiceInputService:
         self._status("error")
 
     def _start_audio_worker(self):
+        """Start the worker that serializes recorder callbacks into backend sends."""
         self._audio_queue = queue.Queue(maxsize=int(self.config.get("audio_queue_size") or 50))
         self._audio_stop = threading.Event()
 
@@ -283,6 +297,7 @@ class VoiceInputService:
         self._audio_worker.start()
 
     def _stop_audio_worker(self):
+        """Signal the audio worker and release queue references during teardown."""
         stop = self._audio_stop
         worker = self._audio_worker
         self._audio_stop = None

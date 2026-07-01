@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""prompt_toolkit status bar fragment rendering."""
+"""Render prompt_toolkit status fragments for live turn and context state."""
 
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ STATUS_ANIM_FRAME_COUNT = len(_STATUS_ANIM_FRAMES)
 
 
 def format_duration(seconds: float) -> str:
+    """Format short live durations for the compact status bar."""
     if seconds < 60:
         return f"{seconds:.0f}s"
     m, s = divmod(int(seconds), 60)
@@ -46,6 +47,7 @@ def format_duration(seconds: float) -> str:
 
 
 def fmt_tokens(n: int) -> str:
+    """Format token counts with compact suffixes for fixed-width status fragments."""
     if n < 1000:
         return str(n)
     if n < 1_000_000:
@@ -56,6 +58,7 @@ def fmt_tokens(n: int) -> str:
 
 
 def user_message_count(agent) -> int:
+    """Read the authoritative user message count with a message-list fallback."""
     if not agent:
         return 0
     value = getattr(agent, "session_user_messages", None)
@@ -68,6 +71,7 @@ def user_message_count(agent) -> int:
 
 
 def format_context_bar(compressor) -> tuple[str, str] | tuple[None, None]:
+    """Return a threshold-aware context usage bar and prompt_toolkit style."""
     if not compressor or compressor.context_length <= 0:
         return None, None
 
@@ -114,6 +118,7 @@ class StatusRenderer:
     """Build prompt_toolkit fragments for the live status area."""
 
     def build_status_fragments(self, owner) -> list:
+        """Build the primary status line and optional subagent progress rows."""
         if not owner._status_bar_visible:
             return []
 
@@ -199,6 +204,7 @@ class StatusRenderer:
         return fragments
 
     def build_subagent_compact_progress(self, owner) -> list:
+        """Show active subagent work while folding completed or hidden tasks."""
         sm = getattr(owner, "subtask_manager", None)
         if not sm:
             return []
@@ -227,7 +233,7 @@ class StatusRenderer:
             else:
                 marker = "◻"
                 style = "class:status-bar-subagent-pending"
-            frags.append((style, f"     {marker} 任务{idx}: {goal}"))
+            frags.append((style, f"     {marker} Task {idx}: {goal}"))
             frags.append(("", "\n"))
 
         hidden_pending = max(0, len(visible_tasks) - max_visible)
@@ -244,6 +250,7 @@ class StatusRenderer:
 
     @staticmethod
     def format_subagent_goal(goal: str, max_len: int = 72) -> str:
+        """Normalize and trim subagent goals for one-line status rows."""
         text = " ".join(str(goal or "").split())
         if len(text) <= max_len:
             return text

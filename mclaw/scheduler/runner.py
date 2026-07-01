@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scheduler runner that executes one local MClaw turn."""
+"""Scheduler runner that executes one local MClaw turn.
+
+The runner converts a scheduled job into an ordinary M-Claw conversation while
+preserving scheduler metadata, session policy, timeout handling, and captured
+tool/token telemetry for the run report.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +26,8 @@ logger = logging.getLogger(__name__)
 
 
 class SchedulerRunner:
+    """Runs a single scheduler job through the agent runtime."""
+
     def __init__(
         self,
         *,
@@ -50,6 +57,7 @@ class SchedulerRunner:
         self.print_fn = print_fn
 
     def run(self, job: SchedulerJob, run: SchedulerRun) -> SchedulerRun:
+        """Execute the job prompt and return the updated run record."""
         started_at = run.started_at or time.time()
         run.started_at = started_at
         try:
@@ -63,12 +71,11 @@ class SchedulerRunner:
                 agent = self._make_agent(job=job, run=run, session_id=session_id)
                 agent_holder["agent"] = agent
                 return agent.run_conversation(
-                    job.prompt,
-                    history,
-                    False,
-                    False,
-                    extra_system,
-                    False,
+                    user_message=job.prompt,
+                    conversation_history=history,
+                    disable_tools=False,
+                    extra_system=extra_system,
+                    advance_background_review=False,
                 )
 
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -82,6 +89,7 @@ class SchedulerRunner:
                         agent.interrupt()
                     except Exception as exc:
                         logger.debug("scheduler agent interrupt failed after timeout: %s", exc)
+                # The worker thread may still unwind cooperatively after interrupt.
                 future.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise TimeoutError(f"scheduler run timed out after {job.timeout_seconds}s")
@@ -107,6 +115,7 @@ class SchedulerRunner:
             return run
 
     def _resolve_session(self, job: SchedulerJob, run: SchedulerRun) -> str:
+        """Resolve or create the session governed by the job's session policy."""
         if job.session_policy == "new_session":
             session_id = f"session_{uuid.uuid4().hex[:12]}"
         else:
@@ -124,12 +133,14 @@ class SchedulerRunner:
         return session_id
 
     def _history_for_session(self, session_id: str) -> list[dict[str, Any]]:
+        """Load prior messages without duplicating the persisted system prompt."""
         history = self.session_db.get_messages_as_conversation(session_id)
         if history and history[0].get("role") == "system":
             return history[1:]
         return history
 
     def _make_agent(self, *, job: SchedulerJob, run: SchedulerRun, session_id: str) -> Any:
+        """Construct the agent with scheduler-scoped platform and tool settings."""
         if self.agent_factory is not None:
             return self.agent_factory(
                 model=self.model,
@@ -165,6 +176,7 @@ class SchedulerRunner:
         )
 
     def _scheduler_context(self, job: SchedulerJob, run: SchedulerRun) -> str:
+        """Build extra system context that identifies the scheduler run."""
         scheduled_for = "-"
         if run.scheduled_for is not None:
             scheduled_for = datetime.fromtimestamp(float(run.scheduled_for), timezone.utc).isoformat()
@@ -185,14 +197,19 @@ class SchedulerRunner:
 
 
 def _extract_tool_calls(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect tool call telemetry from both modern and message-shaped results."""
     calls: list[dict[str, Any]] = []
     for round_event in result.get("assistant_rounds") or []:
+        if not isinstance(round_event, dict):
+            continue
         for item in round_event.get("tool_calls") or []:
             if isinstance(item, dict):
                 calls.append(item)
     if calls:
         return calls
     for msg in result.get("messages") or []:
+        if not isinstance(msg, dict):
+            continue
         for item in msg.get("tool_calls") or []:
             if isinstance(item, dict):
                 calls.append(item)
@@ -200,6 +217,12 @@ def _extract_tool_calls(result: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _extract_token_usage(result: dict[str, Any]) -> dict[str, Any]:
-    usage = dict(result.get("token_usage") or {})
-    usage.setdefault("api_calls", int(result.get("api_calls") or 0))
+    """Normalize token usage metadata while preserving API call count."""
+    raw_usage = result.get("token_usage") or {}
+    usage = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+    try:
+        api_calls = int(result.get("api_calls") or 0)
+    except (TypeError, ValueError):
+        api_calls = 0
+    usage.setdefault("api_calls", api_calls)
     return usage

@@ -11,13 +11,18 @@ from dataclasses import dataclass
 
 @dataclass
 class CommandResult:
+    """Parsed result for a DingTalk slash-style command."""
+
     handled: bool = False
     text: str = ""
     action: str = ""
 
 
 class DingTalkCommandRouter:
+    """Handle lightweight local commands before messages reach the agent."""
+
     def parse(self, text: str) -> tuple[str, str]:
+        """Split a leading slash command from its arguments."""
         stripped = (text or "").strip()
         if not stripped.startswith("/"):
             return "", stripped
@@ -25,10 +30,11 @@ class DingTalkCommandRouter:
         return head.strip().lower(), tail.strip()
 
     def handle(self, text: str, *, status: str = "idle", status_details: str = "") -> CommandResult:
+        """Return command output or mark the message for normal agent handling."""
         command, _args = self.parse(text)
         if not command:
             return CommandResult()
-        if command in {"help", "mclaw"}:
+        if command == "help":
             return CommandResult(
                 handled=True,
                 action="help",

@@ -2,14 +2,14 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render assistant responses and intermediate progress messages."""
+"""Render assistant responses through message sinks or classic Rich output."""
 
 from __future__ import annotations
 
 from typing import Callable
 
 
-DEFAULT_ASSISTANT_TITLE = "M-Claw回复:"
+DEFAULT_ASSISTANT_TITLE = "M-Claw 回复:"
 DEFAULT_ASSISTANT_TITLE_STYLE = "bold #6CB4EE"
 INTERMEDIATE_ASSISTANT_TITLE = "- 任务进展："
 INTERMEDIATE_ASSISTANT_TITLE_STYLE = "#6B8E23"
@@ -18,6 +18,8 @@ THINKING_ASSISTANT_TITLE_STYLE = "bold #D99A2B"
 
 
 class ResponseRenderer:
+    """Bridge response text between UI-neutral sinks and terminal Markdown rendering."""
+
     def __init__(
         self,
         *,
@@ -36,6 +38,7 @@ class ResponseRenderer:
         title: str = DEFAULT_ASSISTANT_TITLE,
         title_style: str = DEFAULT_ASSISTANT_TITLE_STYLE,
     ) -> None:
+        """Emit a non-empty assistant message to the active output path."""
         content = str(text or "").strip()
         if not content:
             return
@@ -57,6 +60,7 @@ def _print_assistant_response(
     title: str = DEFAULT_ASSISTANT_TITLE,
     title_style: str = DEFAULT_ASSISTANT_TITLE_STYLE,
 ) -> None:
+    """Render a Markdown assistant response in the classic terminal frontend."""
     from rich.markdown import Markdown
     from rich.text import Text
 

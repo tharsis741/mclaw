@@ -15,8 +15,9 @@ import hashlib
 import json
 import time
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any
 
 from mclaw.constants import get_mclaw_home
 
@@ -25,7 +26,7 @@ def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
 
-def _sha256_file(path: Path) -> Optional[str]:
+def _sha256_file(path: Path) -> str | None:
     try:
         h = hashlib.sha256()
         with path.open("rb") as fh:
@@ -36,13 +37,14 @@ def _sha256_file(path: Path) -> Optional[str]:
         return None
 
 
-def inspect_path(path_value: str) -> Dict[str, Any]:
+def inspect_path(path_value: str) -> dict[str, Any]:
+    """Capture stable path metadata used to compare rollback states later."""
     path = Path(path_value).expanduser()
     try:
         resolved = path.resolve()
     except OSError:
         resolved = path
-    out: Dict[str, Any] = {"path": str(resolved), "exists": resolved.exists()}
+    out: dict[str, Any] = {"path": str(resolved), "exists": resolved.exists()}
     if not out["exists"]:
         return out
     try:
@@ -62,7 +64,7 @@ def inspect_path(path_value: str) -> Dict[str, Any]:
 class OperationJournal:
     """Persist operation records under M-Claw home operations."""
 
-    def __init__(self, base_dir: Optional[Path] = None):
+    def __init__(self, base_dir: Path | None = None):
         self.base_dir = Path(base_dir or (get_mclaw_home() / "operations"))
         self.operations_dir = self.base_dir / "operations"
         self.sessions_dir = self.base_dir / "sessions"
@@ -72,22 +74,23 @@ class OperationJournal:
         *,
         session_id: str,
         turn_id: str,
-        message_id_before_turn: Optional[int],
-        messages_len_before_turn: Optional[int],
+        message_id_before_turn: int | None,
+        messages_len_before_turn: int | None,
         tool_call_id: str,
         tool_name: str,
         action: str,
         cwd: str,
         workspace: str,
         raw_command: str = "",
-        targets: Optional[Iterable[str]] = None,
+        targets: Iterable[str] | None = None,
         risk: str = "normal",
-        checkpoint_commit: str = None,
-        checkpoint_status: str = None,
-        checkpoint_reason: str = None,
-    ) -> Dict[str, Any]:
-        op_id = f"op_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        target_records: List[Dict[str, Any]] = []
+        checkpoint_commit: str | None = None,
+        checkpoint_status: str | None = None,
+        checkpoint_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Start an audit record before executing a mutating tool call."""
+        operation_id = f"op_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        target_records: list[dict[str, Any]] = []
         for target in targets or []:
             before = inspect_path(str(target))
             target_records.append({
@@ -96,8 +99,7 @@ class OperationJournal:
                 "after": None,
             })
         record = {
-            "operation_id": op_id,
-            "op_id": op_id,
+            "operation_id": operation_id,
             "session_id": session_id,
             "turn_id": turn_id,
             "message_id_before_turn": message_id_before_turn,
@@ -123,12 +125,13 @@ class OperationJournal:
 
     def finalize(
         self,
-        record: Dict[str, Any],
+        record: dict[str, Any],
         *,
         success: bool,
         result_preview: str = "",
-        after_commit: str = None,
-    ) -> Dict[str, Any]:
+        after_commit: str | None = None,
+    ) -> dict[str, Any]:
+        """Complete an operation record with post-execution target snapshots."""
         if not record:
             return {}
         for target in record.get("targets") or []:
@@ -143,12 +146,13 @@ class OperationJournal:
 
     def update_checkpoint(
         self,
-        record: Dict[str, Any],
+        record: dict[str, Any],
         *,
-        checkpoint_commit: str = None,
-        checkpoint_status: str = None,
-        checkpoint_reason: str = None,
-    ) -> Dict[str, Any]:
+        checkpoint_commit: str | None = None,
+        checkpoint_status: str | None = None,
+        checkpoint_reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Attach checkpoint outcome metadata after preflight completes."""
         if not record:
             return {}
         record["before_commit"] = checkpoint_commit
@@ -161,22 +165,21 @@ class OperationJournal:
     def record_rollback(
         self,
         *,
-        source_operation: Dict[str, Any],
+        source_operation: dict[str, Any],
         session_id: str,
         rollback_id: str,
         mode: str,
         success: bool,
-        pre_rollback_commit: str = None,
-        restored_commit: str = None,
-        context_rollback_id: str = None,
-        conflict_backups: Optional[List[Dict[str, Any]]] = None,
-        result: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
+        pre_rollback_commit: str | None = None,
+        restored_commit: str | None = None,
+        context_rollback_id: str | None = None,
+        conflict_backups: list[dict[str, Any]] | None = None,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Persist a rollback transaction as an operation-journal record."""
-        op_id = rollback_id or f"rollback_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+        operation_id = rollback_id or f"rollback_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         record = {
-            "operation_id": op_id,
-            "op_id": op_id,
+            "operation_id": operation_id,
             "session_id": session_id or source_operation.get("session_id") or "",
             "turn_id": source_operation.get("turn_id"),
             "message_id_before_turn": source_operation.get("message_id_before_turn"),
@@ -191,13 +194,13 @@ class OperationJournal:
             "before_commit": pre_rollback_commit,
             "after_commit": restored_commit,
             "checkpoint_status": "taken" if pre_rollback_commit else None,
-            "checkpoint_reason": f"rollback {source_operation.get('operation_id') or source_operation.get('op_id')}",
+            "checkpoint_reason": f"rollback {source_operation.get('operation_id')}",
             "risk": source_operation.get("risk", "normal"),
             "status": "completed" if success else "failed",
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
             "rollback": {
-                "source_operation_id": source_operation.get("operation_id") or source_operation.get("op_id"),
+                "source_operation_id": source_operation.get("operation_id"),
                 "mode": mode,
                 "context_rollback_id": context_rollback_id,
                 "conflict_backups": conflict_backups or [],
@@ -211,13 +214,13 @@ class OperationJournal:
     def list_operations(
         self,
         *,
-        session_id: str = None,
-        workspace: str = None,
+        session_id: str | None = None,
+        workspace: str | None = None,
         include_rollbacks: bool = False,
         limit: int = 20,
-    ) -> List[Dict[str, Any]]:
+    ) -> list[dict[str, Any]]:
         """Return recent completed operations, newest first."""
-        records: List[Dict[str, Any]] = []
+        records: list[dict[str, Any]] = []
         if not self.operations_dir.exists():
             return []
         day_dirs = sorted(
@@ -250,10 +253,10 @@ class OperationJournal:
         self,
         ref: str,
         *,
-        session_id: str = None,
-        workspace: str = None,
+        session_id: str | None = None,
+        workspace: str | None = None,
         include_rollbacks: bool = False,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Resolve an operation by 1-based recent index, exact id, or id prefix."""
         ref = str(ref or "").strip()
         if not ref:
@@ -271,19 +274,21 @@ class OperationJournal:
         except ValueError:
             pass
         for record in operations:
-            op_id = str(record.get("operation_id") or record.get("op_id") or "")
-            if op_id == ref or op_id.startswith(ref):
+            operation_id = str(record.get("operation_id") or "")
+            if operation_id == ref or operation_id.startswith(ref):
                 return record
         return None
 
-    def _write_record(self, record: Dict[str, Any]) -> None:
+    def _write_record(self, record: dict[str, Any]) -> None:
+        """Write the canonical JSON record keyed by operation id and day."""
         day = time.strftime("%Y-%m-%d")
         out_dir = self.operations_dir / day
         out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / f"{record.get('operation_id') or record['op_id']}.json"
+        path = out_dir / f"{record['operation_id']}.json"
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    def _append_session(self, record: Dict[str, Any]) -> None:
+    def _append_session(self, record: dict[str, Any]) -> None:
+        """Append a session-local event stream for quick rollback listing."""
         session_id = record.get("session_id") or "unknown"
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         path = self.sessions_dir / f"{session_id}.jsonl"
@@ -292,6 +297,7 @@ class OperationJournal:
 
 
 def default_journal() -> OperationJournal:
+    """Return the journal rooted at the configured M-Claw home directory."""
     return OperationJournal()
 
 
@@ -302,7 +308,8 @@ def _resolve_for_compare(path_value: str) -> str:
         return str(Path(path_value).expanduser()).lower()
 
 
-def _record_matches_workspace(record: Dict[str, Any], workspace_resolved: str) -> bool:
+def _record_matches_workspace(record: dict[str, Any], workspace_resolved: str) -> bool:
+    """Match records by workspace root or by any tracked target under that root."""
     rec_workspace = _resolve_for_compare(record.get("workspace") or record.get("cwd") or "")
     if rec_workspace == workspace_resolved:
         return True

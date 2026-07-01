@@ -2,10 +2,16 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Classic TUI adapter for UI-neutral panel models."""
+"""Classic TUI adapter for UI-neutral panel models.
+
+The runtime builds panel models without depending on Rich. This adapter is the
+single place that maps those model blocks and semantic cell roles into classic
+terminal renderables.
+"""
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 
 from rich.markdown import Markdown as RichMarkdown
@@ -22,6 +28,8 @@ from mclaw.cli.tui.components import (
     section_title,
 )
 from mclaw.cli.tui.theme import ACCENT_DIM, ACCENT_LIGHT, BANNER_TEXT_COLOR, DANGER, INFO, SUCCESS, VALUE_COLOR, WARNING
+
+logger = logging.getLogger(__name__)
 
 
 _TONE_BORDER = {
@@ -40,6 +48,7 @@ def render_panel_model(
     box=None,
     border_style: str | None = None,
 ) -> None:
+    """Render a UI-neutral panel model through the classic Rich TUI pipeline."""
     render_panel(
         printer=printer,
         title=panel.title,
@@ -51,6 +60,7 @@ def render_panel_model(
 
 
 def _render_block(block: PanelBlock):
+    """Map a panel block kind to the matching Rich renderable."""
     if block.kind == "spacer":
         return ""
     if block.kind == "section":
@@ -70,6 +80,7 @@ def _render_block(block: PanelBlock):
 
 
 def _column_options(column):
+    """Translate model column options to Rich Table.add_column kwargs."""
     options = {
         "style": _column_style(column.role),
         "overflow": column.overflow,
@@ -93,6 +104,7 @@ def _column_style(role: str) -> str:
 
 
 def _render_cell(cell: PanelCell):
+    """Map semantic cell roles to classic TUI text styling."""
     style = {
         "primary": BANNER_TEXT_COLOR,
         "muted": ACCENT_DIM,
@@ -107,15 +119,18 @@ def _render_cell(cell: PanelCell):
 
 
 def _render_text_block(block: PanelBlock):
+    """Render text blocks with markdown/ANSI parsing and plain-text fallback."""
     if block.text_format == "markdown":
         try:
             return RichMarkdown(block.text)
-        except Exception:
+        except Exception as exc:
+            logger.debug("Markdown panel block render failed: %s", exc)
             return body_text(block.text)
     if block.text_format == "ansi":
         try:
             return RichText.from_ansi(block.text)
-        except Exception:
+        except Exception as exc:
+            logger.debug("ANSI panel block render failed: %s", exc)
             return body_text(block.text)
     if block.muted:
         return muted_text(block.text)

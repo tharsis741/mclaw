@@ -12,13 +12,29 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any, Dict, Optional
+from typing import Any
+
+from mclaw.tools.search.credentials import is_dashscope_configured
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "qwen3.5-plus"
 _DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 _MAX_WEB_SEARCH_CHARS = 12_000
+_NO_LIVE_SEARCH_PHRASES = (
+    "无法访问互联网",
+    "无法联网",
+    "不能访问网络",
+    "没有联网",
+    "知识库有截止",
+    "knowledge cutoff",
+    "training data",
+    "无法提供实时",
+    "无法获取最新",
+    "我没有实时",
+    "无法提供当前",
+    "不能提供实时",
+)
 
 
 def _convert_html_images_to_markdown(text: str) -> str:
@@ -29,16 +45,30 @@ def _convert_html_images_to_markdown(text: str) -> str:
     return text
 
 
+def _live_search_failure_phrase(text: str) -> str:
+    """Return the fallback phrase when a short response suggests no live search."""
+    if not text or len(text) >= 300:
+        return ""
+    folded = text.casefold()
+    for phrase in _NO_LIVE_SEARCH_PHRASES:
+        if phrase.casefold() in folded:
+            return phrase
+    return ""
+
+
 def search(
     query: str,
     strategy: str,
-    freshness: Optional[int],
-    sites: Optional[str],
+    freshness: int | None,
+    sites: str | None,
     images: bool,
     creds: dict,
     timeout: float,
 ) -> dict:
     """Search via DashScope Qwen enable_search.
+
+    The backend accepts the router's provider-neutral request shape and
+    translates it into DashScope compatible-mode chat completion parameters.
 
     Args:
         query: Search query string.
@@ -74,7 +104,7 @@ def search(
             ),
         }
 
-    if not _is_dashscope_configured(creds):
+    if not is_dashscope_configured(creds):
         logger.warning(
             "DashScope search skipped: credentials do not point to DashScope "
             "(api_key_present=%s, base_url=%s)",
@@ -111,8 +141,10 @@ def search(
 
     client = openai.OpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=timeout)
 
-    extra_body: Dict[str, Any] = {}
-    search_options: Dict[str, Any] = {
+    extra_body: dict[str, Any] = {}
+    # DashScope search controls are passed through extra_body rather than the
+    # OpenAI-compatible top-level request schema.
+    search_options: dict[str, Any] = {
         "search_strategy": strategy,
         "forced_search": True,
         "enable_source": True,
@@ -120,6 +152,8 @@ def search(
         "enable_search_extension": True,
     }
 
+    # Freshness and site filters are only sent for turbo because the deeper
+    # strategies use DashScope's broader multi-source retrieval path.
     if freshness and strategy == "turbo":
         search_options["freshness"] = freshness
     if sites and strategy == "turbo":
@@ -145,28 +179,16 @@ def search(
             result = _convert_html_images_to_markdown(result)
 
         # Detect whether live search actually executed.
-        no_search_phrases = [
-            "无法访问互联网",
-            "无法联网",
-            "不能访问网络",
-            "没有联网",
-            "知识库有截止",
-            "knowledge cutoff",
-            "training data",
-            "无法提供实时",
-            "无法获取最新",
-            "我没有实时",
-            "无法提供当前",
-            "不能提供实时",
-        ]
-        if result and len(result) < 300 and any(p in result for p in no_search_phrases):
+        no_search_phrase = _live_search_failure_phrase(result)
+        if no_search_phrase:
             logger.warning(
-                "DashScope search response suggests search did NOT execute (model=%s, len=%d). "
+                "DashScope search response suggests search did NOT execute (model=%s, len=%d, phrase=%r). "
                 "Possible causes: (1) API key is not a DashScope key, "
                 "(2) model does not support enable_search, "
                 "(3) account lacks search quota. Response: %s",
                 model,
                 len(result),
+                no_search_phrase,
                 result[:200],
             )
             return {
@@ -177,7 +199,7 @@ def search(
                     "Suggestion: retry the same query once, or check your DashScope search quota."
                 ),
                 "_backend": "dashscope",
-                "_hint": "Retry the same query once, or check your DashScope search quota.",
+                "_hint": f"DashScope response matched no-live-search phrase {no_search_phrase!r}; retry once or check search quota.",
             }
 
         logger.info("DashScope search completed (%d chars)", len(result))
@@ -233,20 +255,3 @@ def search(
             "_backend": "dashscope",
             "_hint": "Unexpected error during search.",
         }
-
-
-def _is_dashscope_configured(creds: dict) -> bool:
-    """Return True if the credentials point to DashScope (required for enable_search)."""
-    api_key = creds.get("api_key", "")
-    base_url = creds.get("base_url", "")
-    if not api_key:
-        return False
-    # Detect by DashScope key prefix or base_url domain.
-    if api_key.startswith("sk-dashscope") or "dashscope" in base_url.lower():
-        return True
-    return False
-
-
-def check_requirements(creds: dict) -> bool:
-    """Return True if DashScope is available (required for web_search)."""
-    return _is_dashscope_configured(creds)

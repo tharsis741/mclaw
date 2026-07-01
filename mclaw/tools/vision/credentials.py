@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from mclaw.cli.config import ConfigError
 from mclaw.tools.vision.config import (
     DASHSCOPE_BASE_URL,
     DEFAULT_PROVIDER,
@@ -23,10 +24,12 @@ _SUPPORTED_PROVIDER_HINTS = {"", "auto", "qwen", "dashscope"}
 
 
 def _is_qwen_model(model: str) -> bool:
+    """Return whether a model name belongs to the supported Qwen family."""
     return str(model or "").strip().lower().startswith("qwen")
 
 
 def _is_qwen_target(provider: str, base_url: str, model: str) -> bool:
+    """Infer Qwen compatibility from provider hint, base URL, or model name."""
     provider_hint = str(provider or "").strip().lower()
     return (
         provider_hint in {"qwen", "dashscope"}
@@ -36,16 +39,17 @@ def _is_qwen_target(provider: str, base_url: str, model: str) -> bool:
 
 
 def _unsupported_reason(provider: str, base_url: str, model: str) -> str:
+    """Explain unsupported provider/model combinations without probing secrets."""
     provider_hint = str(provider or "").strip().lower()
     if provider_hint not in _SUPPORTED_PROVIDER_HINTS and not _is_qwen_target(provider, base_url, model):
         return (
-            f"vision provider '{provider_hint}' is not supported yet. "
-            "Only Qwen vision is enabled in this build."
+            f"vision provider '{provider_hint}' is not supported. "
+            "Configure auxiliary.vision.provider as qwen or dashscope."
         )
     if model and not _is_qwen_model(model) and not _is_qwen_target(provider, base_url, model):
         return (
-            f"vision model '{model}' does not look like a Qwen vision model. "
-            "Only Qwen vision is enabled in this build."
+            f"vision model '{model}' is outside the supported Qwen vision configuration. "
+            "Configure a Qwen vision model for auxiliary.vision.model."
         )
     return ""
 
@@ -53,9 +57,8 @@ def _unsupported_reason(provider: str, base_url: str, model: str) -> str:
 def resolve_vision_credentials(parent_agent: Any = None, config: dict | None = None) -> VisionCredentials:
     """Resolve credentials for the currently supported vision provider.
 
-    M-Claw currently enables only Qwen vision. The return type keeps a
-    provider field so future provider clients can be added without changing the
-    tool orchestration layer.
+    M-Claw enables Qwen vision through DashScope-compatible credentials. The
+    provider field keeps client selection separate from tool orchestration.
     """
     cfg = vision_config(parent_agent=parent_agent, config=config)
     provider_hint = str(cfg.get("provider") or "auto").strip().lower()
@@ -88,18 +91,16 @@ def resolve_vision_credentials(parent_agent: Any = None, config: dict | None = N
     )
 
 
-def feature_env_configured() -> bool:
-    try:
-        from mclaw.runtime.features import authorized_configured_env_vars, get_feature
-
-        spec = get_feature("vision_analyze")
-        return bool(spec and authorized_configured_env_vars(spec, env_value))
-    except Exception:
-        return bool(authorized_env_value("DASHSCOPE_API_KEY") or authorized_env_value("QWEN_API_KEY"))
-
-
 def diagnose_vision_credentials(config: dict | None = None) -> dict:
-    creds = resolve_vision_credentials(config=config)
+    """Return availability diagnostics without exposing credential values."""
+    try:
+        creds = resolve_vision_credentials(config=config)
+    except ConfigError as exc:
+        return {
+            "available": False,
+            "reason": f"vision config check failed: {type(exc).__name__}: {exc}",
+            "fix": "Check auxiliary.vision config.",
+        }
     if creds.unsupported_reason:
         return {
             "available": False,

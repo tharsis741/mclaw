@@ -11,7 +11,6 @@ import logging
 import socket
 import time
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 from mclaw.tools.vision.config import MAX_IMAGE_SIZE_BYTES, resolve_download_timeout
@@ -22,6 +21,7 @@ _LOCAL_HOSTS = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
 
 
 def _ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return whether an IP address is safe for remote image fetching."""
     return not (
         ip.is_private
         or ip.is_loopback
@@ -33,6 +33,7 @@ def _ip_is_public(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
 
 
 def _resolve_host_ips(hostname: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
+    """Resolve a hostname to unique IP addresses for SSRF checks."""
     try:
         return [ipaddress.ip_address(hostname)]
     except ValueError:
@@ -77,9 +78,13 @@ def _download_image_sync(
     parent_agent=None,
     max_bytes: int = MAX_IMAGE_SIZE_BYTES,
 ) -> Path:
-    """Download an image synchronously with retry logic and a hard size cap."""
+    """Download an image synchronously with retry logic and a hard size cap.
+
+    The final redirected URL is revalidated before bytes are written, and the
+    streamed body is capped even when the server omits Content-Length.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    last_error: Optional[Exception] = None
+    last_error: Exception | None = None
 
     for attempt in range(max_retries):
         try:
@@ -145,4 +150,3 @@ def _download_image_sync(
                 )
 
     raise last_error or RuntimeError("Image download failed")
-

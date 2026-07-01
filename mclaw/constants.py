@@ -58,6 +58,7 @@ VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
+    """Normalize user-facing reasoning effort text for provider adapters."""
     if not effort or not effort.strip():
         return None
     effort = effort.strip().lower()

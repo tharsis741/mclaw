@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from mclaw.safety.mutation_detector import MutationIntent, detect_mutation
 from mclaw.safety.path_resolver import normalize_path, resolve_workspace
@@ -17,9 +17,11 @@ from mclaw.safety.policy import RiskDecision, RiskPolicyEngine
 
 @dataclass
 class SafetyPlan:
+    """Preflight output shared by checkpointing, journal, and dispatch layers."""
+
     intent: MutationIntent
     workspace: str
-    target_paths: List[str]
+    target_paths: list[str]
     decision: RiskDecision
 
     @property
@@ -30,12 +32,13 @@ class SafetyPlan:
 class MClawSafetyLayer:
     """Normalize mutation metadata before checkpoint and operation journal."""
 
-    def __init__(self, *, config: Optional[Dict] = None, checkpoint_manager: Any = None):
+    def __init__(self, *, config: dict | None = None, checkpoint_manager: Any = None):
         self.config = config or {}
         self.checkpoint_manager = checkpoint_manager
         self.policy = RiskPolicyEngine(self.config)
 
-    def plan(self, tool_name: str, arguments: Dict[str, Any], parent_agent: Any = None) -> SafetyPlan:
+    def plan(self, tool_name: str, arguments: dict[str, Any], parent_agent: Any = None) -> SafetyPlan:
+        """Build a policy-ready safety plan for one tool invocation."""
         intent = detect_mutation(tool_name, arguments or {})
         terminal_cwd = _terminal_cwd(arguments, parent_agent)
         launch_cwd = _launch_cwd(parent_agent)
@@ -44,23 +47,52 @@ class MClawSafetyLayer:
             for path in intent.target_paths
             if path
         ]
-        workspace = self._workspace_for(intent, normalized_targets, terminal_cwd, launch_cwd, parent_agent)
+        workspace = self._workspace_for(normalized_targets, terminal_cwd, launch_cwd, parent_agent)
+        policy_workspace = self._policy_workspace_for(terminal_cwd, launch_cwd, parent_agent)
         decision = self.policy.decide(
             action=intent.action,
             target_paths=normalized_targets,
-            workspace=workspace,
+            workspace=policy_workspace,
             raw_command=intent.raw_command,
         ) if intent.mutates else RiskDecision("none", "allow", "read-only")
         return SafetyPlan(intent=intent, workspace=workspace, target_paths=normalized_targets, decision=decision)
 
-    def _workspace_for(
+    def _policy_workspace_for(
         self,
-        intent: MutationIntent,
-        target_paths: List[str],
         terminal_cwd: str,
         launch_cwd: str,
         parent_agent: Any = None,
     ) -> str:
+        """Resolve the workspace boundary used to allow or block mutation targets."""
+        delegation_dir = getattr(parent_agent, "_delegation_dir", None)
+        if getattr(parent_agent, "_delegate_depth", 0) > 0 and delegation_dir:
+            return normalize_path(str(delegation_dir))
+
+        explicit = ""
+        if self.checkpoint_manager is not None:
+            try:
+                seed = terminal_cwd or launch_cwd
+                if seed:
+                    explicit = self.checkpoint_manager.get_working_dir_for_path(seed)
+            except Exception:
+                explicit = ""
+        return resolve_workspace(
+            explicit_workdir=explicit,
+            target_paths=None,
+            terminal_cwd=terminal_cwd,
+            launch_cwd=launch_cwd,
+            recent_checkpoint_dir=str(getattr(parent_agent, "_last_checkpoint_work_dir", "") or ""),
+            fallback_cwd=launch_cwd,
+        )
+
+    def _workspace_for(
+        self,
+        target_paths: list[str],
+        terminal_cwd: str,
+        launch_cwd: str,
+        parent_agent: Any = None,
+    ) -> str:
+        """Resolve the checkpoint workspace, preferring explicit target ownership."""
         target_workspace = _target_workspace(target_paths)
         if target_workspace:
             return target_workspace
@@ -83,7 +115,8 @@ class MClawSafetyLayer:
         )
 
 
-def _terminal_cwd(arguments: Dict[str, Any], parent_agent: Any = None) -> str:
+def _terminal_cwd(arguments: dict[str, Any], parent_agent: Any = None) -> str:
+    """Find the shell cwd associated with the current terminal tool session."""
     workdir = str((arguments or {}).get("workdir") or "").strip()
     if workdir:
         return workdir
@@ -101,6 +134,7 @@ def _terminal_cwd(arguments: Dict[str, Any], parent_agent: Any = None) -> str:
 
 
 def _launch_cwd(parent_agent: Any = None) -> str:
+    """Return the configured process launch cwd when terminal state is unavailable."""
     cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
     if isinstance(cfg, dict):
         terminal_cfg = cfg.get("terminal", {})
@@ -114,7 +148,8 @@ def _launch_cwd(parent_agent: Any = None) -> str:
     return ""
 
 
-def _target_workspace(target_paths: List[str]) -> str:
+def _target_workspace(target_paths: list[str]) -> str:
+    """Use the first explicit target as the checkpoint workspace anchor."""
     for target in target_paths or []:
         if not target:
             continue

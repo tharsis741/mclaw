@@ -11,8 +11,8 @@ operations (``write_file``, ``patch``, ``terminal`` with destructive flags),
 triggered once per conversation turn.  Provides rollback to any previous
 checkpoint.
 
-This is NOT a tool — the LLM never sees it.  It's transparent infrastructure
-controlled by the ``checkpoints`` config flag or ``--checkpoints`` CLI flag.
+This is NOT a tool — the LLM never sees it.  It is transparent runtime
+infrastructure controlled by the ``checkpoints`` configuration.
 
 Storage layout (single shared store, git objects deduplicated across projects)
 -----------------------------------------------------------------------------
@@ -99,7 +99,7 @@ DEFAULT_EXCLUDES = [
     ".git/",
     ".hg/",
     ".svn/",
-    # Worktrees (M-Claw convention — don't recursively snapshot siblings)
+    # Worktree sibling directories are outside snapshot scope.
     ".worktrees/",
     # Native / compiled binaries
     "*.so",
@@ -155,7 +155,7 @@ _GIT_TIMEOUT: int = max(10, min(60, _env_int("MCLAW_CHECKPOINT_TIMEOUT", 30)))
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
 
-# Valid git commit hash pattern: 4–40 hex chars (short or full SHA-1/SHA-256).
+# Valid git commit hash pattern: 4-64 hex chars (short or full SHA-1/SHA-256).
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')
 
 
@@ -167,8 +167,8 @@ def _validate_commit_hash(commit_hash: str) -> Optional[str]:
     """Validate a commit hash to prevent git argument injection.
 
     Returns an error string if invalid, None if valid.
-    Values starting with '-' would be interpreted as git flags
-    (e.g., '--patch', '-p') instead of revision specifiers.
+    Values starting with '-' are git option tokens such as '--patch' or '-p',
+    not revision specifiers.
     """
     if not commit_hash or not commit_hash.strip():
         return "Empty commit hash"
@@ -207,6 +207,7 @@ def _normalize_path(path_value: str) -> Path:
 
 
 def _path_is_relative_to(path: Path, root: Path) -> bool:
+    """Compatibility helper for proving a path stays inside a root."""
     try:
         path.relative_to(root)
         return True
@@ -268,6 +269,7 @@ def _checkpoint_meta_path(store: Path, commit_hash: str) -> Path:
 
 
 def _write_checkpoint_meta(store: Path, commit_hash: str, metadata: Optional[Dict]) -> None:
+    """Persist optional runtime metadata beside the shadow commit."""
     if not metadata:
         return
     try:
@@ -282,6 +284,7 @@ def _write_checkpoint_meta(store: Path, commit_hash: str, metadata: Optional[Dic
 
 
 def _read_checkpoint_meta(store: Path, commit_hash: str) -> Optional[Dict]:
+    """Load optional metadata for a checkpoint commit."""
     try:
         meta_path = _checkpoint_meta_path(store, commit_hash)
         if not meta_path.exists():
@@ -570,15 +573,15 @@ def _dir_size_bytes(path: Path) -> int:
 class CheckpointManager:
     """Manages automatic filesystem checkpoints.
 
-    Designed to be owned by AIAgent.  Call ``new_turn()`` at the start of
-    each conversation turn and ``ensure_checkpoint(dir, reason)`` before
-    any file-mutating tool call.  The manager deduplicates so at most one
-    snapshot is taken per directory per turn.
+    Designed to be owned by the M-Claw agent runtime.  Call ``new_turn()``
+    at the start of each conversation turn and ``ensure_checkpoint(dir,
+    reason)`` before any file-mutating tool call.  The manager deduplicates
+    so at most one snapshot is taken per directory per turn.
 
     Parameters
     ----------
     enabled : bool
-        Master switch (from config / CLI flag).
+        Runtime configuration switch.
     max_snapshots : int
         Keep at most this many checkpoints per directory.
     max_total_size_mb : int
@@ -630,7 +633,7 @@ class CheckpointManager:
         """Take a checkpoint if enabled and not already done this turn.
 
         Returns True if a checkpoint was taken, False otherwise.
-        Never raises — all errors are silently logged.
+        Records non-fatal failures in ``last_attempt`` instead of raising.
         """
         if not self.enabled:
             self._record_attempt("disabled", working_dir, reason)
@@ -655,7 +658,7 @@ class CheckpointManager:
         target_keys = set(target_info.get("rel") or [])
         targeted_candidate = bool(target_keys) and _dir_file_count(abs_dir) > _MAX_FILES
 
-        # Skip root, home, and other overly broad directories
+        # Reject root, home, and other overly broad directories.
         if abs_dir in {"/", str(Path.home())}:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             self._record_attempt("skipped", abs_dir, reason, detail="directory too broad")
@@ -735,7 +738,7 @@ class CheckpointManager:
 
         ref = _ref_name(_project_hash(abs_dir))
         ok, stdout, _ = _run_git(
-            ["log", ref, f"--format=%H|%h|%aI|%s", "-n", str(self.max_snapshots)],
+            ["log", ref, "--format=%H|%h|%aI|%s", "-n", str(self.max_snapshots)],
             store, abs_dir,
             allowed_returncodes={128, 129},
         )
@@ -781,7 +784,11 @@ class CheckpointManager:
             entry["deletions"] = int(m.group(1))
 
     def diff(self, working_dir: str, commit_hash: str) -> Dict:
-        """Show diff between a checkpoint and the current working tree."""
+        """Show diff between a checkpoint and the current working tree.
+
+        Targeted checkpoints compare only the paths captured in metadata so
+        large-project snapshots do not accidentally report unrelated changes.
+        """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
             return {"success": False, "error": hash_err}
@@ -854,7 +861,11 @@ class CheckpointManager:
         file_path: str = None,
         create_pre_snapshot: bool = True,
     ) -> Dict:
-        """Restore files to a checkpoint state."""
+        """Restore files to a checkpoint state, optionally limited to one file.
+
+        Targeted checkpoints may record paths that were absent at snapshot time;
+        restoring those paths means deleting files created after the checkpoint.
+        """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
             return {"success": False, "error": hash_err}
@@ -888,7 +899,7 @@ class CheckpointManager:
         metadata = _read_checkpoint_meta(store, commit_hash) or {}
 
         if create_pre_snapshot:
-            # Take a pre-rollback snapshot so you can undo the undo.
+            # Take a pre-rollback snapshot so the rollback can be reversed.
             pre_target_paths = metadata.get("target_paths") if metadata.get("targeted") else None
             self._take(
                 abs_dir,
@@ -998,6 +1009,7 @@ class CheckpointManager:
         }
 
     def _target_info(self, working_dir: str, target_paths: Optional[List[str]]) -> Dict:
+        """Normalize explicit target paths into metadata for targeted snapshots."""
         if not target_paths:
             return {"rel": [], "abs": [], "missing": [], "oversize": []}
         abs_dir = _normalize_path(working_dir)
@@ -1039,6 +1051,7 @@ class CheckpointManager:
         *,
         targeted: bool,
     ) -> Dict:
+        """Merge target metadata from repeated per-turn targeted checkpoints."""
         enriched = dict(metadata or {})
         if target_info.get("rel"):
             previous_targets = set(enriched.pop("_previous_target_paths_rel", []) or [])
@@ -1079,7 +1092,7 @@ class CheckpointManager:
         target_info = self._target_info(working_dir, target_paths)
         too_many_files = _dir_file_count(working_dir) > _MAX_FILES
 
-        # Quick size guard — don't try to snapshot enormous directories
+        # Size guard for very large working directories.
         if too_many_files:
             if target_info.get("rel"):
                 targeted_metadata = self._metadata_with_targets(
@@ -1130,10 +1143,8 @@ class CheckpointManager:
             # First snapshot for this project.
             index_file.parent.mkdir(parents=True, exist_ok=True)
 
-        # Stage with per-project index.  Include a per-stage file-size filter
-        # via ``core.bigFileThreshold`` is not what we want — instead, we
-        # rely on the exclude file for broad patterns and post-stage prune
-        # any path whose size exceeds max_file_size_mb.
+        # Stage with a per-project index. Broad exclusions come from the
+        # exclude file, then oversized paths are pruned after staging.
         ok, _, err = _run_git(
             ["add", "-A"], store, working_dir,
             timeout=_GIT_TIMEOUT * 2, index_file=index_file,
@@ -1242,6 +1253,7 @@ class CheckpointManager:
         index_file: Path,
         target_info: Dict,
     ) -> None:
+        """Force-stage only the explicit targets tracked by a targeted checkpoint."""
         for rel in target_info.get("rel", []):
             if rel in target_info.get("oversize", []):
                 _run_git(["rm", "--cached", "--ignore-unmatch", "--", rel], store, working_dir, index_file=index_file)
@@ -1259,6 +1271,7 @@ class CheckpointManager:
         metadata: Dict,
         target_info: Dict,
     ) -> bool:
+        """Snapshot selected paths when the workspace is too large for full staging."""
         rel_paths = [p for p in target_info.get("rel", []) if p not in target_info.get("oversize", [])]
         if not rel_paths:
             self._record_attempt("skipped", working_dir, reason, detail="no target files eligible for checkpoint")
@@ -1337,8 +1350,8 @@ class CheckpointManager:
     ) -> None:
         """Remove any staged file larger than ``max_file_size_mb`` from the index.
 
-        Lets the agent keep snapshotting source code while refusing to
-        swallow generated assets (datasets, model weights, logs, videos).
+        Keeps source checkpoints available while excluding generated assets
+        such as datasets, model weights, logs, and videos.
         """
         cap = self.max_file_size_mb * 1024 * 1024
         if cap <= 0:
@@ -1529,35 +1542,6 @@ class CheckpointManager:
         )
 
 
-def format_checkpoint_list(checkpoints: List[Dict], directory: str) -> str:
-    """Format checkpoint list for display to user."""
-    if not checkpoints:
-        return f"No checkpoints found for {directory}"
-
-    lines = [f"📸 Checkpoints for {directory}:\n"]
-    for i, cp in enumerate(checkpoints, 1):
-        ts = cp["timestamp"]
-        if "T" in ts:
-            ts = ts.split("T")[1].split("+")[0].split("-")[0][:5]
-            date = cp["timestamp"].split("T")[0]
-            ts = f"{date} {ts}"
-
-        files = cp.get("files_changed", 0)
-        ins = cp.get("insertions", 0)
-        dele = cp.get("deletions", 0)
-        if files:
-            stat = f"  ({files} file{'s' if files != 1 else ''}, +{ins}/-{dele})"
-        else:
-            stat = ""
-
-        lines.append(f"  {i}. {cp['short_hash']}  {ts}  {cp['reason']}{stat}")
-
-    lines.append("\n  /rollback <N>             restore to checkpoint N")
-    lines.append("  /rollback diff <N>        preview changes since checkpoint N")
-    lines.append("  /rollback <N> <file>      restore a single file from checkpoint N")
-    return "\n".join(lines)
-
-
 # ---------------------------------------------------------------------------
 # Auto-maintenance
 # ---------------------------------------------------------------------------
@@ -1595,7 +1579,7 @@ def prune_checkpoints(
     Returns a dict with counts ``{"scanned", "deleted_orphan",
     "deleted_stale", "errors", "bytes_freed"}``.
 
-    Never raises — maintenance must never block interactive startup.
+    Uses best-effort deletion so maintenance does not block normal runtime work.
     """
     base = checkpoint_base or CHECKPOINT_BASE
     result = {
@@ -1774,7 +1758,7 @@ def maybe_auto_prune_checkpoints(
                     out["skipped"] = True
                     return out
             except (OSError, ValueError):
-                pass  # corrupt marker — treat as no prior run
+                pass  # Invalid marker; run maintenance normally.
 
         result = prune_checkpoints(
             retention_days=retention_days,
@@ -1807,7 +1791,7 @@ def maybe_auto_prune_checkpoints(
 
 
 # ---------------------------------------------------------------------------
-# Public helpers for `mclaw checkpoints` CLI
+# Public maintenance helpers used by checkpoint command handlers.
 # ---------------------------------------------------------------------------
 
 def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
@@ -1858,7 +1842,7 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
 
 
 def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
-    """Nuke the entire checkpoint base. Irreversible.
+    """Remove the entire checkpoint base. Irreversible.
 
     Returns ``{"bytes_freed": N, "deleted": bool}``.
     """

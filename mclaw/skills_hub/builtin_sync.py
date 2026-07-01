@@ -14,9 +14,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Sequence
 
+import yaml
+
 from mclaw.constants import get_skills_dir
 from mclaw.skills_hub.evolution_store import write_default
 from mclaw.skills_hub.paths import SIDECAR_FILENAMES, validate_skill_name
+from mclaw.skills_hub.schema import SkillSchemaError
 from mclaw.skills_hub.skill_yaml_store import (
     build_skill_yaml,
     extract_short_description,
@@ -27,6 +30,8 @@ from mclaw.skills_hub.skill_yaml_store import (
 
 @dataclass(frozen=True)
 class BuiltinSkill:
+    """Metadata for one bundled Skill discovered from the application package."""
+
     name: str
     short_description: str
     source_key: str
@@ -35,12 +40,16 @@ class BuiltinSkill:
 
 
 def _get_app_root() -> Path:
+    """Return the application root for both source-tree and frozen builds."""
+
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[2]
 
 
 def _get_builtin_skills_dir() -> Path:
+    """Resolve the bundled Skill source directory with packaging-aware fallbacks."""
+
     env_override = os.getenv("MCLAW_BUILTIN_SKILLS", "").strip()
     if env_override:
         return Path(env_override)
@@ -57,6 +66,8 @@ def get_builtin_skills_dir() -> Path:
 
 
 def _read_manifest(manifest_file: Path) -> Dict[str, str]:
+    """Read the last-synced bundled hashes from the user's skills root."""
+
     if not manifest_file.exists():
         return {}
     result: Dict[str, str] = {}
@@ -64,15 +75,23 @@ def _read_manifest(manifest_file: Path) -> Dict[str, str]:
         line = line.strip()
         if not line:
             continue
-        if ":" in line:
-            name, _, hash_val = line.partition(":")
-            result[name.strip()] = hash_val.strip()
-        else:
-            result[line] = ""
+        if ":" not in line:
+            continue
+        name, _, hash_val = line.partition(":")
+        name = name.strip()
+        hash_val = hash_val.strip()
+        if not name or not hash_val:
+            continue
+        try:
+            result[validate_skill_name(name)] = hash_val
+        except ValueError:
+            continue
     return result
 
 
 def _write_manifest(entries: Dict[str, str], manifest_file: Path) -> None:
+    """Persist bundled Skill hashes through a replace step to avoid torn files."""
+
     manifest_file.parent.mkdir(parents=True, exist_ok=True)
     data = "\n".join(f"{name}:{hash_val}" for name, hash_val in sorted(entries.items())) + "\n"
     tmp = manifest_file.with_suffix(".tmp")
@@ -81,6 +100,8 @@ def _write_manifest(entries: Dict[str, str], manifest_file: Path) -> None:
 
 
 def _discover_builtin_skills(skills_source_dir: Path) -> List[BuiltinSkill]:
+    """Find valid built-in Skill packages without reading excluded Skill bodies deeply."""
+
     skills: List[BuiltinSkill] = []
     if not skills_source_dir.exists():
         return skills
@@ -98,7 +119,7 @@ def _discover_builtin_skills(skills_source_dir: Path) -> List[BuiltinSkill]:
             manifest = read_skill_yaml(skill_dir)
             name = validate_skill_name(str(manifest.get("name") or "").strip())
             short_description = str(manifest.get("short_description") or "").strip()
-        except Exception:
+        except (OSError, ValueError, yaml.YAMLError, SkillSchemaError):
             continue
         if name in seen_names:
             continue
@@ -116,6 +137,8 @@ def _discover_builtin_skills(skills_source_dir: Path) -> List[BuiltinSkill]:
 
 
 def _dir_hash(directory: Path, *, exclude_generated_sidecars: bool = False) -> str:
+    """Hash package content, optionally ignoring service-owned sidecar files."""
+
     hasher = hashlib.md5()
     for fpath in sorted(directory.rglob("*")):
         if fpath.is_file():
@@ -127,17 +150,17 @@ def _dir_hash(directory: Path, *, exclude_generated_sidecars: bool = False) -> s
     return hasher.hexdigest()
 
 
-def _ensure_skill2_sidecars(skill_dir: Path, *, name: str, source_original: str, force: bool = False) -> None:
+def _ensure_skill_sidecars(skill_dir: Path, *, name: str, source_original: str, force: bool = False) -> None:
+    """Ensure bundled Skills have M-Claw sidecars while preserving existing summaries."""
+
     skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
     short_description = extract_short_description(skill_md, name)
     manifest_path = skill_dir / "mclaw_skill.yaml"
     if manifest_path.exists():
         try:
-            import yaml
-
             existing = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
             short_description = str(existing.get("short_description") or short_description).strip()
-        except Exception:
+        except (OSError, ValueError, yaml.YAMLError, SkillSchemaError):
             pass
     if force or not (skill_dir / "mclaw_skill.yaml").exists():
         write_skill_yaml(
@@ -156,14 +179,14 @@ def _ensure_skill2_sidecars(skill_dir: Path, *, name: str, source_original: str,
 
 
 def _is_existing_same_builtin(dest: Path, source_key: str) -> bool:
+    """Return whether an existing destination still identifies as this bundled Skill."""
+
     manifest = dest / "mclaw_skill.yaml"
     if not manifest.exists():
         return False
     try:
-        import yaml
-
         data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-    except Exception:
+    except (OSError, ValueError, yaml.YAMLError, SkillSchemaError):
         return False
     source = data.get("source") if isinstance(data, dict) else None
     if not isinstance(source, dict):
@@ -192,6 +215,8 @@ def sync_selected_skills(skill_names: Sequence[str], quiet: bool = False) -> dic
 
 
 def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> dict:
+    """Synchronize bundled Skills into the user root without overwriting edits."""
+
     builtins_dir = _get_builtin_skills_dir()
     skills_dir = get_skills_dir()
     manifest_file = skills_dir / ".builtin_manifest"
@@ -229,14 +254,14 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
         if skill_name not in manifest:
             if dest.exists():
                 if _is_existing_same_builtin(dest, source_key):
-                    _ensure_skill2_sidecars(dest, name=skill_name, source_original=source_key)
+                    _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key)
                     skipped += 1
                     manifest[skill_name] = bundled_hash
                 else:
                     user_modified.append(skill_name)
             else:
                 shutil.copytree(skill_src, dest)
-                _ensure_skill2_sidecars(dest, name=skill_name, source_original=source_key, force=True)
+                _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key, force=True)
                 copied.append(skill_name)
                 manifest[skill_name] = bundled_hash
                 if not quiet:
@@ -244,8 +269,10 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
             continue
 
         if dest.exists():
-            _ensure_skill2_sidecars(dest, name=skill_name, source_original=source_key)
+            _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key)
             origin_hash = manifest.get(skill_name, "")
+            # The sync hash ignores generated sidecars so local Skill memory edits do not
+            # make a bundled package look user-modified.
             user_hash = _dir_hash(dest, exclude_generated_sidecars=True)
 
             if not origin_hash:
@@ -263,8 +290,9 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
                 backup = dest.with_suffix(".bak")
                 shutil.move(str(dest), str(backup))
                 try:
+                    # Replace through a backup so a failed copy can restore the enabled Skill.
                     shutil.copytree(skill_src, dest)
-                    _ensure_skill2_sidecars(dest, name=skill_name, source_original=source_key, force=True)
+                    _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key, force=True)
                     manifest[skill_name] = bundled_hash
                     updated.append(skill_name)
                     if not quiet:

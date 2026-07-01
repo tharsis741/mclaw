@@ -12,7 +12,6 @@ module.
 from __future__ import annotations
 
 import importlib.util
-import os
 import shutil
 from pathlib import Path
 
@@ -25,10 +24,12 @@ from mclaw.runtime.shell import ShellProfile
 
 
 def _feature_from_module(module: str) -> FeatureState:
+    """Map an import probe to a runtime feature availability state."""
     return FeatureState.ENABLED if importlib.util.find_spec(module) else FeatureState.AVAILABLE_WITH_INSTALL
 
 
 class LinuxRuntime(Runtime):
+    """Runtime profile for Linux, macOS, and other POSIX-like hosts."""
     kind = "linux"
 
     def __init__(self) -> None:
@@ -56,6 +57,7 @@ class LinuxRuntime(Runtime):
 
     @staticmethod
     def _shell_profile() -> ShellProfile:
+        """Prefer bash login semantics, falling back to POSIX sh."""
         executable = shutil.which("bash") or ("/usr/bin/bash" if Path("/usr/bin/bash").exists() else "") or ("/bin/bash" if Path("/bin/bash").exists() else "") or shutil.which("sh") or "/bin/sh"
         name = "bash" if Path(executable).name == "bash" else "sh"
         args = ("-lc",) if name == "bash" else ("-c",)

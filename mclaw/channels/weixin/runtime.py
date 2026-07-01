@@ -2,10 +2,10 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run the Weixin long-poll channel loop.
+"""Weixin long-poll runtime orchestration.
 
-The runtime combines configuration, polling, deduplication, session routing,
-media handling, and outbound target registration around the shared runner.
+The runtime wires account state, context-token persistence, iLink polling, and
+the shared channel adapter into one private-chat gateway process.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from mclaw.channels.weixin.config import WeixinConfig
 from mclaw.channels.weixin.context_token_store import ContextTokenStore
 from mclaw.channels.weixin.dedup import MessageDeduplicator
 from mclaw.channels.weixin.ilink_client import ILinkClient
+from mclaw.channels.weixin.outbound_registry import unregister_weixin_outbound_targets_for_adapter
 from mclaw.channels.weixin.runtime_lock import WeixinRuntimeLock
 from mclaw.channels.weixin.session_router import WeixinSessionRouter
 from mclaw.state import SessionDB
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 class WeixinRuntime:
+    """Own the Weixin channel lifecycle, polling loop, and dispatch task set."""
+
     def __init__(
         self,
         *,
@@ -47,7 +50,6 @@ class WeixinRuntime:
         adapter: WeixinAdapter | None = None,
         runtime_lock: WeixinRuntimeLock | None = None,
     ) -> None:
-        self.root_config = config
         self.weixin_config = WeixinConfig.from_config(config)
         self.session_db = session_db or SessionDB()
         self.account_store = account_store or WeixinAccountStore()
@@ -87,6 +89,7 @@ class WeixinRuntime:
         self._running = False
 
     async def start(self) -> None:
+        """Validate config, acquire the account lock, restore tokens, and poll forever."""
         errors = self.weixin_config.validate()
         if errors:
             raise RuntimeError("; ".join(errors))
@@ -107,6 +110,7 @@ class WeixinRuntime:
             raise
 
     async def stop(self) -> None:
+        """Stop polling, drain active dispatch tasks, close iLink, and release state."""
         self._running = False
         interrupt_all = getattr(self.runner, "interrupt_all", None)
         if interrupt_all:
@@ -128,10 +132,12 @@ class WeixinRuntime:
         try:
             await self.client.close()
         finally:
+            unregister_weixin_outbound_targets_for_adapter(self.adapter)
             if self.runtime_lock is not None:
                 self.runtime_lock.release()
 
     async def _poll_loop(self) -> None:
+        """Run the iLink long-poll loop with conservative backoff after failures."""
         sync_buf = self.account_store.load_sync_buf(self.weixin_config.account_id)
         consecutive_failures = 0
         while self._running:
@@ -152,6 +158,7 @@ class WeixinRuntime:
                 await asyncio.sleep(30 if consecutive_failures >= 3 else 2)
 
     async def poll_once(self, sync_buf: str) -> tuple[str, bool]:
+        """Poll one iLink batch, persist the new sync cursor, and fan out messages."""
         response = await self.client.get_updates(
             sync_buf,
             timeout_ms=self.weixin_config.poll_timeout_ms,
@@ -165,12 +172,14 @@ class WeixinRuntime:
             sync_buf = new_sync_buf
             self.account_store.save_sync_buf(self.weixin_config.account_id, sync_buf)
         for message in response.get("msgs") or []:
+            # Message processing runs concurrently so long polling can continue.
             task = asyncio.create_task(self._dispatch_message(message))
             self._dispatch_tasks.add(task)
             task.add_done_callback(self._dispatch_tasks.discard)
         return sync_buf, True
 
     async def _dispatch_message(self, message: dict) -> None:
+        """Run one inbound payload through the adapter without killing the poll loop."""
         try:
             await self.adapter.process_message(message)
         except asyncio.CancelledError:
@@ -179,6 +188,7 @@ class WeixinRuntime:
             logger.exception("weixin message dispatch failed: %s", exc)
 
     async def run_forever(self) -> None:
+        """Start the runtime and always run shutdown cleanup on exit."""
         try:
             await self.start()
         finally:

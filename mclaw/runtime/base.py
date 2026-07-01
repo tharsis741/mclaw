@@ -13,7 +13,6 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import dataclass
-from pathlib import Path
 
 from mclaw.runtime.features import RuntimeFeatures
 from mclaw.runtime.paths import PathPolicy
@@ -24,6 +23,7 @@ from mclaw.runtime.shell import CWD_MARKER, ShellProfile
 
 @dataclass(frozen=True)
 class ExecResult:
+    """Synchronous command result normalized across runtime implementations."""
     output: str
     returncode: int
     cwd: str
@@ -32,6 +32,7 @@ class ExecResult:
 
 
 class Runtime:
+    """Base runtime facade for shell execution, path policy, and capabilities."""
     kind: str = "unknown"
 
     def __init__(
@@ -54,6 +55,7 @@ class Runtime:
         *,
         allowed_sensitive: set[str] | None = None,
     ) -> dict[str, str]:
+        """Build a subprocess environment with only authorized secrets retained."""
         env = sanitize_subprocess_env(os.environ, allowed_sensitive=allowed_sensitive)
         env["MCLAW_HOME"] = str(self.paths.mclaw_home)
         if extra:
@@ -70,6 +72,7 @@ class Runtime:
         env: dict | None = None,
         scoped_secret_keys: set[str] | None = None,
     ) -> ExecResult:
+        """Run a foreground command under path policy and return captured output."""
         cwd_value = cwd or os.getcwd()
         decision = self.paths.check("execute", cwd_value)
         if not decision.allowed:
@@ -123,6 +126,7 @@ class Runtime:
         use_pty: bool = False,
         scoped_secret_keys: set[str] | None = None,
     ) -> SpawnResult:
+        """Start a background command with PTY fallback and sanitized env state."""
         cwd_value = cwd or os.getcwd()
         decision = self.paths.check("execute", cwd_value)
         if not decision.allowed:
@@ -192,9 +196,11 @@ class Runtime:
         base: str | os.PathLike | None = None,
         action: str = "read",
     ):
+        """Apply runtime path policy to a caller-supplied path."""
         return self.paths.check(action, path, base=base)
 
     def doctor(self) -> dict:
+        """Return machine-readable runtime diagnostics for mclaw doctor."""
         data = {
             "kind": self.kind,
             "shell": self.shell.name,
@@ -216,6 +222,7 @@ class Runtime:
 
     @staticmethod
     def _strip_cwd_marker(output: str) -> tuple[str, str]:
+        """Remove shell-injected cwd marker while preserving command output."""
         latest = ""
         kept: list[str] = []
         for line in output.splitlines():

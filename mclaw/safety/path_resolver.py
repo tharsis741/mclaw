@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any
 
 _QUOTED_WINDOWS_ABS_PATH_RE = re.compile(r'["\']([A-Za-z]:[\\/][^"\']+)["\']')
 _WINDOWS_ABS_PATH_RE = re.compile(r'[A-Za-z]:[\\/][^\s"\'<>|`]+(?:[\\/][^\s"\'<>|`]+)*')
@@ -19,6 +20,7 @@ _MOJIBAKE_MARKERS = ("娴嬭瘯", "娴嬭", "瘯")
 
 
 def repair_common_mojibake(text: str) -> str:
+    """Repair known Windows console mojibake in command and path text."""
     if not text or not any(marker in text for marker in _MOJIBAKE_MARKERS):
         return text
     try:
@@ -28,12 +30,14 @@ def repair_common_mojibake(text: str) -> str:
 
 
 def msys_to_windows_path(path: str) -> str:
+    """Convert Git Bash-style drive paths to Windows paths."""
     if len(path) >= 3 and path[0] == "/" and path[2] == "/":
         return f"{path[1].upper()}:/{path[3:]}"
     return path
 
 
-def normalize_path(path_value: str, cwd: str = None) -> str:
+def normalize_path(path_value: str, cwd: str | None = None) -> str:
+    """Normalize shell-facing path text into an absolute comparison path."""
     value = repair_common_mojibake(str(path_value or "")).strip().strip("'\"")
     if not value:
         return ""
@@ -48,6 +52,7 @@ def normalize_path(path_value: str, cwd: str = None) -> str:
 
 
 def is_mclaw_runtime_path(path_value: Any) -> bool:
+    """Treat M-Claw runtime internals as unsafe defaults for user workspace scope."""
     try:
         from mclaw.runtime.manager import RuntimeManager
 
@@ -56,9 +61,10 @@ def is_mclaw_runtime_path(path_value: Any) -> bool:
         return False
 
 
-def extract_absolute_paths_from_command(command: str) -> List[str]:
+def extract_absolute_paths_from_command(command: str) -> list[str]:
+    """Extract explicit absolute paths from Windows and Git Bash command text."""
     command = repair_common_mojibake(command or "")
-    paths: List[str] = []
+    paths: list[str] = []
     seen = set()
     quoted_spans = []
     for match in _QUOTED_WINDOWS_ABS_PATH_RE.finditer(command):
@@ -83,12 +89,13 @@ def extract_absolute_paths_from_command(command: str) -> List[str]:
 def resolve_workspace(
     *,
     explicit_workdir: str = "",
-    target_paths: Optional[Iterable[str]] = None,
+    target_paths: Iterable[str] | None = None,
     terminal_cwd: str = "",
     launch_cwd: str = "",
     recent_checkpoint_dir: str = "",
     fallback_cwd: str = "",
 ) -> str:
+    """Choose the best workspace root from explicit targets and runtime fallbacks."""
     candidates = [
         explicit_workdir,
         _first_target_parent(target_paths),
@@ -103,7 +110,7 @@ def resolve_workspace(
     return normalize_path(os.getcwd())
 
 
-def _first_target_parent(target_paths: Optional[Iterable[str]]) -> str:
+def _first_target_parent(target_paths: Iterable[str] | None) -> str:
     for target in target_paths or []:
         normalized = normalize_path(str(target))
         if normalized:
@@ -112,7 +119,7 @@ def _first_target_parent(target_paths: Optional[Iterable[str]]) -> str:
     return ""
 
 
-def _append_path(paths: List[str], seen: set, value: str) -> None:
+def _append_path(paths: list[str], seen: set[str], value: str) -> None:
     cleaned = normalize_path(str(value).strip().rstrip(";,"))
     if cleaned and cleaned not in seen:
         paths.append(cleaned)

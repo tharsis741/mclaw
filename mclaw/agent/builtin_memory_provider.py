@@ -7,12 +7,16 @@
 from __future__ import annotations
 
 import copy
+from typing import Any
+
 from mclaw.agent.memory_provider import MemoryProvider
-from mclaw.tools.memory_tool import MEMORY_TOOL_SCHEMAS, handle_memory_tool_call
+from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES, MEMORY_TOOL_SCHEMAS, handle_memory_tool_call
 from mclaw.tools.registry import tool_error
 
 
 class BuiltinMemoryProvider(MemoryProvider):
+    """File-backed provider for M-Claw's built-in memory and user profile tools."""
+
     def __init__(
         self,
         memory_store=None,
@@ -58,7 +62,8 @@ class BuiltinMemoryProvider(MemoryProvider):
         if self._store is not None:
             self._store.load_from_disk()
 
-    def get_tool_schemas(self):
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
+        """Return memory tool schemas narrowed to enabled storage targets."""
         targets = []
         if self._memory_enabled:
             targets.append("memory")
@@ -79,9 +84,12 @@ class BuiltinMemoryProvider(MemoryProvider):
                 target_schema["description"] = "Only 'user' profile memory is enabled."
         return schemas
 
-    def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
-        if tool_name not in {schema["function"]["name"] for schema in MEMORY_TOOL_SCHEMAS}:
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
+        """Validate enabled targets before delegating to the built-in memory tool."""
+        if tool_name not in MEMORY_TOOL_NAMES:
             return super().handle_tool_call(tool_name, args, **kwargs)
+        if self._store is None:
+            return tool_error("Built-in memory store is not available.", success=False)
         target = args.get("target", "memory")
         if target == "memory" and not self._memory_enabled:
             return tool_error("Memory target 'memory' is disabled by configuration.", success=False)

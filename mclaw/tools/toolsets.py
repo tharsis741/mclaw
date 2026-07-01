@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Set
+from typing import Any
 
 CREDENTIALS_TOOLS: list[str] = ["secret_request_many"]
 TERMINAL_TOOLS = ["terminal", "process"]
@@ -35,7 +35,8 @@ REQUIRED_TOOLSETS = ["credentials", "terminal", "file", "memory", "skills", "ses
 OPTIONAL_TOOLSETS = ["web", "vision", "browser", "weixin", "dingtalk"]
 
 
-def _tools_for_toolsets(toolset_names: list[str], definitions: Dict[str, Dict[str, Any]]) -> list[str]:
+def _tools_for_toolsets(toolset_names: list[str], definitions: dict[str, dict[str, Any]]) -> list[str]:
+    """Flatten toolsets while preserving first-seen tool order."""
     tools: list[str] = []
     seen: set[str] = set()
     for toolset_name in toolset_names:
@@ -47,7 +48,7 @@ def _tools_for_toolsets(toolset_names: list[str], definitions: Dict[str, Dict[st
     return tools
 
 
-TOOLSETS: Dict[str, Dict[str, Any]] = {
+TOOLSETS: dict[str, dict[str, Any]] = {
     "credentials": {
         "description": "Scoped credential requests and authorization",
         "display": {"emoji": "🔐", "summary_zh": "请求密钥授权"},
@@ -139,13 +140,9 @@ TOOLSETS["mclaw-required"] = {
 }
 
 
-def get_toolset(name: str) -> Optional[Dict[str, Any]]:
-    return TOOLSETS.get(name)
-
-
-def resolve_toolset(name: str) -> List[str]:
+def resolve_toolset(name: str) -> list[str]:
     """Resolve a toolset name to a flat list of tool names."""
-    if name in ("all", "*"):
+    if name == "all":
         tools = set()
         for ts in TOOLSETS.values():
             tools.update(ts.get("tools", []))
@@ -156,28 +153,19 @@ def resolve_toolset(name: str) -> List[str]:
     return list(ts.get("tools", []))
 
 
-def resolve_multiple_toolsets(names: List[str]) -> Set[str]:
+def resolve_multiple_toolsets(names: list[str]) -> set[str]:
+    """Resolve multiple toolset names into a deduplicated tool-name set."""
     tools = set()
     for name in names:
         tools.update(resolve_toolset(name))
     return tools
 
 
-def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
-    return dict(TOOLSETS)
-
-
-def get_toolset_names() -> List[str]:
-    return sorted(TOOLSETS.keys())
-
-
-def get_required_toolset_names() -> List[str]:
-    return list(REQUIRED_TOOLSETS)
-
-
-def get_optional_toolset_names() -> List[str]:
+def get_optional_toolset_names() -> list[str]:
+    """Return optional toolset names exposed in setup and diagnostics."""
     return list(OPTIONAL_TOOLSETS)
 
 
 def validate_toolset(name: str) -> bool:
-    return name in TOOLSETS or name in ("all", "*")
+    """Return whether a toolset name or the special `all` preset is valid."""
+    return name in TOOLSETS or name == "all"

@@ -10,28 +10,47 @@ but "auto" should inherit the active agent credentials and model.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+import logging
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
-def _task_config(task: str, parent_agent: Any = None) -> Dict[str, Any]:
+def _task_config(task: str, parent_agent: Any = None) -> dict[str, Any]:
+    """Read task-specific auxiliary config from the live agent or disk config."""
     cfg = getattr(parent_agent, "config", None) if parent_agent is not None else None
     if not cfg:
-        try:
-            from mclaw.cli.config import load_config
-            cfg = load_config()
-        except Exception:
-            cfg = {}
+        from mclaw.cli.config import load_config
+
+        cfg = load_config(strict=True)
     aux = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
     task_cfg = aux.get(task, {}) if isinstance(aux, dict) else {}
     return task_cfg if isinstance(task_cfg, dict) else {}
 
 
-def _resolve_auxiliary_credentials(task: str, parent_agent: Any = None) -> Dict[str, Any]:
+def _coerce_timeout(value: Any, default: float = 60.0) -> float:
+    """Clamp auxiliary task timeouts to a bounded positive value."""
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        timeout = default
+    if timeout <= 0:
+        return default
+    return min(timeout, 600.0)
+
+
+def _resolve_auxiliary_credentials(task: str, parent_agent: Any = None) -> dict[str, Any]:
+    """Resolve task credentials while allowing `auto` to inherit the parent agent.
+
+    Auxiliary work must be independently configurable, but the default path is
+    intentionally cheap: reuse the already-selected provider, model, endpoint,
+    and API mode from the interactive agent.
+    """
     task_cfg = _task_config(task, parent_agent)
-    provider = str(task_cfg.get("provider") or "auto")
-    model = str(task_cfg.get("model") or "")
-    base_url = str(task_cfg.get("base_url") or "")
-    timeout = float(task_cfg.get("timeout") or 60)
+    provider = str(task_cfg.get("provider") or "auto").strip()
+    model = str(task_cfg.get("model") or "").strip()
+    base_url = str(task_cfg.get("base_url") or "").strip()
+    timeout = _coerce_timeout(task_cfg.get("timeout"), default=60.0)
 
     parent_provider = str(getattr(parent_agent, "provider", "") or "")
     parent_model = str(getattr(parent_agent, "model", "") or "")
@@ -49,27 +68,18 @@ def _resolve_auxiliary_credentials(task: str, parent_agent: Any = None) -> Dict[
             "timeout": timeout,
         }
 
-    try:
-        from mclaw.cli.auth import PROVIDER_REGISTRY, resolve_api_key, resolve_base_url
-        provider_cfg = PROVIDER_REGISTRY.get(provider)
-        inherited_model = parent_model if provider == parent_provider else ""
-        return {
-            "provider": provider,
-            "model": model or inherited_model,
-            "base_url": base_url or resolve_base_url(provider),
-            "api_key": resolve_api_key(provider) or parent_api_key,
-            "api_mode": provider_cfg.api_mode if provider_cfg else "chat_completions",
-            "timeout": timeout,
-        }
-    except Exception:
-        return {
-            "provider": provider,
-            "model": model or parent_model,
-            "base_url": base_url or parent_base_url,
-            "api_key": parent_api_key,
-            "api_mode": parent_api_mode,
-            "timeout": timeout,
-        }
+    from mclaw.cli.auth import PROVIDER_REGISTRY, resolve_api_key, resolve_base_url
+
+    provider_cfg = PROVIDER_REGISTRY.get(provider)
+    inherited_model = parent_model if provider == parent_provider else ""
+    return {
+        "provider": provider,
+        "model": model or inherited_model,
+        "base_url": base_url or resolve_base_url(provider),
+        "api_key": resolve_api_key(provider) or parent_api_key,
+        "api_mode": provider_cfg.api_mode if provider_cfg else "chat_completions",
+        "timeout": timeout,
+    }
 
 
 def extract_content_or_reasoning(response: Any) -> str:
@@ -81,15 +91,15 @@ def extract_content_or_reasoning(response: Any) -> str:
             content = getattr(msg, "content", None) or ""
             reasoning = getattr(msg, "reasoning_content", None) or ""
             return (content or reasoning or "").strip()
-    except Exception:
-        pass
+    except (AttributeError, IndexError, TypeError) as exc:
+        logger.debug("OpenAI-compatible auxiliary response parsing failed: %s", exc)
 
     try:
         blocks = getattr(response, "content", None)
         if isinstance(blocks, str):
             return blocks.strip()
         if isinstance(blocks, list):
-            parts: List[str] = []
+            parts: list[str] = []
             for block in blocks:
                 text = getattr(block, "text", None)
                 if text is None and isinstance(block, dict):
@@ -97,15 +107,15 @@ def extract_content_or_reasoning(response: Any) -> str:
                 if text:
                     parts.append(str(text))
             return "\n".join(parts).strip()
-    except Exception:
-        pass
+    except (AttributeError, TypeError) as exc:
+        logger.debug("Anthropic-compatible auxiliary response parsing failed: %s", exc)
 
     return ""
 
 
 def call_auxiliary_llm(
     task: str,
-    messages: List[Dict[str, str]],
+    messages: list[dict[str, str]],
     parent_agent: Any = None,
     temperature: float = 0.1,
     max_tokens: int = 4000,
@@ -125,6 +135,8 @@ def call_auxiliary_llm(
 
         system = ""
         anth_messages = []
+        # Anthropic Messages accepts system text separately and only user or
+        # assistant turns in the messages array.
         for msg in messages:
             if msg.get("role") == "system" and not system:
                 system = msg.get("content") or ""
@@ -175,6 +187,8 @@ def call_auxiliary_llm(
         return extract_content_or_reasoning(client.chat.completions.create(**kwargs))
     except Exception as exc:
         if exc.__class__.__name__ == "BadRequestError" and "temperature" in str(exc).lower():
+            # Some OpenAI-compatible endpoints reject temperature for fixed-mode
+            # reasoning models; retry without changing the caller's prompt.
             kwargs.pop("temperature", None)
             return extract_content_or_reasoning(client.chat.completions.create(**kwargs))
         raise

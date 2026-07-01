@@ -2,7 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Minimal Tencent iLink client used by the Weixin channel."""
+"""Minimal Tencent iLink protocol client used by the Weixin channel.
+
+The adapter keeps raw HTTP details here so runtime code can work with
+channel-level operations: polling, sending, typing, config, and media upload.
+"""
 
 from __future__ import annotations
 
@@ -45,6 +49,7 @@ def _json_dumps(payload: dict[str, Any]) -> str:
 
 
 def _headers(token: str | None, body: str) -> dict[str, str]:
+    """Build iLink headers, including the per-request synthetic WeChat UIN."""
     headers = {
         "Content-Type": "application/json",
         "AuthorizationType": "ilink_bot_token",
@@ -59,6 +64,8 @@ def _headers(token: str | None, body: str) -> dict[str, str]:
 
 
 class ILinkClient:
+    """Async HTTP client for the subset of Tencent iLink used by M-Claw."""
+
     def __init__(self, *, base_url: str, token: str, timeout_ms: int = 15000) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
@@ -74,6 +81,7 @@ class ILinkClient:
         await self.close()
 
     async def open(self) -> None:
+        """Open an httpx client bound to the current asyncio event loop."""
         loop = asyncio.get_running_loop()
         if self._client is not None and self._client_loop is loop and not loop.is_closed():
             return
@@ -82,6 +90,7 @@ class ILinkClient:
             self._client = None
             self._client_loop = None
             try:
+                # httpx transports are loop-affine, so a reused client must be closed first.
                 await client.aclose()
             except RuntimeError as exc:
                 if "Event loop is closed" not in str(exc):
@@ -90,6 +99,7 @@ class ILinkClient:
         self._client_loop = loop
 
     async def close(self) -> None:
+        """Close the underlying HTTP client if one is active."""
         client = self._client
         self._client = None
         self._client_loop = None
@@ -97,6 +107,7 @@ class ILinkClient:
             await client.aclose()
 
     async def post(self, endpoint: str, payload: dict[str, Any], *, timeout_ms: int | None = None) -> dict[str, Any]:
+        """POST an iLink JSON payload with the channel version envelope."""
         await self.open()
         assert self._client is not None
         body = _json_dumps({**payload, "base_info": {"channel_version": CHANNEL_VERSION}})
@@ -110,6 +121,7 @@ class ILinkClient:
         return response.json()
 
     async def get(self, endpoint: str, *, timeout_ms: int | None = None) -> dict[str, Any]:
+        """GET an iLink endpoint that does not require the bot-token header shape."""
         await self.open()
         assert self._client is not None
         response = await self._client.get(
@@ -124,6 +136,7 @@ class ILinkClient:
         return response.json()
 
     async def download_bytes(self, url: str, *, timeout_ms: int | None = None) -> bytes:
+        """Download raw media bytes from a previously validated CDN URL."""
         await self.open()
         assert self._client is not None
         response = await self._client.get(url, timeout=(timeout_ms or self.timeout_ms) / 1000)
@@ -131,6 +144,7 @@ class ILinkClient:
         return response.content
 
     async def upload_bytes(self, url: str, data: bytes, *, timeout_ms: int | None = None) -> str:
+        """Upload encrypted media bytes and return the CDN encrypted parameter."""
         await self.open()
         assert self._client is not None
         response = await self._client.post(
@@ -142,10 +156,12 @@ class ILinkClient:
         response.raise_for_status()
         encrypted_param = response.headers.get("x-encrypted-param")
         if not encrypted_param:
+            # iLink needs this response header to reference the uploaded CDN object.
             raise RuntimeError(f"CDN upload missing x-encrypted-param header: {response.text[:200]}")
         return encrypted_param
 
     async def get_bot_qrcode(self, *, bot_type: str = "3", timeout_ms: int = 35000) -> dict[str, Any]:
+        """Request a QR code used to bind a Weixin account to the bot channel."""
         return await self.get(f"{EP_GET_BOT_QR}?bot_type={bot_type}", timeout_ms=timeout_ms)
 
     async def get_qrcode_status(
@@ -155,6 +171,7 @@ class ILinkClient:
         base_url: str | None = None,
         timeout_ms: int = 35000,
     ) -> dict[str, Any]:
+        """Poll QR login status, temporarily following a redirect host when provided."""
         old_base_url = self.base_url
         if base_url:
             self.base_url = base_url.rstrip("/")
@@ -164,6 +181,7 @@ class ILinkClient:
             self.base_url = old_base_url
 
     async def get_updates(self, sync_buf: str, *, timeout_ms: int) -> dict[str, Any]:
+        """Long-poll inbound updates, returning an empty batch on poll timeout."""
         try:
             return await self.post(
                 EP_GET_UPDATES,
@@ -171,6 +189,7 @@ class ILinkClient:
                 timeout_ms=timeout_ms,
             )
         except httpx.TimeoutException:
+            # A long-poll timeout means "no messages yet", not a channel failure.
             return {"ret": 0, "msgs": [], "get_updates_buf": sync_buf}
 
     async def send_text(
@@ -181,6 +200,7 @@ class ILinkClient:
         client_id: str,
         context_token: str | None = None,
     ) -> dict[str, Any]:
+        """Send a terminal text item to a Weixin peer."""
         msg: dict[str, Any] = {
             "from_user_id": "",
             "to_user_id": to_user_id,
@@ -201,6 +221,7 @@ class ILinkClient:
         client_id: str,
         context_token: str | None = None,
     ) -> dict[str, Any]:
+        """Send a prebuilt iLink item, such as an encrypted media descriptor."""
         msg: dict[str, Any] = {
             "from_user_id": "",
             "to_user_id": to_user_id,
@@ -224,6 +245,7 @@ class ILinkClient:
         filesize: int,
         aeskey_hex: str,
     ) -> dict[str, Any]:
+        """Ask iLink for the CDN upload target for encrypted outbound media."""
         return await self.post(
             EP_GET_UPLOAD_URL,
             {
@@ -240,12 +262,14 @@ class ILinkClient:
         )
 
     async def get_config(self, *, user_id: str, context_token: str | None = None) -> dict[str, Any]:
+        """Fetch per-peer config, optionally scoped by a conversation context token."""
         payload: dict[str, Any] = {"ilink_user_id": user_id}
         if context_token:
             payload["context_token"] = context_token
         return await self.post(EP_GET_CONFIG, payload)
 
     async def send_typing(self, *, user_id: str, typing_ticket: str, started: bool) -> None:
+        """Send typing start/stop state for an active Weixin conversation."""
         await self.post(
             EP_SEND_TYPING,
             {

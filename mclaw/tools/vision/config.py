@@ -31,30 +31,30 @@ def env_value(key: str, default: str = "") -> str:
 
 
 def authorized_env_value(key: str, default: str = "") -> str:
+    """Read an env value only when authorized for the vision tool scope."""
     try:
-        from mclaw.runtime.features import authorized_env_value
+        from mclaw.runtime.features import authorized_env_value as _authorized_env_value
 
-        return authorized_env_value(VISION_REQUIRED_FOR, key, env_value, default)
+        return _authorized_env_value(VISION_REQUIRED_FOR, key, env_value, default)
     except Exception:
         return ""
 
 
 def effective_config(parent_agent: Any = None, config: dict | None = None) -> dict:
+    """Resolve config from explicit args, parent agent state, or global loader."""
     if isinstance(config, dict):
         return config
     if parent_agent is not None:
         cfg = getattr(parent_agent, "config", None)
         if isinstance(cfg, dict):
             return cfg
-    try:
-        from mclaw.cli.config import load_config
+    from mclaw.cli.config import load_config
 
-        return load_config()
-    except Exception:
-        return {}
+    return load_config(strict=True)
 
 
 def vision_config(parent_agent: Any = None, config: dict | None = None) -> dict:
+    """Return the auxiliary.vision section as a normalized dictionary."""
     cfg = effective_config(parent_agent=parent_agent, config=config)
     vision = cfg.get("auxiliary", {}).get("vision", {}) if isinstance(cfg, dict) else {}
     return vision if isinstance(vision, dict) else {}
@@ -62,12 +62,12 @@ def vision_config(parent_agent: Any = None, config: dict | None = None) -> dict:
 
 def resolve_timeout(parent_agent: Any = None) -> float:
     """Vision LLM call timeout: config -> env -> default."""
-    try:
-        val = vision_config(parent_agent=parent_agent).get("timeout")
-        if val is not None:
+    val = vision_config(parent_agent=parent_agent).get("timeout")
+    if val is not None:
+        try:
             return float(val)
-    except Exception:
-        pass
+        except (TypeError, ValueError):
+            pass
     env_val = os.getenv("MCLAW_VISION_TIMEOUT", "").strip()
     if env_val:
         try:
@@ -79,12 +79,12 @@ def resolve_timeout(parent_agent: Any = None) -> float:
 
 def resolve_download_timeout(parent_agent: Any = None) -> float:
     """Image-download timeout: config -> env -> default."""
-    try:
-        val = vision_config(parent_agent=parent_agent).get("download_timeout")
-        if val is not None:
+    val = vision_config(parent_agent=parent_agent).get("download_timeout")
+    if val is not None:
+        try:
             return float(val)
-    except Exception:
-        pass
+        except (TypeError, ValueError):
+            pass
     env_val = os.getenv("MCLAW_VISION_DOWNLOAD_TIMEOUT", "").strip()
     if env_val:
         try:

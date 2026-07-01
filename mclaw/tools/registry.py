@@ -10,12 +10,14 @@ schema, handler, toolset membership, and availability check.
 
 import json
 import logging
-from typing import Callable, Dict, List, Optional, Set
+from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
 
 class ToolEntry:
+    """Registered tool metadata used for schema exposure and handler dispatch."""
+
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn", "diagnose_fn",
         "requires_env", "is_async", "description", "emoji",
@@ -42,22 +44,22 @@ class ToolRegistry:
     """Singleton registry that collects tool schemas + handlers from tool files."""
 
     def __init__(self):
-        self._tools: Dict[str, ToolEntry] = {}
-        self._toolset_checks: Dict[str, Callable] = {}
+        self._tools: dict[str, ToolEntry] = {}
 
     def _ensure_discovered(self) -> None:
         try:
             from mclaw.tools.dispatch import _discover_tools
             _discover_tools()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Tool discovery failed: %s", exc, exc_info=True)
 
     def register(
         self, name: str, toolset: str, schema: dict, handler: Callable,
-        check_fn: Callable = None, diagnose_fn: Callable = None, requires_env: list = None,
+        check_fn: Callable | None = None, diagnose_fn: Callable | None = None, requires_env: list | None = None,
         is_async: bool = False, description: str = "", emoji: str = "",
         max_result_size_chars: int | float | None = None,
     ):
+        """Register one callable tool and its model-visible schema."""
         existing = self._tools.get(name)
         if existing and existing.toolset != toolset:
             logger.warning(
@@ -71,22 +73,12 @@ class ToolRegistry:
             description=description or schema.get("description", ""),
             emoji=emoji, max_result_size_chars=max_result_size_chars,
         )
-        if check_fn and toolset not in self._toolset_checks:
-            self._toolset_checks[toolset] = check_fn
 
-    def deregister(self, name: str) -> None:
-        entry = self._tools.pop(name, None)
-        if entry is None:
-            return
-        if entry.toolset in self._toolset_checks and not any(
-            e.toolset == entry.toolset for e in self._tools.values()
-        ):
-            self._toolset_checks.pop(entry.toolset, None)
-
-    def get_definitions(self, tool_names: Set[str], quiet: bool = False, config: dict | None = None) -> List[dict]:
+    def get_definitions(self, tool_names: set[str], config: dict | None = None) -> list[dict]:
+        """Return schemas for enabled and currently available tools only."""
         self._ensure_discovered()
         result = []
-        check_results: Dict[Callable, bool] = {}
+        check_results: dict[Callable, bool] = {}
         for name in sorted(tool_names):
             entry = self._tools.get(name)
             if not entry:
@@ -102,6 +94,7 @@ class ToolRegistry:
                         else:
                             check_results[entry.check_fn] = bool(entry.check_fn())
                     except Exception:
+                        logger.debug("Tool availability check failed for %s", entry.name, exc_info=True)
                         check_results[entry.check_fn] = False
                 if not check_results[entry.check_fn]:
                     continue
@@ -166,7 +159,8 @@ class ToolRegistry:
             "requirements": list(entry.requires_env or []),
         }
 
-    def get_tool_diagnostics(self, tool_names: Set[str] | None = None, config: dict | None = None) -> List[dict]:
+    def get_tool_diagnostics(self, tool_names: set[str] | None = None, config: dict | None = None) -> list[dict]:
+        """Return user-facing availability diagnostics for selected tools."""
         self._ensure_discovered()
         names = sorted(tool_names or set(self._tools.keys()))
         diagnostics = []
@@ -176,22 +170,8 @@ class ToolRegistry:
                 diagnostics.append(self._entry_diagnostic(entry, config=config))
         return diagnostics
 
-    def get_toolset_diagnostics(self, config: dict | None = None) -> Dict[str, dict]:
-        self._ensure_discovered()
-        grouped: Dict[str, dict] = {}
-        for item in self.get_tool_diagnostics(config=config):
-            ts = item["toolset"]
-            state = grouped.setdefault(ts, {"available": True, "tools": [], "unavailable": [], "requirements": []})
-            state["tools"].append(item["tool"])
-            for req in item.get("requirements") or []:
-                if req not in state["requirements"]:
-                    state["requirements"].append(req)
-            if not item.get("available"):
-                state["available"] = False
-                state["unavailable"].append(item)
-        return grouped
-
     def dispatch(self, name: str, args: dict, **kwargs) -> str:
+        """Invoke a registered handler and normalize unexpected failures to JSON."""
         entry = self._tools.get(name)
         if not entry:
             return json.dumps({"error": f"Unknown tool: {name}"})
@@ -204,22 +184,13 @@ class ToolRegistry:
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
 
-    def get_all_tool_names(self) -> List[str]:
-        self._ensure_discovered()
-        return sorted(self._tools.keys())
-
-    def get_schema(self, name: str) -> Optional[dict]:
-        self._ensure_discovered()
-        entry = self._tools.get(name)
-        return entry.schema if entry else None
-
     def get_description(self, name: str) -> str:
-        """Return the tool's short description (Chinese), or empty string if not found."""
+        """Return the tool's short description, or empty string if not found."""
         self._ensure_discovered()
         entry = self._tools.get(name)
         return entry.description if entry else ""
 
-    def get_toolset_for_tool(self, name: str) -> Optional[str]:
+    def get_toolset_for_tool(self, name: str) -> str | None:
         self._ensure_discovered()
         entry = self._tools.get(name)
         return entry.toolset if entry else None
@@ -232,49 +203,12 @@ class ToolRegistry:
             return entry.max_result_size_chars
         return default
 
-    def get_emoji(self, name: str, default: str = "⚡") -> str:
-        self._ensure_discovered()
-        entry = self._tools.get(name)
-        return (entry.emoji if entry and entry.emoji else default)
-
-    def get_tool_to_toolset_map(self) -> Dict[str, str]:
-        self._ensure_discovered()
-        return {name: e.toolset for name, e in self._tools.items()}
-
-    def is_toolset_available(self, toolset: str) -> bool:
-        self._ensure_discovered()
-        check = self._toolset_checks.get(toolset)
-        if not check:
-            return True
-        try:
-            return bool(check())
-        except Exception:
-            return False
-
-    def check_toolset_requirements(self) -> Dict[str, bool]:
-        self._ensure_discovered()
-        toolsets = set(e.toolset for e in self._tools.values())
-        return {ts: self.is_toolset_available(ts) for ts in sorted(toolsets)}
-
-    def get_available_toolsets(self) -> Dict[str, dict]:
-        self._ensure_discovered()
-        diagnostics = self.get_toolset_diagnostics()
-        toolsets: Dict[str, dict] = {}
-        for ts, info in diagnostics.items():
-            toolsets[ts] = {
-                "available": bool(info.get("available")),
-                "tools": sorted(info.get("tools") or []),
-                "description": "",
-                "requirements": sorted(info.get("requirements") or []),
-                "unavailable": info.get("unavailable") or [],
-            }
-        return toolsets
-
 
 registry = ToolRegistry()
 
 
 def tool_error(message, **extra) -> str:
+    """Build a JSON error payload for tool handlers."""
     result = {"error": str(message)}
     if extra:
         result.update(extra)
@@ -282,6 +216,7 @@ def tool_error(message, **extra) -> str:
 
 
 def tool_result(data=None, **kwargs) -> str:
+    """Build a JSON success payload for tool handlers."""
     if data is not None:
         return json.dumps(data, ensure_ascii=False)
     return json.dumps(kwargs, ensure_ascii=False)

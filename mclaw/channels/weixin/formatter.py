@@ -18,6 +18,7 @@ _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
 
 
 def normalize_markdown_for_weixin(content: str | None) -> str:
+    """Convert lightweight Markdown into text shapes accepted by Weixin messages."""
     text = str(content or "")
     lines: list[str] = []
     for line in text.splitlines():
@@ -30,6 +31,7 @@ def normalize_markdown_for_weixin(content: str | None) -> str:
 
 
 def split_text_for_weixin(content: str, max_length: int = 2000) -> list[str]:
+    """Split outbound text while preserving code-fence continuity across chunks."""
     text = normalize_markdown_for_weixin(content)
     if not text:
         return []
@@ -56,6 +58,7 @@ def split_text_for_weixin(content: str, max_length: int = 2000) -> list[str]:
         if current and current_len + add_len > max_length - 12:
             chunk = "\n".join(current)
             if in_fence and not chunk.rstrip().endswith("```"):
+                # Close and reopen fences so each Weixin chunk renders independently.
                 chunk += "\n```"
             chunks.append(chunk)
             current = []

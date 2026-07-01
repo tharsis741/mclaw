@@ -19,7 +19,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from mclaw.constants import get_mclaw_home
 from mclaw.system.lock import file_lock
@@ -37,8 +37,8 @@ def _audit_log(action: str, target: str, detail: str) -> None:
         preview = detail[:120].replace("\n", " ")
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {action.upper():7s} {target:6s} | {preview}\n")
-    except OSError:
-        pass  # audit is best-effort, never block the operation
+    except OSError as exc:
+        logger.debug("Memory audit log write failed: %s", exc)
 
 ENTRY_DELIMITER = "\n§\n"
 _MEMORY_FENCE_RE = re.compile(r"</?\s*memory-context\s*>", re.IGNORECASE)
@@ -46,7 +46,7 @@ _DEFAULT_MEMORY_LIMIT = 2200
 _DEFAULT_USER_LIMIT = 1375
 _DEFAULT_PREFETCH_LIMIT = 6
 _MEMORY_THREAT_PATTERNS = [
-    # Prompt injection — must appear at start of content to be suspicious
+    # Prompt injection: suspicious only when it appears at the start of content.
     (r"^\s*ignore\s+(all|previous|prior)\s+instructions", "prompt_injection"),
     (r"^\s*system\s+prompt\s+override", "prompt_injection_override"),
     (r"^\s*act\s+as\s+if\s+you\s+have\s+no\s+restrictions", "restriction_bypass"),
@@ -54,7 +54,7 @@ _MEMORY_THREAT_PATTERNS = [
     # Allow benign contexts such as "you are now working on...".
     (r"you\s+are\s+now\s*[:\-]\s*(admin|root|system|ai|gpt|claude)", "role_hijack"),
     (r"you\s+are\s+now\s+(?:a\s+(?:\w+\s+)?|an\s+|)(system|ai|gpt|claude|assistant|admin|root)\b", "role_hijack"),
-    # Deception — active instruction to hide info from user
+    # Deception: active instruction to hide info from user.
     (r"^\s*do\s+not\s+tell\s+the\s+user\s+(what|that|this|about|anything|everything)\b", "deception_hide"),
     (r"^\s*disregard\s+(your|all|any)\s+(instructions|rules|guidelines)", "disregard_rules"),
     # Exfiltration risk: active curl/wget commands with URL arguments.
@@ -78,10 +78,12 @@ _INVISIBLE_CHARS = {
 
 
 def _scan_memory_content(content: str, *, audit: bool = True) -> str | None:
+    """Return a rejection reason when a memory entry crosses the safety boundary."""
     for char in _INVISIBLE_CHARS:
         if char in content:
             msg = f"Blocked: content contains invisible unicode character U+{ord(char):04X}."
-            _audit_log("blocked", "—", msg)
+            if audit:
+                _audit_log("blocked", "-", msg)
             return msg
     for pattern, pattern_id in _MEMORY_THREAT_PATTERNS:
         if re.search(pattern, content, re.IGNORECASE):
@@ -89,14 +91,15 @@ def _scan_memory_content(content: str, *, audit: bool = True) -> str | None:
                 f"Blocked: content matches threat pattern '{pattern_id}'. "
                 "Memory entries are injected into prompts and must not contain injection or exfiltration payloads."
             )
-            # Log a truncated preview of the content for diagnosis (first 80 chars, newlines collapsed)
-            preview = content[:80].replace("\n", " ")
-            _audit_log("blocked", "—", f"{msg} | content_preview={preview!r}")
+            if audit:
+                preview = content[:80].replace("\n", " ")
+                _audit_log("blocked", "-", f"{msg} | content_preview={preview!r}")
             return msg
     return None
 
 
 def _render_safe_memory_entry(entry: str) -> str:
+    """Render stored entries defensively before injecting them into prompts."""
     scan_error = _scan_memory_content(entry, audit=False)
     if scan_error:
         return f"[BLOCKED: {scan_error}]"
@@ -104,19 +107,26 @@ def _render_safe_memory_entry(entry: str) -> str:
 
 
 class MemoryStore:
+    """File-backed store for user profile and long-term assistant memory.
+
+    The store keeps an in-memory snapshot for prompt construction, reloads under
+    file locks before writes, and persists entries atomically so memory tool calls
+    can run safely across concurrent sessions.
+    """
+
     def __init__(
         self,
         memory_char_limit: int = _DEFAULT_MEMORY_LIMIT,
         user_char_limit: int = _DEFAULT_USER_LIMIT,
         prefetch_limit: int = _DEFAULT_PREFETCH_LIMIT,
     ):
-        self.memory_entries: List[str] = []
-        self.user_entries: List[str] = []
+        self.memory_entries: list[str] = []
+        self.user_entries: list[str] = []
         self.memory_char_limit = memory_char_limit
         self.user_char_limit = user_char_limit
         self.prefetch_limit = prefetch_limit
-        self._system_prompt_snapshot: Dict[str, str] = {"memory": "", "user": ""}
-        self._last_disk_state: Dict[str, str] = {}
+        self._system_prompt_snapshot: dict[str, str] = {"memory": "", "user": ""}
+        self._last_disk_state: dict[str, str] = {}
 
     @staticmethod
     def get_memory_dir() -> Path:
@@ -130,6 +140,7 @@ class MemoryStore:
         return base / "MEMORY.md"
 
     def load_from_disk(self) -> None:
+        """Load both memory targets and freeze the prompt snapshot."""
         mem_dir = self.get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
         self.memory_entries = self._dedupe(self._read_file(self._path_for("memory")))
@@ -144,6 +155,7 @@ class MemoryStore:
         }
 
     def prefetch(self, query: str) -> str:
+        """Return a small memory-context block relevant to the current user query."""
         query = (query or "").strip().lower()
         if not query:
             return ""
@@ -197,13 +209,13 @@ class MemoryStore:
         )
 
     @staticmethod
-    def _dedupe(entries: List[str]) -> List[str]:
+    def _dedupe(entries: list[str]) -> list[str]:
         return list(dict.fromkeys(entries))
 
-    def _entries_for(self, target: str) -> List[str]:
+    def _entries_for(self, target: str) -> list[str]:
         return self.user_entries if target == "user" else self.memory_entries
 
-    def _set_entries(self, target: str, entries: List[str]) -> None:
+    def _set_entries(self, target: str, entries: list[str]) -> None:
         if target == "user":
             self.user_entries = entries
         else:
@@ -232,8 +244,10 @@ class MemoryStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         self._write_file(path, self._entries_for(target))
         self._last_disk_state[target] = self._file_hash(path)
+        self._system_prompt_snapshot[target] = self._render_block(target, self._entries_for(target))
 
-    def add(self, target: str, content: str) -> Dict[str, Any]:
+    def add(self, target: str, content: str) -> dict[str, Any]:
+        """Validate and append one durable memory entry."""
         content = (content or "").strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
@@ -270,18 +284,20 @@ class MemoryStore:
             _audit_log("add", target, content)
         return self._success_response(target, "Entry added.")
 
-    def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
+    def replace(self, target: str, old_text: str, new_content: str) -> dict[str, Any]:
+        """Replace exactly one matching entry after validating the new content."""
         old_text = (old_text or "").strip()
         new_content = (new_content or "").strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
             return {"success": False, "error": "new_content cannot be empty."}
-        scan_error = _scan_memory_content(new_content)
-        if scan_error:
-            return {"success": False, "error": scan_error}
 
         with file_lock(self._path_for(target).with_suffix(self._path_for(target).suffix + ".lock")):
+            scan_error = _scan_memory_content(new_content)
+            if scan_error:
+                return {"success": False, "error": scan_error}
+
             self._reload_target(target)
             entries = self._entries_for(target)
             matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
@@ -307,10 +323,11 @@ class MemoryStore:
             entries[idx] = new_content
             self._set_entries(target, entries)
             self.save_to_disk(target)
-            _audit_log("replace", target, f"{old_text!r} → {new_content}")
+            _audit_log("replace", target, f"{old_text!r} => {new_content}")
         return self._success_response(target, "Entry replaced.")
 
-    def remove(self, target: str, old_text: str) -> Dict[str, Any]:
+    def remove(self, target: str, old_text: str) -> dict[str, Any]:
+        """Remove exactly one matching entry from a memory target."""
         old_text = (old_text or "").strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
@@ -335,11 +352,11 @@ class MemoryStore:
             _audit_log("remove", target, removed)
         return self._success_response(target, "Entry removed.")
 
-    def format_for_system_prompt(self, target: str) -> Optional[str]:
+    def format_for_system_prompt(self, target: str) -> str | None:
         block = self._system_prompt_snapshot.get(target, "")
         return block if block else None
 
-    def _success_response(self, target: str, message: str = "") -> Dict[str, Any]:
+    def _success_response(self, target: str, message: str = "") -> dict[str, Any]:
         entries = self._entries_for(target)
         current = self._char_count(target)
         limit = self._char_limit(target)
@@ -348,14 +365,14 @@ class MemoryStore:
             "success": True,
             "target": target,
             "entries": entries,
-            "usage": f"{pct}% — {current:,}/{limit:,} chars",
+            "usage": f"{pct}% - {current:,}/{limit:,} chars",
             "entry_count": len(entries),
         }
         if message:
             result["message"] = message
         return result
 
-    def _render_block(self, target: str, entries: List[str]) -> str:
+    def _render_block(self, target: str, entries: list[str]) -> str:
         if not entries:
             return ""
         limit = self._char_limit(target)
@@ -363,26 +380,27 @@ class MemoryStore:
         current = len(content)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
         if target == "user":
-            header = f"USER PROFILE [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"USER PROFILE [{pct}% - {current:,}/{limit:,} chars]"
         else:
-            header = f"MEMORY [{pct}% — {current:,}/{limit:,} chars]"
+            header = f"MEMORY [{pct}% - {current:,}/{limit:,} chars]"
         separator = "═" * 46
         return f"{separator}\n{header}\n{separator}\n{content}"
 
     @staticmethod
-    def _read_file(path: Path) -> List[str]:
+    def _read_file(path: Path) -> list[str]:
         if not path.exists():
             return []
         try:
             raw = path.read_text(encoding="utf-8")
-        except OSError:
+        except OSError as exc:
+            logger.debug("Memory file read failed for %s: %s", path, exc)
             return []
         if not raw.strip():
             return []
         return [entry.strip() for entry in raw.split(ENTRY_DELIMITER) if entry.strip()]
 
     @staticmethod
-    def _write_file(path: Path, entries: List[str]) -> None:
+    def _write_file(path: Path, entries: list[str]) -> None:
         content = ENTRY_DELIMITER.join(entries) if entries else ""
         fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=".mem_")
         try:
@@ -394,8 +412,8 @@ class MemoryStore:
         except BaseException:
             try:
                 os.unlink(tmp_path)
-            except OSError:
-                pass
+            except OSError as exc:
+                logger.debug("Temporary memory file cleanup failed for %s: %s", tmp_path, exc)
             raise
 
     @staticmethod
@@ -404,7 +422,8 @@ class MemoryStore:
             return ""
         try:
             return hashlib.sha256(path.read_bytes()).hexdigest()
-        except OSError:
+        except OSError as exc:
+            logger.debug("Memory file hash failed for %s: %s", path, exc)
             return ""
 
 
@@ -419,6 +438,7 @@ _DEFAULT_STORE: MemoryStore | None = None
 
 
 def get_default_store() -> MemoryStore:
+    """Return the process-global memory store used by direct tool handlers."""
     global _DEFAULT_STORE
     if _DEFAULT_STORE is None:
         _DEFAULT_STORE = MemoryStore()
@@ -480,6 +500,7 @@ def memory_remove_tool(old_text: str | None, target: str = "memory", store: Memo
 
 
 def handle_memory_tool_call(tool_name: str, args: dict[str, Any], store: MemoryStore | None = None) -> str:
+    """Route a normalized tool call to the matching memory operation."""
     args = args or {}
     target = args.get("target", "memory")
     if tool_name == MEMORY_READ_TOOL:
@@ -592,7 +613,7 @@ MEMORY_REMOVE_SCHEMA = {
 }
 
 
-MEMORY_TOOL_SCHEMAS = [
+MEMORY_TOOL_SCHEMAS: list[dict[str, Any]] = [
     MEMORY_READ_SCHEMA,
     MEMORY_ADD_SCHEMA,
     MEMORY_REPLACE_SCHEMA,
@@ -600,15 +621,15 @@ MEMORY_TOOL_SCHEMAS = [
 ]
 
 
-def _handle_memory_read(args: dict, **kw) -> str:
+def _handle_memory_read(args: dict[str, Any], **_kwargs) -> str:
     return memory_read_tool(target=args.get("target", "memory"))
 
 
-def _handle_memory_add(args: dict, **kw) -> str:
+def _handle_memory_add(args: dict[str, Any], **_kwargs) -> str:
     return memory_add_tool(content=args.get("content"), target=args.get("target", "memory"))
 
 
-def _handle_memory_replace(args: dict, **kw) -> str:
+def _handle_memory_replace(args: dict[str, Any], **_kwargs) -> str:
     return memory_replace_tool(
         old_text=args.get("old_text"),
         content=args.get("content"),
@@ -616,7 +637,7 @@ def _handle_memory_replace(args: dict, **kw) -> str:
     )
 
 
-def _handle_memory_remove(args: dict, **kw) -> str:
+def _handle_memory_remove(args: dict[str, Any], **_kwargs) -> str:
     return memory_remove_tool(old_text=args.get("old_text"), target=args.get("target", "memory"))
 
 
@@ -625,7 +646,7 @@ registry.register(
     toolset="memory",
     schema=MEMORY_READ_SCHEMA,
     handler=_handle_memory_read,
-    description="读取长期记忆",
+    description="Read persistent memory",
     emoji="🧠",
 )
 registry.register(
@@ -633,7 +654,7 @@ registry.register(
     toolset="memory",
     schema=MEMORY_ADD_SCHEMA,
     handler=_handle_memory_add,
-    description="写入长期记忆",
+    description="Add persistent memory",
     emoji="🧠",
 )
 registry.register(
@@ -641,7 +662,7 @@ registry.register(
     toolset="memory",
     schema=MEMORY_REPLACE_SCHEMA,
     handler=_handle_memory_replace,
-    description="替换长期记忆",
+    description="Replace persistent memory",
     emoji="🧠",
 )
 registry.register(
@@ -649,6 +670,6 @@ registry.register(
     toolset="memory",
     schema=MEMORY_REMOVE_SCHEMA,
     handler=_handle_memory_remove,
-    description="删除长期记忆",
+    description="Remove persistent memory",
     emoji="🧠",
 )

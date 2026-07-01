@@ -2,12 +2,17 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Search backend router — selects and executes search backend based on config."""
+"""Select and execute web-search backends behind one tool contract.
+
+The router normalizes configuration, credential selection, backend exceptions,
+and Tavily-to-DashScope fallback so tool callers receive one stable response
+shape regardless of provider.
+"""
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
+import re
 
 from mclaw.cli.config import load_config
 from mclaw.tools.search.config import load_search_config
@@ -27,6 +32,11 @@ BACKENDS = {
     "dashscope": dashscope_search,
     "tavily": tavily_search,
 }
+_ERROR_DETAIL_MAX_CHARS = 500
+
+
+def _load_config_strict() -> dict:
+    return load_config(strict=True)
 
 
 def _tavily_creds_ok(parent_agent=None) -> bool:
@@ -36,38 +46,66 @@ def _tavily_creds_ok(parent_agent=None) -> bool:
 
 def _dashscope_creds_ok(parent_agent=None) -> bool:
     """Return True if web_search-scoped DashScope credentials are available."""
-    return dashscope_creds_ok(parent_agent=parent_agent, load_config_fn=load_config)
+    return dashscope_creds_ok(parent_agent=parent_agent, load_config_fn=_load_config_strict)
 
 
 def _effective_backend(backend_name: str, parent_agent=None) -> str:
+    """Resolve auto mode to the first credentialed backend preference."""
     if backend_name == "auto":
         return "tavily" if _tavily_creds_ok(parent_agent=parent_agent) else "dashscope"
     return backend_name
 
 
-def _invoke_backend(backend_name: str, request: SearchRequest, creds: dict, timeout: float) -> SearchResponse:
-    backend_fn = BACKENDS[backend_name]
-    result = backend_fn(
-        query=request.query,
-        strategy=request.strategy,
-        freshness=request.freshness,
-        sites=request.sites,
-        images=request.images,
-        creds=creds,
-        timeout=timeout,
+def _safe_error_detail(exc: BaseException | str) -> str:
+    """Redact likely secret material before returning backend failures."""
+    detail = str(exc)
+    if not isinstance(exc, str):
+        detail = f"{type(exc).__name__}: {detail or type(exc).__name__}"
+    detail = re.sub(
+        r"(?i)\b(api[_-]?key|token|secret|password)\s*[:=]\s*['\"]?[^'\"\s,;]+",
+        r"\1=<redacted>",
+        detail,
     )
-    return SearchResponse.from_mapping(result, default_backend=backend_name)
+    detail = re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "<redacted>", detail)
+    if len(detail) > _ERROR_DETAIL_MAX_CHARS:
+        detail = detail[:_ERROR_DETAIL_MAX_CHARS] + "...[truncated]"
+    return detail
+
+
+def _invoke_backend(backend_name: str, request: SearchRequest, creds: dict, timeout: float) -> SearchResponse:
+    """Call one backend adapter and convert exceptions into SearchResponse."""
+    backend_fn = BACKENDS[backend_name]
+    try:
+        result = backend_fn(
+            query=request.query,
+            strategy=request.strategy,
+            freshness=request.freshness,
+            sites=request.sites,
+            images=request.images,
+            creds=creds,
+            timeout=timeout,
+        )
+        return SearchResponse.from_mapping(result, default_backend=backend_name)
+    except Exception as exc:
+        detail = _safe_error_detail(exc)
+        logger.warning("%s search backend failed: %s", backend_name, detail, exc_info=True)
+        return SearchResponse(
+            success=False,
+            results=f"{backend_name} search backend failed: {detail}",
+            backend=backend_name,
+            hint=f"Check {backend_name} configuration, dependencies, and service status.",
+        )
 
 
 def execute_search(
     query: str,
     strategy: str = "turbo",
-    freshness: Optional[int] = None,
-    sites: Optional[str] = None,
+    freshness: int | None = None,
+    sites: str | None = None,
     images: bool = False,
     parent_agent=None,
 ) -> dict:
-    """Route search to the configured backend."""
+    """Route search to the configured backend and apply configured fallback."""
     request = SearchRequest(
         query=query,
         strategy=strategy,
@@ -75,7 +113,7 @@ def execute_search(
         sites=sites,
         images=images,
     )
-    search_config = load_search_config(parent_agent=parent_agent, load_config_fn=load_config)
+    search_config = load_search_config(parent_agent=parent_agent, load_config_fn=_load_config_strict)
     backend_name = _effective_backend(search_config.backend, parent_agent=parent_agent)
 
     if backend_name not in BACKENDS:
@@ -88,7 +126,7 @@ def execute_search(
     if backend_name == "tavily":
         creds = get_tavily_creds()
     else:
-        creds = resolve_dashscope_creds(parent_agent=parent_agent, load_config_fn=load_config)
+        creds = resolve_dashscope_creds(parent_agent=parent_agent, load_config_fn=_load_config_strict)
 
     result = _invoke_backend(
         backend_name,
@@ -103,11 +141,13 @@ def execute_search(
         and search_config.fallback
         and _dashscope_creds_ok(parent_agent=parent_agent)
     ):
+        # Fallback is deliberately one-way: DashScope can replace Tavily when
+        # Tavily fails, but DashScope failures surface directly to the caller.
         logger.warning("Tavily failed (%s), falling back to DashScope", result.results)
         ds_result = _invoke_backend(
             "dashscope",
             request,
-            resolve_dashscope_creds(parent_agent=parent_agent, load_config_fn=load_config),
+            resolve_dashscope_creds(parent_agent=parent_agent, load_config_fn=_load_config_strict),
             search_config.timeout_for_backend("dashscope", strategy),
         )
         if ds_result.success:
@@ -118,6 +158,19 @@ def execute_search(
                 results=ds_result.results,
                 backend=ds_result.backend,
                 hint=f"{hint} [{fallback_hint}]" if hint else fallback_hint,
+                fallback_from="tavily",
+                fallback_error=result.results,
+            )
+        else:
+            hint = ds_result.hint
+            fallback_hint = f"DashScope fallback also failed after Tavily failure: {result.results}"
+            ds_result = SearchResponse(
+                success=False,
+                results=ds_result.results,
+                backend=ds_result.backend,
+                hint=f"{hint} [{fallback_hint}]" if hint else fallback_hint,
+                fallback_from="tavily",
+                fallback_error=result.results,
             )
         result = ds_result
 

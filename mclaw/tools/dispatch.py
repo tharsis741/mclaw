@@ -15,24 +15,24 @@ import asyncio
 import json
 import logging
 import os
-import re
 import threading
 from contextlib import contextmanager
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar, copy_context
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any
 
+from mclaw.safety.mutation_detector import terminal_action
+from mclaw.safety.path_resolver import repair_common_mojibake
 from mclaw.tools.registry import registry
-from mclaw.tools.toolsets import resolve_toolset, resolve_multiple_toolsets, validate_toolset
+from mclaw.tools.toolsets import resolve_multiple_toolsets
 
 logger = logging.getLogger(__name__)
 
 # Per-call context set by core.py before handle_function_calls and read by tools.
 _current_session_db: ContextVar[Any] = ContextVar("current_session_db", default=None)
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
-_tool_whitelist: ContextVar[Optional[Set[str]]] = ContextVar("tool_whitelist", default=None)
-_tool_action_whitelist: ContextVar[Optional[Dict[str, Set[str]]]] = ContextVar("tool_action_whitelist", default=None)
+_tool_whitelist: ContextVar[set[str] | None] = ContextVar("tool_whitelist", default=None)
+_tool_action_whitelist: ContextVar[dict[str, set[str]] | None] = ContextVar("tool_action_whitelist", default=None)
 
 
 def set_tool_context(session_db: Any = None, session_id: str = "") -> None:
@@ -54,8 +54,8 @@ def get_current_session_id() -> str:
 @contextmanager
 def tool_dispatch_policy(
     *,
-    tool_whitelist: Optional[Set[str]] = None,
-    action_whitelist: Optional[Dict[str, Set[str]]] = None,
+    tool_whitelist: set[str] | None = None,
+    action_whitelist: dict[str, set[str]] | None = None,
 ):
     """Temporarily restrict tool names and per-tool action values."""
     token_tools = _tool_whitelist.set(set(tool_whitelist) if tool_whitelist is not None else None)
@@ -70,7 +70,8 @@ def tool_dispatch_policy(
         _tool_whitelist.reset(token_tools)
 
 
-def _policy_error(tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
+def _policy_error(tool_name: str, arguments: dict[str, Any]) -> str | None:
+    """Return a JSON policy error when contextual restrictions reject a call."""
     from mclaw.tools.registry import tool_error
 
     whitelist = _tool_whitelist.get()
@@ -92,50 +93,18 @@ def _policy_error(tool_name: str, arguments: Dict[str, Any]) -> Optional[str]:
 # ── Tool classification for concurrent dispatch ──────────────────────────────
 
 # Tools that must remain serial because their semantics depend on order.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+_NEVER_PARALLEL_TOOLS = frozenset()
 
 # Read-only tools that may run concurrently after path-overlap checks.
 _PARALLEL_SAFE_TOOLS = frozenset({
     "read_file", "search_files",
     "skill_view", "skill_tree", "skills_list", "skill_search", "vision_analyze",
-    "web_search", "batch_read",
-    "read", "grep", "glob",
+    "web_search",
 })
 
 # Path-scoped tools need overlap checks before concurrent dispatch.
 _PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch", "edit_file", "delete_file", "skill_manage"})
 
-# Write tools that trigger a checkpoint snapshot before execution.
-_WRITE_SNAPSHOT_TOOLS = frozenset({"write_file", "patch", "edit_file", "delete_file", "skill_manage"})
-
-_DESTRUCTIVE_TERMINAL_PATTERNS = re.compile(
-    r"""(?:^|\s|&&|\|\||;|`)(?:
-        rm\s|rmdir\s|del\s|erase\s|rd\s|
-        cp\s|copy\s|install\s|
-        mv\s|move\s|ren\s|rename\s|
-        sed\s+-i|
-        truncate\s|
-        dd\s|
-        shred\s|
-        remove-item\b|ri\b|
-        move-item\b|mi\b|
-        copy-item\b|ci\b|
-        rename-item\b|rni\b|
-        new-item\b|ni\b|
-        set-content\b|sc\b|
-        add-content\b|ac\b|
-        clear-content\b|clc\b|
-        out-file\b|
-        git\s+(?:reset|clean|checkout)\s
-    )""",
-    re.IGNORECASE | re.VERBOSE,
-)
-_REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
-_QUOTED_WINDOWS_ABS_PATH_RE = re.compile(r'["\']([A-Za-z]:[\\/][^"\']+)["\']')
-_WINDOWS_ABS_PATH_RE = re.compile(r'[A-Za-z]:[\\/][^\s"\'<>|`]+(?:[\\/][^\s"\'<>|`]+)*')
-_QUOTED_MSYS_ABS_PATH_RE = re.compile(r'["\'](/[A-Za-z]/[^"\']+)["\']')
-_MSYS_ABS_PATH_RE = re.compile(r'(?<!\S)/[A-Za-z]/[^\s"\'<>|`]+')
-_MOJIBAKE_MARKERS = ("娴嬭瘯", "娴嬭", "瘯")
 _CHECKPOINT_METADATA_REDACT_KEYS = {
     "content",
     "new_content",
@@ -157,7 +126,23 @@ _CONCURRENT_TOOL_TIMEOUTS = {
     "skill_search": 60,
 }
 
+_TOOL_MODULES = (
+    "mclaw.tools.file_tools",
+    "mclaw.tools.secret_tool",
+    "mclaw.tools.terminal_tool",
+    "mclaw.tools.process_registry",
+    "mclaw.tools.memory_tool",
+    "mclaw.tools.skill_tools",
+    "mclaw.tools.session_search_tool",
+    "mclaw.tools.delegate_tool",
+    "mclaw.tools.vision_tool",
+    "mclaw.tools.web_search_tool",
+    "mclaw.tools.browser_tool",
+    "mclaw.tools.weixin_tool",
+    "mclaw.tools.dingtalk_tool",
+)
 _discovery_done = False
+_discovery_failed_modules: set[str] = set()
 _discovery_lock = threading.Lock()
 
 _worker_loop = None
@@ -165,6 +150,7 @@ _worker_loop_lock = threading.Lock()
 
 
 def _get_worker_loop():
+    """Return the shared event loop used to run async tool handlers."""
     global _worker_loop
     with _worker_loop_lock:
         if _worker_loop is None or _worker_loop.is_closed():
@@ -172,7 +158,7 @@ def _get_worker_loop():
                 try:
                     _worker_loop.close()
                 except Exception:
-                    pass
+                    logger.debug("Failed to close stale worker event loop", exc_info=True)
             _worker_loop = asyncio.new_event_loop()
             t = threading.Thread(target=_worker_loop.run_forever, daemon=True)
             t.start()
@@ -191,43 +177,44 @@ def _run_async(coro):
         return future.result(timeout=600)
 
 
+def _positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
 def _discover_tools():
     """Import all tool modules to trigger their registry.register() calls."""
     global _discovery_done
     with _discovery_lock:
-        if _discovery_done:
+        if _discovery_done and not _discovery_failed_modules:
             return
-        _discovery_done = True
+        if _discovery_done:
+            modules_to_import = tuple(sorted(_discovery_failed_modules))
+        else:
+            modules_to_import = _TOOL_MODULES
+            _discovery_done = True
 
-    # Tool modules register themselves at import time.
-    _tool_modules = [
-        "mclaw.tools.file_tools",
-        "mclaw.tools.secret_tool",
-        "mclaw.tools.terminal_tool",
-        "mclaw.tools.process_registry",
-        "mclaw.tools.memory_tool",
-        "mclaw.tools.skill_tools",
-        "mclaw.tools.session_search_tool",
-        "mclaw.tools.delegate_tool",
-        "mclaw.tools.vision_tool",
-        "mclaw.tools.web_search_tool",
-        "mclaw.tools.browser_tool",
-        "mclaw.tools.weixin_tool",
-        "mclaw.tools.dingtalk_tool",
-    ]
-
-    for module_name in _tool_modules:
+    failed_modules: set[str] = set()
+    for module_name in modules_to_import:
         try:
             __import__(module_name)
         except Exception as e:
-            logger.debug("Failed to import tool module %s: %s", module_name, e)
+            failed_modules.add(module_name)
+            logger.warning("Tool module import failed: %s: %s", module_name, e, exc_info=True)
+
+    with _discovery_lock:
+        _discovery_failed_modules.difference_update(modules_to_import)
+        _discovery_failed_modules.update(failed_modules)
 
 
 def get_tool_definitions(
-    enabled_toolsets: List[str] = None,
-    disabled_toolsets: List[str] = None,
+    enabled_toolsets: list[str] | None = None,
+    disabled_toolsets: list[str] | None = None,
     config: dict | None = None,
-) -> Tuple[List[dict], Set[str]]:
+) -> tuple[list[dict], set[str]]:
     """Return (tool_definitions, valid_tool_names) for the enabled toolsets."""
     _discover_tools()
 
@@ -248,17 +235,17 @@ def get_tool_definitions(
     except Exception:
         logger.debug("Runtime feature filtering failed", exc_info=True)
 
-    definitions = registry.get_definitions(tool_names, quiet=True, config=config)
+    definitions = registry.get_definitions(tool_names, config=config)
     valid_names = {d["function"]["name"] for d in definitions}
     return definitions, valid_names
 
 
 def handle_function_call(
     tool_name: str,
-    tool_args: Dict[str, Any],
+    tool_args: dict[str, Any],
     task_id: str = "",
     session_id: str = "",
-    enabled_tools: Set[str] = None,
+    enabled_tools: set[str] | None = None,
 ) -> str:
     """Dispatch a tool call by name, returning JSON string result."""
     _discover_tools()
@@ -279,18 +266,8 @@ def handle_function_call(
     )
 
 
-def get_toolset_for_tool(name: str) -> Optional[str]:
+def get_toolset_for_tool(name: str) -> str | None:
     return registry.get_toolset_for_tool(name)
-
-
-def get_all_tool_names() -> List[str]:
-    _discover_tools()
-    return registry.get_all_tool_names()
-
-
-def check_toolset_requirements() -> Dict[str, bool]:
-    _discover_tools()
-    return registry.check_toolset_requirements()
 
 
 # ── Concurrent batch dispatch ─────────────────────────────────────────────────
@@ -310,11 +287,11 @@ def _paths_overlap(path1: str, path2: str) -> bool:
         return True  # on resolve error, conservatively treat as overlapping
 
 
-def _extract_path_from_args(tool_name: str, arguments: dict) -> Optional[str]:
+def _extract_path_from_args(tool_name: str, arguments: dict) -> str | None:
     """Extract file path from tool arguments for path-overlap detection."""
     if tool_name in _PATH_SCOPED_TOOLS:
         if tool_name == "skill_manage":
-            # Skill 2.0 only permits M-Claw home skills/<skill-name>.
+            # Managed Skill operations are scoped to M-Claw home storage.
             from mclaw.constants import get_skills_dir
             root = str(get_skills_dir().resolve())
             name = arguments.get("name", "")
@@ -322,120 +299,8 @@ def _extract_path_from_args(tool_name: str, arguments: dict) -> Optional[str]:
             if name:
                 parts.append(name)
             return str(Path(*parts))
-        return arguments.get("file_path") or arguments.get("path")
+        return arguments.get("path")
     return None
-
-
-def _is_destructive_terminal_command(command: str) -> bool:
-    if not command:
-        return False
-    return bool(_DESTRUCTIVE_TERMINAL_PATTERNS.search(command) or _REDIRECT_OVERWRITE.search(command))
-
-
-def _terminal_workdir(arguments: dict, parent_agent: Any = None) -> str:
-    workdir = str(arguments.get("workdir") or "").strip()
-    if workdir:
-        return workdir
-    cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
-    if isinstance(cfg, dict):
-        terminal_cfg = cfg.get("terminal", {})
-        if isinstance(terminal_cfg, dict):
-            configured = str(terminal_cfg.get("cwd") or "").strip()
-            if configured and configured != ".":
-                return configured
-        launch_cwd = str(cfg.get("_launch_cwd") or "").strip()
-        if launch_cwd and not _is_mclaw_runtime_path(launch_cwd):
-            return launch_cwd
-    try:
-        from mclaw.tools import terminal_tool
-
-        current_id = getattr(terminal_tool, "_current_session_id", None)
-        env = getattr(terminal_tool, "_env_registry", {}).get(current_id) if current_id else None
-        cwd = getattr(env, "cwd", None)
-        if cwd and not _is_mclaw_runtime_path(cwd):
-            return str(cwd)
-    except Exception:
-        pass
-    launch_cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
-    if launch_cwd and not _is_mclaw_runtime_path(launch_cwd):
-        return str(launch_cwd)
-    try:
-        from mclaw.tools import terminal_tool
-
-        current_id = getattr(terminal_tool, "_current_session_id", None)
-        env = getattr(terminal_tool, "_env_registry", {}).get(current_id) if current_id else None
-        cwd = getattr(env, "cwd", None)
-        if cwd:
-            return str(cwd)
-    except Exception:
-        pass
-    return os.getcwd()
-
-
-def _is_mclaw_runtime_path(path_value: Any) -> bool:
-    try:
-        from mclaw.runtime.manager import RuntimeManager
-
-        return RuntimeManager.current().paths.is_runtime_internal_path(path_value)
-    except Exception:
-        return False
-
-
-def _extract_absolute_paths_from_command(command: str) -> list[str]:
-    if not command:
-        return []
-    command = _repair_common_mojibake(command)
-    paths = []
-    seen = set()
-    quoted_spans = []
-    for match in _QUOTED_WINDOWS_ABS_PATH_RE.finditer(command):
-        value = match.group(1).strip().rstrip(";,")
-        if value and value not in seen:
-            paths.append(value)
-            seen.add(value)
-        quoted_spans.append(match.span())
-    for match in _QUOTED_MSYS_ABS_PATH_RE.finditer(command):
-        value = _msys_to_windows_path(match.group(1).strip().rstrip(";,"))
-        if value and value not in seen:
-            paths.append(value)
-            seen.add(value)
-        quoted_spans.append(match.span())
-
-    def inside_quoted_span(start: int, end: int) -> bool:
-        return any(start >= q_start and end <= q_end for q_start, q_end in quoted_spans)
-
-    for match in _WINDOWS_ABS_PATH_RE.finditer(command):
-        if inside_quoted_span(match.start(), match.end()):
-            continue
-        value = match.group(0).strip().rstrip(";,")
-        if value and value not in seen:
-            paths.append(value)
-            seen.add(value)
-    for match in _MSYS_ABS_PATH_RE.finditer(command):
-        if inside_quoted_span(match.start(), match.end()):
-            continue
-        value = _msys_to_windows_path(match.group(0).strip().rstrip(";,"))
-        if value and value not in seen:
-            paths.append(value)
-            seen.add(value)
-    return paths
-
-
-def _msys_to_windows_path(path: str) -> str:
-    if len(path) >= 3 and path[0] == "/" and path[2] == "/":
-        drive = path[1].upper()
-        rest = path[3:]
-        return f"{drive}:/{rest}"
-    return path
-
-
-def _repair_common_mojibake(text: str) -> str:
-    if not text or not any(marker in text for marker in _MOJIBAKE_MARKERS):
-        return text
-    try:
-        return text.encode("gbk").decode("utf-8")
-    except UnicodeError:
-        return text
 
 
 def _redact_checkpoint_value(value: Any, key: str = "") -> Any:
@@ -479,7 +344,7 @@ def _checkpoint_metadata(
 def _checkpoint_reason(tool_name: str, arguments: dict) -> str:
     if tool_name != "terminal":
         return f"before {tool_name}"
-    command = _repair_common_mojibake(str(arguments.get("command") or ""))
+    command = repair_common_mojibake(str(arguments.get("command") or ""))
     return f"before terminal: {command[:60]}"
 
 
@@ -490,21 +355,22 @@ def _mutation_action(tool_name: str, arguments: dict) -> str:
         return str(arguments.get("action") or "skill_manage")
     if tool_name != "terminal":
         return tool_name
-    command = _repair_common_mojibake(str(arguments.get("command") or "")).lower()
-    if re.search(r'\b(rm|del|erase|remove-item|ri|rmdir|rd)\b', command):
-        return "delete"
-    if re.search(r'\b(mv|move|ren|rename|move-item|rename-item)\b', command):
-        return "move"
-    if re.search(r'\b(cp|copy|copy-item)\b', command):
-        return "copy"
-    if _REDIRECT_OVERWRITE.search(command) or re.search(r'\b(set-content|out-file|truncate)\b', command):
-        return "overwrite"
-    if re.search(r'\b(add-content|new-item)\b', command):
-        return "write"
-    return "unknown_destructive"
+    return terminal_action(str(arguments.get("command") or ""))
 
 
 def _file_safety_enabled(parent_agent: Any = None) -> bool:
+    cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
+    if not isinstance(cfg, dict):
+        return True
+    safety_cfg = cfg.get("file_safety", {})
+    if isinstance(safety_cfg, bool):
+        return safety_cfg
+    if isinstance(safety_cfg, dict):
+        return bool(safety_cfg.get("enabled", True))
+    return True
+
+
+def _operation_journal_enabled(parent_agent: Any = None) -> bool:
     cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
     if not isinstance(cfg, dict):
         return True
@@ -516,7 +382,7 @@ def _file_safety_enabled(parent_agent: Any = None) -> bool:
     return True
 
 
-def _build_file_safety_plan(tool_name: str, arguments: dict, checkpoint_manager: Optional[Any], parent_agent: Any = None):
+def _build_file_safety_plan(tool_name: str, arguments: dict, checkpoint_manager: Any | None, parent_agent: Any = None):
     if not _file_safety_enabled(parent_agent):
         return None
     try:
@@ -536,26 +402,30 @@ def _build_file_safety_plan(tool_name: str, arguments: dict, checkpoint_manager:
 def _file_safety_block_error(
     tool_name: str,
     arguments: dict,
-    checkpoint_manager: Optional[Any],
+    checkpoint_manager: Any | None,
     parent_agent: Any = None,
-) -> Optional[str]:
+) -> str | None:
     plan = _build_file_safety_plan(tool_name, arguments, checkpoint_manager, parent_agent)
     if not plan or not plan.mutates:
         return None
     decision = plan.decision
-    if decision.action != "block":
+    if decision.allowed:
         return None
     from mclaw.tools.registry import tool_error
 
-    return tool_error(f"File safety blocked {tool_name}: {decision.reason}", success=False)
+    return tool_error(
+        f"File safety blocked {tool_name}: {decision.reason} (action={decision.action})",
+        success=False,
+    )
 
 
 def _maybe_checkpoint_before_tool(
     tool_name: str,
     arguments: dict,
-    checkpoint_manager: Optional[Any],
+    checkpoint_manager: Any | None,
     parent_agent: Any = None,
-) -> Optional[dict]:
+) -> dict | None:
+    """Take a pre-mutation checkpoint and start an operation journal entry."""
     if checkpoint_manager is None:
         return None
     try:
@@ -579,7 +449,7 @@ def _maybe_checkpoint_before_tool(
             return None
         operation = None
         journal = None
-        if _file_safety_enabled(parent_agent):
+        if _operation_journal_enabled(parent_agent):
             try:
                 from mclaw.safety.operation_journal import default_journal
                 journal = default_journal()
@@ -609,7 +479,7 @@ def _maybe_checkpoint_before_tool(
                 tool_name,
                 arguments,
                 parent_agent,
-                operation_id=(operation or {}).get("operation_id") or (operation or {}).get("op_id", ""),
+                operation_id=(operation or {}).get("operation_id", ""),
             ),
             target_paths=target_paths or None,
         )
@@ -618,7 +488,7 @@ def _maybe_checkpoint_before_tool(
             try:
                 journal.update_checkpoint(
                     operation,
-                    checkpoint_commit=attempt.get("commit") or attempt.get("hash"),
+                    checkpoint_commit=attempt.get("commit"),
                     checkpoint_status=attempt.get("status"),
                     checkpoint_reason=attempt.get("reason"),
                 )
@@ -637,7 +507,7 @@ def _maybe_checkpoint_before_tool(
 def _tool_result_success(result: str) -> bool:
     try:
         parsed = json.loads(result)
-    except Exception:
+    except (json.JSONDecodeError, TypeError):
         return True
     if isinstance(parsed, dict):
         if (
@@ -652,7 +522,8 @@ def _tool_result_success(result: str) -> bool:
     return True
 
 
-def _finalize_operation(operation: Optional[dict], result: str, success: bool, parent_agent: Any = None) -> None:
+def _finalize_operation(operation: dict | None, result: str, success: bool, parent_agent: Any = None) -> None:
+    """Finalize an operation journal entry after tool execution."""
     if not operation:
         return
     try:
@@ -670,7 +541,7 @@ def _finalize_operation(operation: Optional[dict], result: str, success: bool, p
                 setattr(parent_agent, "_tool_operation_ids", op_map)
             tool_call_id = operation.get("tool_call_id")
             if tool_call_id:
-                op_map[tool_call_id] = operation.get("operation_id") or operation.get("op_id")
+                op_map[tool_call_id] = operation.get("operation_id")
     except Exception:
         logger.debug("Operation journal finalize failed", exc_info=True)
 
@@ -678,12 +549,12 @@ def _finalize_operation(operation: Optional[dict], result: str, success: bool, p
 def _should_parallelize_tool_batch(calls: list) -> bool:
     """Determine if a batch of tool calls should run concurrently.
 
-    Mirrors _should_parallelize_tool_batch() logic:
-      1. Single call or 'clarify' present → never parallel
-      2. JSON parse failure / non-dict args → never parallel
-      3. Path overlap on _PATH_SCOPED_TOOLS → never parallel
-      4. Any tool not in _PARALLEL_SAFE_TOOLS → never parallel
-      5. Otherwise → parallel
+    The dispatch layer only parallelizes independent read-only operations:
+      1. Single call: never parallel
+      2. JSON parse failure / non-dict args: never parallel
+      3. Path overlap on _PATH_SCOPED_TOOLS: never parallel
+      4. Any tool not in _PARALLEL_SAFE_TOOLS: never parallel
+      5. Otherwise: parallel
     """
     if len(calls) <= 1:
         return False
@@ -731,32 +602,60 @@ def _concurrent_tool_timeout(tool_name: str, parent_agent: Any = None) -> int:
         auxiliary = cfg.get("auxiliary", {})
         if isinstance(auxiliary, dict):
             if tool_name == "web_search":
+                web_cfg = auxiliary.get("web_search", {})
+                if not isinstance(web_cfg, dict):
+                    web_cfg = {}
+                fast_timeout = _positive_int(web_cfg.get("tavily_timeout"), timeout)
+                backend = str(web_cfg.get("backend") or "auto").lower()
                 try:
-                    web_cfg = auxiliary.get("web_search", {})
-                    if not isinstance(web_cfg, dict):
-                        web_cfg = {}
-                    fast_timeout = int(web_cfg.get("timeout", timeout))
-                    backend = str(web_cfg.get("backend") or "auto").lower()
-                    fallback = bool(web_cfg.get("fallback", True))
-                    if backend == "dashscope" or fallback:
-                        slow_timeout = int(
-                            web_cfg.get(
-                                "dashscope_deep_timeout",
-                                web_cfg.get("dashscope_timeout", 90),
-                            )
-                        )
-                        timeout = max(fast_timeout, slow_timeout)
-                    else:
-                        timeout = fast_timeout
+                    from mclaw.tools.search.config import parse_bool_config
+
+                    fallback = parse_bool_config(web_cfg.get("fallback"), default=True)
                 except Exception:
-                    pass
+                    fallback = True
+                if backend == "dashscope" or fallback:
+                    slow_timeout = _positive_int(
+                        web_cfg.get(
+                            "dashscope_deep_timeout",
+                            web_cfg.get("dashscope_timeout", 90),
+                        ),
+                        90,
+                    )
+                    timeout = max(fast_timeout, slow_timeout)
+                else:
+                    timeout = fast_timeout
             elif tool_name == "vision_analyze":
-                try:
-                    vision_cfg = auxiliary.get("vision", {})
-                    timeout = int(vision_cfg.get("timeout", timeout)) + int(vision_cfg.get("download_timeout", 0))
-                except Exception:
-                    pass
+                vision_cfg = auxiliary.get("vision", {})
+                if isinstance(vision_cfg, dict):
+                    timeout = (
+                        _positive_int(vision_cfg.get("timeout"), timeout)
+                        + _positive_int(vision_cfg.get("download_timeout"), 0)
+                    )
     return max(1, timeout)
+
+
+def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -> int:
+    """Return per-call timeout for tools that must run on the serial path."""
+    timeout = 120
+    if tool_name != "terminal":
+        return timeout
+    try:
+        from mclaw.tools.terminal_tool import DEFAULT_TIMEOUT
+    except ImportError:
+        return timeout
+    timeout = DEFAULT_TIMEOUT
+    cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
+    if isinstance(cfg, dict):
+        terminal_cfg = cfg.get("terminal", {})
+        if isinstance(terminal_cfg, dict):
+            timeout = _positive_int(terminal_cfg.get("timeout"), timeout)
+    try:
+        args = json.loads(func.get("arguments", "{}") or "{}")
+    except (json.JSONDecodeError, TypeError, ValueError):
+        args = {}
+    if isinstance(args, dict) and args.get("timeout") is not None:
+        timeout = _positive_int(args.get("timeout"), timeout)
+    return max(1, timeout) + 5
 
 
 def _invoke_tool_builtin(
@@ -764,14 +663,8 @@ def _invoke_tool_builtin(
     arguments: dict,
     memory_manager: Any = None,
     parent_agent: Any = None,
-) -> Optional[str]:
-    """Layer 1: direct builtin handlers. Returns JSON string result or None to fall through.
-
-    Builtin tools (todo, memory, session_search, delegate_task) are handled here
-    before falling through to the registry. Currently a stub — m-claw does not
-    have these builtins yet, but the hook is here for future expansion.
-    Memory tool IS routed here when memory_manager is provided.
-    """
+) -> str | None:
+    """Route memory tools through the active memory manager before registry dispatch."""
     # Memory tools route through MemoryManager so provider config and snapshot refresh apply.
     if memory_manager is not None and memory_manager.has_tool(tool_name):
         return memory_manager.handle_tool_call(tool_name, arguments)
@@ -831,12 +724,12 @@ def _truncate_json_value(obj, excess):
     return obj, 0
 
 
-def _extract_json_object(s: str) -> Optional[dict]:
-    """Extract the first JSON object from a string with possible trailing junk.
+def _extract_json_object(s: str) -> dict | None:
+    """Extract the first JSON object from a string with trailing content.
 
     Some providers append newlines or control characters after the closing
-    brace. ``raw_decode`` lets us parse the first valid object and ignore the
-    remaining suffix instead of failing the whole tool call.
+    brace. ``raw_decode`` parses the first valid object and leaves the
+    remaining suffix outside the tool arguments.
     """
     if not s:
         return None
@@ -856,15 +749,15 @@ def _extract_json_object(s: str) -> Optional[dict]:
 def _dispatch_single(
     call: dict,
     tool_names: set,
-    checkpoint_manager: Optional[Any],
-    memory_manager: Optional[Any] = None,
+    checkpoint_manager: Any | None,
+    memory_manager: Any | None = None,
     parent_agent: Any = None,
 ) -> str:
     """Single tool dispatch with availability check + optional checkpoint."""
     func = call.get("function", {})
     tool_name = func.get("name", "")
     raw_args = func.get("arguments", "{}")
-    arguments: Dict[str, Any] = {}
+    arguments: dict[str, Any] = {}
     try:
         if isinstance(raw_args, str):
             arguments = json.loads(raw_args)
@@ -913,10 +806,10 @@ def _dispatch_single(
 
     # Final result-size guard before tool output enters conversation history.
     # Individual tools should limit themselves first; this catches abnormal
-    # payloads that would otherwise blow up context.
+    # payloads that would otherwise exceed the context budget.
     max_size = registry.get_max_result_size(tool_name)
     if max_size is not None and isinstance(result, str) and len(result) > max_size:
-        # Try structured truncation for JSON so we don't break parseability.
+        # Structured truncation preserves JSON parseability.
         parsed = None
         try:
             parsed = json.loads(result)
@@ -972,7 +865,7 @@ def _dispatch_single(
             task_id = getattr(parent_agent, "session_id", "default") if parent_agent else "default"
             notify_other_tool_call(task_id=task_id)
         except Exception:
-            pass
+            logger.debug("Read tracker notification failed after %s", tool_name, exc_info=True)
 
     _finalize_operation(operation, result, _tool_result_success(result), parent_agent)
     return result
@@ -981,7 +874,6 @@ def _dispatch_single(
 def handle_function_calls(
     calls: list,
     tool_names: set,
-    available_toolsets: set = None,
     memory_manager: Any = None,
     checkpoint_manager: Any = None,
     parent_agent: Any = None,
@@ -989,8 +881,8 @@ def handle_function_calls(
     """Dispatch a batch of tool calls, automatically choosing serial or concurrent.
 
     Concurrent path is chosen when all calls are read-only and pass the
-    _should_parallelize_tool_batch() checks (no path overlap, all in whitelist,
-    no 'clarify' tool). Serial path uses CheckpointManager (passed in) for write tools.
+    _should_parallelize_tool_batch() checks (no path overlap, all in whitelist).
+    Serial path uses CheckpointManager (passed in) for write tools.
 
     checkpoint_manager should be created once per agent turn and passed in to
     ensure the same file is snapshotted at most once per turn.
@@ -1002,12 +894,11 @@ def handle_function_calls(
 
     if use_concurrent:
         # Concurrent path: read-only tools do not checkpoint. Memory tools are
-        # excluded from _PARALLEL_SAFE_TOOLS, so they should not reach here.
+        # excluded from _PARALLEL_SAFE_TOOLS, so they stay on the serial path.
         _tool_names = [c.get("function", {}).get("name", "?") for c in calls]
         logger.info("[TOOL CONCURRENT START] tools=%s", _tool_names)
         results: list = [None] * len(calls)
-        # Use daemon threads instead of ThreadPoolExecutor to avoid
-        # shutdown(wait=True) waiting forever on a stuck worker.
+        # Daemon threads keep timed-out tool calls from blocking shutdown.
         _tool_threads: list[tuple[threading.Thread, int]] = []
         for i, call in enumerate(calls):
             ctx = copy_context()
@@ -1061,23 +952,7 @@ def handle_function_calls(
                 tool_result[0] = tool_error(str(exc), success=False)
         t = threading.Thread(target=lambda: ctx.run(_run), daemon=True)
         t.start()
-        tool_timeout = 120
-        if tname == "terminal":
-            try:
-                from mclaw.tools.terminal_tool import DEFAULT_TIMEOUT
-                tool_timeout = DEFAULT_TIMEOUT
-                cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
-                if isinstance(cfg, dict):
-                    tool_timeout = int(cfg.get("terminal", {}).get("timeout", tool_timeout))
-                try:
-                    args = json.loads(func.get("arguments", "{}") or "{}")
-                    if args.get("timeout") is not None:
-                        tool_timeout = int(args["timeout"])
-                except Exception:
-                    pass
-            except Exception:
-                tool_timeout = 120
-            tool_timeout = max(1, tool_timeout) + 5
+        tool_timeout = _serial_tool_timeout(tname, func, parent_agent)
         t.join(timeout=tool_timeout)
         if tool_result[0] is None:
             from mclaw.tools.registry import tool_error

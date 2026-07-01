@@ -39,6 +39,7 @@ class PetController:
 
     @classmethod
     def from_config(cls, config: dict | None, session_id: str = "") -> "PetController":
+        """Build a controller from the main application config shape."""
         return cls(PetConfig.from_config(config), session_id=session_id)
 
     @property
@@ -54,11 +55,13 @@ class PetController:
         return self._last_error
 
     def start_if_enabled(self) -> bool:
+        """Start the sidecar only when configuration and environment allow it."""
         if not self.config.enabled:
             return False
         return self.start()
 
     def start(self) -> bool:
+        """Spawn the isolated pet sidecar and initialize its event queues."""
         with self._lock:
             if self.running:
                 return True
@@ -66,7 +69,7 @@ class PetController:
                 self._last_error = f"Unsupported pet backend: {self.config.backend}"
                 return False
             if importlib.util.find_spec("PySide6") is None:
-                self._last_error = "PySide6 is not installed. Install with: pip install -e \".[pet]\""
+                self._last_error = "PySide6 is not installed. Install M-Claw dependencies with: pip install -e ."
                 return False
             try:
                 load_pet_manifest(self.config.asset)
@@ -76,6 +79,7 @@ class PetController:
             try:
                 mp.freeze_support()
                 ctx = mp.get_context("spawn")
+                # Spawn keeps the Qt event loop isolated from the main CLI process.
                 event_queue = ctx.Queue(maxsize=128)
                 command_queue = ctx.Queue(maxsize=32)
                 runtime_config = self.config.to_runtime_dict()
@@ -104,6 +108,7 @@ class PetController:
                 return False
 
     def stop(self) -> None:
+        """Ask the sidecar to exit, then tear down process and queue resources."""
         self.emit(PetEventType.APP_EXITING, state=PetState.IDLE)
         with self._lock:
             proc = self._process
@@ -117,31 +122,31 @@ class PetController:
             if proc.is_alive():
                 try:
                     proc.terminate()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Pet sidecar terminate failed: %s", exc)
                 proc.join(timeout=0.5)
             if proc.is_alive():
                 try:
                     proc.kill()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.debug("Pet sidecar kill failed: %s", exc)
                 proc.join(timeout=0.5)
         for q in (event_queue, command_queue):
             if q is None:
                 continue
             try:
                 q.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Pet queue close failed: %s", exc)
             try:
                 q.join_thread()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Pet queue join_thread failed: %s", exc)
         if proc is not None:
             try:
                 proc.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Pet sidecar process close failed: %s", exc)
 
     def emit(
         self,
@@ -152,6 +157,7 @@ class PetController:
         payload: dict[str, Any] | None = None,
         throttle_seconds: float = 0.5,
     ) -> bool:
+        """Send one runtime event to the sidecar without blocking the main turn."""
         if not self.config.enabled:
             return False
         q = self._queue
@@ -185,6 +191,7 @@ class PetController:
 
 
     def get_command_nowait(self) -> dict[str, Any] | None:
+        """Return a sidecar-originated command, such as a dropped-file request."""
         q = self._command_queue
         if q is None or not self.running:
             return None
@@ -199,6 +206,7 @@ class PetController:
 
 
 def _run_sidecar(event_queue: mp.Queue, command_queue: mp.Queue, runtime_config: dict) -> None:
+    """Late-import the Qt runtime inside the spawned sidecar process."""
     from mclaw.pet.runtime_qt import run_pet
 
     run_pet(event_queue, command_queue, runtime_config)

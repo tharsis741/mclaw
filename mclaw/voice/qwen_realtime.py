@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Qwen realtime ASR backend for streaming voice transcription."""
+"""Qwen realtime ASR backend."""
 
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ def _is_kaihong_runtime() -> bool:
 
 
 def _configure_ca_bundle(config: dict) -> None:
+    """Install a CA bundle path for SDKs that honor common SSL env vars."""
     bundle = str(config.get("ca_bundle") or "").strip()
     if bundle.lower() == "auto":
         bundle = ""
@@ -61,6 +62,7 @@ def _configure_ca_bundle(config: dict) -> None:
 
 
 def _ensure_dashscope_address_family(config: dict) -> None:
+    """Force DashScope DNS resolution to IPv4 on runtimes with weak IPv6 paths."""
     global _FORCED_IPV4_GETADDRINFO, _ORIGINAL_GETADDRINFO
 
     force_ipv4 = _truthy(config.get("force_ipv4"), default=_is_kaihong_runtime())
@@ -70,6 +72,7 @@ def _ensure_dashscope_address_family(config: dict) -> None:
     _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 
     def getaddrinfo_ipv4(host, port, family=0, type=0, proto=0, flags=0):  # noqa: A002 - socket API name
+        """Mirror socket.getaddrinfo while constraining the address family."""
         infos = _ORIGINAL_GETADDRINFO(host, port, socket.AF_INET, type, proto, flags)
         ipv4_infos = [info for info in infos if info[0] == socket.AF_INET]
         return ipv4_infos or infos
@@ -79,6 +82,8 @@ def _ensure_dashscope_address_family(config: dict) -> None:
 
 
 class QwenRealtimeASRBackend:
+    """Adapter from raw PCM chunks to DashScope/Qwen realtime transcription events."""
+
     def __init__(self, config: dict, on_transcript, on_error=None, on_status=None):
         self.config = config or {}
         self.on_transcript = on_transcript
@@ -88,6 +93,7 @@ class QwenRealtimeASRBackend:
         self._conversation = None
 
     def connect(self):
+        """Open the websocket session and configure server-side VAD/transcription."""
         try:
             import dashscope
             from dashscope.audio.qwen_omni import (
@@ -99,7 +105,7 @@ class QwenRealtimeASRBackend:
         except ImportError as exc:
             raise RuntimeError(
                 f"Qwen realtime ASR SDK import failed: {exc}. "
-                "Install or upgrade voice dependencies with: pip install -e .[voice]"
+                "Install or upgrade M-Claw dependencies from the source directory: pip install -e ."
             ) from exc
 
         api_key = self.config.get("api_key") or ""
@@ -112,6 +118,8 @@ class QwenRealtimeASRBackend:
         backend = self
 
         class Callback(OmniRealtimeCallback):
+            """Forward SDK callbacks into the service-level callback contract."""
+
             def on_open(self):
                 backend._status("connected")
 
@@ -165,6 +173,7 @@ class QwenRealtimeASRBackend:
         self._status("ready")
 
     def send_audio(self, pcm_bytes: bytes):
+        """Append one PCM chunk after converting to the SDK's base64 payload."""
         if not self.connected:
             raise RuntimeError("Qwen ASR backend is not connected")
         if not pcm_bytes:
@@ -173,6 +182,7 @@ class QwenRealtimeASRBackend:
         self._conversation.append_audio(audio_b64)
 
     def finish(self, commit: bool = False, timeout: int = 10):
+        """Optionally commit buffered audio before closing a manual recording turn."""
         conv = self._conversation
         self._conversation = None
         if conv is None:
@@ -190,6 +200,7 @@ class QwenRealtimeASRBackend:
                 self.connected = False
 
     def close(self):
+        """Best-effort shutdown used for cancellation and service teardown paths."""
         conv = self._conversation
         self._conversation = None
         if conv is not None:

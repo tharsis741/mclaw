@@ -48,6 +48,7 @@ class RuntimeWorkerSupervisor:
         self.hooks = hooks
 
     def start(self) -> RuntimeWorkerHandles:
+        """Start daemon worker threads owned by the interactive runtime."""
         process_thread = threading.Thread(target=self._process_loop, daemon=True)
         animation_thread = threading.Thread(target=self._animation_loop, daemon=True)
         process_thread.start()
@@ -55,12 +56,14 @@ class RuntimeWorkerSupervisor:
         return RuntimeWorkerHandles(process_thread, animation_thread)
 
     def _safe_invalidate(self) -> None:
+        """Request a frontend redraw without letting renderer failures kill a worker."""
         try:
             self.hooks.invalidate()
         except Exception:
             pass
 
     def _process_loop(self) -> None:
+        """Drain queued user input while allowing idle hooks between messages."""
         while not self.runtime.should_exit:
             try:
                 try:
@@ -79,6 +82,7 @@ class RuntimeWorkerSupervisor:
                 self.hooks.on_error(exc)
 
     def _animation_loop(self) -> None:
+        """Tick animation and redraw hooks until cooperative runtime shutdown."""
         while not self.runtime.should_exit:
             running = bool(self.runtime.agent_running)
             interval = self.hooks.animation_interval(running)

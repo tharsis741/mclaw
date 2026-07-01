@@ -45,6 +45,7 @@ _ASR_REQUIRED_FOR = "runtime:asr"
 
 
 def _authorized_env_value(name: str) -> str:
+    """Read ASR credentials only through the runtime scoped-secret gate."""
     try:
         from mclaw.runtime.features import authorized_env_value
 
@@ -54,6 +55,7 @@ def _authorized_env_value(name: str) -> str:
 
 
 def _resolve_enabled(value: Any, config: dict | None = None) -> tuple[bool, str]:
+    """Resolve the user-facing enabled mode, probing input hardware for auto."""
     if isinstance(value, str) and value.strip().lower() == "auto":
         try:
             from mclaw.voice.recorder import AudioRecorder
@@ -82,19 +84,18 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 
 def effective_config(parent_agent=None, config: dict | None = None) -> dict:
+    """Select the config source in the same order as interactive runtime callers."""
     if isinstance(config, dict) and config:
         return config
     if parent_agent is not None:
         cfg = getattr(parent_agent, "config", None)
         if isinstance(cfg, dict) and cfg:
             return cfg
-    try:
-        return load_config()
-    except Exception:
-        return {}
+    return load_config(strict=True)
 
 
 def _is_dashscope_target(section: dict) -> bool:
+    """Detect whether this ASR section needs DashScope/Qwen credentials."""
     provider = str(section.get("provider") or "").lower()
     backend = str(section.get("backend") or "").lower()
     model = str(section.get("model") or "").lower()
@@ -114,6 +115,7 @@ def _default_realtime_url(region: str) -> str:
 
 
 def resolve_asr_config(parent_agent=None, config: dict | None = None) -> Dict[str, Any]:
+    """Build the effective ASR config with defaults, hardware gating, and secrets."""
     cfg = effective_config(parent_agent=parent_agent, config=config)
     auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
     if not isinstance(auxiliary, dict):
@@ -153,6 +155,7 @@ def resolve_asr_config(parent_agent=None, config: dict | None = None) -> Dict[st
 
 
 def mask_asr_status(config: dict) -> dict:
+    """Return a status-safe copy that never exposes the plaintext API key."""
     status = dict(config)
     status["api_key"] = mask_api_key(str(config.get("api_key") or ""))
     return status

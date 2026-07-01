@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Public entry points for M-Claw file safety infrastructure."""
+"""File safety infrastructure for M-Claw."""
 
 from mclaw.safety.safety_layer import MClawSafetyLayer, SafetyPlan
 

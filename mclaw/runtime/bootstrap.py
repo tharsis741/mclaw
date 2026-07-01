@@ -21,6 +21,7 @@ class BootstrapPathResolver:
 
     @staticmethod
     def is_kaihong_host() -> bool:
+        """Detect Kaihong/OpenHarmony-style hosts using low-level markers only."""
         if not sys.platform.startswith("linux"):
             return False
         machine = platform.machine().lower()
@@ -55,6 +56,7 @@ class BootstrapPathResolver:
 
     @staticmethod
     def resolve_mclaw_home() -> Path:
+        """Resolve MCLAW_HOME before config, dotenv, or logging are available."""
         configured = os.environ.get("MCLAW_HOME", "").strip()
         if configured:
             return Path(configured).expanduser()
@@ -68,10 +70,12 @@ class BootstrapPathResolver:
 
     @staticmethod
     def default_workspace() -> Path:
+        """Return the bootstrap workspace derived from the resolved home."""
         return BootstrapPathResolver.resolve_mclaw_home() / "workspace"
 
     @staticmethod
     def ensure_env() -> Path:
+        """Set MCLAW_HOME in-process so later imports share one path root."""
         home = BootstrapPathResolver.resolve_mclaw_home()
         os.environ["MCLAW_HOME"] = str(home)
         return home

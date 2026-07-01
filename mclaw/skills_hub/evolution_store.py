@@ -17,10 +17,14 @@ from mclaw.skills_hub.schema import EVOLUTION_SECTIONS, SkillSchemaError, valida
 
 
 def default_evolution() -> dict[str, list[str]]:
+    """Return an empty skill_evolution.json payload with all required sections."""
+
     return {section: [] for section in EVOLUTION_SECTIONS}
 
 
 def normalize_initial_evolution(initial: dict[str, Any] | None = None) -> dict[str, list[str]]:
+    """Validate caller-provided initial memory and remove duplicate blank entries."""
+
     data = default_evolution()
     if initial:
         for section, values in initial.items():
@@ -33,6 +37,8 @@ def normalize_initial_evolution(initial: dict[str, Any] | None = None) -> dict[s
 
 
 def read_evolution(skill_dir: Path) -> dict[str, list[str]]:
+    """Read and validate the skill_evolution.json sidecar for one Skill."""
+
     path = skill_dir / "skill_evolution.json"
     if not path.exists():
         raise SkillSchemaError("skill_evolution.json is missing.")
@@ -41,6 +47,8 @@ def read_evolution(skill_dir: Path) -> dict[str, list[str]]:
 
 
 def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write JSON through fsync and replace so sidecars are not partially persisted."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp", prefix=f".{path.name}.")
     try:
@@ -59,6 +67,8 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def write_default(skill_dir: Path, initial: dict[str, Any] | None = None) -> None:
+    """Create the default evolution sidecar for a new or synchronized Skill."""
+
     atomic_write_json(skill_dir / "skill_evolution.json", normalize_initial_evolution(initial))
 
 
@@ -70,6 +80,8 @@ def update_evolution(
     content: str | None = None,
     old_text: str | None = None,
 ) -> dict[str, Any]:
+    """Apply one append, replace, or remove operation to Skill evolution memory."""
+
     if section not in EVOLUTION_SECTIONS:
         raise SkillSchemaError(f"Invalid section: {section}")
     if operation not in {"append", "replace", "remove"}:
@@ -94,6 +106,7 @@ def update_evolution(
     path = skill_dir / "skill_evolution.json"
     lock_path = skill_dir / "skill_evolution.json.lock"
     with file_lock(lock_path):
+        # The lock keeps read-modify-write evolution updates serial across agents.
         data = read_evolution(skill_dir)
         entries = list(data[section])
         changed = False

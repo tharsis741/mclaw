@@ -15,12 +15,11 @@ import logging
 import os
 import threading
 from pathlib import Path
-from typing import Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
 _READ_TRACKER_LOCK = threading.Lock()
-_READ_TRACKER: Dict[str, dict] = {}
+_READ_TRACKER: dict[str, dict] = {}
 
 
 def _get_task_data(task_id: str) -> dict:
@@ -37,7 +36,7 @@ def _get_task_data(task_id: str) -> dict:
         )
 
 
-def check_dedup(path: str, offset: int, limit: int, task_id: str = "default") -> Optional[str]:
+def check_dedup(path: str, offset: int, limit: int, task_id: str = "default") -> str | None:
     """Return a reuse hint when an unchanged file region was already read.
 
     Returns None when the file is new, changed, or not previously read.
@@ -69,7 +68,7 @@ def check_dedup(path: str, offset: int, limit: int, task_id: str = "default") ->
     return None
 
 
-def record_read(path: str, offset: int, limit: int, task_id: str = "default") -> Tuple[int, bool]:
+def record_read(path: str, offset: int, limit: int, task_id: str = "default") -> tuple[int, bool]:
     """Record a read and return consecutive repeat count plus block decision.
 
     The count tracks identical consecutive reads. should_block becomes True
@@ -105,7 +104,7 @@ def record_read(path: str, offset: int, limit: int, task_id: str = "default") ->
     return count, count >= 4
 
 
-def notify_other_tool_call(task_id: str = "default"):
+def notify_other_tool_call(task_id: str = "default") -> None:
     """Reset consecutive read count after a non-read tool executes.
 
     This keeps warnings and blocking scoped to truly consecutive repeated reads.
@@ -117,7 +116,7 @@ def notify_other_tool_call(task_id: str = "default"):
             task_data["consecutive"] = 0
 
 
-def reset_file_dedup(task_id: str = None):
+def reset_file_dedup(task_id: str | None = None) -> None:
     """Clear read deduplication cache after context compression.
 
     Original read content has been replaced by summaries, so rereading the same
@@ -134,23 +133,24 @@ def reset_file_dedup(task_id: str = None):
                     task_data["dedup"].clear()
 
 
-def get_read_files_summary(task_id: str = "default") -> list:
+def get_read_files_summary(task_id: str = "default") -> list[dict[str, list[str]]]:
     """Return read-file summaries for context retention and diagnostics."""
     with _READ_TRACKER_LOCK:
         task_data = _READ_TRACKER.get(task_id, {})
         read_history = task_data.get("read_history", set())
-        seen_paths: dict = {}
+        seen_paths: dict[str, list[str]] = {}
         for (path, offset, limit) in read_history:
             if path not in seen_paths:
                 seen_paths[path] = []
-            seen_paths[path].append(f"lines {offset}-{offset + limit - 1}")
+            seen_paths[path].append(f"chars {offset}-{offset + limit - 1}")
         return [
             {"path": p, "regions": regions}
             for p, regions in sorted(seen_paths.items())
         ]
 
 
-def clear_read_tracker(task_id: str = None):
+def clear_read_tracker(task_id: str | None = None) -> None:
+    """Clear read tracking for one task or for all tasks."""
     with _READ_TRACKER_LOCK:
         if task_id:
             _READ_TRACKER.pop(task_id, None)

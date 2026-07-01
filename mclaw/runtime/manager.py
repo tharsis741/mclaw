@@ -22,10 +22,12 @@ from mclaw.runtime.windows import WindowsRuntime
 
 
 class RuntimeManager:
+    """Process-wide runtime selector and cache."""
     _current: ClassVar[Runtime | None] = None
 
     @classmethod
     def detect(cls) -> str:
+        """Select the runtime kind from host platform and Kaihong probes."""
         if sys.platform == "win32":
             return "windows"
         if BootstrapPathResolver.is_kaihong_host():
@@ -34,6 +36,7 @@ class RuntimeManager:
 
     @classmethod
     def create(cls, kind: str | None = None) -> Runtime:
+        """Instantiate a runtime implementation without updating the singleton."""
         selected = (kind or cls.detect()).lower()
         if selected == "windows":
             return WindowsRuntime()
@@ -45,10 +48,12 @@ class RuntimeManager:
 
     @classmethod
     def current(cls, config: dict | None = None) -> Runtime:
+        """Return the cached runtime for this process."""
         if cls._current is None:
             cls._current = cls.create()
         return cls._current
 
     @classmethod
     def reset(cls) -> None:
+        """Clear the cached runtime, primarily for tests and diagnostics."""
         cls._current = None

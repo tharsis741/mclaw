@@ -13,18 +13,17 @@ from typing import Any
 
 @dataclass(frozen=True)
 class SlashCommandSpec:
+    """User-visible metadata for one built-in slash command."""
+
     name: str
     description: str
     visible: bool = True
-    canonical: str | None = None
-
-    @property
-    def dispatch_name(self) -> str:
-        return self.canonical or self.name
 
 
 @dataclass(frozen=True)
 class ParsedSlashCommand:
+    """Normalized slash command text separated from its raw argument string."""
+
     name: str
     args: str = ""
     canonical_name: str = ""
@@ -32,6 +31,8 @@ class ParsedSlashCommand:
 
 @dataclass(frozen=True)
 class CommandDispatchResult:
+    """Outcome of routing one slash command through the runtime dispatcher."""
+
     parsed: ParsedSlashCommand
     handled: bool
     continue_running: bool = True
@@ -66,34 +67,43 @@ _COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec("save", "导出当前会话"),
     SlashCommandSpec("schedule", "管理本地定时任务"),
     SlashCommandSpec("skills", "管理技能"),
+    SlashCommandSpec("skill", "Skill subcommands", visible=False),
     SlashCommandSpec("quit", "退出 M-Claw"),
 )
 
-_EXTRA_COMMANDS: tuple[SlashCommandSpec, ...] = (
-    SlashCommandSpec("skill", "Skill commands", visible=False),
-    SlashCommandSpec("skill install", "安装外部 Skill", canonical="skill"),
-    SlashCommandSpec("skill creation", "创建新 Skill", canonical="skill"),
+_COMMAND_COMPLETIONS: tuple[SlashCommandSpec, ...] = (
+    SlashCommandSpec("skill install", "安装外部 Skill"),
+    SlashCommandSpec("skill creation", "创建新 Skill"),
 )
 
-_COMMAND_BY_NAME = {spec.name: spec for spec in (*_COMMANDS, *_EXTRA_COMMANDS)}
+_COMMAND_BY_NAME = {spec.name: spec for spec in _COMMANDS}
 
 
 def iter_builtin_commands(*, visible_only: bool = False) -> tuple[SlashCommandSpec, ...]:
-    commands = (*_COMMANDS, *_EXTRA_COMMANDS)
+    """Return built-in command specs, optionally excluding hidden aliases."""
+    commands = _COMMANDS
     if not visible_only:
         return commands
     return tuple(spec for spec in commands if spec.visible)
 
 
+def iter_builtin_completions() -> tuple[SlashCommandSpec, ...]:
+    """Return slash completions, including multi-word command shortcuts."""
+    return (*iter_builtin_commands(visible_only=True), *_COMMAND_COMPLETIONS)
+
+
 def builtin_command_names(*, visible_only: bool = False) -> frozenset[str]:
+    """Return canonical built-in names used to reserve the slash namespace."""
     return frozenset(spec.name for spec in iter_builtin_commands(visible_only=visible_only))
 
 
 def get_builtin_command(name: str) -> SlashCommandSpec | None:
+    """Resolve a command name with or without a leading slash."""
     return _COMMAND_BY_NAME.get((name or "").lstrip("/").lower())
 
 
 def split_slash_command(text: str) -> tuple[str, str]:
+    """Split raw slash input into a lower-case command name and raw args."""
     parts = (text or "").strip().split(maxsplit=1)
     if not parts:
         return "", ""
@@ -103,6 +113,7 @@ def split_slash_command(text: str) -> tuple[str, str]:
 
 
 def is_slash_command(text: str) -> bool:
+    """Return True only for a single leading slash command token."""
     if not text or not text.startswith("/"):
         return False
     first_word = text.split(maxsplit=1)[0]
@@ -110,11 +121,13 @@ def is_slash_command(text: str) -> bool:
 
 
 def canonical_command_name(name: str) -> str:
+    """Map known aliases to their canonical command name."""
     spec = get_builtin_command(name)
-    return spec.dispatch_name if spec else (name or "").lstrip("/").lower()
+    return spec.name if spec else (name or "").lstrip("/").lower()
 
 
 def parse_slash_command(text: str) -> ParsedSlashCommand:
+    """Parse raw slash input while preserving the original argument text."""
     name, args = split_slash_command(text)
     return ParsedSlashCommand(
         name=name,
@@ -165,7 +178,11 @@ class CommandRouter:
 
 
 class SlashInputDispatcher:
-    """Routes raw slash input to built-in command handlers or skills."""
+    """Routes raw slash input to built-in command handlers or Skills.
+
+    Built-in commands win namespace conflicts. Skill invocation is only tried
+    after the runtime command catalog declines the slash name.
+    """
 
     def __init__(
         self,

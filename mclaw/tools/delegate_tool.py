@@ -25,17 +25,19 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from mclaw.tools.path_extract import extract_absolute_paths
 from mclaw.tools.registry import registry, tool_error
+
+if TYPE_CHECKING:
+    from mclaw.agent.core import MClaw
 
 logger = logging.getLogger(__name__)
 
 DELEGATE_BLOCKED_TOOLS = frozenset([
     "delegate_task",    # prevent recursive delegation
-    "memory",           # legacy memory tool name kept as defense in depth
-    "memory_read",
+    "memory_read",      # children must not mutate persistent memory
     "memory_add",
     "memory_replace",
     "memory_remove",
@@ -132,7 +134,7 @@ def _build_child_system_prompt(
         "- 以任务目标为准，结合上下文完成可独立处理的部分。\n"
         "- 本地文件读写以工作区为默认范围；优先使用工作区内已有文件和上下文提供的路径。\n"
         "- 只能通过 terminal 访问 delegation workspace 内的文件，不要声称拥有更高权限。\n"
-        "- 不要用 terminal 直接访问 delegation workspace 之外的路径，除非任务上下文明确要求。\n"
+        "- 不要用 terminal 直接访问 delegation workspace 之外的路径。\n"
         "- 路径或文件不明确时，先做最小范围探索，再读取关键文件。\n"
         "- 信息收集类任务直接返回结论；需要交付文件时再创建或修改文件。\n"
         "- 遇到缺失文件、权限限制、工具不可用或上下文不足时，说明影响和已完成部分。\n"
@@ -175,11 +177,13 @@ def _extract_paths_from_text(text: str) -> List[str]:
 
 
 def _workspace_preparation_for_child(child: Any) -> Dict[str, Any]:
+    """Return the full workspace-copy report attached during child setup."""
     preparation = getattr(child, "_workspace_preparation", None)
     return preparation if isinstance(preparation, dict) else {}
 
 
 def _workspace_preparation_summary(child: Any) -> Dict[str, Any]:
+    """Collapse workspace-copy details for parent-facing pending metadata."""
     preparation = _workspace_preparation_for_child(child)
     return {
         "detected_count": len(preparation.get("detected_paths", [])),
@@ -224,6 +228,7 @@ def _generate_dir_tree(path: str, max_depth: int = 4, max_files_per_dir: int = 3
 
 
 def _copy_path_limited(src: Path, dest: Path) -> tuple[int, int, list[str]]:
+    """Copy one file or directory into a bounded delegation workspace."""
     copied_files = 0
     copied_bytes = 0
     skipped: list[str] = []
@@ -269,6 +274,11 @@ def _prepare_delegation_workspace(
     child_delegation_dir: Path,
 ) -> tuple[str, Optional[str], str, Dict[str, Any]]:
     """Copy referenced external paths into the child workspace and rewrite paths.
+
+    Child agents may only work inside their delegation workspace. Absolute
+    paths mentioned in the task are copied into that workspace under hard file
+    and byte limits, then the goal/context are rewritten so child terminal
+    access stays within the isolated tree.
 
     Returns:
         (new_goal, new_context, workspace_path, preparation_report)
@@ -484,7 +494,13 @@ def _build_child_agent(
     max_iterations: int,
     parent_agent,
 ) -> "MClaw":
-    """Construct a child MClaw instance on the main thread."""
+    """Construct a child MClaw instance with isolated state and tools.
+
+    The parent decides the maximum capability envelope. This builder narrows it
+    again for delegation, resolves optional delegation-specific provider
+    credentials, preloads referenced files into an isolated workspace, and
+    installs filtered tool definitions without re-running discovery.
+    """
     from mclaw.agent.core import MClaw
     from mclaw.tools.dispatch import get_tool_definitions, get_toolset_for_tool
 
@@ -595,8 +611,6 @@ def _build_child_agent(
         provider=child_provider,
         system_prompt=child_prompt,          # inject lightweight prompt directly
         skip_memory=True,                    # disable the memory subsystem
-        skip_context_files=True,             # do not load SOUL.md
-        skip_skills=True,                    # do not register Skill tools
         enabled_toolsets=child_toolsets,     # restricted toolset
         max_iterations=max_iterations,
         session_db=getattr(parent_agent, "_session_db", None),
@@ -779,13 +793,17 @@ def _run_all_children_background(
     task_id: str,
     start_time: float,
 ) -> None:
-    """Run all children in a daemon thread and queue their final results."""
+    """Run all children in a daemon thread and queue their final results.
+
+    Non-blocking TUI mode cannot wait on every child future inline. Results are
+    therefore placed on the module queue and later matched by task id by the
+    runtime command layer.
+    """
     results: List[Dict[str, Any]] = []
     goal_map = {i: task["goal"] for i, task, _child in children}
 
-    # Avoid ``with ThreadPoolExecutor(...)`` because __exit__ calls
-    # shutdown(wait=True). If a worker blocks in an API call, that would block
-    # this daemon thread and prevent _subagent_results.put() from ever running.
+    # The executor lifecycle is controlled explicitly so result delivery stays
+    # independent from slow child workers.
     executor = ThreadPoolExecutor(max_workers=min(len(children), MAX_CONCURRENT_CHILDREN))
     try:
         futures = {}
@@ -938,7 +956,9 @@ def delegate_task(
     """Spawn one or more isolated child agents for delegated tasks.
 
     The model-facing API always uses a tasks array, including a single task.
-    At most MAX_CONCURRENT_CHILDREN tasks run in parallel.
+    At most MAX_CONCURRENT_CHILDREN tasks run in parallel. When the parent TUI
+    supplies a progress callback, this function returns pending-task metadata
+    immediately and the runtime later drains results from the shared queue.
 
     Returns a JSON string with child results or pending-task metadata.
     """
@@ -1076,8 +1096,7 @@ def delegate_task(
                 )
                 futures[future] = i
 
-            # Wait with future.result(timeout) rather than as_completed so one
-            # stuck worker cannot block forever.
+            # Per-future timeouts keep each child task bounded independently.
             for future, idx in futures.items():
                 try:
                     entry = future.result(timeout=_SUBAGENT_MAX_WALL_TIME)
@@ -1191,6 +1210,6 @@ registry.register(
         tasks=args.get("tasks"),
         parent_agent=kw.get("parent_agent"),
     ),
-    description="委托子代理处理任务（隔离上下文）",
+    description="Delegate tasks to isolated subagents",
     emoji="🔀",
 )

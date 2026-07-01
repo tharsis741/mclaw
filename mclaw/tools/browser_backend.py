@@ -16,10 +16,11 @@ import queue
 import shutil
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any
 
 from mclaw.constants import get_mclaw_home
 
@@ -37,7 +38,7 @@ def _default_downloads_dir() -> Path:
 # JavaScript snippet that tags interactive elements and returns metadata.
 _SNAPSHOT_JS = """
 (() => {
-    // Clear old refs
+    // Clear stale refs from the previous snapshot.
     document.querySelectorAll('[data-mclaw-ref]').forEach(el =>
         el.removeAttribute('data-mclaw-ref')
     );
@@ -107,8 +108,8 @@ _SNAPSHOT_JS = """
 """
 
 
-def _safe_page_info(page) -> Tuple[str, str]:
-    """Safely read page url and title, swallowing errors."""
+def _safe_page_info(page) -> tuple[str, str]:
+    """Read page URL and title without surfacing transient browser state errors."""
     url = ""
     title = ""
     try:
@@ -124,13 +125,14 @@ def _safe_page_info(page) -> Tuple[str, str]:
 
 @dataclass
 class _SessionState:
+    """Mutable browser state owned by one logical M-Claw browser session."""
     context: Any
     page: Any
-    ref_map: Dict[str, Any] = field(default_factory=dict)
+    ref_map: dict[str, Any] = field(default_factory=dict)
     last_activity: float = field(default_factory=time.time)
     downloads_dir: Path = field(default_factory=_default_downloads_dir)
-    downloads: List[Path] = field(default_factory=list)
-    download_errors: List[str] = field(default_factory=list)
+    downloads: list[Path] = field(default_factory=list)
+    download_errors: list[str] = field(default_factory=list)
 
 
 class BrowserBackend:
@@ -138,15 +140,15 @@ class BrowserBackend:
 
     def __init__(self, headless: bool = True):
         self._headless = headless
-        self._playwright: Optional[Any] = None
-        self._browser: Optional[Any] = None
-        self._sessions: Dict[str, _SessionState] = {}
+        self._playwright: Any | None = None
+        self._browser: Any | None = None
+        self._sessions: dict[str, _SessionState] = {}
         self._lock = threading.Lock()
         self._started = False
         self._task_queue: "queue.Queue[tuple[Callable, tuple, dict, Future] | None]" = queue.Queue()
         self._worker_lock = threading.Lock()
-        self._worker_thread: Optional[threading.Thread] = None
-        self._worker_thread_id: Optional[int] = None
+        self._worker_thread: threading.Thread | None = None
+        self._worker_thread_id: int | None = None
 
     # Playwright's sync API is thread-affine: all operations on a browser/page
     # must run on the same thread that started sync_playwright().
@@ -163,6 +165,7 @@ class BrowserBackend:
             self._worker_thread.start()
 
     def _worker_loop(self) -> None:
+        """Run all Playwright sync calls on the thread that owns Playwright."""
         self._worker_thread_id = threading.get_ident()
         while True:
             task = self._task_queue.get()
@@ -178,6 +181,7 @@ class BrowserBackend:
         self._worker_thread_id = None
 
     def _run_on_worker(self, fn: Callable, *args, **kwargs):
+        """Marshal browser work onto the Playwright owner thread."""
         if threading.get_ident() == self._worker_thread_id:
             return fn(*args, **kwargs)
         self._ensure_worker()
@@ -186,6 +190,7 @@ class BrowserBackend:
         return future.result()
 
     def _shutdown_worker(self) -> None:
+        """Stop the worker after browser resources have been closed."""
         thread = self._worker_thread
         if not thread or not thread.is_alive():
             return
@@ -278,10 +283,11 @@ class BrowserBackend:
 
     # ── Session management ────────────────────────────────────────────────────
 
-    def get_or_create_page(self, session_id: str) -> Tuple[Any, _SessionState]:
+    def get_or_create_page(self, session_id: str) -> tuple[Any, _SessionState]:
         return self._run_on_worker(self._get_or_create_page_impl, session_id)
 
-    def _get_or_create_page_impl(self, session_id: str) -> Tuple[Any, _SessionState]:
+    def _get_or_create_page_impl(self, session_id: str) -> tuple[Any, _SessionState]:
+        """Create an isolated context and page for a session on first use."""
         self._ensure_started_impl()
         with self._lock:
             if session_id in self._sessions:
@@ -313,40 +319,12 @@ class BrowserBackend:
             self._sessions[session_id] = state
             return page, state
 
-    def close_session(self, session_id: str) -> None:
-        return self._run_on_worker(self._close_session_impl, session_id)
-
-    def _close_session_impl(self, session_id: str) -> None:
-        with self._lock:
-            state = self._sessions.pop(session_id, None)
-            if state:
-                try:
-                    state.context.close()
-                except Exception as e:
-                    logger.debug("Error closing session %s: %s", session_id, e)
-                logger.info("Closed browser session: %s", session_id)
-
-    def list_sessions(self) -> List[str]:
-        return self._run_on_worker(self._list_sessions_impl)
-
-    def _list_sessions_impl(self) -> List[str]:
-        with self._lock:
-            return list(self._sessions.keys())
-
-    def get_session_age(self, session_id: str) -> float:
-        return self._run_on_worker(self._get_session_age_impl, session_id)
-
-    def _get_session_age_impl(self, session_id: str) -> float:
-        with self._lock:
-            state = self._sessions.get(session_id)
-            return time.time() - state.last_activity if state else float("inf")
-
     # ── Navigation ────────────────────────────────────────────────────────────
 
-    def navigate(self, session_id: str, url: str) -> Dict[str, str]:
+    def navigate(self, session_id: str, url: str) -> dict[str, str]:
         return self._run_on_worker(self._navigate_impl, session_id, url)
 
-    def _navigate_impl(self, session_id: str, url: str) -> Dict[str, str]:
+    def _navigate_impl(self, session_id: str, url: str) -> dict[str, str]:
         page, state = self._get_or_create_page_impl(session_id)
         logger.info("Navigating to %s", url)
         try:
@@ -362,10 +340,11 @@ class BrowserBackend:
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
-    def snapshot(self, session_id: str) -> Dict[str, Any]:
+    def snapshot(self, session_id: str) -> dict[str, Any]:
         return self._run_on_worker(self._snapshot_impl, session_id)
 
-    def _snapshot_impl(self, session_id: str) -> Dict[str, Any]:
+    def _snapshot_impl(self, session_id: str) -> dict[str, Any]:
+        """Return a compact page snapshot and refresh the ref-to-element map."""
         page, state = self._get_or_create_page_impl(session_id)
         state.last_activity = time.time()
         url_val, title_val = _safe_page_info(page)
@@ -385,8 +364,8 @@ class BrowserBackend:
         headings = result.get("headings", [])
         text_blocks = result.get("textBlocks", [])
 
-        lines: List[str] = []
-        ref_map: Dict[str, Any] = {}
+        lines: list[str] = []
+        ref_map: dict[str, Any] = {}
 
         # Include headings as page context.
         for h in headings[:8]:
@@ -463,7 +442,7 @@ class BrowserBackend:
 
     # ── Interaction ───────────────────────────────────────────────────────────
 
-    def _get_element(self, session_id: str, ref: str) -> Optional[Any]:
+    def _get_element(self, session_id: str, ref: str) -> Any | None:
         """Resolve a ref ID to a Playwright Locator via data-mclaw-ref attribute."""
         page, _ = self._get_or_create_page_impl(session_id)
         locator = page.locator(f'[data-mclaw-ref="{ref}"]')
@@ -475,6 +454,7 @@ class BrowserBackend:
         return None
 
     def _unique_path(self, dest: Path) -> Path:
+        """Choose a non-conflicting destination without overwriting downloads."""
         if not dest.exists():
             return dest
         stem = dest.stem
@@ -486,7 +466,8 @@ class BrowserBackend:
                 return candidate
         return parent / f"{stem}_{int(time.time() * 1000)}{suffix}"
 
-    def _download_destination(self, state: _SessionState, suggested: str, path: Optional[str] = None) -> Path:
+    def _download_destination(self, state: _SessionState, suggested: str, path: str | None = None) -> Path:
+        """Resolve caller output path while preserving browser suggested names."""
         safe_name = Path(suggested or "download").name or "download"
         if not path:
             dest = state.downloads_dir / safe_name
@@ -504,10 +485,11 @@ class BrowserBackend:
         self,
         state: _SessionState,
         download: Any,
-        path: Optional[str] = None,
+        path: str | None = None,
         *,
         queue_download: bool = True,
     ) -> Path:
+        """Persist a Playwright Download and optionally queue it for later pickup."""
         suggested = download.suggested_filename or "download"
         dest = self._download_destination(state, suggested, path=path)
         download.save_as(str(dest))
@@ -516,7 +498,7 @@ class BrowserBackend:
         logger.info("Download saved: %s (%d bytes)", dest, dest.stat().st_size)
         return dest
 
-    def _download_result(self, path: Path) -> Dict[str, Any]:
+    def _download_result(self, path: Path) -> dict[str, Any]:
         return {
             "success": True,
             "filename": path.name,
@@ -524,7 +506,7 @@ class BrowserBackend:
             "size": path.stat().st_size,
         }
 
-    def _move_download(self, source: Path, state: _SessionState, path: Optional[str]) -> Path:
+    def _move_download(self, source: Path, state: _SessionState, path: str | None) -> Path:
         if not path:
             return source
         dest = self._download_destination(state, source.name, path=path)
@@ -533,10 +515,10 @@ class BrowserBackend:
         shutil.move(str(source), str(dest))
         return dest
 
-    def click(self, session_id: str, ref: str) -> Dict[str, Any]:
+    def click(self, session_id: str, ref: str) -> dict[str, Any]:
         return self._run_on_worker(self._click_impl, session_id, ref)
 
-    def _click_impl(self, session_id: str, ref: str) -> Dict[str, Any]:
+    def _click_impl(self, session_id: str, ref: str) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
         element = self._get_element(session_id, ref)
 
@@ -551,7 +533,7 @@ class BrowserBackend:
             }
 
         logger.info("Clicking element @%s", ref)
-        captured_download: Optional[Path] = None
+        captured_download: Path | None = None
 
         def _handle_download(download):
             nonlocal captured_download
@@ -578,8 +560,8 @@ class BrowserBackend:
         finally:
             try:
                 page.remove_listener("download", _handle_download)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("Download listener cleanup failed: %s", exc)
 
         snap = self._snapshot_impl(session_id)
         result = {
@@ -592,10 +574,10 @@ class BrowserBackend:
             result["download"] = self._download_result(captured_download)
         return result
 
-    def type_text(self, session_id: str, ref: str, text: str) -> Dict[str, Any]:
+    def type_text(self, session_id: str, ref: str, text: str) -> dict[str, Any]:
         return self._run_on_worker(self._type_text_impl, session_id, ref, text)
 
-    def _type_text_impl(self, session_id: str, ref: str, text: str) -> Dict[str, Any]:
+    def _type_text_impl(self, session_id: str, ref: str, text: str) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
         element = self._get_element(session_id, ref)
 
@@ -631,10 +613,10 @@ class BrowserBackend:
             "snapshot": snap["snapshot"],
         }
 
-    def scroll(self, session_id: str, direction: str = "down") -> Dict[str, Any]:
+    def scroll(self, session_id: str, direction: str = "down") -> dict[str, Any]:
         return self._run_on_worker(self._scroll_impl, session_id, direction)
 
-    def _scroll_impl(self, session_id: str, direction: str = "down") -> Dict[str, Any]:
+    def _scroll_impl(self, session_id: str, direction: str = "down") -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
         logger.info("Scrolling %s", direction)
 
@@ -667,10 +649,10 @@ class BrowserBackend:
             "snapshot": snap["snapshot"],
         }
 
-    def press(self, session_id: str, key: str) -> Dict[str, Any]:
+    def press(self, session_id: str, key: str) -> dict[str, Any]:
         return self._run_on_worker(self._press_impl, session_id, key)
 
-    def _press_impl(self, session_id: str, key: str) -> Dict[str, Any]:
+    def _press_impl(self, session_id: str, key: str) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
         logger.info("Pressing key: %s", key)
         try:
@@ -691,10 +673,10 @@ class BrowserBackend:
 
     # ── Screenshot ────────────────────────────────────────────────────────────
 
-    def screenshot(self, session_id: str, path: Optional[str] = None) -> Dict[str, Any]:
+    def screenshot(self, session_id: str, path: str | None = None) -> dict[str, Any]:
         return self._run_on_worker(self._screenshot_impl, session_id, path)
 
-    def _screenshot_impl(self, session_id: str, path: Optional[str] = None) -> Dict[str, Any]:
+    def _screenshot_impl(self, session_id: str, path: str | None = None) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
 
         if not path:
@@ -723,19 +705,20 @@ class BrowserBackend:
     def download(
         self,
         session_id: str,
-        url: Optional[str] = None,
-        path: Optional[str] = None,
-        ref: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        url: str | None = None,
+        path: str | None = None,
+        ref: str | None = None,
+    ) -> dict[str, Any]:
         return self._run_on_worker(self._download_impl, session_id, url, path, ref)
 
     def _download_impl(
         self,
         session_id: str,
-        url: Optional[str] = None,
-        path: Optional[str] = None,
-        ref: Optional[str] = None,
-    ) -> Dict[str, Any]:
+        url: str | None = None,
+        path: str | None = None,
+        ref: str | None = None,
+    ) -> dict[str, Any]:
+        """Handle the three download modes exposed by browser_download."""
         page, state = self._get_or_create_page_impl(session_id)
 
         if ref:

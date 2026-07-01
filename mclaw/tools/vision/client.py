@@ -12,20 +12,25 @@ from mclaw.tools.vision.types import VisionCredentials
 
 
 class VisionClient(Protocol):
+    """Provider adapter contract for multimodal image analysis."""
     provider: str
 
     def analyze(self, messages: list, credentials: VisionCredentials, timeout: float) -> str:
+        """Return model text for a prepared multimodal message payload."""
         ...
 
 
 class UnsupportedVisionProviderError(RuntimeError):
+    """Raised when configuration names a provider without an adapter."""
     pass
 
 
 class QwenVisionClient:
+    """OpenAI-compatible client for Qwen/DashScope vision models."""
     provider = "qwen"
 
     def analyze(self, messages: list, credentials: VisionCredentials, timeout: float) -> str:
+        """Call the Qwen vision model and fall back when temperature is rejected."""
         try:
             import openai
         except ImportError as exc:
@@ -70,6 +75,7 @@ _CLIENTS: dict[str, VisionClient] = {
 
 
 def get_vision_client(provider: str) -> VisionClient:
+    """Resolve a configured provider name to a concrete vision client."""
     provider_key = str(provider or "").strip().lower()
     client = _CLIENTS.get(provider_key)
     if client is None:
@@ -85,6 +91,7 @@ def call_vision_llm(
     timeout: float,
     provider: str = "qwen",
 ) -> str:
+    """Compatibility wrapper used by the tool-facing vision entrypoint."""
     credentials = VisionCredentials(
         provider=provider or "qwen",
         api_key=api_key,

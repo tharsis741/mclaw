@@ -26,11 +26,14 @@ def count_logical_lines(text: str) -> int:
 
 
 def folded_paste_placeholder(line_count: int) -> str:
+    """Create the visible token that stands in for a multi-line paste."""
     return f"[输入行数过多，已折叠{line_count}行!]"
 
 
 @dataclass(frozen=True)
 class FoldedPasteSegment:
+    """Remember one folded paste placeholder and the text it hides."""
+
     placeholder: str
     text: str
 
@@ -57,6 +60,7 @@ class FoldedPasteStore:
         return placeholder
 
     def expand(self, display_text: str) -> str:
+        """Restore unchanged placeholders before the composer submits text."""
         expanded = str(display_text or "")
         for segment in self._segments:
             if segment.placeholder in expanded:
@@ -88,6 +92,7 @@ class HistoryNavigationState:
         self._navigate_history(buffer, lambda: buffer.history_forward(count=count))
 
     def _navigate_history(self, buffer, action) -> None:
+        """Run prompt_toolkit history movement without treating the preview as an edit."""
         before = (getattr(buffer, "working_index", None), getattr(buffer, "text", ""))
         self.suppress_text_changed = True
         try:

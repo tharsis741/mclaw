@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared Rich-based building blocks for M-Claw TUI panels."""
+"""Shared M-Claw TUI building blocks.
+
+Helpers in this module stay renderer-neutral enough for individual panels to
+compose Rich objects, while centralizing M-Claw width, border, escaping, and
+command highlighting rules.
+"""
 
 from __future__ import annotations
 
@@ -22,7 +27,6 @@ from mclaw.cli.tui.theme import (
     ACCENT_COLOR,
     ACCENT_DIM,
     ACCENT_LIGHT,
-    BANNER_TEXT_COLOR,
     COMMAND_ARG_COLOR,
     COMMAND_COLOR,
     COMMAND_EXAMPLE_COLOR,
@@ -37,6 +41,7 @@ from mclaw.cli.tui.theme import (
 
 
 def terminal_panel_width(*, fallback: int = 96, min_width: int = 64, max_width: int = 104) -> int:
+    """Return the bounded panel width used by classic terminal rendering."""
     columns = shutil.get_terminal_size((fallback, 24)).columns
     return min(max(columns - 2, min_width), max_width)
 
@@ -80,6 +85,7 @@ def build_panel(
     title_align: str = "center",
     padding: tuple[int, int] = (1, 2),
 ) -> Panel:
+    """Build a branded Rich panel without printing it."""
     return Panel(
         Group(*items),
         title=title if not isinstance(title, str) else f"[bold {ACCENT_LIGHT}] {title} [/]",
@@ -93,6 +99,7 @@ def build_panel(
 
 
 def key_value_table(rows: Iterable[tuple[str, object]], *, key_style: str = ACCENT_COLOR) -> Table:
+    """Render two-column metadata while escaping plain string values."""
     table = Table.grid(padding=(0, 2), pad_edge=False)
     table.add_column(style=f"bold {key_style}", no_wrap=True)
     table.add_column(style=VALUE_COLOR, overflow="fold")
@@ -102,6 +109,7 @@ def key_value_table(rows: Iterable[tuple[str, object]], *, key_style: str = ACCE
 
 
 def command_table(rows: Iterable[tuple[str, object]]) -> Table:
+    """Render command help rows with slash/argument highlighting."""
     table = Table.grid(padding=(0, 3), pad_edge=False)
     table.add_column(no_wrap=True)
     table.add_column(style=MUTED, overflow="fold")
@@ -111,6 +119,7 @@ def command_table(rows: Iterable[tuple[str, object]]) -> Table:
 
 
 def data_table(columns: Sequence[tuple[str, dict]], rows: Iterable[Sequence[object]]) -> Table:
+    """Render structured table rows from UI-neutral column descriptors."""
     table = Table(box=None, show_header=True, header_style=f"bold {ACCENT_LIGHT}", padding=(0, 2))
     for name, options in columns:
         table.add_column(name, **options)
@@ -136,6 +145,7 @@ def vertical_stack(*items):
 
 
 def status_label(state: str, labels: dict[str, tuple[str, str]] | None = None) -> RichText:
+    """Return a localized status badge for compact TUI panels."""
     palette = labels or {
         "success": ("成功", SUCCESS),
         "warning": ("注意", WARNING),
@@ -148,6 +158,7 @@ def status_label(state: str, labels: dict[str, tuple[str, str]] | None = None) -
 
 
 def _safe_cell(value):
+    """Escape plain text cells but pass through Rich renderables unchanged."""
     if isinstance(value, str):
         return escape(value)
     if is_renderable(value):
@@ -179,6 +190,7 @@ _COMMAND_TOKEN_RE = re.compile(r"(<[^>]+>|--[A-Za-z0-9_-]+|/[A-Za-z0-9_-]+)")
 
 
 def _highlight_command(command: str) -> RichText:
+    """Apply command, flag, and placeholder styles within one help command."""
     if "<" not in command and "--" not in command:
         return RichText(command, style=f"bold {COMMAND_COLOR}")
 

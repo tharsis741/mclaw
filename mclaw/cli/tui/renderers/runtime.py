@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Runtime notification rendering for the interactive TUI."""
+"""Render transient runtime notifications for the interactive TUI."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ DIM = Colors.DIM
 
 
 class RuntimeRenderer:
-    """Render transient runtime messages that should not become full panels."""
+    """Route runtime notices to structured event sinks or legacy terminal text."""
 
     def __init__(
         self,
@@ -29,6 +29,7 @@ class RuntimeRenderer:
         self._event_sink = event_sink
 
     def line(self, text: str = "") -> None:
+        """Emit an informational runtime message through the active output path."""
         if self._event_sink is not None:
             self._event_sink(EventType.RUNTIME_MESSAGE, {"level": "info", "message": text})
             return
@@ -62,7 +63,7 @@ class RuntimeRenderer:
         self._printer("\n  (无子代理任务)")
 
     def background_processes_stopped(self, count: int) -> None:
-        self.dim(f"Stopped {count} background process(es).")
+        self.dim(f"已停止 {count} 个后台进程。")
 
     def watcher_notice(self, symbol: str, notice: str) -> None:
         self.dim(f"{symbol} {notice}", leading_newline=True)
@@ -71,12 +72,14 @@ class RuntimeRenderer:
         self.dim("密钥输入已取消。")
 
     def command_echo(self, symbol: str, command: str) -> None:
+        """Echo a submitted command while preserving symbol metadata for event sinks."""
         if self._event_sink is not None:
             self._event_sink(EventType.RUNTIME_MESSAGE, {"level": "command", "message": command, "symbol": symbol})
             return
         self._printer(f"\n  {symbol}  {command}")
 
     def user_message(self, marker: str, user_input: str) -> None:
+        """Render user input as a transient runtime event or classic highlighted line."""
         if self._event_sink is not None:
             self._event_sink(EventType.RUNTIME_MESSAGE, {"level": "user", "message": user_input, "symbol": marker})
             return

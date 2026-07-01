@@ -10,7 +10,11 @@ from collections.abc import Iterable
 
 
 def build_skill_install_intent(source: str) -> str:
-    """Build the model task queued by /skill install."""
+    """Build the model task queued by /skill install.
+
+    The prompt preserves the user-provided source as the trust boundary for
+    retries and fallback discovery during external Skill installation.
+    """
     source_text = str(source or "").strip()
     return (
         "用户要安装外部 M-Claw Skill。\n\n"
@@ -25,7 +29,11 @@ def build_skill_install_intent(source: str) -> str:
 
 
 def build_skill_creation_intent(brief: str) -> str:
-    """Build the model task queued by /skill creation."""
+    """Build the model task queued by /skill creation.
+
+    The prompt makes information gathering an explicit gate before the model
+    starts writing Skill scaffolds or auxiliary assets.
+    """
     brief_text = str(brief or "").strip()
     return (
         "用户要创建新的 M-Claw Skill。\n\n"
@@ -45,7 +53,11 @@ def build_skill_creation_intent(brief: str) -> str:
 
 
 def build_pet_file_drop_intent(paths: Iterable[object]) -> str:
-    """Build the model task queued when files are dropped onto the desktop pet."""
+    """Build the model task queued when files are dropped onto the desktop pet.
+
+    Only non-empty local path strings are forwarded so the normal file-reading
+    tool policy remains responsible for later access decisions.
+    """
     clean_paths = []
     for path in paths:
         text = str(path or "").strip()

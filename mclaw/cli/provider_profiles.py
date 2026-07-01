@@ -20,6 +20,8 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class ProviderProfile:
+    """Callable and catalog identity for one provider-facing setup option."""
+
     id: str
     label: str
     models_dev_provider: str
@@ -111,6 +113,7 @@ PROVIDER_PROFILES: dict[str, list[ProviderProfile]] = {
             note="Coding Plan 与普通 MiniMax API key 不通用。",
         ),
     ],
+    "minimax-cn": [ProviderProfile("api", "MiniMax 中国区 API", "minimax-cn")],
     "zhipu": [
         ProviderProfile("api", "智谱开放平台 API", "zhipuai"),
         ProviderProfile(
@@ -185,10 +188,13 @@ PROVIDER_PROFILES: dict[str, list[ProviderProfile]] = {
         ),
     ],
     "xai": [ProviderProfile("api", "xAI API", "xai")],
+    "microsoft": [ProviderProfile("api", "Azure AI / Azure OpenAI API", "azure")],
     "meta": [
         ProviderProfile("api", "Meta Llama API", "llama"),
     ],
     "mistral": [ProviderProfile("api", "Mistral API", "mistral")],
+    "cohere": [ProviderProfile("api", "Cohere API", "cohere")],
+    "amazon": [ProviderProfile("api", "Amazon Bedrock API", "amazon-bedrock")],
     "groq": [ProviderProfile("host", "Groq 托管模型 API", "groq", kind="host")],
     "together": [ProviderProfile("host", "Together AI 托管模型 API", "togetherai", kind="host")],
     "fireworks": [ProviderProfile("host", "Fireworks AI 托管模型 API", "fireworks-ai", kind="host")],
@@ -245,10 +251,12 @@ def get_default_provider_profile(provider_key: str) -> ProviderProfile:
 
 
 def resolve_models_dev_provider(provider_key: str, profile_id: str = "") -> str:
+    """Return the models.dev provider id that backs a M-Claw provider profile."""
     return get_provider_profile(provider_key, profile_id).models_dev_provider
 
 
 def profile_help_lines(provider_key: str) -> list[str]:
+    """Format profile choices for errors and setup prompts."""
     lines: list[str] = []
     for profile in get_provider_profiles(provider_key):
         suffix = f"；{profile.note}" if profile.note else ""
@@ -257,6 +265,7 @@ def profile_help_lines(provider_key: str) -> list[str]:
 
 
 def search_models_dev_provider_ids(query: str, provider_ids: list[str], *, limit: int = 10) -> list[str]:
+    """Find likely models.dev provider ids without treating matches as routing."""
     raw = str(query or "").strip()
     if not raw:
         return []

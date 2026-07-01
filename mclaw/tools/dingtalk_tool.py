@@ -18,6 +18,7 @@ from mclaw.tools.registry import registry, tool_error
 
 
 def dingtalk_send_text(text: str, parent_agent=None) -> str:
+    """Send text through the DingTalk target bound to the current agent session."""
     if parent_agent is None:
         return tool_error("dingtalk_send_text requires an active DingTalk agent session", success=False)
     session_id = str(getattr(parent_agent, "session_id", "") or "")
@@ -34,6 +35,7 @@ def dingtalk_send_text(text: str, parent_agent=None) -> str:
 
 
 def dingtalk_send_file(file_path: str, caption: str = "", parent_agent=None) -> str:
+    """Send a local file through the current DingTalk outbound target."""
     if parent_agent is None:
         return tool_error("dingtalk_send_file requires an active DingTalk agent session", success=False)
     session_id = str(getattr(parent_agent, "session_id", "") or "")
@@ -98,10 +100,12 @@ DINGTALK_SEND_FILE_SCHEMA = {
 
 
 def _handle_dingtalk_send_text(args: dict, **kw) -> str:
+    """Registry adapter for DingTalk text sends."""
     return dingtalk_send_text(text=args.get("text", ""), parent_agent=kw.get("parent_agent"))
 
 
 def _handle_dingtalk_send_file(args: dict, **kw) -> str:
+    """Registry adapter for DingTalk file sends."""
     return dingtalk_send_file(
         file_path=args.get("file_path", ""),
         caption=args.get("caption", ""),
@@ -114,7 +118,7 @@ registry.register(
     toolset="dingtalk",
     schema=DINGTALK_SEND_TEXT_SCHEMA,
     handler=_handle_dingtalk_send_text,
-    description="向当前钉钉会话发送文本/Markdown",
+    description="Send text or Markdown to the current DingTalk conversation",
     emoji="📨",
     max_result_size_chars=2000,
 )
@@ -124,7 +128,7 @@ registry.register(
     toolset="dingtalk",
     schema=DINGTALK_SEND_FILE_SCHEMA,
     handler=_handle_dingtalk_send_file,
-    description="向当前钉钉会话发送本地文件/音频/视频",
+    description="Send a file to the current DingTalk conversation",
     emoji="📎",
     max_result_size_chars=2000,
 )

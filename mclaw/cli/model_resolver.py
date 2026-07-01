@@ -15,14 +15,16 @@ from __future__ import annotations
 import difflib
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
 
 from mclaw.agent import models_dev
-from mclaw.cli.auth import PROVIDER_REGISTRY
+from mclaw.cli.auth import PROVIDER_REGISTRY, detect_provider_for_model as _detect_provider_for_model
+from mclaw.cli.provider_profiles import get_default_provider_profile
 
 
 @dataclass
 class ModelSuggestion:
+    """A catalog-backed suggestion that is safe to show but not auto-apply."""
+
     model: str
     provider: str = ""
     score: float = 0.0
@@ -30,6 +32,8 @@ class ModelSuggestion:
 
 @dataclass
 class ModelResolution:
+    """Resolved model/provider intent before credentials and endpoints are used."""
+
     status: str
     model: str
     provider: str = ""
@@ -43,7 +47,7 @@ class ModelResolution:
         return self.status in {"ok", "unverified"}
 
 
-def resolve_provider_key(provider_input: str, user_providers: Optional[dict] = None) -> str:
+def resolve_provider_key(provider_input: str, user_providers: dict | None = None) -> str:
     """Resolve user-entered provider text to M-Claw's canonical provider key."""
     raw = str(provider_input or "").strip()
     if not raw:
@@ -84,7 +88,7 @@ def resolve_model_input(
     *,
     provider_input: str = "",
     current_provider: str = "",
-    user_providers: Optional[dict] = None,
+    user_providers: dict | None = None,
     max_suggestions: int = 5,
 ) -> ModelResolution:
     """Resolve a model name without guessing unsafe substitutions.
@@ -151,8 +155,8 @@ def resolve_model_input(
         )
 
     # No explicit provider: prefer exact catalog match, then current provider,
-    # then prefix detection.  Do not silently keep current provider for totally
-    # unknown model names.
+    # then prefix detection. Unknown model names require an explicit provider
+    # decision when no catalog or prefix evidence is available.
     current = resolve_provider_key(current_provider, user_providers)
     if current and (current in PROVIDER_REGISTRY or current in user_providers):
         match = _find_model_match(model, catalog, provider=current)
@@ -202,7 +206,13 @@ def resolve_model_input(
             provider_known=True,
         )
 
-    suggestions = _suggest_models(model, catalog, limit=max_suggestions)
+    suggestions = _suggest_models(
+        model,
+        catalog,
+        limit=max_suggestions,
+        user_providers=user_providers,
+        require_routable=True,
+    )
     if suggestions:
         return ModelResolution(
             status="unknown_model",
@@ -270,7 +280,7 @@ def _load_catalog() -> list[dict[str, str]]:
     for provider_id, provider_data in providers_data.items():
         mclaw_provider = reverse.get(provider_id, provider_id)
         for model in models_dev._iter_models(provider_data):
-            model_id = str(model.get("id") or model.get("model_id") or "").strip()
+            model_id = str(model.get("id") or "").strip()
             if not model_id:
                 continue
             key = (mclaw_provider, model_id.lower())
@@ -287,27 +297,15 @@ def _load_catalog() -> list[dict[str, str]]:
 
 def _models_dev_to_mclaw_provider() -> dict[str, str]:
     reverse: dict[str, str] = {}
-    try:
-        from mclaw.cli.provider_profiles import get_default_provider_profile
-    except Exception:
-        get_default_provider_profile = None
-
-    if get_default_provider_profile:
-        for mclaw_provider in PROVIDER_REGISTRY:
-            try:
-                dev_provider = get_default_provider_profile(mclaw_provider).models_dev_provider
-            except Exception:
-                continue
-            if dev_provider and dev_provider not in reverse:
-                reverse[dev_provider] = mclaw_provider
-
-    for mclaw_provider, dev_provider in models_dev.PROVIDER_TO_MODELS_DEV.items():
-        if mclaw_provider in PROVIDER_REGISTRY and dev_provider not in reverse:
+    for mclaw_provider in PROVIDER_REGISTRY:
+        dev_provider = get_default_provider_profile(mclaw_provider).models_dev_provider
+        if dev_provider and dev_provider not in reverse:
             reverse[dev_provider] = mclaw_provider
+
     return reverse
 
 
-def _find_model_match(model: str, catalog: list[dict[str, str]], *, provider: str = "") -> Optional[dict[str, str]]:
+def _find_model_match(model: str, catalog: list[dict[str, str]], *, provider: str = "") -> dict[str, str] | None:
     matches = _find_model_matches(model, catalog, provider=provider)
     return matches[0] if matches else None
 
@@ -328,11 +326,16 @@ def _suggest_models(
     *,
     provider: str = "",
     limit: int = 5,
+    user_providers: dict | None = None,
+    require_routable: bool = False,
 ) -> list[ModelSuggestion]:
+    user_providers = user_providers or {}
     scoped = [item for item in catalog if not provider or item["provider"] == provider]
     query = _model_key(model)
     scored = []
     for item in scoped:
+        if require_routable and not _is_routable_provider(item["provider"], user_providers):
+            continue
         score = difflib.SequenceMatcher(None, query, item["key"]).ratio()
         if query and (query in item["key"] or item["key"] in query):
             score = max(score, 0.72)
@@ -352,23 +355,6 @@ def _suggest_models(
     return suggestions
 
 
-def _detect_provider_for_model(model: str) -> str:
-    lower = str(model or "").lower()
-    for pname, pcfg in PROVIDER_REGISTRY.items():
-        for prefix in pcfg.model_prefixes:
-            if lower.startswith(prefix.lower()):
-                return pname
-    if "/" in str(model or ""):
-        prefix = lower.split("/")[0]
-        known_orgs = {
-            "anthropic", "openai", "google", "meta-llama", "mistralai",
-            "microsoft", "nousresearch", "qwen", "deepseek",
-        }
-        if prefix in known_orgs or prefix in PROVIDER_REGISTRY:
-            return "openrouter"
-    return ""
-
-
 def _is_routable_provider(provider: str, user_providers: dict) -> bool:
     return provider in PROVIDER_REGISTRY or provider in user_providers
 
@@ -378,4 +364,4 @@ def _model_key(value: str) -> str:
 
 
 def _compact_provider_name(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())

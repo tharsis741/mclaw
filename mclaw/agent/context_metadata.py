@@ -5,29 +5,23 @@
 """Resolve model context windows from cache, providers, and fallbacks.
 
 The agent needs a conservative context length before it can decide when to
-compact history. This module resolves that value from explicit config,
-persistent cache, provider APIs, the models.dev registry, fuzzy built-in
-defaults, and finally a 128K fallback.
-
-Runtime overflow errors are parsed separately so callers can update cached
-limits after a provider reports a more precise value.
+compact history. This module resolves that value from persistent cache,
+provider APIs, the models.dev registry, fuzzy built-in defaults, and finally
+a 128K fallback.
 """
 
 from __future__ import annotations
 
 import logging
-import re
 import time
-from pathlib import Path
-from typing import Optional
 
+import requests
 import yaml
 
 from mclaw.constants import get_mclaw_home
 
 logger = logging.getLogger(__name__)
 
-CONTEXT_PROBE_TIERS = [128_000, 64_000, 32_000, 16_000, 8_000]
 DEFAULT_FALLBACK_CONTEXT = 128_000
 
 DEFAULT_CONTEXT_LENGTHS = {
@@ -78,30 +72,31 @@ DEFAULT_CONTEXT_LENGTHS = {
 _CACHE_PATH = get_mclaw_home() / "context_length_cache.yaml"
 
 
-def _load_length_cache() -> dict:
+def _load_length_cache() -> dict[str, object]:
     try:
         if _CACHE_PATH.exists():
-            return yaml.safe_load(_CACHE_PATH.read_text(encoding="utf-8")) or {}
-    except Exception:
-        pass
+            data = yaml.safe_load(_CACHE_PATH.read_text(encoding="utf-8")) or {}
+            return data if isinstance(data, dict) else {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.debug("Failed to load context length cache: %s", exc)
     return {}
 
 
-def _save_length_cache(cache: dict) -> None:
+def _save_length_cache(cache: dict[str, object]) -> None:
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
         _CACHE_PATH.write_text(yaml.dump(cache, allow_unicode=True), encoding="utf-8")
-    except Exception:
-        pass
+    except (OSError, TypeError, yaml.YAMLError) as exc:
+        logger.debug("Failed to save context length cache: %s", exc)
 
 
-def get_cached_context_length(model: str, base_url: str) -> Optional[int]:
+def get_cached_context_length(model: str, base_url: str) -> int | None:
     """Read from persistent cache. Key = (base_url, model)."""
     cache = _load_length_cache()
     key = f"{base_url or ''}:{model}".lower()
     entry = cache.get(key, {})
     if isinstance(entry, dict):
-        return entry.get("context_length")
+        return _coerce_context_length(entry.get("context_length"))
     return None
 
 
@@ -113,67 +108,30 @@ def save_context_length(model: str, base_url: str, length: int) -> None:
     _save_length_cache(cache)
 
 
-def parse_context_limit_from_error(error_msg: str) -> Optional[int]:
-    """Extract context limit from API error.
-
-    Examples:
-      "maximum context length is 32768 tokens" → 32768
-      "context limit: 200000 tokens" → 200000
-    """
-    patterns = [
-        r"maximum context.*?(\d{3,7})\s*tokens?",
-        r"context.*?limit.*?(\d{3,7})\s*tokens?",
-        r"(\d{5,7})\s*tokens?\s*(?:maximum|limit)",
-    ]
-    for pat in patterns:
-        m = re.search(pat, error_msg, re.IGNORECASE)
-        if m:
-            val = int(m.group(1))
-            if 1000 <= val <= 10_000_000:
-                return val
-    return None
-
-
-def get_next_probe_tier(current: int) -> Optional[int]:
-    """Return the next lower tier from CONTEXT_PROBE_TIERS."""
-    for tier in sorted(CONTEXT_PROBE_TIERS, reverse=True):
-        if tier < current:
-            return tier
-    return None
-
-
 def get_model_context_length(
     model: str,
     base_url: str = "",
     api_key: str = "",
-    config_context_length: Optional[int] = None,
     provider: str = "",
 ) -> int:
     """Resolve context length for a model.
 
     Resolution order:
-      0. config explicit override
       1. persistent cache in M-Claw home context_length_cache.yaml
-      2. custom endpoint /models (only for truly custom endpoints)
+      2. custom endpoint /models for non-built-in endpoints
       3. Anthropic /v1/models API
-      4. models.dev registry (core — 4000+ models)
-      5. hardcoded DEFAULT_CONTEXT_LENGTHS fuzzy match
-      6. Error probe (caller should invoke after API overflow error)
-      7. default 128K fallback
+      4. models.dev registry
+      5. DEFAULT_CONTEXT_LENGTHS fuzzy match
+      6. default 128K fallback
     """
-    # Level 0: explicit config override
-    if config_context_length and config_context_length > 0:
-        return config_context_length
-
     model_lower = model.lower()
 
-    # Level 1: persistent cache
+    # Persistent cache.
     cached = get_cached_context_length(model, base_url)
     if cached:
         return cached
 
-    # Level 2: custom endpoint /models (only when base_url looks custom)
-    # Skip known providers to avoid unnecessary API calls.
+    # Custom endpoint /models, skipped for built-in provider hosts.
     if base_url:
         known_hostnames = [
             "openai.com", "anthropic.com", "openrouter.ai",
@@ -183,46 +141,54 @@ def get_model_context_length(
         ]
         if not any(known in base_url.lower() for known in known_hostnames):
             try:
-                import requests
                 resp = requests.get(
                     f"{base_url.rstrip('/')}/models",
                     timeout=5,
                     headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
                 )
                 if resp.status_code == 200:
-                    for m in resp.json().get("data", []):
+                    data = resp.json()
+                    entries = data.get("data", []) if isinstance(data, dict) else []
+                    for m in entries:
+                        if not isinstance(m, dict):
+                            continue
                         mid = m.get("id", "").lower()
                         if mid == model_lower or mid.endswith(f"/{model_lower}"):
                             ctx = (
                                 m.get("context_length") or m.get("context_window")
                                 or m.get("max_tokens") or m.get("max_position_embeddings")
                             )
-                            if ctx:
-                                save_context_length(model, base_url, int(ctx))
-                                return int(ctx)
-            except Exception:
-                pass
+                            length = _coerce_context_length(ctx)
+                            if length:
+                                save_context_length(model, base_url, length)
+                                return length
+            except (requests.RequestException, ValueError) as exc:
+                logger.debug("Custom endpoint context probe failed for %s: %s", model, exc)
 
-    # Level 3: Anthropic /v1/models API
+    # Anthropic /v1/models API.
     if provider == "anthropic" or "claude" in model_lower:
         try:
-            import requests
             resp = requests.get(
                 "https://api.anthropic.com/v1/models",
                 timeout=5,
                 headers={"x-api-key": api_key} if api_key else {},
             )
             if resp.status_code == 200:
-                for m in resp.json().get("data", []):
+                data = resp.json()
+                entries = data.get("data", []) if isinstance(data, dict) else []
+                for m in entries:
+                    if not isinstance(m, dict):
+                        continue
                     if m.get("id", "").lower() == model_lower:
                         ctx = m.get("context_length") or m.get("max_tokens")
-                        if ctx:
-                            save_context_length(model, base_url, int(ctx))
-                            return int(ctx)
-        except Exception:
-            pass
+                        length = _coerce_context_length(ctx)
+                        if length:
+                            save_context_length(model, base_url, length)
+                            return length
+        except (requests.RequestException, ValueError) as exc:
+            logger.debug("Anthropic context probe failed for %s: %s", model, exc)
 
-    # Level 4: models.dev (core)
+    # models.dev registry.
     if provider:
         from mclaw.agent.models_dev import lookup_models_dev_context
         ctx = lookup_models_dev_context(provider, model)
@@ -230,15 +196,20 @@ def get_model_context_length(
             save_context_length(model, base_url, ctx)
             return ctx
 
-    # Level 5: hardcoded DEFAULT_CONTEXT_LENGTHS fuzzy match
     # Match the longest keys first so specific variants win.
     for key, length in sorted(DEFAULT_CONTEXT_LENGTHS.items(), key=lambda x: -len(x[0])):
         if key in model_lower:
             save_context_length(model, base_url, length)
             return length
 
-    # Level 6 is the runtime error probe; callers invoke
-    # parse_context_limit_from_error after overflow failures.
-    # Level 7: default fallback.
+    # Default fallback.
     save_context_length(model, base_url, DEFAULT_FALLBACK_CONTEXT)
     return DEFAULT_FALLBACK_CONTEXT
+
+
+def _coerce_context_length(value: object) -> int | None:
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        return None
+    return length if length > 0 else None

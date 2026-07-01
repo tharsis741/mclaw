@@ -2,12 +2,16 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Credential resolution for web-search backends."""
+"""Credential resolution for web-search backends.
+
+Credential reads are scoped through runtime authorization so model-invoked web
+search cannot use unrelated secrets merely because they exist in the process.
+"""
 
 from __future__ import annotations
 
 import os
-from typing import Callable
+from collections.abc import Callable
 
 from mclaw.tools.search.config import effective_config
 
@@ -26,6 +30,7 @@ def env_value(key: str, default: str = "") -> str:
 
 
 def authorized_env_value(key: str, default: str = "") -> str:
+    """Read an env value only when authorized for the web_search tool scope."""
     try:
         from mclaw.runtime.features import authorized_env_value as _authorized_env_value
 
@@ -35,6 +40,7 @@ def authorized_env_value(key: str, default: str = "") -> str:
 
 
 def is_dashscope_configured(creds: dict) -> bool:
+    """Validate that credentials are usable for DashScope enable_search."""
     api_key = creds.get("api_key", "")
     base_url = creds.get("base_url", "")
     if not api_key:
@@ -68,6 +74,7 @@ def resolve_dashscope_creds(
 
 
 def get_tavily_creds() -> dict[str, str]:
+    """Return Tavily credentials in the backend adapter's expected shape."""
     return {"api_key": authorized_env_value("TAVILY_API_KEY")}
 
 
@@ -80,16 +87,7 @@ def dashscope_creds_ok(
     config: dict | None = None,
     load_config_fn: Callable[[], dict] | None = None,
 ) -> bool:
+    """Return True when scoped DashScope or Qwen credentials are configured."""
     return is_dashscope_configured(
         resolve_dashscope_creds(parent_agent=parent_agent, config=config, load_config_fn=load_config_fn)
     )
-
-
-def feature_env_configured() -> bool:
-    try:
-        from mclaw.runtime.features import authorized_configured_env_vars, get_feature
-
-        spec = get_feature("web_search")
-        return bool(spec and authorized_configured_env_vars(spec, env_value))
-    except Exception:
-        return bool(tavily_creds_ok() or authorized_env_value("DASHSCOPE_API_KEY") or authorized_env_value("QWEN_API_KEY"))

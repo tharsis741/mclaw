@@ -25,6 +25,7 @@ _SENSITIVE_ENV_RE = re.compile(r"(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH)",
 
 
 def sanitize_subprocess_env(env: dict[str, str] | os._Environ, *, allowed_sensitive: set[str] | None = None) -> dict[str, str]:
+    """Drop sensitive environment variables unless explicitly scoped in."""
     allowed = {str(item) for item in (allowed_sensitive or set())}
     clean: dict[str, str] = {}
     for key, value in dict(env).items():
@@ -36,11 +37,13 @@ def sanitize_subprocess_env(env: dict[str, str] | os._Environ, *, allowed_sensit
 
 
 def env_hash(env: dict[str, str]) -> str:
+    """Return a stable non-secret fingerprint for a sanitized environment."""
     payload = "\n".join(f"{key}={env[key]}" for key in sorted(env))
     return hashlib.sha256(payload.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 def kill_process_tree(pid: int) -> None:
+    """Best-effort terminate a process and its children on the host platform."""
     if pid <= 0:
         return
     if os.name == "nt":
@@ -71,6 +74,8 @@ def kill_process_tree(pid: int) -> None:
 
 @dataclass(frozen=True)
 class ProcessProfile:
+    """Runtime spawn options shared by platform-specific process launchers."""
+
     start_new_session: bool = True
     stdout_pipe: bool = True
     stderr_to_stdout: bool = True
@@ -79,6 +84,8 @@ class ProcessProfile:
 
 @dataclass
 class SpawnResult:
+    """Process handle metadata returned by runtime spawn implementations."""
+
     pid: int
     process: subprocess.Popen | None = None
     pty: Any = None
@@ -91,6 +98,7 @@ class SpawnResult:
 
 @contextmanager
 def null_file_lock(path: str | Path):
+    """Provide a file-backed context for runtimes without native locking."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "a+", encoding="utf-8") as lock_file:

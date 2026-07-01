@@ -27,11 +27,6 @@ def is_truthy_value(value: Any, default: bool = False) -> bool:
     return bool(value)
 
 
-def env_var_enabled(name: str, default: str = "") -> bool:
-    """Return True when an environment variable is set to a truthy value."""
-    return is_truthy_value(os.getenv(name, default), default=False)
-
-
 def atomic_json_write(
     path: Union[str, Path],
     data: Any,

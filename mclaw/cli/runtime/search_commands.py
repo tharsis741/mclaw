@@ -10,6 +10,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from mclaw.cli.config import ConfigError
+
 
 @dataclass(frozen=True)
 class RuntimeSearchCommandHooks:
@@ -33,17 +35,28 @@ class RuntimeSearchCommandCoordinator:
         self.hooks = hooks
 
     def handle_search_backend(self, raw_args: str) -> None:
+        """Show backend status or switch backend with deferred key setup."""
         raw_args = str(raw_args or "").strip()
         if not raw_args:
-            self.hooks.render_backend_status(self.hooks.get_status())
+            try:
+                status = self.hooks.get_status()
+            except ConfigError as exc:
+                self.hooks.render_error(f"配置错误: {exc}")
+                return
+            self.hooks.render_backend_status(status)
             return
 
-        result = self.hooks.switch_search_backend(
-            raw_args,
-            print_fn=self.hooks.print_fn,
-            prompt_for_missing_key=False,
-        )
+        try:
+            result = self.hooks.switch_search_backend(
+                raw_args,
+                print_fn=self.hooks.print_fn,
+            )
+        except ConfigError as exc:
+            self.hooks.render_error(f"配置错误: {exc}")
+            return
         if getattr(result, "needs_api_key", False):
+            # Key entry is completed by the host prompt loop so the command can
+            # run safely inside prompt_toolkit without blocking on stdin.
             self.hooks.remember_pending_key_setup({
                 "_search_backend": True,
                 "env_var": getattr(result, "key_env_var", ""),

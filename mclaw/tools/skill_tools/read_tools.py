@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Skill 2.0 list, tree, view, and external search tools."""
+"""Local Skill list, tree, view, and external search tools."""
 
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ def _normalize_skill_key(value: str) -> str:
 
 
 def _infer_search_intent(query: str, results: list[ExternalSkill]) -> str:
+    """Classify whether a ClawHub query names a Skill or describes a capability."""
     key = _normalize_skill_key(query)
     if not key:
         return "capability"
@@ -44,6 +45,7 @@ def _infer_search_intent(query: str, results: list[ExternalSkill]) -> str:
 
 
 def _serialize_external_skill(skill: ExternalSkill) -> dict[str, Any]:
+    """Convert external search results into the tool display contract."""
     description = str(skill.description or "").strip()
     description_zh = description if _contains_cjk(description) else ""
     source_ref = str(skill.url or "").strip()
@@ -70,7 +72,7 @@ def _serialize_external_skill(skill: ExternalSkill) -> dict[str, Any]:
 
 
 def skills_list(task_id: str | None = None) -> str:
-    """List enabled Skill 2.0 packages."""
+    """List enabled local Skill packages without reading their payloads."""
     try:
         skills = list_skills()
         return json.dumps(
@@ -87,7 +89,7 @@ def skills_list(task_id: str | None = None) -> str:
 
 
 def skill_view(name: str, file_path: str | None = None, task_id: str | None = None) -> str:
-    """View a Skill payload or one non-sidecar file under the Skill root."""
+    """View Skill metadata or one allowed non-sidecar file under the Skill root."""
     try:
         if not name:
             return tool_error("Skill name is required.", success=False)
@@ -105,7 +107,7 @@ def skill_view(name: str, file_path: str | None = None, task_id: str | None = No
 
 
 def skill_tree(name: str, max_entries: int = 500, task_id: str | None = None) -> str:
-    """List one Skill's file tree without reading file contents."""
+    """List one Skill's file tree without exposing file contents."""
     try:
         if not name:
             return tool_error("Skill name is required.", success=False)
@@ -123,7 +125,7 @@ def skill_tree(name: str, max_entries: int = 500, task_id: str | None = None) ->
 
 
 def skill_search(query: str, task_id: str | None = None) -> str:
-    """Search ClawHub for external skills."""
+    """Search ClawHub and return install suggestions that still require consent."""
     try:
         results = search(query)
         serialized = [_serialize_external_skill(item) for item in results]
@@ -225,7 +227,7 @@ registry.register(
     toolset="skills",
     schema=SKILLS_LIST_SCHEMA,
     handler=lambda args, **kw: skills_list(task_id=kw.get("task_id")),
-    description="列出可用 Skill",
+    description="List available Skills",
     emoji="📎",
 )
 
@@ -236,7 +238,7 @@ registry.register(
     handler=lambda args, **kw: skill_view(
         args.get("name", ""), file_path=args.get("file_path"), task_id=kw.get("task_id")
     ),
-    description="查看 Skill 内容",
+    description="View Skill content",
     emoji="📄",
 )
 
@@ -249,7 +251,7 @@ registry.register(
         max_entries=args.get("max_entries", 500),
         task_id=kw.get("task_id"),
     ),
-    description="列出 Skill 文件树",
+    description="List Skill file tree",
     emoji="🌳",
 )
 
@@ -258,6 +260,6 @@ registry.register(
     toolset="skills",
     schema=SKILL_SEARCH_SCHEMA,
     handler=lambda args, **kw: skill_search(query=args.get("query", ""), task_id=kw.get("task_id")),
-    description="搜索 ClawHub Skill",
+    description="Search ClawHub Skills",
     emoji="🔎",
 )

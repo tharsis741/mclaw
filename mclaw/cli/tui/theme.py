@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Shared color, border, and brand tokens for the M-Claw TUI."""
+"""Shared M-Claw TUI theme tokens."""
 
 from rich import box as rich_box
 

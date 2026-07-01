@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Command-line entry point, first-run setup, and startup wiring for M-Claw."""
+"""Command-line entry point, first-run setup, and startup wiring for M-Claw.
+
+The module keeps process bootstrap, configuration discovery, provider setup, and
+channel launch decisions in one place so the interactive app receives a fully
+resolved runtime configuration.
+"""
 
 import argparse
 import multiprocessing as mp
@@ -18,6 +23,7 @@ from mclaw.constants import display_mclaw_path
 
 
 def _setup_logging(level: str = "INFO"):
+    """Configure file-only process logging before any runtime components start."""
     from mclaw.constants import get_mclaw_home
     log_dir = get_mclaw_home() / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -34,6 +40,7 @@ def _setup_logging(level: str = "INFO"):
 
 
 def _format_cli_help() -> str:
+    """Return the curated top-level help shown before argparse dispatch."""
     return """M-CLAW 命令指引
 
 核心命令
@@ -58,6 +65,8 @@ def _format_cli_help() -> str:
 
 
 class _MClawArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser variant that renders short product-native errors."""
+
     def error(self, message: str) -> None:
         msg = str(message or "")
         if "invalid choice" in msg:
@@ -204,6 +213,7 @@ def _print_setup_cancelled(configured_count: int = 0) -> None:
 
 
 def _parse_secret_batch_values(text: str, env_vars: list[str]) -> tuple[dict[str, str], str]:
+    """Parse one masked setup input into the exact credential variables requested."""
     import json as _json
     import re as _re
 
@@ -244,6 +254,7 @@ def _parse_secret_batch_values(text: str, env_vars: list[str]) -> tuple[dict[str
 
 
 def _prompt_secret_batch(env_vars: list[str], *, prompt: str, print_plain, color, Colors) -> dict[str, str] | None:
+    """Collect one or more setup secrets through a single hidden prompt."""
     requested = [str(item or "").strip().upper() for item in env_vars if str(item or "").strip()]
     if not requested:
         return {}
@@ -350,18 +361,15 @@ def _has_any_provider_configured() -> bool:
         if resolve_api_key(pname):
             return True
 
-    # Check custom endpoint compatibility variables.
+    # Check custom endpoint environment variables.
     for var in ("MCLAW_API_KEY", "MCLAW_ANTHROPIC_API_KEY", "OPENAI_BASE_URL"):
         if get_env_value(var):
             return True
 
     # Check active_provider and user-defined providers in config.yaml.
-    try:
-        cfg = load_config()
-        if cfg.get("active_provider") or cfg.get("providers"):
-            return True
-    except Exception:
-        pass
+    cfg = load_config(strict=True)
+    if cfg.get("active_provider") or cfg.get("providers"):
+        return True
 
     return False
 
@@ -377,42 +385,49 @@ def _first_run_check() -> bool:
 
     # If the config file exists, keep checking whether it contains usable content.
     from mclaw.cli.config import load_config
-    try:
-        cfg = load_config()
-        has_model = bool(cfg.get("model"))
-        fallback_entries = cfg.get("fallback_providers")
-        has_fallback_model = any(
-            isinstance(entry, dict)
-            and str(entry.get("provider") or "").strip()
-            and str(entry.get("model") or "").strip()
-            for entry in fallback_entries
-        ) if isinstance(fallback_entries, list) else False
-        providers = cfg.get("providers")
-        has_user_provider_model = any(
-            isinstance(provider_cfg, dict)
-            and str(provider_cfg.get("model") or provider_cfg.get("default_model") or "").strip()
-            for provider_cfg in providers.values()
-        ) if isinstance(providers, dict) else False
-        if has_model or has_fallback_model or has_user_provider_model:
-            return False
-    except Exception:
-        pass
+    cfg = load_config(strict=True)
+    has_model = bool(cfg.get("model"))
+    fallback_entries = cfg.get("fallback_providers")
+    has_fallback_model = any(
+        isinstance(entry, dict)
+        and str(entry.get("provider") or "").strip()
+        and str(entry.get("model") or "").strip()
+        for entry in fallback_entries
+    ) if isinstance(fallback_entries, list) else False
+    providers = cfg.get("providers")
+    has_user_provider_model = any(
+        isinstance(provider_cfg, dict)
+        and str(provider_cfg.get("model") or "").strip()
+        for provider_cfg in providers.values()
+    ) if isinstance(providers, dict) else False
+    if has_model or has_fallback_model or has_user_provider_model:
+        return False
 
     return True
 
 
 def _run_chat(args):
-    """Run the interactive TUI chat loop."""
+    """Resolve first-run setup, provider credentials, and then enter the TUI."""
     from mclaw.cli.config import load_merged_config, ensure_mclaw_home, ConfigError
     from mclaw.cli.auth import resolve_provider
     from mclaw.cli.colors import Colors, color
 
     ensure_mclaw_home()
 
-    # First-run detection
-    if _first_run_check():
+    try:
+        first_run = _first_run_check()
+    except ConfigError as exc:
+        print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
+        sys.exit(1)
+
+    if first_run:
         _run_setup(args)
-        if not _has_any_provider_configured():
+        try:
+            provider_configured = _has_any_provider_configured()
+        except ConfigError as exc:
+            print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
+            sys.exit(1)
+        if not provider_configured:
             print_plain(color("  未配置任何供应商，退出。\n", Colors.RED))
             sys.exit(1)
 
@@ -518,7 +533,8 @@ def _run_weixin(args):
         print_plain(color("\n  未找到 API 密钥。请先运行 mclaw setup 配置模型供应商。\n", Colors.RED))
         sys.exit(1)
     if not resolved["model"]:
-        resolved["model"] = "openai/gpt-4o-mini"
+        print_plain(color("\n  未指定模型。请先运行 mclaw setup 配置默认模型。\n", Colors.RED))
+        sys.exit(1)
 
     runtime = WeixinRuntime(
         config=config,
@@ -668,7 +684,8 @@ def _run_dingtalk(args):
         print_plain(color("\n  未找到 API 密钥。请先运行 mclaw setup 配置模型供应商。\n", Colors.RED))
         sys.exit(1)
     if not resolved["model"]:
-        resolved["model"] = "openai/gpt-4o-mini"
+        print_plain(color("\n  未指定模型。请先运行 mclaw setup 配置默认模型。\n", Colors.RED))
+        sys.exit(1)
 
     runtime = DingTalkRuntime(
         config=config,
@@ -712,7 +729,7 @@ def _run_dingtalk(args):
         message = str(exc)
         if "dingtalk-stream" in message:
             print_plain(color("\n  缺少钉钉运行依赖。", Colors.RED))
-            print_plain(color("  请安装: pip install -e .[dingtalk]\n", Colors.DIM))
+            print_plain(color("  请在 M-Claw 源码目录安装依赖: pip install -e .\n", Colors.DIM))
             sys.exit(1)
         if isinstance(exc, DingTalkRuntimeLockError) or "already running" in message:
             print_plain(color("\n  钉钉 Stream 网关已经在运行。", Colors.YELLOW))
@@ -954,7 +971,7 @@ def _run_dingtalk_check(_args):
         config=config,
     )
     agent_api_key_ok = bool(resolved_provider.get("api_key"))
-    agent_model = resolved_provider.get("model") or "openai/gpt-4o-mini"
+    agent_model = resolved_provider.get("model") or ""
     agent_provider = resolved_provider.get("provider") or "unresolved"
 
     required_api_ok = (
@@ -963,7 +980,7 @@ def _run_dingtalk_check(_args):
         and requirements.get("stream_api")
         and requirements.get("robot_api")
     )
-    ready = bool(required_api_ok and agent_api_key_ok and not errors)
+    ready = bool(required_api_ok and agent_api_key_ok and agent_model and not errors)
 
     report = {
         "ready": ready,
@@ -1005,7 +1022,7 @@ def _run_dingtalk_check(_args):
     print_plain(color(f"  client_secret:   {'configured' if dingtalk_config.client_secret else 'missing'}", Colors.GREEN if dingtalk_config.client_secret else Colors.RED))
     print_plain(color(f"  group_policy:    {dingtalk_config.group_policy}", Colors.DIM))
     print_plain(color(f"  agent_provider:  {agent_provider}", Colors.GREEN if agent_api_key_ok else Colors.RED))
-    print_plain(color(f"  agent_model:     {agent_model}", Colors.DIM))
+    print_plain(color(f"  agent_model:     {agent_model or 'missing'}", Colors.DIM if agent_model else Colors.RED))
     print_plain(color(f"  agent_api_key:   {'configured' if agent_api_key_ok else 'missing'}", Colors.GREEN if agent_api_key_ok else Colors.RED))
     print_plain(color(f"  ready:           {'yes' if ready else 'no'}", Colors.GREEN if ready else Colors.RED))
     if errors:
@@ -1013,87 +1030,16 @@ def _run_dingtalk_check(_args):
         for error in errors:
             print_plain(color(f"  - {error}", Colors.DIM))
     if not requirements["dingtalk_stream"]:
-        print_plain(color("\n  安装依赖: pip install -e .[dingtalk]", Colors.DIM))
+        print_plain(color("\n  安装依赖: pip install -e .", Colors.DIM))
     if not requirements.get("robot_api"):
         print_plain(color("\n  Robot API incomplete: 媒体下载和 Thinking/Done reaction 不可用。", Colors.DIM))
     if not agent_api_key_ok:
         print_plain(color("  Agent provider missing: 请先运行 mclaw setup 配置模型供应商 API key。", Colors.DIM))
+    if agent_api_key_ok and not agent_model:
+        print_plain(color("  Agent model missing: 请先运行 mclaw setup 配置默认模型。", Colors.DIM))
     print_plain()
     if getattr(_args, "strict", False) and not ready:
         sys.exit(1)
-
-
-def _run_dingtalk_send_file(args):
-    """Send one local file through DingTalk OpenAPI for diagnostics."""
-    import asyncio
-    from types import SimpleNamespace
-
-    from mclaw.channels.dingtalk.adapter import DingTalkAdapter
-    from mclaw.channels.dingtalk.config import DingTalkConfig
-    from mclaw.channels.dingtalk.stream_client import DingTalkClient
-    from mclaw.cli.colors import Colors, color
-    from mclaw.cli.config import ConfigError, ensure_mclaw_home, load_merged_config
-
-    ensure_mclaw_home()
-    try:
-        config = load_merged_config()
-    except ConfigError as exc:
-        print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
-        sys.exit(1)
-
-    dingtalk_config = DingTalkConfig.from_config(config)
-    errors = dingtalk_config.validate()
-    if errors:
-        print_plain(color("\n  钉钉未配置：缺少 DINGTALK_CLIENT_ID 或 DINGTALK_CLIENT_SECRET。", Colors.RED))
-        for error in errors:
-            print_plain(color(f"  - {error}", Colors.DIM))
-        print_plain()
-        sys.exit(1)
-
-    conversation_id = (getattr(args, "conversation_id", "") or "").strip()
-    staff_id = (getattr(args, "staff_id", "") or "").strip()
-    if conversation_id and staff_id:
-        print_plain(color("\n  --conversation-id 和 --staff-id 只能二选一。\n", Colors.RED))
-        sys.exit(1)
-    if not conversation_id and not staff_id:
-        mappings = dingtalk_config.open_conversation_map
-        if len(mappings) == 1:
-            conversation_id = next(iter(mappings))
-        else:
-            print_plain(color("\n  请传入 --conversation-id，或在 open_conversation_map 中只保留一个群映射。", Colors.RED))
-            print_plain(color("  私聊诊断可传入 --staff-id。\n", Colors.DIM))
-            sys.exit(1)
-
-    chat_id = conversation_id or f"oto:{staff_id}"
-
-    async def _send():
-        client = DingTalkClient(dingtalk_config)
-        await client.open()
-        try:
-            adapter = DingTalkAdapter(
-                config=dingtalk_config,
-                client=client,
-                runner=SimpleNamespace(model="diagnostic"),
-                session_router=SimpleNamespace(),
-            )
-            if staff_id:
-                adapter._message_contexts[chat_id] = SimpleNamespace(
-                    conversation_type="1",
-                    sender_staff_id=staff_id,
-                )
-            return await adapter.send_file(chat_id, file_path=args.file_path, caption=getattr(args, "caption", "") or "")
-        finally:
-            await client.close()
-
-    result = asyncio.run(_send())
-    if not getattr(result, "success", False):
-        print_plain(color(f"\n  钉钉文件发送失败: {getattr(result, 'error', '') or 'unknown error'}\n", Colors.RED))
-        sys.exit(1)
-    print_plain(color("\n  钉钉文件发送已提交。", Colors.GREEN))
-    message_id = getattr(result, "message_id", "") or ""
-    if message_id:
-        print_plain(color(f"  process/message id: {message_id}", Colors.DIM))
-    print_plain()
 
 
 def _run_setup(args):
@@ -1454,7 +1400,6 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
             web_cfg = {}
             auxiliary["web_search"] = web_cfg
         web_cfg["backend"] = "auto"
-        web_cfg.setdefault("timeout", 30)
         web_cfg.setdefault("tavily_timeout", 30)
         web_cfg.setdefault("dashscope_timeout", 90)
         web_cfg.setdefault("dashscope_deep_timeout", 120)
@@ -1741,7 +1686,7 @@ def _select_setup_model(
     models = list(dict.fromkeys(models))[:20]
 
     if models:
-        print_plain(color(f"  可选模型", Colors.BOLD, Colors.BLUE) + color(f"  来自 {source}", Colors.DIM))
+        print_plain(color("  可选模型", Colors.BOLD, Colors.BLUE) + color(f"  来自 {source}", Colors.DIM))
         for idx, model in enumerate(models, 1):
             marker = color(" *", Colors.BOLD, Colors.CYAN) if fallback_model and model == fallback_model else ""
             print_plain(f"    {_setup_index(idx)}. {model}{marker}")
@@ -1796,7 +1741,6 @@ def _setup_models_dev_provider(config: dict, models_dev_provider: str):
     """Configure a provider found only through models.dev via a custom endpoint."""
     from mclaw.agent import models_dev
     from mclaw.cli.colors import Colors, color
-    from mclaw.cli.config import save_config
 
     models = models_dev.list_models_dev_provider(models_dev_provider, limit=20)
     print_plain(_setup_label("模型库") + color(models_dev_provider, Colors.GREEN))
@@ -1822,10 +1766,6 @@ def _setup_models_dev_provider(config: dict, models_dev_provider: str):
         candidate_models=models,
         source_label=f"models.dev / {models_dev_provider}",
     )
-    if result:
-        config["models_dev_provider"] = models_dev_provider
-        save_config(config)
-        result["models_dev_provider"] = models_dev_provider
     return result
 
 
@@ -2028,7 +1968,7 @@ def _setup_api_key_provider(
     if not api_key:
         api_key = current_key
     if not api_key:
-        print_plain(color(f"  未提供 API 密钥。", Colors.RED))
+        print_plain(color("  未提供 API 密钥。", Colors.RED))
         return None
 
     save_env_value(env_var, api_key)
@@ -2095,6 +2035,7 @@ def _probe_anthropic(base_url: str, api_key: str) -> bool:
 
 
 def main():
+    """Bootstrap the CLI process and dispatch to chat, setup, doctor, or channel runtimes."""
     mp.freeze_support()
     configure_text_output()
     from mclaw.runtime.bootstrap import BootstrapPathResolver
@@ -2117,7 +2058,6 @@ def main():
     resume_parser.add_argument("session_id", nargs="?", default=RESUME_LATEST_SESSION, help="可选会话 ID 或前缀")
     subparsers.add_parser("setup", help="运行初始设置向导")
     subparsers.add_parser("doctor", help="检查运行环境、依赖、工具和通道配置")
-    subparsers.add_parser("chat", help="启动交互式对话（默认）")
     weixin_parser = subparsers.add_parser("weixin", help="启动微信私聊网关")
     weixin_subparsers = weixin_parser.add_subparsers(dest="weixin_command")
     weixin_login_parser = weixin_subparsers.add_parser("login", help="扫码登录微信 iLink Bot")
@@ -2131,14 +2071,6 @@ def main():
     dingtalk_nested_check_parser = dingtalk_subparsers.add_parser("check", help="检查钉钉 Stream 网关依赖和配置")
     dingtalk_nested_check_parser.add_argument("--strict", action="store_true", help="未 ready 时返回非零退出码")
     dingtalk_nested_check_parser.add_argument("--json", action="store_true", help="输出机器可读 JSON 报告")
-    dingtalk_check_parser = subparsers.add_parser("dingtalk-check", help=argparse.SUPPRESS)
-    dingtalk_check_parser.add_argument("--strict", action="store_true", help="未 ready 时返回非零退出码")
-    dingtalk_check_parser.add_argument("--json", action="store_true", help="输出机器可读 JSON 报告")
-    dingtalk_send_file_parser = subparsers.add_parser("dingtalk-send-file", help="通过钉钉 OpenAPI 直接发送本地文件")
-    dingtalk_send_file_parser.add_argument("file_path", help="要发送的本地文件路径")
-    dingtalk_send_file_parser.add_argument("--caption", default="", help="可选说明文字")
-    dingtalk_send_file_parser.add_argument("--conversation-id", default="", help="群聊 Stream conversation_id")
-    dingtalk_send_file_parser.add_argument("--staff-id", default="", help="私聊目标 senderStaffId/userId")
     args = parser.parse_args()
     _setup_logging("INFO")
 
@@ -2166,10 +2098,6 @@ def main():
             _run_dingtalk_check(args)
         else:
             _run_dingtalk(args)
-    elif args.command == "dingtalk-check":
-        _run_dingtalk_check(args)
-    elif args.command == "dingtalk-send-file":
-        _run_dingtalk_send_file(args)
     else:
         _run_chat(args)
 

@@ -9,6 +9,7 @@ import sys
 
 
 def should_use_color() -> bool:
+    """Return whether CLI output may use ANSI color for the current stdout."""
     if os.environ.get("NO_COLOR") is not None:
         return False
     if os.environ.get("TERM") == "dumb":
@@ -31,6 +32,7 @@ class Colors:
 
 
 def color(text: str, *codes) -> str:
+    """Wrap text in ANSI codes only when terminal capability checks allow it."""
     if not should_use_color():
         return text
     return "".join(codes) + text + Colors.RESET

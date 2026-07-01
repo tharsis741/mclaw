@@ -19,14 +19,18 @@ if TYPE_CHECKING:
 
 @dataclass
 class DingTalkOutboundTarget:
+    """Session-bound bridge from function-call tools to the DingTalk event loop."""
+
     adapter: "DingTalkAdapter"
     chat_id: str
     loop: asyncio.AbstractEventLoop
 
     def send_text(self, *, text: str) -> "SendResult":
+        """Schedule a text send on the adapter's owning event loop."""
         return self._run(self.adapter.send(self.chat_id, text), timeout=120, label="text")
 
     def send_file(self, *, file_path: str, caption: str = "") -> "SendResult":
+        """Schedule a file send with a longer timeout for upload work."""
         return self._run(
             self.adapter.send_file(self.chat_id, file_path=file_path, caption=caption),
             timeout=600,
@@ -34,6 +38,7 @@ class DingTalkOutboundTarget:
         )
 
     def _run(self, coro, *, timeout: float, label: str) -> "SendResult":
+        """Run an async DingTalk send from synchronous tool execution."""
         if self.loop.is_closed():
             coro.close()
             return SendResult(success=False, error="DingTalk event loop is closed")
@@ -61,20 +66,18 @@ def register_dingtalk_outbound_target(
     chat_id: str,
     loop: asyncio.AbstractEventLoop,
 ) -> None:
+    """Bind a channel session to the outbound adapter target for tool calls."""
     if session_id:
         _targets[session_id] = DingTalkOutboundTarget(adapter=adapter, chat_id=chat_id, loop=loop)
 
 
 def get_dingtalk_outbound_target(session_id: str) -> DingTalkOutboundTarget | None:
+    """Return the outbound target for a currently active DingTalk session."""
     return _targets.get(session_id)
 
 
-def unregister_dingtalk_outbound_target(session_id: str) -> None:
-    if session_id:
-        _targets.pop(session_id, None)
-
-
 def unregister_dingtalk_outbound_targets_for_adapter(adapter: "DingTalkAdapter") -> None:
+    """Remove stale target bindings when an adapter shuts down."""
     stale = [session_id for session_id, target in _targets.items() if target.adapter is adapter]
     for session_id in stale:
         _targets.pop(session_id, None)

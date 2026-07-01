@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render Skill command output through the shared TUI panel boundary."""
+"""Render Skill command output through panel sinks or classic Rich panels."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ from mclaw.cli.tui.panel_renderer import render_panel_model
 
 
 class SkillsRenderer:
+    """Bridge Skill command text into the shared panel rendering boundary."""
+
     def __init__(
         self,
         *,
@@ -25,8 +27,9 @@ class SkillsRenderer:
         self._panel_sink = panel_sink
 
     def render_skills_output(self, text: str) -> None:
+        """Render raw Skill command text without interpreting Skill file contents."""
         panel = PanelModel(
-            title="M-Claw Skills",
+            title="M-Claw 技能",
             namespace="skills",
             blocks=(text_block(text or "无输出"),),
         )

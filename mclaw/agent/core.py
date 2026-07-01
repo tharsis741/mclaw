@@ -6,9 +6,9 @@
 
 This module coordinates provider calls, tool dispatch, memory refresh, context
 compression, session persistence, checkpoint integration, and streaming
-response handling. It intentionally centralizes the turn lifecycle; future
-refactors should split responsibilities only after tool-call and persistence
-tests cover the current behavior.
+response handling. The turn lifecycle stays centralized so API calls, tools,
+persistence, and recovery state remain ordered across CLI, channel, and
+scheduler runtimes.
 """
 
 import json
@@ -33,11 +33,22 @@ from mclaw.agent.retry_utils import (
     jittered_backoff,
 )
 from mclaw.state import SessionDB
-from mclaw.tools.interrupt import is_interrupted, set_interrupt
+from mclaw.tools.interrupt import set_interrupt
 
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
+
+SKILL_WRITE_ACTIONS = frozenset({
+    "create",
+    "edit",
+    "patch",
+    "delete",
+    "write_file",
+    "remove_file",
+    "enable_drafting",
+    "evolution_update",
+})
 
 _SECRET_VALUE_RE = re.compile(
     r"(?i)\b(?:sk-(?:api-)?[A-Za-z0-9_-]{16,}|[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})"
@@ -67,7 +78,12 @@ def _redact_log_secrets(value: Any) -> Any:
 
 
 class MClaw:
-    """Stateful agent facade for one conversation session."""
+    """Stateful agent facade for one conversation session.
+
+    ``MClaw`` owns the canonical message list, provider client, tool registry,
+    memory/compression helpers, checkpoint metadata, and callback hooks used by
+    CLI, channel, and scheduler runtimes.
+    """
 
     def __init__(
         self,
@@ -90,12 +106,11 @@ class MClaw:
         event_callback: Callable = None,
         print_fn: Callable = None,
         workspace: str = None,
-        # Subagent isolation flags.
+        # Subagent isolation.
         skip_memory: bool = False,
-        skip_context_files: bool = False,
-        skip_skills: bool = False,
         config: dict | None = None,
     ):
+        """Create session-scoped runtime state without starting a model call."""
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
@@ -117,10 +132,8 @@ class MClaw:
         self._status_callback = status_callback
         self._event_callback = event_callback
 
-        # Subagent isolation flags.
+        # Subagent isolation.
         self._skip_memory = skip_memory
-        self._skip_context_files = skip_context_files
-        self._skip_skills = skip_skills
         self._delegate_depth: int = 0
 
         self.messages: List[Dict[str, Any]] = []
@@ -161,8 +174,6 @@ class MClaw:
 
         # Context compressor.
         compression_cfg = self.config.get("compression", {}) if isinstance(self.config, dict) else {}
-        auxiliary_cfg = self.config.get("auxiliary", {}) if isinstance(self.config, dict) else {}
-        auxiliary_compression_cfg = auxiliary_cfg.get("compression", {}) if isinstance(auxiliary_cfg, dict) else {}
         if compression_cfg.get("enabled", True):
             try:
                 compression_threshold = float(compression_cfg.get("threshold", 0.50))
@@ -177,24 +188,21 @@ class MClaw:
             except (TypeError, ValueError):
                 compression_protect_last_n = 20
             try:
-                compression_summary_timeout = int(auxiliary_compression_cfg.get("timeout", 180))
+                compression_summary_timeout = int(compression_cfg.get("summary_timeout", 180))
             except (TypeError, ValueError):
                 compression_summary_timeout = 180
             compression_summary_timeout = max(30, min(compression_summary_timeout, 600))
 
             summary_model = (
                 compression_cfg.get("summary_model")
-                or auxiliary_compression_cfg.get("model")
                 or ""
             )
             summary_provider = (
                 compression_cfg.get("summary_provider")
-                or auxiliary_compression_cfg.get("provider")
                 or ""
             )
             summary_base_url = (
                 compression_cfg.get("summary_base_url")
-                or auxiliary_compression_cfg.get("base_url")
                 or ""
             )
             summary_api_key = ""
@@ -214,6 +222,7 @@ class MClaw:
                 summary_base_url_override=summary_base_url,
                 summary_api_key_override=summary_api_key,
                 summary_timeout=compression_summary_timeout,
+                config=self.config,
             )
         else:
             self.context_compressor = None
@@ -266,6 +275,7 @@ class MClaw:
                     self.session_user_messages = 0
 
     def _discover_tools(self):
+        """Load the active tool schemas and validation set for this session."""
         from mclaw.tools.dispatch import get_tool_definitions
         definitions, valid_names = get_tool_definitions(
             enabled_toolsets=self.enabled_toolsets,
@@ -275,9 +285,10 @@ class MClaw:
         self.valid_tool_names = valid_names
 
     def _build_checkpoint_manager(self):
+        """Build the filesystem checkpoint manager from config and runtime flags."""
         cp_cfg = self.config.get("checkpoints", {}) if isinstance(self.config, dict) else {}
-        if isinstance(cp_cfg, bool):
-            cp_cfg = {"enabled": cp_cfg}
+        if not isinstance(cp_cfg, dict):
+            cp_cfg = {}
         try:
             from mclaw.runtime.manager import RuntimeManager
 
@@ -301,6 +312,7 @@ class MClaw:
         )
 
     def _get_checkpoint_manager(self):
+        """Return checkpoint state, backfilling fields for resumed/older agents."""
         checkpoint_mgr = getattr(self, "_checkpoint_mgr", None)
         if checkpoint_mgr is None:
             checkpoint_mgr = self._build_checkpoint_manager()
@@ -459,10 +471,10 @@ class MClaw:
                     )
                     _, tool_calls, _, _ = self._parse_openai(response)
 
-                # Parse tool_calls directly and invoke memory handlers without
-                # handle_function_calls(), avoiding a second LLM decision.
+                # Parse tool calls directly and route them through MemoryManager
+                # without asking the model for a second decision.
                 if tool_calls:
-                    from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES, handle_memory_tool_call
+                    from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES
 
                     for tc in tool_calls:
                         fn = tc.get("function", {})
@@ -474,16 +486,15 @@ class MClaw:
                         except json.JSONDecodeError:
                             continue
 
-                        # Direct memory call without dispatch.
-                        result = handle_memory_tool_call(tool_name, args, store=self._memory_store)
+                        result = self._memory_manager.handle_tool_call(tool_name, args)
                         try:
                             result_data = json.loads(result)
                             if result_data.get("success"):
                                 logger.info(
                                     "Memory flush saved: %s", args.get("target", "memory")
                                 )
-                        except Exception:
-                            pass
+                        except (json.JSONDecodeError, TypeError) as exc:
+                            logger.debug("Memory flush result could not be parsed: %s", exc)
             except Exception as e:
                 logger.debug("flush_memories failed: %s", e)
 
@@ -551,6 +562,7 @@ class MClaw:
             self._status_callback(msg)
 
     def _emit_event(self, event: dict):
+        """Send structured agent events to the hosting runtime without failing turns."""
         if not self._event_callback:
             return
         try:
@@ -559,8 +571,7 @@ class MClaw:
             logger.warning("agent event callback failed", exc_info=True)
 
     def _strip_event_visible_content(self, text: str) -> str:
-        import re
-
+        """Remove provider reasoning tags before emitting UI-visible event text."""
         text = str(text or "")
         text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
         text = re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL | re.IGNORECASE)
@@ -571,6 +582,7 @@ class MClaw:
         content: str,
         reasoning_content: str | None = None,
     ) -> tuple[str, str]:
+        """Choose the safest visible payload for an intermediate assistant event."""
         visible_content = self._strip_event_visible_content(content)
         if visible_content:
             return visible_content, "content"
@@ -592,6 +604,7 @@ class MClaw:
         was_streamed: bool,
         is_final_override: bool | None = None,
     ) -> dict:
+        """Build a provider-neutral event describing one assistant API round."""
         calls = tool_calls or []
         visible_content, content_source = self._assistant_round_visible_content(
             content,
@@ -617,11 +630,13 @@ class MClaw:
         }
 
     def _is_cleanup_only_tool_batch(self, tool_calls: list | None) -> bool:
+        """Detect terminal cleanup batches that should not trigger another model turn."""
         calls = tool_calls or []
         return bool(calls) and all(self._is_cleanup_tool_call(tc) for tc in calls)
 
     @staticmethod
     def _is_cleanup_tool_call(tool_call: dict) -> bool:
+        """Identify low-risk temporary-file cleanup commands from terminal calls."""
         fn = (tool_call or {}).get("function", {}) or {}
         if fn.get("name") != "terminal":
             return False
@@ -714,6 +729,7 @@ class MClaw:
             )
 
     def _build_system_prompt(self) -> str:
+        """Assemble the current system prompt from platform, tools, and memory."""
         if self.system_prompt:
             return self.system_prompt
         memory_block = None
@@ -747,14 +763,15 @@ class MClaw:
         self,
         user_message: str,
         conversation_history: List[Dict] = None,
-        skip_delegation_analysis: bool = False,
         disable_tools: bool = False,
         extra_system: str = "",
         advance_background_review: bool = True,
     ) -> Dict[str, Any]:
-        """Run one conversation turn with full tool-calling loop.
+        """Run one conversation turn through API, tools, persistence, and review hooks.
 
-        Returns dict with: final_response, messages, model, session_id, api_calls, assistant_rounds
+        Returns dict with: final_response, messages, model, session_id,
+        api_calls, assistant_rounds, and any pending handoff metadata needed by
+        the hosting runtime.
         """
         self.clear_interrupt()
         self._memory_changed_in_turn = False
@@ -889,7 +906,6 @@ class MClaw:
                 try:
                     # Log the full message list before API calls to diagnose context growth.
                     try:
-                        import json as _json
                         _msgs_log = []
                         for i, m in enumerate(messages):
                             _entry = {"index": i, "role": m.get("role", "?")}
@@ -912,7 +928,7 @@ class MClaw:
                                 _entry["tool_call_id"] = m["tool_call_id"]
                             _msgs_log.append(_entry)
                         _total_chars = sum(e.get("content_length", 0) for e in _msgs_log)
-                        logger.info("[MESSAGES BEFORE API CALL] total_messages=%d total_chars=%d details=%s", len(messages), _total_chars, _json.dumps(_redact_log_secrets(_msgs_log), ensure_ascii=False, default=str))
+                        logger.info("[MESSAGES BEFORE API CALL] total_messages=%d total_chars=%d details=%s", len(messages), _total_chars, json.dumps(_redact_log_secrets(_msgs_log), ensure_ascii=False, default=str))
                     except Exception:
                         pass
 
@@ -938,13 +954,25 @@ class MClaw:
                         # Retry once after compression without consuming normal retry budget.
                         self._emit_status("Context overflow — compressing and retrying...")
                         self.flush_memories()
-                        messages = self.context_compressor.compress(messages)
-                        self._refresh_memory_snapshot()
-                        new_sys = self._build_system_prompt()
-                        if messages and messages[0].get("role") == "system":
-                            messages[0]["content"] = new_sys
-                        self.context_compressor._compressed_this_turn = True
-                        continue  # retry with compressed messages
+                        from mclaw.agent.context_compressor import estimate_messages_tokens
+                        before_tokens = estimate_messages_tokens(messages)
+                        compressed_messages = self.context_compressor.compress(messages)
+                        after_tokens = estimate_messages_tokens(compressed_messages)
+                        if len(compressed_messages) >= len(messages) and after_tokens >= before_tokens:
+                            logger.warning(
+                                "Context overflow compression did not reduce history "
+                                "(messages=%d tokens=%d)",
+                                len(messages),
+                                before_tokens,
+                            )
+                        else:
+                            messages = compressed_messages
+                            self._refresh_memory_snapshot()
+                            new_sys = self._build_system_prompt()
+                            if messages and messages[0].get("role") == "system":
+                                messages[0]["content"] = new_sys
+                            self.context_compressor._compressed_this_turn = True
+                            continue  # retry with compressed messages
                     if is_retryable_error(e) and retry_count < MAX_RETRIES - 1:
                         retry_count += 1
                         retry_after = get_retry_after(e)
@@ -982,8 +1010,7 @@ class MClaw:
             self._track_usage(response)
             self.session_api_calls += 1
 
-            # Feed real token usage back into the compressor so later decisions
-            # use measured API values instead of rough estimates.
+            # Feed measured API token usage back into the compressor.
             usage = getattr(response, "usage", None)
             if usage and self.context_compressor:
                 self.context_compressor.update_from_response({
@@ -1052,8 +1079,8 @@ class MClaw:
                     final_response_recorded = True
                     break
 
-                # Prune old tool results after each tool batch so large read_file
-                # or terminal output does not accumulate unbounded in history.
+                # Prune earlier tool results after each tool batch so large
+                # read_file or terminal output stays bounded in history.
                 if self.context_compressor:
                     logger.info("[POST-TOOL] pruning context before next iteration")
                     messages, _pruned = self.context_compressor.prune(messages)
@@ -1131,8 +1158,8 @@ class MClaw:
                     review_memory=_should_review_memory,
                     review_skills=_should_review_skills,
                 )
-            except Exception:
-                pass  # background review is best-effort
+            except Exception as exc:
+                logger.debug("Background review scheduling failed: %s", exc)
 
         # Restore tools if this turn temporarily disabled them.
         if disable_tools:
@@ -1153,6 +1180,7 @@ class MClaw:
     # ── OpenAI API calls ──
 
     def _call_openai(self, messages: List[Dict]):
+        """Call an OpenAI-compatible provider and normalize streaming timeouts."""
         logger.info("[_call_openai] start model=%s stream=%s", self.model, bool(self._stream_callback))
         api_messages = self._prepare_openai_messages(messages)
         kwargs = {"model": self.model, "messages": api_messages, "timeout": 30}
@@ -1179,7 +1207,6 @@ class MClaw:
             except Exception as exc:
                 result_container[0] = exc
 
-        import threading
         t = threading.Thread(target=_run, daemon=True)
         t.start()
         logger.info("[_call_openai] watchdog thread started, waiting max 90s")
@@ -1245,7 +1272,7 @@ class MClaw:
                     stream = self.client.chat.completions.create(**kwargs)
                     return
                 except openai.APITimeoutError as exc:
-                    # Do not retry timeouts: the server did not respond within the limit.
+                    # Timeout responses complete this attempt immediately.
                     create_exc[0] = exc
                     return
                 except openai.RateLimitError as exc:
@@ -1414,7 +1441,8 @@ class MClaw:
                 if self._stream_callback:
                     self._stream_callback(delta.content)
 
-            # MiniMax reasoning: collect but don't stream to UI (already separated by reasoning_split=True)
+            # MiniMax reasoning is collected separately from assistant text
+            # because reasoning_split=True separates the two streams.
             if delta and getattr(delta, "reasoning_content", None):
                 _had_meaningful = True
                 reasoning_chunks.append(delta.reasoning_content)
@@ -1532,6 +1560,7 @@ class MClaw:
         return resp
 
     def _parse_openai(self, response) -> tuple:
+        """Extract visible content, reasoning, tools, and finish state from OpenAI."""
         msg = response.choices[0].message
         content = msg.content or ""
         reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
@@ -1587,6 +1616,7 @@ class MClaw:
         return best_val
 
     def _call_anthropic(self, messages: List[Dict]):
+        """Call an Anthropic-compatible provider using converted messages/tools."""
         system, conv = self._split_anthropic_messages(messages)
         api_model = self._normalize_anthropic_model(self.model)
         max_output = self._get_anthropic_max_output(api_model)
@@ -1613,6 +1643,7 @@ class MClaw:
         return result
 
     def _split_anthropic_messages(self, messages: List[Dict]):
+        """Convert canonical OpenAI-style history into Anthropic message blocks."""
         system = ""
         conv = []
         for msg in messages:
@@ -1762,6 +1793,7 @@ class MClaw:
         return partial
 
     def _parse_anthropic(self, response) -> tuple:
+        """Extract assistant text and tool_use blocks from Anthropic responses."""
         content_parts = []
         tool_calls = []
         for block in response.content:
@@ -1797,7 +1829,12 @@ class MClaw:
         assistant_content: str = "",
         reasoning_content: str = None,
     ):
-        """Dispatch tool calls (batch, serial or concurrent) and append results to messages."""
+        """Dispatch tool calls and append normalized results to the conversation.
+
+        The dispatcher may run read-only tools concurrently, but write-capable
+        tools share the checkpoint manager so filesystem recovery metadata stays
+        aligned with the assistant tool call that produced it.
+        """
         from mclaw.tools.dispatch import handle_function_calls, set_tool_context
 
         if not tool_calls:
@@ -1889,7 +1926,6 @@ class MClaw:
         results = handle_function_calls(
             calls=tool_calls,
             tool_names=set(self.valid_tool_names),
-            available_toolsets=None,
             memory_manager=self._memory_manager,
             checkpoint_manager=checkpoint_mgr,
             parent_agent=self,
@@ -1907,7 +1943,8 @@ class MClaw:
         if getattr(self, "_memory_review_round", 0) > 0:
             try:
                 from mclaw.tools.memory_tool import MEMORY_WRITE_TOOL_NAMES
-            except Exception:
+            except Exception as exc:
+                logger.debug("Memory write metadata unavailable: %s", exc)
                 MEMORY_WRITE_TOOL_NAMES = set()
             for tc, result in zip(tool_calls, results):
                 fn = tc.get("function", {})
@@ -1919,8 +1956,8 @@ class MClaw:
                         self._memory_changed_in_turn = True
                         self._turns_since_memory_review = 0
                         break
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+                    logger.debug("Memory write result could not be parsed: %s", exc)
 
         # Reset the Skill review counter only after skill_manage truly succeeds.
         # The counter may have been pre-reset before execution; this is the final correction.
@@ -1932,33 +1969,14 @@ class MClaw:
                 try:
                     result_data = json.loads(result)
                     action = str(result_data.get("action") or "").strip()
-                    if result_data.get("success") and action in {
-                        "create",
-                        "edit",
-                        "patch",
-                        "delete",
-                        "write_file",
-                        "remove_file",
-                        "enable_drafting",
-                        "evolution_update",
-                    }:
+                    if result_data.get("success") and action in SKILL_WRITE_ACTIONS:
                         self._turns_since_evolution_review = 0
                         break  # only one skill_manage per batch
-                except Exception:
-                    pass
+                except (json.JSONDecodeError, TypeError) as exc:
+                    logger.debug("Memory write result could not be parsed: %s", exc)
 
         pending_delegate_data = None
         pending_skill_import_confirmation = None
-        skill_write_actions = {
-            "create",
-            "edit",
-            "patch",
-            "delete",
-            "write_file",
-            "remove_file",
-            "enable_drafting",
-            "evolution_update",
-        }
 
         # Append tool results in call order.
         for i, tc in enumerate(tool_calls):
@@ -1985,7 +2003,7 @@ class MClaw:
                     args = json.loads(fn.get("arguments") or "{}")
                     action = str(args.get("action") or "").strip()
                     result_data = json.loads(result)
-                    if result_data.get("success") and action in skill_write_actions:
+                    if result_data.get("success") and action in SKILL_WRITE_ACTIONS:
                         self._skills_changed_in_turn = True
                     if (
                         result_data.get("requires_confirmation")
@@ -2104,6 +2122,7 @@ class MClaw:
         return obj
 
     def _track_usage(self, response):
+        """Record provider token usage after redacting verbose response logs."""
         # Log the full response object for usage, model, choices, and related fields.
         try:
             resp_dict = self._obj_to_dict(response)

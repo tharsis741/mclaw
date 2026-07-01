@@ -14,6 +14,12 @@ from pathlib import Path
 
 @contextmanager
 def file_lock(path: str | Path):
+    """Acquire an exclusive advisory lock around a local state file.
+
+    Windows uses a one-byte non-blocking ``msvcrt`` lock with a bounded wait;
+    POSIX hosts use ``fcntl.flock`` and rely on the OS to release the lock when
+    the file handle closes.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if os.name == "nt":

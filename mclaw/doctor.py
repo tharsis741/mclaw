@@ -12,15 +12,20 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from mclaw.constants import display_mclaw_home, get_mclaw_home
+from mclaw.tools.browser_requirements import find_playwright_browsers_root
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class CheckResult:
+    """Raw diagnostic result before product-level grouping."""
     name: str
     ok: bool
     detail: str
@@ -30,6 +35,7 @@ class CheckResult:
 
 @dataclass
 class DoctorLine:
+    """Rendered product-facing diagnostic row."""
     section: str
     name: str
     status: str
@@ -40,10 +46,11 @@ class DoctorLine:
 def _load_config() -> dict:
     from mclaw.cli.config import load_config
 
-    return load_config()
+    return load_config(strict=True)
 
 
 def _append_secret_allowlist_check(results: list[CheckResult]) -> None:
+    """Validate the scoped secret allowlist shape without exposing values."""
     allowlist_path = get_mclaw_home() / "secret_allowlist.json"
     if not allowlist_path.exists():
         results.append(CheckResult("secret allowlist", True, "not created yet"))
@@ -128,6 +135,7 @@ def _format_required_envs(spec: object) -> str:
 
 
 def _append_feature_checks(results: list[CheckResult], cfg: dict | None) -> None:
+    """Check optional feature credentials against config and secret scopes."""
     try:
         from mclaw.cli.config import get_env_value
         from mclaw.runtime.features import configured_env_vars, list_feature_specs
@@ -180,36 +188,6 @@ def _append_feature_checks(results: list[CheckResult], cfg: dict | None) -> None
             results.append(CheckResult(name, True, "not enabled; optional"))
 
 
-def _has_chromium_browser(root: Path) -> bool:
-    return any(root.glob("chromium-*")) or any(root.glob("chrome-*")) or any(root.glob("**/chrome.exe"))
-
-
-def _find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, str]:
-    env_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip().strip('"')
-    if env_value:
-        root = Path(env_value)
-        if not root.exists():
-            return False, f"{env_value}; path does not exist"
-        return _has_chromium_browser(root), f"{env_value}; chromium={'yes' if _has_chromium_browser(root) else 'no'}"
-
-    candidates = []
-    local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_appdata:
-        candidates.append(Path(local_appdata) / "ms-playwright")
-    candidates.append(Path.home() / ".cache" / "ms-playwright")
-    if os.name == "nt":
-        candidates.append(Path.home() / "AppData" / "Local" / "ms-playwright")
-
-    seen: set[str] = set()
-    for root in candidates:
-        key = os.path.normcase(str(root))
-        if key in seen:
-            continue
-        seen.add(key)
-        if root.exists():
-            return _has_chromium_browser(root), f"{root}; chromium={'yes' if _has_chromium_browser(root) else 'no'}; source=default cache"
-    return False, "not found in PLAYWRIGHT_BROWSERS_PATH or default Playwright cache"
-
 def _exists_env_path(name: str) -> tuple[bool, str]:
     value = os.environ.get(name, "").strip().strip('"')
     if not value:
@@ -220,6 +198,7 @@ def _exists_env_path(name: str) -> tuple[bool, str]:
 
 def _module_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
+
 
 def _check_sqlite_fts5() -> CheckResult:
     try:
@@ -307,6 +286,7 @@ def _append_runtime_module_checks(results: list[CheckResult]) -> None:
 
 
 def _append_tool_diagnostics(results: list[CheckResult], diagnostics: list[dict]) -> None:
+    """Condense registry diagnostics into user-actionable doctor checks."""
     unavailable = [item for item in diagnostics if not item.get("available")]
     if not unavailable:
         results.append(CheckResult("tool diagnostics", True, f"all registered tools available ({len(diagnostics)})"))
@@ -392,13 +372,13 @@ def _append_dingtalk_checks(results: list[CheckResult], cfg: dict | None) -> Non
                 "dingtalk channel",
                 False,
                 f"failed to import diagnostics: {type(exc).__name__}: {exc}",
-                "Install DingTalk optional dependencies: pip install -e .[dingtalk]",
+                "Install M-Claw dependencies from the source directory: pip install -e .",
             )
         )
         return
 
     config = DingTalkConfig.from_config(cfg or {})
-    configured = bool(config.enabled or config.client_id or config.client_secret)
+    configured = bool(config.enabled or config.client_id or config.client_secret or config.robot_code)
     if not configured:
         results.append(CheckResult("dingtalk channel", True, "not configured; optional"))
         return
@@ -424,6 +404,7 @@ def _append_dingtalk_checks(results: list[CheckResult], cfg: dict | None) -> Non
     detail_parts = [
         f"client_id={'yes' if config.client_id else 'no'}",
         f"client_secret={'yes' if config.client_secret else 'no'}",
+        f"robot_code={'yes' if config.robot_code else 'no'}",
         f"group_policy={config.group_policy}",
         f"agent_provider={resolved_provider.get('provider') or 'unresolved'}",
         f"agent_api_key={'yes' if agent_api_key_ok else 'no'}",
@@ -445,11 +426,32 @@ def _append_dingtalk_checks(results: list[CheckResult], cfg: dict | None) -> Non
 
 
 def run_doctor() -> list[CheckResult]:
+    """Collect diagnostics across config, runtime, tools, channels, and host state."""
+    from mclaw.cli.config import ConfigError
+
     results: list[CheckResult] = []
     cfg: dict | None = None
     try:
         cfg = _load_config()
-    except Exception:
+        results.append(CheckResult("configuration", True, "ready"))
+    except ConfigError as exc:
+        results.append(
+            CheckResult(
+                "configuration",
+                False,
+                str(exc),
+                "Fix config.yaml under MCLAW_HOME, then run mclaw doctor again.",
+            )
+        )
+    except Exception as exc:
+        results.append(
+            CheckResult(
+                "configuration",
+                False,
+                f"failed: {type(exc).__name__}: {exc}",
+                "Check mclaw.cli.config imports and MCLAW_HOME access.",
+            )
+        )
         cfg = None
     results.append(CheckResult("runtime mode", True, "source"))
     try:
@@ -531,7 +533,7 @@ def run_doctor() -> list[CheckResult]:
         value = display_mclaw_home() + " (default)"
     results.append(CheckResult("MCLAW_HOME", True, value, "Set MCLAW_HOME to the active M-Claw home directory."))
 
-    browser_ok, browser_detail = _find_playwright_browsers_root(cfg)
+    browser_ok, browser_detail = find_playwright_browsers_root(cfg)
     if not browser_ok:
         browser_detail += "; not required unless browser tool is used"
     results.append(
@@ -561,7 +563,7 @@ def run_doctor() -> list[CheckResult]:
 
             tool_names = RuntimeManager.current(cfg).features.filter_tool_names(tool_names)
         except Exception:
-            pass
+            logger.debug("Runtime feature filtering failed during doctor tool diagnostics", exc_info=True)
 
         diagnostics = registry.get_tool_diagnostics(tool_names=tool_names, config=cfg)
         _append_tool_diagnostics(results, diagnostics)
@@ -608,7 +610,7 @@ def _doctor_detail(item: CheckResult) -> str:
     if name in {"weixin channel", "dingtalk channel"}:
         if detail.startswith("not configured"):
             return "optional; not configured"
-        if "missing=" in detail or "config_errors=" in detail:
+        if "missing=" in detail or "config_errors=" in detail or "agent_api_key=no" in detail:
             return "configuration incomplete"
         if "token=yes" in detail or "client_secret=yes" in detail:
             return "configured"
@@ -745,6 +747,7 @@ def _doctor_line(
 
 
 def _product_doctor_lines(results: list[CheckResult]) -> list[DoctorLine]:
+    """Map low-level checks into the stable product-facing doctor sections."""
     lines: list[DoctorLine] = []
     mapped: set[int] = set()
 
@@ -794,6 +797,7 @@ def _product_doctor_lines(results: list[CheckResult]) -> list[DoctorLine]:
 
 
 def format_doctor(results: list[CheckResult]) -> str:
+    """Render doctor results as a compact terminal report."""
     product_lines = _product_doctor_lines(results)
     failed = sum(1 for item in product_lines if item.status == "FAIL")
     warnings = sum(1 for item in product_lines if item.status == "WARN")
@@ -834,7 +838,7 @@ def main() -> None:
 
         configure_text_output()
     except Exception:
-        pass
+        logger.debug("Failed to configure doctor text output", exc_info=True)
     print(format_doctor(run_doctor()))
 
 

@@ -6,14 +6,14 @@
 
 This module exposes the public tool schemas and handlers for read, write,
 patch, edit, delete, search, and directory listing operations. Low-level file
-I/O lives in ``file_operations``; this layer adds tool JSON formatting,
-delegation workspace restrictions, Skill-store protection, and read-size
-guardrails before registering handlers with the tool registry.
+IO remains in file_operations; this layer owns tool-facing limits, delegation
+path policy, Skill-store protection, and registry registration.
 """
 
 import json
-from pathlib import Path
+import logging
 import os
+from pathlib import Path
 
 from mclaw.tools import file_operations as ops
 from mclaw.runtime.manager import RuntimeManager
@@ -21,8 +21,11 @@ from mclaw.tools.registry import registry
 from mclaw.constants import get_skills_dir
 from mclaw.skills_hub.paths import get_skill_drafting_dir
 
+logger = logging.getLogger(__name__)
+
 
 def _is_path_within(path: Path, root: Path) -> bool:
+    """Return whether path is equal to or nested under root without prefix leaks."""
     try:
         return path == root or path.is_relative_to(root)
     except ValueError:
@@ -46,6 +49,7 @@ def _skill_store_mutation_error(file_path: str, tool_name: str) -> str | None:
             Path(ops._normalize_path(str(get_skill_drafting_dir()))),
         ]
     except Exception:
+        logger.debug("Skill storage protection check failed for %s", tool_name, exc_info=True)
         return None
 
     for root in protected_roots:
@@ -61,54 +65,52 @@ def _skill_store_mutation_error(file_path: str, tool_name: str) -> str | None:
     return None
 
 
-def _check_delegation_path(file_path: str, parent_agent, mode: str = "write") -> tuple[bool, str]:
-    """Validate delegated file access and return ``(allowed, error_message)``."""
+def _check_delegation_path(file_path: str, parent_agent, mode: str = "write") -> tuple[bool, str, str]:
+    """Validate delegated file access and return (allowed, error_message, resolved_path)."""
     if parent_agent is None:
-        return True, ""
+        return True, "", file_path
     if getattr(parent_agent, "_delegate_depth", 0) <= 0:
-        return True, ""
+        return True, "", file_path
     delegation_dir = getattr(parent_agent, "_delegation_dir", None)
     if delegation_dir is None:
-        return True, ""
+        return True, "", file_path
+    preparation = getattr(parent_agent, "_workspace_preparation", None)
+    workspace_dir = preparation.get("workspace_path") if isinstance(preparation, dict) else None
+    base_dir = workspace_dir or delegation_dir
 
     runtime = RuntimeManager.current(getattr(parent_agent, "config", None))
     action = "read" if mode == "read" else "write"
-    decision = runtime.paths.check(action, file_path, base=str(delegation_dir))
+    decision = runtime.paths.check(action, file_path, base=str(base_dir))
     if not decision.allowed:
-        return False, decision.error_message()
+        return False, decision.error_message(), file_path
 
-    if mode == "read":
-        return True, ""
     try:
         abs_path = decision.resolved
         root = Path(delegation_dir).resolve()
-        try:
-            allowed = abs_path.is_relative_to(root)
-        except AttributeError:
-            allowed = os.path.commonpath([
-                os.path.normcase(str(abs_path)),
-                os.path.normcase(str(root)),
-            ]) == os.path.normcase(str(root))
-        if not allowed:
+        if not _is_path_within(abs_path, root):
             return False, (
-                f"Subagents may only modify files under {delegation_dir}; "
-                f"refused path: {file_path}"
-            )
+                f"子代理只能访问 {delegation_dir} 下的文件，"
+                f"禁止访问: {file_path}"
+            ), file_path
     except Exception:
-        return False, f"Invalid path: {file_path}"
-    return True, ""
+        logger.debug("Delegation path validation failed for %s", file_path, exc_info=True)
+        return False, f"无效路径: {file_path}", file_path
+    return True, "", str(decision.resolved)
 
 
-# Safety cap: one read_file call must not return more than this many chars.
-# 100K chars ≈ 25–50K tokens across typical tokenisers.  Files larger than
-# this create context pressure; callers should use offset+limit pagination.
+# read_file tool.
+
+# Safety cap for a single read_file result.
+# 100K characters is roughly 25K-50K tokens across common tokenizers. Files
+# larger than this should be read in targeted offset+limit ranges.
 _READ_FILE_MAX_CHARS = 100_000
 
-# Default read size when the model did not provide an explicit limit.
+# Default read size when the model does not provide an explicit limit.
 _READ_FILE_DEFAULT_LIMIT = 50_000
 
 
 def _coerce_read_limit(value, default: int = _READ_FILE_MAX_CHARS) -> int:
+    """Clamp configured read limits to the tool's hard safety ceiling."""
     try:
         limit = int(value)
     except (TypeError, ValueError):
@@ -117,6 +119,7 @@ def _coerce_read_limit(value, default: int = _READ_FILE_MAX_CHARS) -> int:
 
 
 def _configured_read_limit(parent_agent=None) -> int:
+    """Read the per-agent file read ceiling without exceeding module policy."""
     config = getattr(parent_agent, "config", None) if parent_agent is not None else None
     if isinstance(config, dict) and config.get("file_read_max_chars") is not None:
         return _coerce_read_limit(config.get("file_read_max_chars"))
@@ -130,12 +133,12 @@ def read_file_tool(
     task_id: str = "default",
     max_chars: int | None = None,
 ) -> str:
-    """Read a file with optional offset and byte limit.
+    """Read a file with optional character offset and limit.
 
     Args:
         path: Absolute or relative file path to read.
-        offset: Byte offset to start reading from (default: 0).
-        limit: Maximum bytes to read (default: 50,000, hard cap: 100,000).
+        offset: Character offset to start reading from (default: 0).
+        limit: Maximum characters to read (default: 50,000, hard cap: 100,000).
 
     Returns:
         JSON string with content, path, and staleness info.
@@ -143,7 +146,7 @@ def read_file_tool(
     from mclaw.tools.read_tracker import check_dedup, record_read
 
     try:
-        # ── Dedup check ───────────────────────────────────────────────
+        # Dedup check.
         hard_limit = _coerce_read_limit(max_chars)
         default_limit = min(_READ_FILE_DEFAULT_LIMIT, hard_limit)
         dedup_msg = check_dedup(path, offset, limit or default_limit, task_id=task_id)
@@ -155,7 +158,7 @@ def read_file_tool(
             }, ensure_ascii=False)
 
         if limit is None:
-            # Probe whether remaining content exceeds the hard safety cap.
+            # Probe whether the remaining content exceeds the hard safety cap.
             probe_limit = hard_limit + 1
             content = ops.read_file(path, offset=offset, limit=probe_limit)
 
@@ -168,7 +171,7 @@ def read_file_tool(
                     ),
                 }, ensure_ascii=False)
 
-            # Apply the default read size on normal responses.
+            # Apply the default read window for normal responses.
             effective_limit = default_limit
             hint = None
             if len(content) > effective_limit:
@@ -202,14 +205,14 @@ def read_file_tool(
                     f"Use offset={offset + effective_limit} to continue reading."
                 )
 
-        # ── Track for consecutive-loop detection ──────────────────────
+        # Track consecutive reads to prevent tool-call loops.
         count, should_block = record_read(path, offset, limit or default_limit, task_id=task_id)
         if should_block:
             return json.dumps({
                 "error": (
-                    f"BLOCKED: You have read this exact file region {count} times in a row. "
-                    "The content has NOT changed. You already have this information. "
-                    "STOP re-reading and proceed with your task."
+                    f"Repeated read blocked after {count} identical attempts. "
+                    "The content has not changed. Use the earlier read_file result "
+                    "and continue the task."
                 ),
                 "path": path,
                 "already_read": count,
@@ -223,8 +226,11 @@ def read_file_tool(
 
         return json.dumps(result, ensure_ascii=False)
 
-    except (OSError, PermissionError) as e:
+    except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# write_file tool.
 
 def write_file_tool(path: str, content: str) -> str:
     """Write content to a file atomically.
@@ -234,7 +240,7 @@ def write_file_tool(path: str, content: str) -> str:
         content: Content to write.
 
     Returns:
-        JSON string with written path and byte count.
+        JSON string with written path and UTF-8 byte count.
     """
     blocked = _skill_store_mutation_error(path, "write_file")
     if blocked:
@@ -243,10 +249,13 @@ def write_file_tool(path: str, content: str) -> str:
         written = ops.write_file(path, content)
         return json.dumps({
             "path": written,
-            "bytes_written": len(content),
+            "bytes_written": len(content.encode("utf-8")),
         }, ensure_ascii=False)
-    except (OSError, PermissionError) as e:
+    except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# patch tool.
 
 def patch_tool(path: str, old_str: str, new_str: str) -> str:
     """Replace the first occurrence of old_str with new_str in a file.
@@ -265,8 +274,11 @@ def patch_tool(path: str, old_str: str, new_str: str) -> str:
     try:
         patched = ops.patch_file(path, old_str, new_str)
         return json.dumps({"path": patched}, ensure_ascii=False)
-    except (OSError, ValueError, PermissionError) as e:
+    except (OSError, ValueError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# edit_file tool.
 
 def edit_file_tool(path: str, old_block: str, new_block: str) -> str:
     """Replace one exact old_block with new_block.
@@ -287,8 +299,11 @@ def edit_file_tool(path: str, old_block: str, new_block: str) -> str:
     try:
         edited = ops.edit_file(path, old_block, new_block)
         return json.dumps({"path": edited}, ensure_ascii=False)
-    except (OSError, ValueError, PermissionError) as e:
+    except (OSError, ValueError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# delete_file tool.
 
 def delete_file_tool(path: str) -> str:
     """Delete one file after Runtime PathPolicy approval."""
@@ -298,8 +313,11 @@ def delete_file_tool(path: str) -> str:
     try:
         deleted = ops.delete_file(path)
         return json.dumps({"path": deleted, "deleted": True}, ensure_ascii=False)
-    except (OSError, FileNotFoundError, IsADirectoryError, PermissionError) as e:
+    except OSError as e:
         return json.dumps({"error": str(e), "success": False}, ensure_ascii=False)
+
+
+# search_files tool.
 
 def search_files_tool(
     directory: str,
@@ -321,8 +339,11 @@ def search_files_tool(
     try:
         results = ops.search_files(directory, pattern, file_pattern=file_pattern, limit=limit)
         return json.dumps({"results": results}, ensure_ascii=False)
-    except (OSError, PermissionError) as e:
+    except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
+
+
+# list_directory tool.
 
 def list_directory_tool(path: str) -> str:
     """List directory contents with file size and modification time.
@@ -339,16 +360,18 @@ def list_directory_tool(path: str) -> str:
         if hint:
             result["_hint"] = hint
         return json.dumps(result, ensure_ascii=False)
-    except (OSError, NotADirectoryError, PermissionError) as e:
+    except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-# Public tool schemas.
+
+# Function-calling tool schemas.
+
 READ_FILE_SCHEMA = {
     "type": "function",
     "function": {
         "name": "read_file",
         "description": "Read the contents of a file from disk with optional offset and limit. "
-                       "Defaults to 50,000 bytes; hard cap at 100,000 bytes. "
+                       "Defaults to 50,000 characters; hard cap at 100,000 characters. "
                        "Use offset+limit pagination for large files.",
         "parameters": {
             "type": "object",
@@ -359,11 +382,11 @@ READ_FILE_SCHEMA = {
                 },
                 "offset": {
                     "type": "integer",
-                    "description": "Byte offset to start reading from (default: 0).",
+                    "description": "Character offset to start reading from (default: 0).",
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Maximum bytes to read (default: 50,000, max: 100,000).",
+                    "description": "Maximum characters to read (default: 50,000, max: 100,000).",
                 },
             },
             "required": ["path"],
@@ -519,19 +542,17 @@ LIST_DIRECTORY_SCHEMA = {
     },
 }
 
-# ---------------------------------------------------------------------------
-# Dispatch wrappers — registry calls handler(args_dict, **meta_kwargs)
-# ---------------------------------------------------------------------------
+# Dispatch wrappers: registry calls handler(args_dict, **meta_kwargs).
 
 def _handle_read_file(args: dict, **kw) -> str:
     path = args.get("path", "")
-    safe, err = _check_delegation_path(path, kw.get("parent_agent"), mode="read")
+    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"), mode="read")
     if not safe:
         return json.dumps({"error": err}, ensure_ascii=False)
     parent_agent = kw.get("parent_agent")
     task_id = getattr(parent_agent, "session_id", "default") if parent_agent else "default"
     return read_file_tool(
-        path=path,
+        path=resolved_path,
         offset=args.get("offset", 0),
         limit=args.get("limit"),
         task_id=task_id,
@@ -540,47 +561,47 @@ def _handle_read_file(args: dict, **kw) -> str:
 
 def _handle_write_file(args: dict, **kw) -> str:
     path = args.get("path", "")
-    safe, err = _check_delegation_path(path, kw.get("parent_agent"))
+    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
     if not safe:
         return json.dumps({"error": err, "success": False}, ensure_ascii=False)
-    return write_file_tool(path=path, content=args.get("content", ""))
+    return write_file_tool(path=resolved_path, content=args.get("content", ""))
 
 def _handle_patch(args: dict, **kw) -> str:
     path = args.get("path", "")
-    safe, err = _check_delegation_path(path, kw.get("parent_agent"))
+    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
     if not safe:
         return json.dumps({"error": err, "success": False}, ensure_ascii=False)
     return patch_tool(
-        path=path,
+        path=resolved_path,
         old_str=args.get("old_str", ""),
         new_str=args.get("new_str", ""),
     )
 
 def _handle_edit_file(args: dict, **kw) -> str:
     path = args.get("path", "")
-    safe, err = _check_delegation_path(path, kw.get("parent_agent"))
+    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
     if not safe:
         return json.dumps({"error": err, "success": False}, ensure_ascii=False)
     return edit_file_tool(
-        path=path,
+        path=resolved_path,
         old_block=args.get("old_block", ""),
         new_block=args.get("new_block", ""),
     )
 
 def _handle_delete_file(args: dict, **kw) -> str:
     path = args.get("path", "")
-    safe, err = _check_delegation_path(path, kw.get("parent_agent"))
+    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
     if not safe:
         return json.dumps({"error": err, "success": False}, ensure_ascii=False)
-    return delete_file_tool(path=path)
+    return delete_file_tool(path=resolved_path)
 
 def _handle_search_files(args: dict, **kw) -> str:
     directory = args.get("directory", "")
-    safe, err = _check_delegation_path(directory, kw.get("parent_agent"), mode="read")
+    safe, err, resolved_directory = _check_delegation_path(directory, kw.get("parent_agent"), mode="read")
     if not safe:
         return json.dumps({"error": err}, ensure_ascii=False)
     return search_files_tool(
-        directory=directory,
+        directory=resolved_directory,
         pattern=args.get("pattern", ""),
         file_pattern=args.get("file_pattern"),
         limit=args.get("limit"),
@@ -588,18 +609,18 @@ def _handle_search_files(args: dict, **kw) -> str:
 
 def _handle_list_directory(args: dict, **kw) -> str:
     path = args.get("path", "")
-    safe, err = _check_delegation_path(path, kw.get("parent_agent"), mode="read")
+    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"), mode="read")
     if not safe:
         return json.dumps({"error": err}, ensure_ascii=False)
-    return list_directory_tool(path=path)
+    return list_directory_tool(path=resolved_path)
 
-# Register all file tools with the central registry.
+# Register all file tools in the tool registry.
 registry.register(
     name="read_file",
     toolset="file",
     schema=READ_FILE_SCHEMA,
     handler=_handle_read_file,
-    description="读取文件内容",
+    description="Read file contents",
     emoji="📖",
     max_result_size_chars=100_000,
 )
@@ -609,7 +630,7 @@ registry.register(
     toolset="file",
     schema=WRITE_FILE_SCHEMA,
     handler=_handle_write_file,
-    description="新建或覆盖文件",
+    description="Create or overwrite a file",
     emoji="✏️",
     max_result_size_chars=10_000,
 )
@@ -619,7 +640,7 @@ registry.register(
     toolset="file",
     schema=PATCH_SCHEMA,
     handler=_handle_patch,
-    description="精确替换文件中的字符串",
+    description="Replace an exact string in a file",
     emoji="📝",
     max_result_size_chars=10_000,
 )
@@ -629,7 +650,7 @@ registry.register(
     toolset="file",
     schema=EDIT_FILE_SCHEMA,
     handler=_handle_edit_file,
-    description="多行替换文件内容",
+    description="Replace an exact text block in a file",
     emoji="📝",
     max_result_size_chars=10_000,
 )
@@ -639,7 +660,7 @@ registry.register(
     toolset="file",
     schema=DELETE_FILE_SCHEMA,
     handler=_handle_delete_file,
-    description="删除单个文件",
+    description="Delete a single file",
     emoji="🗑️",
     max_result_size_chars=10_000,
 )
@@ -649,7 +670,7 @@ registry.register(
     toolset="file",
     schema=SEARCH_FILES_SCHEMA,
     handler=_handle_search_files,
-    description="在目录中搜索文件",
+    description="Search files in a directory",
     emoji="🔍",
     max_result_size_chars=100_000,
 )
@@ -659,7 +680,7 @@ registry.register(
     toolset="file",
     schema=LIST_DIRECTORY_SCHEMA,
     handler=_handle_list_directory,
-    description="查看目录文件列表",
+    description="List directory contents",
     emoji="📁",
     max_result_size_chars=50_000,
 )

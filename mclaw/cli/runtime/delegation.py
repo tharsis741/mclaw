@@ -69,6 +69,7 @@ class RuntimeDelegationCoordinator:
         self.synthesis_timeout_seconds = synthesis_timeout_seconds
 
     def handle_pending_delegate(self, result: dict[str, Any]) -> bool:
+        """Resolve one pending delegation payload and optionally run synthesis."""
         if not result.get("pending_delegate"):
             return False
 
@@ -105,6 +106,7 @@ class RuntimeDelegationCoordinator:
         return True
 
     def _poll_result(self, task_id: str, manager: Any) -> dict[str, Any] | None:
+        """Poll the subagent result queue with completion-event grace windows."""
         deadline = time.time() + max(0.0, self.poll_timeout_seconds)
         while time.time() < deadline:
             pending_result = self.hooks.get_pending_result(task_id, 0.2)
@@ -132,6 +134,7 @@ class RuntimeDelegationCoordinator:
         return None
 
     def _render_result(self, pending_result: dict[str, Any] | None) -> str:
+        """Render aggregation output and return the prompt used for synthesis."""
         try:
             if pending_result:
                 return self.hooks.render_aggregation(pending_result)
@@ -142,6 +145,7 @@ class RuntimeDelegationCoordinator:
             return ""
 
     def _run_synthesis(self, synthesis_prompt: str) -> None:
+        """Run parent synthesis in a worker so UI timeout policy stays local."""
         self.hooks.set_synthesis_status()
         self.hooks.invalidate()
         self.hooks.clear_stream_state()
@@ -172,6 +176,7 @@ class RuntimeDelegationCoordinator:
 
 
 def _completion_event_is_set(manager: Any) -> bool:
+    """Read a manager completion event without depending on its concrete type."""
     event = getattr(manager, "completion_event", None)
     if event is None:
         return False

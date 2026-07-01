@@ -118,6 +118,8 @@ def _log_unhandled_inbound_payload(message: Any, *, message_type: str, conversat
 
 
 class DingTalkAdapter:
+    """Normalize DingTalk callbacks and route them through M-Claw agent sessions."""
+
     def __init__(
         self,
         *,
@@ -142,22 +144,24 @@ class DingTalkAdapter:
 
     @property
     def SUPPORTS_MESSAGE_EDITING(self) -> bool:  # noqa: N802
+        """DingTalk replies are append-only in the current channel implementation."""
         return False
 
     @property
     def REQUIRES_EDIT_FINALIZE(self) -> bool:  # noqa: N802
+        """No finalize pass is needed because responses are sent once."""
         return False
 
     def clear_runtime_state(self) -> None:
+        """Clear per-runtime caches and outbound targets during shutdown."""
         self._session_webhooks.clear()
         self._message_contexts.clear()
         self._done_reaction_fired.clear()
         unregister_dingtalk_outbound_targets_for_adapter(self)
-        seen = getattr(self.dedup, "_seen", None)
-        if isinstance(seen, dict):
-            seen.clear()
+        self.dedup.clear()
 
     async def process_message(self, message: Any) -> AgentTurnResult | None:
+        """Process one SDK callback into commands, scheduler binds, or an agent turn."""
         message_id = str(
             getattr(message, "message_id", None)
             or getattr(message, "msg_id", None)
@@ -202,6 +206,7 @@ class DingTalkAdapter:
 
         reply_route: tuple[str, int] | None = None
         if chat_id:
+            # Cache the SDK message so later tool calls can recover reply routes.
             self._message_contexts[chat_id] = message
             self._done_reaction_fired.discard(chat_id)
             reply_route = self._remember_session_webhook(chat_id, message)
@@ -341,6 +346,7 @@ class DingTalkAdapter:
         message_id: str,
         reply_route: tuple[str, int] | None,
     ) -> AgentTurnResult | None:
+        """Bind a scheduler target before the text enters the general agent loop."""
         command = parse_schedule_bind_command(text)
         if command is None:
             return None
@@ -370,6 +376,7 @@ class DingTalkAdapter:
         return AgentTurnResult(session_id="scheduler-bind", final_response=result.message)
 
     def _compile_mention_patterns(self) -> list[re.Pattern]:
+        """Compile configured group mention patterns, skipping invalid entries."""
         compiled: list[re.Pattern] = []
         for pattern in self.config.mention_patterns:
             try:
@@ -379,6 +386,7 @@ class DingTalkAdapter:
         return compiled
 
     def _is_user_allowed(self, sender_id: str, sender_staff_id: str, *, is_group: bool) -> bool:
+        """Apply DM policy and sender allowlist before any agent work starts."""
         allowed = self.config.allowed_user_set()
         if not is_group and self.config.dm_policy == "disabled":
             return False
@@ -393,6 +401,7 @@ class DingTalkAdapter:
         return bool(candidates & allowed)
 
     def _should_process_message(self, *, message: Any, text: str, is_group: bool, chat_id: str) -> bool:
+        """Decide whether a group or private message should reach M-Claw."""
         if not is_group:
             return self.config.dm_policy != "disabled"
         if self.config.group_policy == "disabled":
@@ -411,6 +420,7 @@ class DingTalkAdapter:
         return any(pattern.search(text or "") for pattern in self._mention_patterns)
 
     def _remember_session_webhook(self, chat_id: str, message: Any) -> tuple[str, int] | None:
+        """Cache a validated session webhook for future replies in the same chat."""
         session_webhook = str(getattr(message, "session_webhook", "") or "")
         expires_ms = self._session_webhook_expiry_ms(message)
         if not session_webhook or not _DINGTALK_WEBHOOK_RE.match(session_webhook):
@@ -432,6 +442,7 @@ class DingTalkAdapter:
             return 0
 
     def _get_valid_webhook(self, chat_id: str) -> tuple[str, int] | None:
+        """Return a cached webhook only if it is still inside the expiry margin."""
         entry = self._session_webhooks.get(chat_id)
         if not entry:
             return None
@@ -463,6 +474,7 @@ class DingTalkAdapter:
         return self._get_valid_webhook(chat_id) is not None
 
     async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> None:
+        """Send the final agent result through the route captured on the inbound message."""
         route = self._route_from_channel_message(message)
         if result.error:
             await self.send(
@@ -484,6 +496,7 @@ class DingTalkAdapter:
             )
 
     def _agent_event_callback(self, chat_id: str):
+        """Create a session event callback that reports saved skill updates."""
         async def _callback(_session_id: str, event: dict[str, Any]) -> None:
             if event.get("type") != "skills_saved":
                 return
@@ -540,6 +553,7 @@ class DingTalkAdapter:
         route: tuple[str, int] | None = None,
         done_message: ChannelMessage | Any | None = None,
     ) -> SendResult:
+        """Send chunked markdown text through a valid DingTalk reply route."""
         chunks = split_text_for_dingtalk(content, self.config.max_message_length)
         if not chunks:
             return SendResult(success=True)
@@ -551,6 +565,7 @@ class DingTalkAdapter:
         return last_result
 
     async def send_file(self, chat_id: str, *, file_path: str, caption: str = "") -> SendResult:
+        """Send a local file using the safest DingTalk route for its media type."""
         path = Path(file_path)
         if not path.is_file():
             return SendResult(success=False, error=f"File not found: {file_path}")
@@ -562,7 +577,7 @@ class DingTalkAdapter:
             return SendResult(
                 success=False,
                 error=f"File exceeds DingTalk media_max_bytes ({size_bytes} > {self.config.media_max_bytes})",
-        )
+            )
         if path.suffix.lower() in _TEXT_SUFFIXES:
             if self._openapi_destination_for_chat(chat_id) is not None:
                 return await self._send_openapi_file(chat_id, path=path, caption=caption)
@@ -595,6 +610,7 @@ class DingTalkAdapter:
         return await self._send_openapi_file(chat_id, path=upload_path, caption=caption)
 
     def _openapi_destination_for_chat(self, chat_id: str) -> tuple[str, str] | None:
+        """Resolve group or private OpenAPI targets from config and recent context."""
         open_conversation_id = self.config.open_conversation_map.get(chat_id, "")
         if open_conversation_id:
             return "group", open_conversation_id
@@ -614,6 +630,7 @@ class DingTalkAdapter:
         msg_key: str,
         msg_param: dict[str, Any],
     ) -> SendResult:
+        """Dispatch an OpenAPI message to the group or private endpoint."""
         kind, target_id = destination
         if kind == "group":
             return await self.client.send_group_robot_message(
@@ -637,6 +654,7 @@ class DingTalkAdapter:
         )
 
     async def _send_openapi_file(self, chat_id: str, *, path: Path, caption: str = "") -> SendResult:
+        """Upload and send a file card through DingTalk robot OpenAPI."""
         destination = self._openapi_destination_for_chat(chat_id)
         if destination is None:
             return SendResult(
@@ -670,6 +688,7 @@ class DingTalkAdapter:
         )
 
     async def _send_openapi_audio(self, chat_id: str, *, path: Path, caption: str = "") -> SendResult:
+        """Upload and send an audio card through DingTalk robot OpenAPI."""
         destination = self._openapi_destination_for_chat(chat_id)
         if destination is None:
             return SendResult(
@@ -702,6 +721,7 @@ class DingTalkAdapter:
         )
 
     async def _send_openapi_video(self, chat_id: str, *, path: Path, caption: str = "") -> SendResult:
+        """Upload video plus generated cover image through DingTalk robot OpenAPI."""
         destination = self._openapi_destination_for_chat(chat_id)
         if destination is None:
             return SendResult(
@@ -741,6 +761,7 @@ class DingTalkAdapter:
         )
 
     def _default_video_cover_path(self) -> Path:
+        """Create the tiny cover image required by DingTalk video messages."""
         cache_dir = Path(self.config.media_cache_dir).expanduser() if self.config.media_cache_dir else Path(tempfile.gettempdir())
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -752,6 +773,7 @@ class DingTalkAdapter:
         return path
 
     def _zip_for_dingtalk(self, path: Path) -> Path:
+        """Wrap unsupported file types in a zip accepted by DingTalk file cards."""
         cache_dir = Path(self.config.media_cache_dir).expanduser() if self.config.media_cache_dir else Path(tempfile.gettempdir())
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -776,6 +798,7 @@ class DingTalkAdapter:
         return None
 
     def _read_text_file(self, path: Path) -> tuple[str, str | None]:
+        """Decode a text file for webhook markdown delivery with common encodings."""
         data = path.read_bytes()
         if b"\x00" in data[:4096]:
             return "", "File looks binary; DingTalk text-file delivery only supports readable text files"
@@ -787,6 +810,7 @@ class DingTalkAdapter:
         return data.decode("utf-8", errors="replace"), None
 
     async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
+        """Typing indicators are intentionally unsupported for DingTalk webhook replies."""
         return None
 
     async def send_image(
@@ -865,6 +889,7 @@ class DingTalkAdapter:
         route: tuple[str, int] | None = None,
         done_message: ChannelMessage | Any | None = None,
     ) -> SendResult:
+        """Send one markdown chunk and fire the completion reaction on final replies."""
         is_final_reply = reply_to is not None
         webhook_info = route if self._is_route_valid(route) else self._get_valid_webhook(chat_id)
         if not webhook_info:
@@ -878,6 +903,7 @@ class DingTalkAdapter:
         return result
 
     def _fire_thinking_reaction(self, message: Any) -> None:
+        """Start a non-blocking reaction that marks an inbound turn as in progress."""
         msg_id = str(getattr(message, "message_id", "") or "")
         conversation_id = str(getattr(message, "conversation_id", "") or "")
         if not msg_id or not conversation_id:
@@ -891,6 +917,7 @@ class DingTalkAdapter:
         )
 
     def _fire_done_reaction(self, chat_id: str, *, done_message: ChannelMessage | Any | None = None) -> None:
+        """Swap the thinking reaction for a done reaction once a final reply succeeds."""
         msg_id = ""
         conversation_id = ""
         if isinstance(done_message, ChannelMessage):

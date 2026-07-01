@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Security scan wrapper for Skill 2.0 packages."""
+"""Security scan wrapper for Skill packages."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from mclaw.skills_hub.security_scan import format_scan_report, risk_label, scan_
 
 
 def review_skill_package(skill_dir: Path, *, source: str = "community") -> dict[str, Any]:
+    """Run the guard scanner and serialize the install policy decision."""
     result = scan_skill(skill_dir, source=source)
     allowed, reason = should_allow_install(result)
     risk_level = risk_label(result.verdict)
@@ -40,6 +41,7 @@ def review_skill_package(skill_dir: Path, *, source: str = "community") -> dict[
 
 
 def write_security_review(drafting_dir: Path, review: dict[str, Any]) -> Path:
+    """Persist the scanner result as the drafting transaction audit artifact."""
     path = drafting_dir / "security_review.json"
     path.write_text(json.dumps(review, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return path

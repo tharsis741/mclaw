@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Data models for the Skill 2.0 skills_hub package."""
+"""Skill Hub data models."""
 
 from __future__ import annotations
 
@@ -12,9 +12,11 @@ from typing import Any, Dict, List, Optional
 
 @dataclass
 class ExternalSkill:
+    """Catalog result shape shared by ClawHub search and UI serialization."""
+
     name: str
     description: str
-    source: str  # 'clawhub' | 'web'
+    source: str
     slug: str = ""
     url: str = ""
     author: str = ""

@@ -13,6 +13,8 @@ from typing import Any, Dict
 
 
 class PetState(str, Enum):
+    """Animation states understood by pet manifests and runtime events."""
+
     IDLE = "idle"
     RUNNING = "running"
     REVIEW = "review"
@@ -29,6 +31,8 @@ class PetState(str, Enum):
 
 
 class PetEventType(str, Enum):
+    """Runtime event names that can be mirrored to the pet sidecar."""
+
     APP_STARTED = "app_started"
     APP_EXITING = "app_exiting"
     TURN_STARTED = "turn_started"
@@ -58,6 +62,8 @@ LOW_PRIORITY_EVENTS = {
 
 @dataclass
 class PetEvent:
+    """Serializable event envelope sent across the controller-to-sidecar queue."""
+
     type: str
     state: str | None = None
     text: str = ""
@@ -66,6 +72,7 @@ class PetEvent:
     ts: float = field(default_factory=time.time)
 
     def to_dict(self) -> dict:
+        """Return the queue-safe representation used by multiprocessing."""
         return {
             "type": self.type,
             "state": self.state,
@@ -77,6 +84,7 @@ class PetEvent:
 
     @classmethod
     def from_dict(cls, data: dict) -> "PetEvent":
+        """Reconstruct an event from a sidecar queue payload."""
         return cls(
             type=str(data.get("type") or ""),
             state=data.get("state"),

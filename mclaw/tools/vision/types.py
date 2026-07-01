@@ -11,6 +11,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class VisionCredentials:
+    """Resolved provider credentials and validation state for one vision call."""
     provider: str
     api_key: str
     base_url: str

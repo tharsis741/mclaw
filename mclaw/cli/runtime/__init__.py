@@ -13,6 +13,7 @@ from .commands import (
     builtin_command_names,
     canonical_command_name,
     is_slash_command,
+    iter_builtin_completions,
     iter_builtin_commands,
     parse_slash_command,
 )
@@ -117,6 +118,7 @@ __all__ = [
     "builtin_command_names",
     "canonical_command_name",
     "is_slash_command",
+    "iter_builtin_completions",
     "iter_builtin_commands",
     "parse_slash_command",
     "PanelBlock",

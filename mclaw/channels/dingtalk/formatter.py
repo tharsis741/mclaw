@@ -11,6 +11,7 @@ import textwrap
 
 
 def normalize_markdown_for_dingtalk(content: str | None) -> str:
+    """Normalize Markdown constructs that DingTalk renders poorly."""
     text = str(content or "")
     lines = text.split("\n")
     out: list[str] = []
@@ -28,6 +29,7 @@ def normalize_markdown_for_dingtalk(content: str | None) -> str:
 
 
 def split_text_for_dingtalk(content: str, max_length: int = 20000) -> list[str]:
+    """Split Markdown into DingTalk-sized chunks while preserving code fences."""
     text = normalize_markdown_for_dingtalk(content)
     if not text:
         return []

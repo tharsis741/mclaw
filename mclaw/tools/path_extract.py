@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Iterable, List
+from collections.abc import Iterable
 
 
 PATH_EXTENSIONS = (
@@ -37,7 +37,7 @@ def _clean_path(path: str) -> str:
     return cleaned.strip()
 
 
-def _dedupe(paths: Iterable[str]) -> List[str]:
+def _dedupe(paths: Iterable[str]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
     for path in paths:
@@ -80,13 +80,12 @@ def _extend_to_existing_path(text: str, start: int, initial: str) -> str:
     return best
 
 
-def extract_absolute_paths(text: str) -> List[str]:
+def extract_absolute_paths(text: str) -> list[str]:
     """Extract Windows/Unix absolute paths, including paths with spaces.
 
-    The extractor is intentionally extension-aware for unquoted paths. This
-    avoids the old failure mode where `D:/foo/M-Robots OS 3.0.pptx` was cut at
-    the first space while also preventing greedy matches from eating following
-    prose.
+    Extension-aware matching captures unquoted file paths such as
+    `D:/foo/M-Robots OS 3.0.pptx` while keeping surrounding prose outside the
+    match.
     """
     if not text:
         return []

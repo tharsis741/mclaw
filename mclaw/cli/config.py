@@ -15,11 +15,10 @@ import platform
 import re
 import tempfile
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Any
 
 import yaml
 
-from mclaw.cli.colors import Colors, color
 from mclaw.cli.default_soul import DEFAULT_SOUL_MD
 from mclaw.cli.tui.console import print_plain
 from mclaw.constants import get_mclaw_home
@@ -29,10 +28,10 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 class ConfigError(Exception):
-    """Raised when project-level configuration is invalid or violates security rules."""
+    """Raised when M-Claw configuration is invalid or violates security rules."""
 
 
-# ── Config paths ──
+# Config paths.
 
 def get_config_path() -> Path:
     return get_mclaw_home() / "config.yaml"
@@ -62,6 +61,8 @@ def find_project_config(start_dir: Path | None = None) -> Path | None:
 
 
 _FORBIDDEN_PROJECT_FIELDS = {"sandbox.root", "delegation_dir", "security.trusted_workspaces"}
+
+
 def _check_forbidden_fields(config: dict, path: str = "") -> None:
     """Recursively check for forbidden fields. Raises ConfigError if found."""
     for key, value in config.items():
@@ -85,17 +86,37 @@ def load_project_config(path: Path) -> dict:
     except Exception as exc:
         raise ConfigError(f"Cannot read .mclaw.yaml: {exc}") from exc
 
-    config = raw if isinstance(raw, dict) else {}
+    if raw is None:
+        config = {}
+    elif isinstance(raw, dict):
+        config = raw
+    else:
+        raise ConfigError(".mclaw.yaml must contain a YAML mapping.")
+
     _check_forbidden_fields(config)
     # Project config may tune pet visuals, but cannot force desktop GUI startup
     # for every checkout. Runtime enablement remains controlled by user config.
-    try:
-        pet_cfg = config.get("display", {}).get("pet", {})
-        if isinstance(pet_cfg, dict):
-            pet_cfg.pop("enabled", None)
-    except Exception:
-        pass
+    display_cfg = config.get("display")
+    pet_cfg = display_cfg.get("pet") if isinstance(display_cfg, dict) else None
+    if isinstance(pet_cfg, dict):
+        pet_cfg.pop("enabled", None)
     return config
+
+
+def _load_user_config_file(config_path: Path) -> dict[str, Any]:
+    """Read config.yaml and require a YAML mapping."""
+    try:
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in {config_path}: {exc}") from exc
+    except Exception as exc:
+        raise ConfigError(f"Cannot read {config_path}: {exc}") from exc
+
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"{config_path} must contain a YAML mapping.")
+    return raw
 
 
 def load_merged_config(cwd: Path | None = None) -> dict:
@@ -106,29 +127,20 @@ def load_merged_config(cwd: Path | None = None) -> dict:
     # 1. User-level config
     user_path = get_config_path()
     if user_path.exists():
-        try:
-            with open(user_path, encoding="utf-8") as f:
-                user_config = yaml.safe_load(f) or {}
-            config = _deep_merge(config, user_config)
-        except Exception as e:
-            print_plain(f"Warning: Failed to load user config: {e}")
+        user_config = _load_user_config_file(user_path)
+        config = _deep_merge(config, user_config)
 
     # 2. Project-level config
     project_path = find_project_config(cwd)
     if project_path:
-        try:
-            project_config = load_project_config(project_path)
-            config = _deep_merge(config, project_config)
-            config["_project_config_dir"] = str(project_path.parent)
-        except ConfigError:
-            raise
-        except Exception as e:
-            print_plain(f"Warning: Failed to load project config: {e}")
+        project_config = load_project_config(project_path)
+        config = _deep_merge(config, project_config)
+        config["_project_config_dir"] = str(project_path.parent)
 
     return config
 
 
-# ── Security helpers ──
+# Security helpers.
 
 def _secure_dir(path):
     """Set directory to owner-only access (0700). Best-effort on Windows."""
@@ -168,11 +180,12 @@ def ensure_mclaw_home():
 
 
 
-# ── Default configuration ──
+# Default configuration.
 
-DEFAULT_CONFIG: Dict[str, Any] = {
+DEFAULT_CONFIG: dict[str, Any] = {
     "model": "",
     "active_provider": "",
+    "active_provider_profile": "",
     "providers": {},
     "fallback_providers": [],
     "toolsets": ["mclaw-required"],
@@ -207,6 +220,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "summary_model": "",
         "summary_provider": "auto",
         "summary_base_url": None,
+        "summary_timeout": 180,
     },
     "auxiliary": {
         "vision": {
@@ -218,17 +232,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         },
         "web_search": {
             "backend": "auto",
-            "timeout": 30,
             "tavily_timeout": 30,
             "dashscope_timeout": 90,
             "dashscope_deep_timeout": 120,
             "fallback": True,
-        },
-        "compression": {
-            "provider": "auto",
-            "model": "",
-            "base_url": "",
-            "timeout": 180,
         },
         "session_search": {
             "provider": "auto",
@@ -270,8 +277,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "enabled": False,
             "base_url": "https://ilinkai.weixin.qq.com",
             "dm_policy": "open",
-            "allow_from": [],
-            "group_policy": "disabled",
+            "allowed_users": [],
             "session_scope": "user",
             "max_message_length": 2000,
             "send_chunk_delay_seconds": 1.5,
@@ -294,7 +300,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "dm_policy": "open",
             "group_policy": "mention_only",
             "require_mention": True,
-            "allow_from": [],
             "allowed_users": [],
             "allowed_chats": [],
             "free_response_chats": [],
@@ -303,6 +308,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "max_message_length": 20000,
             "reconnect_backoff_seconds": [2, 5, 10, 30, 60],
             "shutdown_timeout_seconds": 5.0,
+            "close_timeout_seconds": 3.0,
             "dedup_ttl_seconds": 300.0,
             "session_webhooks_max": 500,
             "open_conversation_map": {},
@@ -381,7 +387,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 }
 
 
-# ── Config I/O ──
+# Config I/O.
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge override into base, returning a new dict."""
@@ -394,21 +400,8 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def read_raw_config() -> Dict[str, Any]:
-    """Read config.yaml as-is, without merging defaults."""
-    try:
-        config_path = get_config_path()
-        if config_path.exists():
-            with open(config_path, encoding="utf-8") as f:
-                return yaml.safe_load(f) or {}
-    except Exception:
-        pass
-    return {}
-
-
-def load_config() -> Dict[str, Any]:
+def load_config(*, strict: bool = False) -> dict[str, Any]:
     """Load configuration from M-Claw home config.yaml, merged with defaults."""
-    import copy
     ensure_mclaw_home()
     config_path = get_config_path()
 
@@ -416,16 +409,17 @@ def load_config() -> Dict[str, Any]:
 
     if config_path.exists():
         try:
-            with open(config_path, encoding="utf-8") as f:
-                user_config = yaml.safe_load(f) or {}
+            user_config = _load_user_config_file(config_path)
             config = _deep_merge(config, user_config)
-        except Exception as e:
-            print_plain(f"Warning: Failed to load config: {e}")
+        except ConfigError as exc:
+            if strict:
+                raise
+            print_plain(f"Warning: Failed to load config: {exc}")
 
     return config
 
 
-def save_config(config: Dict[str, Any]):
+def save_config(config: dict[str, Any]) -> None:
     """Save configuration to M-Claw home config.yaml."""
     from mclaw.utils import atomic_yaml_write
     ensure_mclaw_home()
@@ -433,11 +427,12 @@ def save_config(config: Dict[str, Any]):
     _secure_file(get_config_path())
 
 
-def upsert_fallback_provider_model(config: Dict[str, Any], provider: str, model: str) -> None:
+def upsert_fallback_provider_model(config: dict[str, Any], provider: str, model: str) -> None:
     """Record the model a user configured for a provider.
 
-    The fallback list doubles as provider model state for UI display. Only
-    complete provider+model dictionaries are kept on rewrite.
+    fallback_providers stores provider-specific model choices and the provider
+    failover order used when no explicit provider is selected. Only complete
+    provider+model dictionaries are kept on rewrite.
     """
     provider_name = str(provider or "").strip()
     model_name = str(model or "").strip()
@@ -474,9 +469,9 @@ def upsert_fallback_provider_model(config: Dict[str, Any], provider: str, model:
     config["fallback_providers"] = rewritten
 
 
-# ── .env I/O ──
+# .env I/O.
 
-def load_env() -> Dict[str, str]:
+def load_env() -> dict[str, str]:
     """Load environment variables from M-Claw home .env."""
     env_path = get_env_path()
     env_vars = {}
@@ -500,7 +495,7 @@ def _sanitize_api_key(value: str) -> str:
     return value.strip()
 
 
-def save_env_value(key: str, value: str):
+def save_env_value(key: str, value: str) -> None:
     """Save or update a value in M-Claw home .env."""
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
@@ -585,7 +580,7 @@ def remove_env_value(key: str) -> bool:
     return found
 
 
-def get_env_value(key: str) -> Optional[str]:
+def get_env_value(key: str) -> str | None:
     """Get a value from environment or M-Claw home .env."""
     val = os.environ.get(key)
     if val:
@@ -596,7 +591,7 @@ def get_env_value(key: str) -> Optional[str]:
 def mask_api_key(key: str | None) -> str:
     """Return a partially masked version of an API key for display.
 
-    Rules (aligned with CLI-1 fix):
+    Display rules:
     - None or ≤4 chars → "***"
     - 5–12 chars → first 4 + "..."
     - >12 chars → first 4 + "..." + last 4
@@ -609,65 +604,3 @@ def mask_api_key(key: str | None) -> str:
     if n <= 12:
         return key[:4] + "..."
     return key[:4] + "..." + key[-4:]
-
-
-# ── Provider env var registry (for setup wizard) ──
-
-OPTIONAL_ENV_VARS: Dict[str, Dict[str, Any]] = {
-    "OPENROUTER_API_KEY": {
-        "description": "OpenRouter API key",
-        "prompt": "OpenRouter API key",
-        "url": "https://openrouter.ai/keys",
-        "password": True,
-        "category": "provider",
-    },
-    "OPENAI_API_KEY": {
-        "description": "OpenAI API key",
-        "prompt": "OpenAI API key",
-        "url": "https://platform.openai.com/api-keys",
-        "password": True,
-        "category": "provider",
-    },
-    "ANTHROPIC_API_KEY": {
-        "description": "Anthropic API key",
-        "prompt": "Anthropic API key",
-        "url": "https://console.anthropic.com/settings/keys",
-        "password": True,
-        "category": "provider",
-    },
-    "GOOGLE_API_KEY": {
-        "description": "Google AI Studio API key",
-        "prompt": "Google AI Studio API key",
-        "url": "https://aistudio.google.com/app/apikey",
-        "password": True,
-        "category": "provider",
-    },
-    "DASHSCOPE_API_KEY": {
-        "description": "DashScope / Qwen API key",
-        "prompt": "DashScope API key",
-        "url": "https://dashscope.console.aliyun.com/apiKey",
-        "password": True,
-        "category": "provider",
-    },
-    "QWEN_API_KEY": {
-        "description": "Qwen API key",
-        "prompt": "Qwen API key",
-        "url": "https://dashscope.console.aliyun.com/apiKey",
-        "password": True,
-        "category": "provider",
-    },
-    "EXA_API_KEY": {
-        "description": "Exa search API key",
-        "prompt": "Exa API key",
-        "url": "https://dashboard.exa.ai/api-keys",
-        "password": True,
-        "category": "tool",
-    },
-    "FIRECRAWL_API_KEY": {
-        "description": "Firecrawl web scraping API key",
-        "prompt": "Firecrawl API key",
-        "url": "https://www.firecrawl.dev/app/api-keys",
-        "password": True,
-        "category": "tool",
-    },
-}

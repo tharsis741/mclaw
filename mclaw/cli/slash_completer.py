@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from prompt_toolkit.completion import Completer, Completion
 
-from mclaw.cli.runtime.commands import iter_builtin_commands
+from mclaw.cli.runtime.commands import iter_builtin_completions
 from mclaw.cli.skill_registry import SkillRegistry
 
 
@@ -43,7 +43,7 @@ class SlashCompleter(Completer):
         start_position = -len(token)
 
         # Built-in commands
-        for spec in iter_builtin_commands(visible_only=True):
+        for spec in iter_builtin_completions():
             if spec.name.startswith(prefix):
                 yield Completion(
                     f"/{spec.name}",

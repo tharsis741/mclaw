@@ -25,6 +25,7 @@ def _truthy(value: Any, default: bool = False) -> bool:
 
 
 def _enabled_mode(value: Any) -> str:
+    """Normalize user-facing enabled values while preserving the auto mode."""
     if isinstance(value, str) and value.strip().lower() == "auto":
         return "auto"
     return "on" if _truthy(value, False) else "off"
@@ -44,6 +45,8 @@ def _asset(value: Any) -> str:
 
 @dataclass
 class PetNotifyConfig:
+    """Notification toggles that decide which runtime events reach the pet."""
+
     turn_completed: bool = True
     tool_finished: bool = False
     background_completed: bool = True
@@ -53,6 +56,8 @@ class PetNotifyConfig:
 
 @dataclass
 class PetConfig:
+    """Runtime-safe desktop pet settings derived from the main M-Claw config."""
+
     enabled: bool = False
     enabled_mode: str = "off"
     backend: str = "pyside6"
@@ -70,6 +75,7 @@ class PetConfig:
 
     @classmethod
     def from_config(cls, config: dict | None) -> "PetConfig":
+        """Create a bounded runtime config from the nested display.pet section."""
         display = (config or {}).get("display", {})
         raw = display.get("pet", {}) if isinstance(display, dict) else {}
         if not isinstance(raw, dict):
@@ -79,6 +85,7 @@ class PetConfig:
             notify_raw = {}
 
         mode = _enabled_mode(raw.get("enabled"))
+        # Auto mode only enables the sidecar when a GUI session is available.
         enabled = gui_available() if mode == "auto" else mode == "on"
 
         return cls(
@@ -105,6 +112,7 @@ class PetConfig:
         )
 
     def to_runtime_dict(self) -> Dict[str, Any]:
+        """Serialize the config shape passed to the isolated sidecar process."""
         return {
             "enabled": self.enabled,
             "enabled_mode": self.enabled_mode,
@@ -130,6 +138,7 @@ class PetConfig:
 
 
 def ensure_pet_config(config: dict) -> dict:
+    """Ensure the mutable app config contains every desktop pet default key."""
     display = config.setdefault("display", {})
     if not isinstance(display, dict):
         display = {}

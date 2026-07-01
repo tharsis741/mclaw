@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render subagent delegation progress and result summaries."""
+"""Render subagent delegation results for terminal UI and follow-up context."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from mclaw.cli.tui.theme import ACCENT_COLOR
 
 
 class DelegationRenderer:
+    """Present delegated task aggregation while returning context for parent continuation."""
+
     def __init__(
         self,
         *,
@@ -26,6 +28,7 @@ class DelegationRenderer:
         self._panel_sink = panel_sink
 
     def render_aggregation(self, results: dict) -> str:
+        """Render the task summary panel and return text the parent turn can consume."""
         task_results = results.get("results", [])
         total_duration = results.get("total_duration_seconds", 0)
         icons = {"completed": "✅", "error": "❌", "interrupted": "⚠️", "failed": "❌"}

@@ -11,7 +11,7 @@ import re
 import time
 from typing import Any
 
-from mclaw.scheduler.ids import new_target_id
+from mclaw.scheduler.ids import new_target_id, normalize_pairing_code
 from mclaw.scheduler.models import SchedulerTarget, normalize_chat_type
 from mclaw.scheduler.store import SchedulerStore
 
@@ -19,7 +19,10 @@ _SCHEDULE_BIND_RE = re.compile(r"(?:^|\s)/schedule-bind\s+(\S+)(?:\s+(.+))?\s*$"
 
 
 class TargetManager:
+    """Normalizes scheduler delivery targets before routing or persistence."""
+
     def validate_target(self, target: SchedulerTarget) -> SchedulerTarget:
+        """Return a target with canonical chat scope, capabilities, and route state."""
         chat_type = normalize_chat_type(target.chat_type)
         metadata = dict(target.route_metadata or {})
         route_status = target.route_status
@@ -65,6 +68,7 @@ class TargetManager:
         )
 
     def display_target(self, target: SchedulerTarget) -> str:
+        """Render a user-facing target label for scheduler status surfaces."""
         if target.type == "local":
             return f"本地输出：{target.display_name}"
         if target.type == "dingtalk_group":
@@ -75,18 +79,19 @@ class TargetManager:
             return f"微信私聊投递：{target.display_name}"
         return f"{target.type}：{target.display_name}"
 
-    def target_capabilities(self, target: SchedulerTarget) -> dict[str, Any]:
-        return dict(self.validate_target(target).capabilities or {})
-
 
 @dataclass
 class BindCommand:
+    """Parsed channel message requesting scheduler target binding."""
+
     code: str
     display_name: str
 
 
 @dataclass
 class BindResult:
+    """Result returned to channel adapters after processing a bind attempt."""
+
     handled: bool
     success: bool = False
     message: str = ""
@@ -94,11 +99,12 @@ class BindResult:
 
 
 def parse_schedule_bind_command(text: str) -> BindCommand | None:
+    """Extract a scheduler binding code from channel-local slash text."""
     match = _SCHEDULE_BIND_RE.search(text or "")
     if not match:
         return None
     display_name = str(match.group(2) or "").strip()
-    return BindCommand(code=str(match.group(1)).strip(), display_name=display_name or "未命名目标")
+    return BindCommand(code=normalize_pairing_code(match.group(1)), display_name=display_name or "未命名目标")
 
 
 def bind_pairing_from_channel(
@@ -112,8 +118,9 @@ def bind_pairing_from_channel(
     chat_type: str,
     route_metadata: dict[str, Any] | None = None,
 ) -> BindResult:
+    """Bind a waiting pairing code to the channel conversation that sent it."""
     now = time.time()
-    pairing = store.get_pairing(code)
+    pairing = store.get_pairing(normalize_pairing_code(code))
     if not pairing:
         return BindResult(handled=True, success=False, message="绑定失败：绑定码无效或已过期。")
     if pairing.status != "waiting":
@@ -141,6 +148,7 @@ def bind_pairing_from_channel(
     target = TargetManager().validate_target(target)
     if target.route_status != "ready":
         error = _route_error_for_target(target)
+        # Persist failure so the same code cannot later bind to an incomplete route.
         store.fail_pairing(code, error=error)
         return BindResult(handled=True, success=False, message=f"绑定失败：{error}")
 

@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DingTalk Stream Mode and OpenAPI helpers."""
+"""DingTalk Stream Mode, webhook, and OpenAPI helpers.
+
+The client hides optional SDK availability, Stream callback registration, robot
+OpenAPI calls, and webhook/HTTP fallbacks behind one async surface for the
+adapter.
+"""
 
 from __future__ import annotations
 
@@ -59,6 +64,7 @@ MessageHandler = Callable[[Any], Awaitable[None]]
 
 
 def check_dingtalk_requirements() -> dict[str, bool]:
+    """Report which DingTalk optional dependencies expose the APIs this channel uses."""
     stream_api = False
     if DINGTALK_STREAM_AVAILABLE:
         stream_api = all(
@@ -102,6 +108,8 @@ def check_dingtalk_requirements() -> dict[str, bool]:
 
 
 class DingTalkClient:
+    """Async facade over DingTalk Stream Mode, robot OpenAPI, and webhook HTTP calls."""
+
     def __init__(self, config: DingTalkConfig) -> None:
         self.config = config
         self.http: httpx.AsyncClient | None = None
@@ -110,6 +118,7 @@ class DingTalkClient:
         self._bg_tasks: set[asyncio.Task] = set()
 
     async def open(self) -> None:
+        """Initialize the Stream SDK, HTTP client, and optional robot SDK client."""
         if not DINGTALK_STREAM_AVAILABLE:
             raise RuntimeError("dingtalk-stream is not installed. Install dingtalk-stream>=0.20.")
         self.http = httpx.AsyncClient(timeout=30.0)
@@ -122,17 +131,20 @@ class DingTalkClient:
             self.robot_sdk = dingtalk_robot_client.Client(sdk_config)
 
     def register_handler(self, *, loop: asyncio.AbstractEventLoop, handler: MessageHandler) -> None:
+        """Register the adapter callback on the Stream SDK chatbot topic."""
         if not self.stream_client:
             raise RuntimeError("DingTalk stream client is not opened")
         incoming = _IncomingHandler(handler=handler, loop=loop)
         self.stream_client.register_callback_handler(ChatbotMessage.TOPIC, incoming)
 
     async def start_stream(self) -> None:
+        """Enter the SDK-managed Stream Mode receive loop."""
         if not self.stream_client:
             raise RuntimeError("DingTalk stream client is not opened")
         await self.stream_client.start()
 
     async def close(self) -> None:
+        """Close websocket, SDK client, background reaction tasks, and HTTP state."""
         timeout = max(0.1, float(getattr(self.config, "close_timeout_seconds", 3.0) or 3.0))
         websocket = getattr(self.stream_client, "websocket", None) if self.stream_client else None
         if websocket is not None:
@@ -146,7 +158,7 @@ class DingTalkClient:
             except asyncio.TimeoutError:
                 logger.debug("dingtalk stream client close timed out")
             except Exception:
-                pass
+                logger.debug("dingtalk stream client close failed", exc_info=True)
         for task in list(self._bg_tasks):
             task.cancel()
         if self._bg_tasks:
@@ -162,6 +174,7 @@ class DingTalkClient:
         self.robot_sdk = None
 
     async def send_markdown(self, *, session_webhook: str, text: str, title: str = "M-Claw") -> SendResult:
+        """Send a markdown reply through the per-message session webhook."""
         if not self.http:
             return SendResult(success=False, error="HTTP client not initialized")
         payload = {
@@ -182,6 +195,7 @@ class DingTalkClient:
             return SendResult(success=False, error=str(exc))
 
     async def upload_media(self, *, file_path: str, media_type: str = "image") -> SendResult:
+        """Upload media to DingTalk OpenAPI and return the media_id."""
         if not self.http:
             return SendResult(success=False, error="HTTP client not initialized")
         token = await self.get_access_token()
@@ -216,6 +230,7 @@ class DingTalkClient:
         msg_key: str,
         msg_param: dict[str, Any],
     ) -> SendResult:
+        """Send an OpenAPI robot message to a configured group conversation."""
         if not self.http:
             return SendResult(success=False, error="HTTP client not initialized")
         token = await self.get_access_token()
@@ -253,6 +268,7 @@ class DingTalkClient:
         msg_key: str,
         msg_param: dict[str, Any],
     ) -> SendResult:
+        """Send an OpenAPI robot message to one user in a private conversation."""
         if not self.http:
             return SendResult(success=False, error="HTTP client not initialized")
         token = await self.get_access_token()
@@ -290,6 +306,7 @@ class DingTalkClient:
             return SendResult(success=False, error=str(exc))
 
     async def download_bytes(self, url: str, *, timeout_seconds: float = 60.0) -> bytes:
+        """Download bytes from a DingTalk-provided media URL."""
         if not self.http:
             raise RuntimeError("HTTP client not initialized")
         response = await self.http.get(url, timeout=timeout_seconds)
@@ -297,6 +314,7 @@ class DingTalkClient:
         return response.content
 
     async def get_access_token(self) -> str | None:
+        """Return the SDK access token, isolating the blocking SDK call in a thread."""
         if not self.stream_client:
             return None
         try:
@@ -306,6 +324,7 @@ class DingTalkClient:
             return None
 
     async def fetch_download_url(self, *, download_code: str, robot_code: str = "") -> str | None:
+        """Resolve a DingTalk downloadCode into a short-lived download URL."""
         if not self.robot_sdk:
             return None
         token = await self.get_access_token()
@@ -328,6 +347,7 @@ class DingTalkClient:
             return None
 
     def spawn_bg(self, coro) -> None:
+        """Track a fire-and-forget task so shutdown can cancel it."""
         task = asyncio.create_task(coro)
         self._bg_tasks.add(task)
         task.add_done_callback(self._bg_tasks.discard)
@@ -340,6 +360,7 @@ class DingTalkClient:
         emoji_name: str,
         recall: bool = False,
     ) -> None:
+        """Send or recall a DingTalk text reaction for an inbound message."""
         if not self.robot_sdk or not open_msg_id or not open_conversation_id:
             return
         token = await self.get_access_token()
@@ -379,6 +400,8 @@ class DingTalkClient:
 
 
 class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
+    """Bridge SDK callback frames back onto the runtime asyncio loop."""
+
     def __init__(self, *, handler: MessageHandler, loop: asyncio.AbstractEventLoop) -> None:
         if DINGTALK_STREAM_AVAILABLE:
             super().__init__()
@@ -389,6 +412,7 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
         return
 
     async def process(self, message: Any):
+        """Ack DingTalk quickly and schedule normalized message handling asynchronously."""
         try:
             data = getattr(message, "data", message)
             if isinstance(data, str):
@@ -405,6 +429,7 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
         return AckMessage.STATUS_OK, "OK"
 
     def _schedule(self, coro) -> None:
+        """Schedule adapter work on the runtime loop, with a fallback for tests."""
         if not self._loop.is_closed():
             self._loop.create_task(coro)
             return
@@ -415,6 +440,7 @@ class _IncomingHandler(dingtalk_stream.ChatbotHandler if DINGTALK_STREAM_AVAILAB
             raise
 
     async def _safe_handle(self, chatbot_msg: Any) -> None:
+        """Run the adapter handler without letting exceptions escape the SDK callback."""
         try:
             await self._handler(chatbot_msg)
         except Exception:

@@ -25,6 +25,7 @@ _HAS_ESCAPE = re.compile(r"[\x1b\x80-\x9f]")
 
 
 def strip_ansi(text: str) -> str:
+    """Remove terminal control sequences while preserving plain output text."""
     if not text or not _HAS_ESCAPE.search(text):
         return text
     return _ANSI_ESCAPE_RE.sub("", text)

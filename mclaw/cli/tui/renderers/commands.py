@@ -2,10 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render plain slash-command output through shared panel models."""
+"""Render slash-command results as panel models or legacy Rich output."""
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Callable
 
@@ -26,7 +27,7 @@ from mclaw.cli.tui.renderers.status import format_duration
 
 
 class CommandsRenderer:
-    """Render simple slash command outputs through a shared TUI boundary."""
+    """Render slash command outputs through the panel abstraction shared by frontends."""
 
     def __init__(
         self,
@@ -44,11 +45,8 @@ class CommandsRenderer:
     def line(self, text: str = "") -> None:
         self._printer(text)
 
-    def lines(self, lines: list[str]) -> None:
-        for line in lines:
-            self._printer(line)
-
     def _panel_model(self, panel: PanelModel, *, border_style: str | None = None) -> None:
+        """Route panels through injected sinks before falling back to classic Rich output."""
         if self._panel_sink is not None:
             self._panel_sink(panel)
             return
@@ -107,9 +105,11 @@ class CommandsRenderer:
                     ("/model <名称>", "切换模型，缺少密钥时提示配置"),
                     ("/model-update", "刷新和查看 models.dev 模型库缓存"),
                     ("/provider", "查看供应商和密钥状态"),
+                    ("/search-backend", "查看或切换联网搜索后端"),
+                    ("/schedule", "打开本地任务中心"),
                     ("/skills", "查看和使用技能"),
                     ("/usage", "查看本次会话 Token 用量"),
-                    ("/doctor [fix]", "检查运行环境和工具可用性"),
+                    ("/doctor", "检查运行环境和工具可用性"),
                     ("/history", "查看历史会话"),
                     ("/resume <id>", "恢复历史会话"),
                     ("/title <名称>", "设置会话标题"),
@@ -152,6 +152,7 @@ class CommandsRenderer:
         ))
 
     def render_doctor(self, text: str) -> None:
+        """Render the plain doctor report through the structured panel parser below."""
         self._panel_model(_doctor_panel_model(text or "无输出"))
 
     def render_model_status(self, *, model: str, provider: str) -> None:
@@ -362,30 +363,49 @@ class CommandsRenderer:
 
 
 def _doctor_panel_model(text: str) -> PanelModel:
+    """Convert the textual doctor report into a structured panel model."""
     lines = str(text or "").splitlines() or ["无输出"]
     blocks = []
     check_rows = []
     detail_rows = []
+    panel_title = "M-CLAW 运行环境诊断"
+    current_section = ""
+    first_content_seen = False
 
-    for line_no, line in enumerate(lines):
+    for line in lines:
         stripped = line.strip()
         if not stripped:
+            continue
+
+        if not first_content_seen:
+            first_content_seen = True
+            if stripped.startswith("M-CLAW"):
+                panel_title = stripped
+                continue
+            blocks.append(text_block(stripped))
+            continue
+
+        if stripped in _DOCTOR_SECTIONS:
+            current_section = stripped
             continue
 
         parsed = _parse_doctor_check(stripped)
         if parsed:
             label, role, name, detail = parsed
-            check_rows.append((panel_cell(label, role), name, detail))
+            section = "" if current_section == "总览" else current_section
+            check_rows.append((section, panel_cell(label, role), name, detail))
             continue
 
-        if line_no == 0:
-            blocks.append(text_block(stripped))
-        elif stripped.startswith("fix:"):
-            detail_rows.append(("修复建议", stripped[4:].strip()))
-        elif stripped.startswith("Summary:"):
-            detail_rows.append(("汇总", stripped[len("Summary:"):].strip()))
-        else:
-            detail_rows.append(("输出", stripped))
+        if stripped.startswith("修复:"):
+            detail_rows.append(("修复建议", stripped[len("修复:"):].strip()))
+            continue
+
+        overview_row = _parse_doctor_key_value(stripped)
+        if current_section == "总览" and overview_row:
+            detail_rows.append(overview_row)
+            continue
+
+        detail_rows.append(("输出", stripped))
 
     if check_rows:
         if blocks:
@@ -394,6 +414,7 @@ def _doctor_panel_model(text: str) -> PanelModel:
             section_block("检查项"),
             table_block(
                 (
+                    PanelColumn("分组", role="muted", no_wrap=True),
                     PanelColumn("状态", role="accent", no_wrap=True),
                     PanelColumn("项目", role="primary"),
                     PanelColumn("详情", role="muted"),
@@ -408,26 +429,37 @@ def _doctor_panel_model(text: str) -> PanelModel:
         blocks.append(key_value_block(detail_rows))
 
     return PanelModel(
-        title="M-Claw Doctor",
+        title=panel_title,
         namespace="doctor",
         blocks=tuple(blocks or [text_block("无输出")]),
     )
 
 
+_DOCTOR_SECTIONS = {"总览", "核心运行时", "工具能力", "IM通道", "其他"}
+_DOCTOR_CHECK_RE = re.compile(r"^(OK|WARN|FAIL)\s+(.+?)(?:\s{2,}(.+))?$")
+_DOCTOR_FIELD_RE = re.compile(r"^(.+?)\s{2,}(.+)$")
+_DOCTOR_STATUS = {
+    "OK": ("OK", "success"),
+    "WARN": ("WARN", "warning"),
+    "FAIL": ("FAIL", "danger"),
+}
+
+
 def _parse_doctor_check(line: str):
-    markers = {
-        "[OK]": ("OK", "success"),
-        "[WARN]": ("WARN", "warning"),
-        "[FAIL]": ("FAIL", "danger"),
-    }
-    for marker, (label, role) in markers.items():
-        if line.startswith(f"{marker} "):
-            rest = line[len(marker):].strip()
-            if ":" in rest:
-                name, detail = rest.split(":", 1)
-                return label, role, name.strip(), detail.strip()
-            return label, role, rest, ""
-    return None
+    """Parse status-prefixed doctor rows without binding the command layer to Rich."""
+    match = _DOCTOR_CHECK_RE.match(line)
+    if not match:
+        return None
+    status, name, detail = match.groups()
+    label, role = _DOCTOR_STATUS[status]
+    return label, role, name.strip(), (detail or "").strip()
+
+
+def _parse_doctor_key_value(line: str) -> tuple[str, str] | None:
+    match = _DOCTOR_FIELD_RE.match(line)
+    if not match:
+        return None
+    return match.group(1).strip(), match.group(2).strip()
 
 
 def _provider_command_rows() -> list[tuple[str, str]]:

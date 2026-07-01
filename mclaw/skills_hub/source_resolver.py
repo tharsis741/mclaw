@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import re
 import shutil
 import tempfile
 import zipfile
@@ -16,11 +15,13 @@ from urllib.parse import quote, urlparse
 
 import requests
 
-from mclaw.skills_hub.search import CLAW_HUB_API_BASE, ClawHubSearcher
+from mclaw.skills_hub.search import CLAW_HUB_API_BASE, ClawHubSearcher, ClawHubSearchError
 
 
 @dataclass(frozen=True)
 class ResolvedSource:
+    """Normalized source descriptor consumed by install materialization."""
+
     type: str
     original: str
     fetch_url: str
@@ -36,6 +37,7 @@ class SourceResolutionError(ValueError):
 
 
 def resolve_source(source: str) -> ResolvedSource:
+    """Resolve a user-provided Skill source into a trusted fetch/copy plan."""
     value = str(source or "").strip().strip('"')
     if not value:
         raise SourceResolutionError("source is required.")
@@ -58,6 +60,7 @@ def resolve_source(source: str) -> ResolvedSource:
 
 
 def _resolve_clawhub(original: str, parsed) -> ResolvedSource:
+    """Resolve ClawHub URLs through the API so owner and slug are canonical."""
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
         raise SourceResolutionError("ClawHub URL must be https://clawhub.ai/<owner>/<slug>.")
@@ -65,7 +68,7 @@ def _resolve_clawhub(original: str, parsed) -> ResolvedSource:
 
     try:
         detail = ClawHubSearcher().get_skill_detail(slug_hint, raise_on_error=True)
-    except Exception as exc:
+    except ClawHubSearchError as exc:
         raise SourceResolutionError(f"ClawHub detail lookup failed for slug '{slug_hint}'.") from exc
     skill = detail.get("skill") if isinstance(detail, dict) else {}
     if not isinstance(skill, dict):
@@ -96,6 +99,7 @@ def _resolve_clawhub(original: str, parsed) -> ResolvedSource:
 
 
 def _resolve_github(original: str, parsed) -> ResolvedSource:
+    """Resolve GitHub repo/tree/blob URLs into codeload archive metadata."""
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
         raise SourceResolutionError("GitHub URL must include owner and repo.")
@@ -128,12 +132,13 @@ def _resolve_github(original: str, parsed) -> ResolvedSource:
 
 
 def _github_default_branch(owner: str, repo: str) -> str:
+    """Best-effort default-branch lookup; callers fall back when unavailable."""
     try:
         response = requests.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=15)
         if response.ok:
             data = response.json()
             return str(data.get("default_branch") or "").strip()
-    except Exception:
+    except (requests.RequestException, ValueError):
         return ""
     return ""
 
@@ -186,6 +191,7 @@ def _find_archive_package_root(extracted_root: Path, package_root: str = "") -> 
 
 
 def _download_archive(url: str) -> Path:
+    """Download an archive to a temporary file and delete partial files on errors."""
     fd, tmp_path = tempfile.mkstemp(prefix="mclaw_skill_download_", suffix=".zip")
     try:
         import os
@@ -211,6 +217,7 @@ def _download_archive(url: str) -> Path:
 
 
 def _safe_extract_archive(zf: zipfile.ZipFile, target_root: Path) -> None:
+    """Extract zip members while rejecting absolute paths and traversal."""
     root = target_root.resolve()
     for member in zf.infolist():
         raw_name = str(member.filename or "").replace("\\", "/")
@@ -234,6 +241,7 @@ def _safe_extract_archive(zf: zipfile.ZipFile, target_root: Path) -> None:
 
 
 def _copy_dir_contents(src: Path, dst: Path) -> None:
+    """Copy package contents while rejecting symlinks and local cache artifacts."""
     ignore_names = {".git", "__pycache__", ".DS_Store"}
     for item in src.iterdir():
         if item.name in ignore_names:

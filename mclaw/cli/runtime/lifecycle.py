@@ -34,6 +34,12 @@ class RuntimeShutdownCoordinator:
         self.hooks = hooks
 
     def shutdown(self, process_thread: Thread, animation_thread: Thread) -> None:
+        """Stop runtime services in the order required for a clean terminal exit.
+
+        The sequence interrupts active work before joining UI workers, then
+        restores process-level state and decides whether the session should
+        flush based on the runtime's force-exit flag.
+        """
         self.runtime.request_exit()
         self._safe(self.hooks.stop_asr_service)
         self._safe(self.hooks.interrupt_agent)
@@ -49,6 +55,7 @@ class RuntimeShutdownCoordinator:
         self._safe(self.hooks.clear_terminal_title)
 
     def _join(self, thread: Thread, *, timeout: float) -> None:
+        """Join a worker briefly, converting Ctrl+C during shutdown into no-flush exit."""
         try:
             thread.join(timeout=timeout)
         except KeyboardInterrupt:

@@ -3,4 +3,3 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Tool package containing M-Claw function-call implementations."""
-

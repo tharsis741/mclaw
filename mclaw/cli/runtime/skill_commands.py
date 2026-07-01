@@ -54,6 +54,7 @@ class RuntimeSkillCommandCoordinator:
         self.hooks = hooks
 
     def invoke_skill(self, skill: Any, user_intent: str) -> bool:
+        """Inject Skill guidance and optionally queue the user's follow-up intent."""
         try:
             view = skill_store.view_skill(str(skill.name))
             skill_content = str(view.get("content") or "")
@@ -92,7 +93,11 @@ class RuntimeSkillCommandCoordinator:
 
     @staticmethod
     def inject_skill_context(messages: list[dict[str, Any]], skill_text: str) -> None:
-        """Append Skill guidance to the existing system message."""
+        """Append Skill guidance once to the existing system message.
+
+        The first Skill header line is used as the idempotency marker so repeat
+        invocations can refresh context without duplicating the full Skill text.
+        """
         first_line = str(skill_text or "").splitlines()[0] if str(skill_text or "").splitlines() else ""
         marker = first_line if first_line.startswith("[Skill:") else skill_text
         for msg in messages:
@@ -113,6 +118,7 @@ class RuntimeSkillImportConfirmationCoordinator:
         self.hooks = hooks
 
     def handle_input(self, user_input: str) -> bool:
+        """Consume a pending import confirmation if the input is a decision."""
         confirmation = self.hooks.get_pending_confirmation()
         if not confirmation:
             return False
@@ -123,7 +129,7 @@ class RuntimeSkillImportConfirmationCoordinator:
             return True
 
         approve = decision
-        drafting_id = str(confirmation.get("drafting_id") or confirmation.get("staging_id") or "")
+        drafting_id = str(confirmation.get("drafting_id") or "")
         action = "enable_drafting" if approve else "cancel_drafting"
         self.hooks.clear_pending_confirmation()
         self.hooks.set_busy(approve)

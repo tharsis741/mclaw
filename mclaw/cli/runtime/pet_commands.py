@@ -13,12 +13,16 @@ from typing import Any
 
 @dataclass(frozen=True)
 class RuntimePetStartResult:
+    """Result of starting or restarting the desktop pet sidecar."""
+
     ok: bool
     last_error: str = ""
 
 
 @dataclass(frozen=True)
 class RuntimePetStatus:
+    """Snapshot rendered by `/pet status` without binding to the sidecar type."""
+
     pet_cfg: dict[str, Any]
     running: bool
     last_error: str | None = None
@@ -56,6 +60,7 @@ class RuntimePetCommandCoordinator:
         self.hooks = hooks
 
     def handle_pet_command(self, raw_args: str = "") -> None:
+        """Apply `/pet` subcommands to config and sidecar lifecycle hooks."""
         args = str(raw_args or "").strip().split()
         action = args[0].lower() if args else "status"
 

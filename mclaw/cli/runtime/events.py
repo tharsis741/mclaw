@@ -15,6 +15,8 @@ from typing import Any
 
 
 class RuntimeStatus(StrEnum):
+    """Agent-turn states that frontends can render without runtime internals."""
+
     IDLE = "idle"
     REQUESTING = "requesting"
     STREAMING = "streaming"
@@ -26,6 +28,8 @@ class RuntimeStatus(StrEnum):
 
 
 class EventType(StrEnum):
+    """Stable event names emitted across runtime, TUI, and channel adapters."""
+
     APP_STARTED = "app.started"
     STATUS_CHANGED = "status.changed"
     USER_MESSAGE = "user.message"
@@ -46,6 +50,8 @@ class EventType(StrEnum):
 
 @dataclass(frozen=True)
 class MClawEvent:
+    """Timestamped event envelope passed through the synchronous event bus."""
+
     type: EventType | str
     payload: dict[str, Any] = field(default_factory=dict)
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -66,6 +72,7 @@ class EventBus:
         self._lock = RLock()
 
     def subscribe(self, handler: EventHandler) -> Callable[[], None]:
+        """Register a handler and return an idempotent unsubscribe callback."""
         with self._lock:
             self._handlers.append(handler)
 
@@ -79,6 +86,7 @@ class EventBus:
         return unsubscribe
 
     def emit(self, event_type: EventType | str, **payload: Any) -> MClawEvent:
+        """Synchronously publish an immutable event snapshot to current handlers."""
         event = MClawEvent(type=event_type, payload=payload)
         with self._lock:
             handlers = list(self._handlers)

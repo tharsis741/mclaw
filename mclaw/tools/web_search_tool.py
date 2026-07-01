@@ -2,7 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Web Search Tool — thin wrapper around mclaw.tools.search.router.execute_search."""
+"""Tool-facing web search registration and availability diagnostics.
+
+The router owns backend selection. This layer keeps the model-facing schema,
+credential diagnostics, and result envelope stable for the tool registry.
+"""
 
 from __future__ import annotations
 
@@ -10,6 +14,7 @@ import json
 import logging
 from typing import Any
 
+from mclaw.cli.config import ConfigError
 from mclaw.tools.registry import registry, tool_error
 from mclaw.tools.search.config import load_search_config
 from mclaw.tools.search.credentials import dashscope_creds_ok, tavily_creds_ok
@@ -18,9 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 def diagnose_web_search_requirements(config: dict | None = None) -> dict:
+    """Return registry diagnostics without exposing credential values."""
     try:
         search_config = load_search_config(config=config)
-    except Exception as exc:
+    except ConfigError as exc:
         return {"available": False, "reason": f"web search config check failed: {type(exc).__name__}: {exc}", "fix": "Check auxiliary.web_search config."}
 
     backend = search_config.backend
@@ -55,8 +61,8 @@ def check_web_search_requirements(config: dict | None = None) -> bool:
     """Return True if the configured search backend can run."""
     try:
         search_config = load_search_config(config=config)
-    except Exception:
-        search_config = load_search_config(config={})
+    except ConfigError:
+        return False
 
     backend = search_config.backend
     fallback = search_config.fallback
@@ -82,7 +88,7 @@ def web_search(
     images: bool = False,
     parent_agent=None,
 ) -> str:
-    """Search the web using the configured search backend.
+    """Search the web through the configured backend router.
 
     Args:
         query: Search query string.
@@ -90,7 +96,7 @@ def web_search(
         freshness: Only results from last N days (7/30/180/365).
         sites: Comma-separated list of domains to restrict to.
         images: Include images in the response.
-        parent_agent: Optional parent agent for credential inheritance.
+        parent_agent: Optional parent agent for config and credential scoping.
 
     Returns:
         JSON string with {success, results, _hint?}.
@@ -107,25 +113,38 @@ def web_search(
 
     from mclaw.tools.search.router import execute_search
 
-    result = execute_search(
-        query=query,
-        strategy=strategy,
-        freshness=freshness,
-        sites=sites,
-        images=images,
-        parent_agent=parent_agent,
-    )
+    try:
+        result = execute_search(
+            query=query,
+            strategy=strategy,
+            freshness=freshness,
+            sites=sites,
+            images=images,
+            parent_agent=parent_agent,
+        )
+    except ConfigError as exc:
+        return tool_error(f"Configuration error: {exc}", success=False)
 
     if not result.get("success"):
-        return tool_error(result.get("results", "Search failed"), success=False)
+        return tool_error(
+            result.get("results", "Search failed"),
+            success=False,
+            backend=result.get("_backend", ""),
+            hint=result.get("_hint", ""),
+            fallback_from=result.get("_fallback_from", ""),
+            fallback_error=result.get("_fallback_error", ""),
+        )
 
     payload: dict[str, Any] = {"success": True, "results": result.get("results", "")}
-    backend = result.get("_backend")
-    if backend:
-        payload["_backend"] = backend
-    hint = result.get("_hint")
-    if hint:
-        payload["_hint"] = hint
+    for src_key, dst_key in (
+        ("_backend", "_backend"),
+        ("_hint", "_hint"),
+        ("_fallback_from", "_fallback_from"),
+        ("_fallback_error", "_fallback_error"),
+    ):
+        value = result.get(src_key)
+        if value:
+            payload[dst_key] = value
 
     logger.info("Web search completed (%d chars)", len(payload["results"]))
     return json.dumps(payload, ensure_ascii=False)
@@ -139,7 +158,7 @@ WEB_SEARCH_SCHEMA = {
         "name": "web_search",
         "description": (
             "Search the web for real-time information using the configured backend "
-            "(DashScope/Qwen or Tavily). Returns a comprehensive answer with source citations — this result "
+            "(DashScope/Qwen or Tavily). Returns a comprehensive answer with source citations - this result "
             "is usually sufficient to answer the user's question.\n\n"
             "DO NOT call browser_navigate or browser_snapshot after using this tool "
             "to fetch the same information again. The search result already aggregates "
@@ -154,7 +173,7 @@ WEB_SEARCH_SCHEMA = {
             "- turbo (default): fast, good for quick facts\n"
             "- max: thorough multi-source verification\n"
             "- agent: multi-round retrieval for complex questions\n\n"
-            "Results include citation markers like [1], [2] — preserve these in your response."
+            "Results include citation markers like [1], [2] - preserve these in your response."
         ),
         "parameters": {
             "type": "object",
@@ -211,7 +230,7 @@ registry.register(
     handler=_handle_web_search,
     check_fn=check_web_search_requirements,
     diagnose_fn=diagnose_web_search_requirements,
-    description="联网搜索实时信息",
+    description="Search the web for current information",
     emoji="🌐",
     max_result_size_chars=15_000,
 )

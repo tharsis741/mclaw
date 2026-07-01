@@ -2,7 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Channel-specific model context prompt builders."""
+"""Channel-specific model context prompt builders.
+
+These helpers add runtime channel constraints without exposing raw platform
+identifiers or duplicating the main system prompt.
+"""
 
 from __future__ import annotations
 
@@ -17,7 +21,7 @@ def build_channel_context(
     user_name: str = "",
     chat_type: str = "",
 ) -> str:
-    """Build the extra system context for a channel turn."""
+    """Build extra system context for a channel turn."""
     if channel == "weixin":
         return build_weixin_channel_context(user_id=user_id)
     if channel == "dingtalk":
@@ -30,6 +34,7 @@ def build_channel_context(
 
 
 def build_weixin_channel_context(*, user_id: str = "") -> str:
+    """Build Weixin-private-chat context with a hashed user label."""
     safe_user = hashlib.sha256((user_id or "").encode("utf-8")).hexdigest()[:12]
     return (
         "## 当前渠道\n"
@@ -45,6 +50,7 @@ def build_dingtalk_channel_context(
     user_name: str = "",
     user_id: str = "",
 ) -> str:
+    """Build DingTalk context that nudges the model toward channel send tools."""
     display_chat_type = "private chat" if chat_type == "dm" else chat_type
     return (
         "## 当前渠道\n"

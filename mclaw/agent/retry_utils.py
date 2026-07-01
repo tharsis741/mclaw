@@ -19,6 +19,7 @@ def jittered_backoff(
     max_delay: float = 120.0,
     jitter_ratio: float = 0.5,
 ) -> float:
+    """Return capped exponential delay with per-call jitter for API retries."""
     global _jitter_counter
     with _jitter_lock:
         _jitter_counter += 1
@@ -40,6 +41,7 @@ RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 529}
 
 
 def is_retryable_error(exc: Exception) -> bool:
+    """Classify OpenAI and Anthropic transient failures for retry loops."""
     import openai
     import anthropic
     if isinstance(exc, (openai.RateLimitError, anthropic.RateLimitError)):

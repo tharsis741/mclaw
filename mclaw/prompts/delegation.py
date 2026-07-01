@@ -8,7 +8,11 @@ from __future__ import annotations
 
 
 def build_delegate_synthesis_extra_system() -> str:
-    """Return the extra system prompt used when parent turns resume after child agents finish."""
+    """Return the recovery prompt appended after delegated child agents finish.
+
+    The text keeps the parent turn responsible for unfinished work instead of
+    treating child-agent output as an automatic final answer.
+    """
     return (
         "当前是子代理结果回传后的继续阶段。"
         "先用子代理结果判断原始用户任务还缺什么。"

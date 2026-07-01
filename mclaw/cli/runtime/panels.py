@@ -19,12 +19,16 @@ PanelCellRole = Literal["primary", "muted", "accent", "success", "warning", "dan
 
 @dataclass(frozen=True)
 class PanelCell:
+    """One rendered cell plus semantic color role for table-like panels."""
+
     text: str
     role: PanelCellRole = "default"
 
 
 @dataclass(frozen=True)
 class PanelColumn:
+    """Renderer-neutral table column metadata."""
+
     label: str
     role: PanelColumnRole = "default"
     no_wrap: bool = False
@@ -35,6 +39,8 @@ class PanelColumn:
 
 @dataclass(frozen=True)
 class PanelBlock:
+    """A typed panel content block consumed by frontend renderers."""
+
     kind: PanelBlockKind
     text: str = ""
     text_format: PanelTextFormat = "plain"
@@ -46,12 +52,15 @@ class PanelBlock:
 
 @dataclass(frozen=True)
 class PanelModel:
+    """Complete command-output panel independent of Rich or terminal widgets."""
+
     title: str
     blocks: tuple[PanelBlock, ...] = field(default_factory=tuple)
     tone: PanelTone = "info"
     namespace: str = "command"
 
     def with_block(self, block: PanelBlock) -> "PanelModel":
+        """Return a copy with one extra block, preserving tone and namespace."""
         return PanelModel(
             title=self.title,
             blocks=(*self.blocks, block),

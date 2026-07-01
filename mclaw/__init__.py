@@ -2,6 +2,6 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""M-Claw — Cross-platform desktop CLI AI Agent."""
+"""M-Claw robot agent runtime for M-Robots OS."""
 
 __version__ = "1.0.0"

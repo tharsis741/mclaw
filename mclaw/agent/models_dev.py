@@ -5,8 +5,8 @@
 """models.dev registry integration for provider model metadata.
 
 The module uses an offline-first lookup path: one-hour memory cache, disk cache,
-then the public models.dev registry. It only resolves provider/model metadata
-such as context length; provider detection and CLI model listing live elsewhere.
+then the public models.dev registry. It resolves provider metadata for context
+length detection, setup model choices, and runtime model catalog views.
 """
 
 from __future__ import annotations
@@ -14,9 +14,13 @@ from __future__ import annotations
 import json
 import logging
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any
 
+import requests
+
+from mclaw.cli.provider_profiles import resolve_models_dev_provider as _resolve_profile_provider
 from mclaw.constants import get_mclaw_home
 
 logger = logging.getLogger(__name__)
@@ -25,130 +29,87 @@ MODELS_DEV_URL = "https://models.dev/api.json"
 _MODELS_DEV_CACHE_TTL = 3600  # one-hour in-memory cache
 
 # In-memory cache.
-_models_dev_cache: Dict[str, Any] = {}
+_models_dev_cache: dict[str, Any] = {}
 _models_dev_cache_time: float = 0
 
-# Default mapping from M-Claw provider names to models.dev provider IDs.
-# Multi-interface providers, such as Kimi API vs. Kimi Coding Plan, use the
-# finer-grained profile mapping in mclaw.cli.provider_profiles.
-PROVIDER_TO_MODELS_DEV: Dict[str, str] = {
-    "openrouter": "openrouter",
-    "anthropic": "anthropic",
-    "deepseek": "deepseek",
-    "baidu": "qianfan",
-    "tencent": "hunyuan",
-    "xiaomi": "xiaomi",
-    "groq": "groq",
-    "meta": "llama",
-    "mistral": "mistral",
-    "microsoft": "azure",
-    "cohere": "cohere",
-    "amazon": "amazon-bedrock",
-    "together": "togetherai",
-    "perplexity": "perplexity",
-    "fireworks": "fireworks-ai",
-    "deepinfra": "deepinfra",
-    "moonshot": "moonshotai",
-    "minimax": "minimax",
-    "minimax-cn": "minimax-cn",
-    "zhipu": "zhipuai",
-    "qwen": "alibaba",
-    "google": "google",
-    "openai": "openai",
-    "azure": "azure",
-    "xai": "xai",
-    "gemini": "google",
-    "yi": "yi",
-    "stepfun": "stepfun",
-    "baichuan": "baichuan",
-    "doubao": "bytedance",
-    "siliconflow": "siliconflow",
-    "ollama": "ollama",
-}
+
+def _providers_data(registry: dict[str, Any]) -> dict[str, Any]:
+    """Return the current models.dev root-level provider mapping."""
+    return {
+        key: value
+        for key, value in registry.items()
+        if isinstance(value, dict) and isinstance(value.get("models"), dict)
+    }
 
 
-def _providers_data(registry: Dict[str, Any]) -> Dict[str, Any]:
-    """Return provider mapping for both old and current models.dev shapes."""
-    merged: Dict[str, Any] = {}
-    for key, value in registry.items():
-        if key == "providers":
-            continue
-        if isinstance(value, list) or (isinstance(value, dict) and "models" in value):
-            merged[key] = value
-
-    providers = registry.get("providers")
-    if isinstance(providers, dict):
-        merged.update(providers)
-    return merged
+def _iter_models(provider_entry: Any) -> Iterator[dict[str, Any]]:
+    """Yield model dictionaries from one current models.dev provider entry."""
+    if not isinstance(provider_entry, dict):
+        return
+    models = provider_entry.get("models", {})
+    if not isinstance(models, dict):
+        return
+    yield from (m for m in models.values() if isinstance(m, dict))
 
 
-def _iter_models(provider_entry: Any):
-    """Yield model dicts from old list shape or current dict shape."""
-    if isinstance(provider_entry, dict):
-        models = provider_entry.get("models", [])
-        if isinstance(models, dict):
-            yield from (m for m in models.values() if isinstance(m, dict))
-        elif isinstance(models, list):
-            yield from (m for m in models if isinstance(m, dict))
-    elif isinstance(provider_entry, list):
-        yield from (m for m in provider_entry if isinstance(m, dict))
+def _model_id(model: dict[str, Any]) -> str:
+    return str(model.get("id") or "").lower()
 
 
-def _model_id(model: Dict[str, Any]) -> str:
-    return str(model.get("id") or model.get("model_id") or "").lower()
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        length = int(value)
+    except (TypeError, ValueError):
+        return None
+    return length if length > 0 else None
 
 
-def _extract_context_length(model: Dict[str, Any]) -> Optional[int]:
-    """Extract context length from historical and current metadata shapes."""
-    direct = (
-        model.get("context_length")
-        or model.get("context_window")
-        or model.get("max_tokens")
-        or model.get("max_position_embeddings")
-        or model.get("max_input_tokens")
-    )
-    if direct:
-        return int(direct)
-
+def _extract_context_length(model: dict[str, Any]) -> int | None:
+    """Extract context length from the current models.dev limit metadata."""
     limit = model.get("limit")
     if isinstance(limit, dict):
-        ctx = limit.get("context") or limit.get("context_length") or limit.get("input")
+        ctx = limit.get("context")
         if ctx:
-            return int(ctx)
-
-    limits = model.get("limits")
-    if isinstance(limits, dict):
-        ctx = limits.get("context") or limits.get("context_length") or limits.get("input")
-        if ctx:
-            return int(ctx)
-
+            return _coerce_positive_int(ctx)
     return None
 
 
+def _response_json_object(resp: requests.Response) -> dict[str, Any]:
+    """Validate the registry protocol boundary before cache mutation."""
+    data = resp.json()
+    if not isinstance(data, dict):
+        raise ValueError("models.dev registry response must be a JSON object")
+    return data
+
+
 def _get_cache_path() -> Path:
+    """Return the user-scoped models.dev cache path."""
     return get_mclaw_home() / "models_dev_cache.json"
 
 
-def _load_disk_cache() -> Dict[str, Any]:
+def _load_disk_cache() -> dict[str, Any]:
+    """Read the offline registry cache, treating unreadable data as a miss."""
     try:
         path = _get_cache_path()
         if path.exists():
-            return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as e:
-        logger.debug("Failed to load models.dev disk cache: %s", e)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.debug("Failed to load models.dev disk cache: %s", exc)
     return {}
 
 
-def _save_disk_cache(data: Dict[str, Any]) -> None:
+def _save_disk_cache(data: dict[str, Any]) -> None:
+    """Persist fresh registry data without making lookup callers depend on disk I/O."""
     try:
         path = _get_cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    except Exception as e:
-        logger.debug("Failed to save models.dev disk cache: %s", e)
+    except (OSError, TypeError) as exc:
+        logger.debug("Failed to save models.dev disk cache: %s", exc)
 
 
-def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
+def fetch_models_dev(force_refresh: bool = False) -> dict[str, Any]:
     """Fetch models.dev registry.
 
     Resolution order:
@@ -170,34 +131,30 @@ def fetch_models_dev(force_refresh: bool = False) -> Dict[str, Any]:
 
     # Then try a short network fetch.
     try:
-        import requests
         resp = requests.get(MODELS_DEV_URL, timeout=3)
         if resp.status_code == 200:
-            data = resp.json()
+            data = _response_json_object(resp)
             _models_dev_cache = data
             _models_dev_cache_time = time.time()
             _save_disk_cache(data)
             logger.debug("models.dev fetched from network, cached")
             return data
-    except Exception as e:
-        logger.debug("models.dev network fetch failed: %s", e)
+    except (requests.RequestException, ValueError) as exc:
+        logger.debug("models.dev network fetch failed: %s", exc)
 
     return _models_dev_cache or {}
 
 
-def refresh_models_dev_cache(*, timeout: int = 10) -> Dict[str, Any]:
+def refresh_models_dev_cache(*, timeout: int = 10) -> dict[str, Any]:
     """Force-refresh the models.dev disk cache from the network.
 
-    Returns a small status dict suitable for CLI rendering.  Unlike
-    ``fetch_models_dev(force_refresh=True)``, this function reports whether the
-    network refresh actually succeeded instead of silently falling back to stale
-    cache data.
+    Returns a small status dict suitable for CLI rendering, including whether
+    fresh network data replaced the existing cache.
     """
     global _models_dev_cache, _models_dev_cache_time
 
     path = _get_cache_path()
     try:
-        import requests
         resp = requests.get(MODELS_DEV_URL, timeout=timeout)
         if resp.status_code != 200:
             return {
@@ -206,7 +163,7 @@ def refresh_models_dev_cache(*, timeout: int = 10) -> Dict[str, Any]:
                 "cache_path": str(path),
                 **_registry_stats(_models_dev_cache or _load_disk_cache()),
             }
-        data = resp.json()
+        data = _response_json_object(resp)
         _models_dev_cache = data
         _models_dev_cache_time = time.time()
         _save_disk_cache(data)
@@ -215,7 +172,7 @@ def refresh_models_dev_cache(*, timeout: int = 10) -> Dict[str, Any]:
             "cache_path": str(path),
             **_registry_stats(data),
         }
-    except Exception as exc:
+    except (requests.RequestException, ValueError) as exc:
         return {
             "ok": False,
             "error": str(exc),
@@ -224,7 +181,8 @@ def refresh_models_dev_cache(*, timeout: int = 10) -> Dict[str, Any]:
         }
 
 
-def _registry_stats(registry: Dict[str, Any]) -> Dict[str, int]:
+def _registry_stats(registry: dict[str, Any]) -> dict[str, int]:
+    """Summarize a registry snapshot for CLI refresh status payloads."""
     providers_data = _providers_data(registry or {})
     model_count = 0
     for provider_data in providers_data.values():
@@ -235,7 +193,7 @@ def _registry_stats(registry: Dict[str, Any]) -> Dict[str, int]:
     }
 
 
-def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
+def lookup_models_dev_context(provider: str, model: str) -> int | None:
     """Look up context_length for a specific (provider, model) pair.
 
     Returns None if not found in models.dev registry.
@@ -244,7 +202,6 @@ def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
     registry = fetch_models_dev()
     providers_data = _providers_data(registry)
 
-    # models.dev structure: {"providers": {"openai": {"models": [...]}}}
     model_lower = model.lower()
     for m in _iter_models(providers_data.get(dev_provider, {})):
         if _model_id(m) == model_lower:
@@ -252,29 +209,9 @@ def lookup_models_dev_context(provider: str, model: str) -> Optional[int]:
     return None
 
 
-def get_model_info_any_provider(model_id: str) -> Optional[Dict[str, Any]]:
-    """Search all providers in models.dev for a model by ID.
-
-    Returns the raw model dict or None.
-    """
-    registry = fetch_models_dev()
-    providers_data = _providers_data(registry)
-    model_lower = model_id.lower()
-    for provider_data in providers_data.values():
-        for m in _iter_models(provider_data):
-            if _model_id(m) == model_lower:
-                return m
-    return None
-
-
 def resolve_models_dev_provider(provider: str, profile_id: str = "") -> str:
     """Resolve M-Claw provider/profile to a raw models.dev provider id."""
-    try:
-        from mclaw.cli.provider_profiles import resolve_models_dev_provider as _resolve_profile_provider
-
-        return _resolve_profile_provider(provider, profile_id)
-    except Exception:
-        return PROVIDER_TO_MODELS_DEV.get(provider, provider)
+    return _resolve_profile_provider(provider, profile_id)
 
 
 def list_models_dev_provider(provider_id: str, *, limit: int = 20) -> list[str]:
@@ -288,7 +225,7 @@ def list_models_dev_provider(provider_id: str, *, limit: int = 20) -> list[str]:
     models: list[str] = []
     seen = set()
     for m in _iter_models(provider_data):
-        model_id = str(m.get("id") or m.get("model_id") or "").strip()
+        model_id = str(m.get("id") or "").strip()
         if not model_id:
             continue
         key = model_id.lower()

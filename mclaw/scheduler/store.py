@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""SQLite persistence layer for scheduler state."""
+"""SQLite persistence layer for scheduler state.
+
+Scheduler data lives beside session data and reuses ``SessionDB`` locking and
+write execution. This keeps job claiming, run updates, and target pairing
+transitions transactional without giving the scheduler its own connection model.
+"""
 
 from __future__ import annotations
 
@@ -12,8 +17,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from mclaw.scheduler.ids import new_pairing_code, new_run_id
+from mclaw.scheduler.ids import new_pairing_code, new_run_id, normalize_pairing_code
 from mclaw.scheduler.models import (
+    _CONCURRENCY_POLICIES,
+    _JOB_STATUSES,
+    _ROUTE_STATUSES,
+    _SESSION_POLICIES,
+    _TARGET_TYPES,
+    _coerce_bool,
+    _coerce_enum,
+    _coerce_float,
+    _coerce_int,
+    _coerce_mapping,
+    _coerce_optional_float,
+    _coerce_string_list,
     DeliverySpec,
     ScheduleSpec,
     SchedulerJob,
@@ -25,27 +42,10 @@ from mclaw.scheduler.models import (
 from mclaw.scheduler.triggers import next_run_after
 from mclaw.state import SessionDB
 
-_RUN_COLUMNS = (
-    "id",
-    "job_id",
-    "run_no",
-    "status",
-    "claimed_by",
-    "scheduled_for",
-    "started_at",
-    "finished_at",
-    "session_id",
-    "output_path",
-    "final_response",
-    "error",
-    "delivery_result_json",
-    "token_usage_json",
-    "tool_calls_json",
-    "created_at",
-)
-
 
 class SchedulerStore:
+    """Repository for jobs, runs, delivery targets, and pairing requests."""
+
     def __init__(self, session_db: SessionDB | None = None, db_path: str | Path | None = None) -> None:
         self.session_db = session_db or SessionDB(Path(db_path) if db_path else None)
         self._conn = self.session_db._conn
@@ -54,6 +54,7 @@ class SchedulerStore:
         self.ensure_local_target()
 
     def ensure_local_target(self) -> SchedulerTarget:
+        """Create the built-in local delivery target when the database is empty."""
         now = time.time()
         existing = self.get_target("local")
         if existing:
@@ -88,7 +89,7 @@ class SchedulerStore:
             if job is None:
                 raise KeyError(job_id)
             return job
-        updates["updated_at"] = patch.get("updated_at", time.time())
+        updates["updated_at"] = _coerce_float(patch.get("updated_at", time.time()), time.time(), field="job.updated_at", min_value=0)
         assignments = ", ".join(f"{key} = ?" for key in updates)
         values = list(updates.values())
 
@@ -158,6 +159,7 @@ class SchedulerStore:
         return [SchedulerJob.from_row(row) for row in rows]
 
     def claim_job(self, job_id: str, worker_id: str, now: float) -> SchedulerRun | None:
+        """Atomically claim a due job and create its running run record."""
         def _do(conn: sqlite3.Connection) -> SchedulerRun | None:
             job_row = conn.execute("SELECT * FROM scheduler_jobs WHERE id = ?", (job_id,)).fetchone()
             if not job_row:
@@ -200,6 +202,7 @@ class SchedulerStore:
         scheduled_for: float | None,
         now: float,
     ) -> SchedulerRun:
+        """Start an immediate or manual run and mark the job as running."""
         def _do(conn: sqlite3.Connection) -> SchedulerRun:
             run = self._build_run(
                 conn,
@@ -228,6 +231,7 @@ class SchedulerStore:
         return [SchedulerRun.from_row(row) for row in rows]
 
     def enqueue_run(self, job: SchedulerJob, *, scheduled_for: float | None, now: float) -> SchedulerRun:
+        """Persist a queued run for policies that serialize overlapping work."""
         def _do(conn: sqlite3.Connection) -> SchedulerRun:
             return self._build_run(
                 conn,
@@ -265,6 +269,7 @@ class SchedulerStore:
         return self._execute_write(_do)
 
     def claim_queued_run(self, worker_id: str, now: float) -> SchedulerRun | None:
+        """Claim the oldest queued run whose job has no active running attempt."""
         def _do(conn: sqlite3.Connection) -> SchedulerRun | None:
             row = conn.execute(
                 """
@@ -299,6 +304,7 @@ class SchedulerStore:
         return self._execute_write(_do)
 
     def cancel_active_runs(self, job_id: str, *, reason: str, now: float) -> int:
+        """Cancel running or queued attempts for a job without deleting history."""
         def _do(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
                 """
@@ -313,6 +319,7 @@ class SchedulerStore:
         return self._execute_write(_do)
 
     def finish_run(self, run: SchedulerRun, *, job_patch: dict[str, Any]) -> None:
+        """Persist final run output and related job state in one write step."""
         run_row = run.to_row()
         run_updates = {
             key: run_row[key]
@@ -333,7 +340,7 @@ class SchedulerStore:
         }
         job_updates = self._job_patch_to_row(job_patch)
         if job_patch:
-            job_updates["updated_at"] = job_patch.get("updated_at", time.time())
+            job_updates["updated_at"] = _coerce_float(job_patch.get("updated_at", time.time()), time.time(), field="job.updated_at", min_value=0)
 
         def _do(conn: sqlite3.Connection) -> None:
             assignments = ", ".join(f"{key} = ?" for key in run_updates)
@@ -350,17 +357,26 @@ class SchedulerStore:
 
         self._execute_write(_do)
 
-    def recover_stale_runs(self, stale_before: float) -> int:
+    def recover_stale_runs(self, stale_before: float, *, active_run_ids: set[str] | None = None) -> int:
+        """Fail abandoned running rows while preserving caller-known active runs."""
         now = time.time()
+        active_ids = {str(run_id) for run_id in (active_run_ids or set()) if run_id}
 
         def _do(conn: sqlite3.Connection) -> int:
+            active_filter = ""
+            params: list[Any] = [now, float(stale_before)]
+            if active_ids:
+                placeholders = ", ".join("?" for _ in active_ids)
+                active_filter = f" AND id NOT IN ({placeholders})"
+                params.extend(sorted(active_ids))
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE scheduler_runs
                 SET status = 'failed', finished_at = ?, error = 'stale run recovered'
                 WHERE status = 'running' AND COALESCE(started_at, created_at) < ?
+                {active_filter}
                 """,
-                (now, float(stale_before)),
+                tuple(params),
             )
             recovered = cursor.rowcount
             conn.execute(
@@ -398,8 +414,10 @@ class SchedulerStore:
     def create_target(self, target: SchedulerTarget) -> SchedulerTarget:
         row = target.to_row()
         now = time.time()
-        row.setdefault("first_seen_at", now)
-        row.setdefault("last_seen_at", now)
+        if not row.get("first_seen_at"):
+            row["first_seen_at"] = now
+        if not row.get("last_seen_at"):
+            row["last_seen_at"] = now
         row["updated_at"] = now
 
         def _do(conn: sqlite3.Connection) -> SchedulerTarget:
@@ -423,7 +441,7 @@ class SchedulerStore:
 
     def update_target(self, target_id: str, patch: dict[str, Any]) -> SchedulerTarget:
         updates = self._target_patch_to_row(patch)
-        updates["updated_at"] = patch.get("updated_at", time.time())
+        updates["updated_at"] = _coerce_float(patch.get("updated_at", time.time()), time.time(), field="target.updated_at", min_value=0)
         assignments = ", ".join(f"{key} = ?" for key in updates)
 
         def _do(conn: sqlite3.Connection) -> SchedulerTarget:
@@ -452,9 +470,13 @@ class SchedulerStore:
         row = pairing.to_row()
         if not row.get("code"):
             row["code"] = new_pairing_code()
+        else:
+            row["code"] = normalize_pairing_code(row["code"])
         now = time.time()
-        row.setdefault("created_at", now)
-        row.setdefault("updated_at", now)
+        if not row.get("created_at"):
+            row["created_at"] = now
+        if not row.get("updated_at"):
+            row["updated_at"] = now
 
         def _do(conn: sqlite3.Connection) -> SchedulerTargetPairing:
             _insert_row(conn, "scheduler_target_pairings", row)
@@ -465,11 +487,14 @@ class SchedulerStore:
         return self._execute_write(_do)
 
     def get_pairing(self, code: str) -> SchedulerTargetPairing | None:
+        code = normalize_pairing_code(code)
         with self._lock:
             row = self._conn.execute("SELECT * FROM scheduler_target_pairings WHERE code = ?", (code,)).fetchone()
         return SchedulerTargetPairing.from_row(row) if row else None
 
     def bind_pairing(self, code: str, *, target: SchedulerTarget) -> SchedulerTargetPairing:
+        """Bind a waiting pairing code to a routable target transactionally."""
+        code = normalize_pairing_code(code)
         now = time.time()
 
         def _do(conn: sqlite3.Connection) -> SchedulerTargetPairing:
@@ -517,10 +542,10 @@ class SchedulerStore:
         return self._execute_write(_do)
 
     def fail_pairing(self, code: str, *, error: str) -> SchedulerTargetPairing:
-        return self._set_pairing_status(code, status="failed", error=error)
+        return self._set_pairing_status(normalize_pairing_code(code), status="failed", error=error)
 
     def cancel_pairing(self, code: str, *, reason: str = "cancelled_by_user") -> SchedulerTargetPairing:
-        return self._set_pairing_status(code, status="cancelled", error=reason)
+        return self._set_pairing_status(normalize_pairing_code(code), status="cancelled", error=reason)
 
     def expire_pairings(self, now: float) -> int:
         def _do(conn: sqlite3.Connection) -> int:
@@ -566,6 +591,7 @@ class SchedulerStore:
         finished_at: float | None = None,
         error: str = "",
     ) -> SchedulerRun:
+        """Allocate a per-job run number and insert the run within a write transaction."""
         row = conn.execute("SELECT COALESCE(MAX(run_no), 0) + 1 AS next_no FROM scheduler_runs WHERE job_id = ?", (job_id,)).fetchone()
         run = SchedulerRun(
             id=new_run_id(),
@@ -589,6 +615,7 @@ class SchedulerStore:
         return run
 
     def _job_patch_to_row(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Validate job patch fields and translate API names to table columns."""
         result: dict[str, Any] = {}
         direct = {
             "name": "name",
@@ -611,7 +638,21 @@ class SchedulerStore:
             if key in patch:
                 value = patch[key]
                 if key == "enabled":
-                    value = 1 if value else 0
+                    value = 1 if _coerce_bool(value, True, field="job.enabled") else 0
+                elif key in {"next_run_at", "last_run_at"}:
+                    value = _coerce_optional_float(value, field=f"job.{key}", min_value=0)
+                elif key == "status":
+                    value = _coerce_enum(value, _JOB_STATUSES, "idle", field="job.status")
+                elif key == "session_policy":
+                    value = _coerce_enum(value, _SESSION_POLICIES, "task_thread", field="job.session_policy")
+                elif key in {"max_iterations", "timeout_seconds"}:
+                    value = _coerce_int(value, 200 if key == "max_iterations" else 3600, field=f"job.{key}", min_value=1)
+                elif key == "concurrency_policy":
+                    value = _coerce_enum(value, _CONCURRENCY_POLICIES, "skip", field="job.concurrency_policy")
+                elif key == "failure_count":
+                    value = _coerce_int(value, 0, field="job.failure_count", min_value=0)
+                elif key in {"created_at", "updated_at"}:
+                    value = _coerce_float(value, 0, field=f"job.{key}", min_value=0)
                 result[column] = value
         if "schedule" in patch:
             schedule = patch["schedule"]
@@ -620,7 +661,9 @@ class SchedulerStore:
             elif isinstance(schedule, dict):
                 result.update(ScheduleSpec.from_dict(schedule).to_row())
         if "enabled_toolsets" in patch:
-            result["enabled_toolsets_json"] = _json_dumps([str(item) for item in (patch.get("enabled_toolsets") or [])])
+            result["enabled_toolsets_json"] = _json_dumps(
+                _coerce_string_list(patch.get("enabled_toolsets"), field="job.enabled_toolsets")
+            )
         if "delivery" in patch:
             delivery = patch["delivery"]
             if isinstance(delivery, DeliverySpec):
@@ -630,6 +673,7 @@ class SchedulerStore:
         return result
 
     def _target_patch_to_row(self, patch: dict[str, Any]) -> dict[str, Any]:
+        """Validate target patch fields and translate API names to table columns."""
         result: dict[str, Any] = {}
         direct = {
             "type": "type",
@@ -646,11 +690,20 @@ class SchedulerStore:
         }
         for key, column in direct.items():
             if key in patch:
-                result[column] = 1 if key == "enabled" and patch[key] else patch[key]
+                value = patch[key]
+                if key == "type":
+                    value = _coerce_enum(value, _TARGET_TYPES, "local", field="target.type")
+                elif key == "route_status":
+                    value = _coerce_enum(value, _ROUTE_STATUSES, "ready", field="target.route_status")
+                elif key == "enabled":
+                    value = 1 if _coerce_bool(value, True, field="target.enabled") else 0
+                elif key in {"first_seen_at", "last_seen_at", "updated_at"}:
+                    value = _coerce_float(value, 0, field=f"target.{key}", min_value=0)
+                result[column] = value
         if "route_metadata" in patch:
-            result["route_metadata_json"] = _json_dumps(dict(patch.get("route_metadata") or {}))
+            result["route_metadata_json"] = _json_dumps(_coerce_mapping(patch.get("route_metadata"), field="target.route_metadata"))
         if "capabilities" in patch:
-            result["capabilities_json"] = _json_dumps(dict(patch.get("capabilities") or {}))
+            result["capabilities_json"] = _json_dumps(_coerce_mapping(patch.get("capabilities"), field="target.capabilities"))
         return result
 
 

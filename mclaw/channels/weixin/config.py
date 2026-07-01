@@ -4,13 +4,14 @@
 
 """Load and validate Weixin channel configuration.
 
-The module normalizes config/env values used by long polling, outbound message
-delivery, and optional media handling.
+The config object normalizes YAML and environment values while keeping the
+channel token behind the runtime scoped-secret boundary.
 """
 
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -20,13 +21,17 @@ from mclaw.constants import display_mclaw_path
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 _WEIXIN_REQUIRED_FOR = "channel:weixin"
 
+logger = logging.getLogger(__name__)
+
 
 def _authorized_secret_env(name: str, get_raw) -> str:
+    """Return a secret environment value only when the Weixin scope is authorized."""
     try:
         from mclaw.runtime.features import authorized_env_value
 
         return authorized_env_value(_WEIXIN_REQUIRED_FOR, name, get_raw)
-    except Exception:
+    except Exception as exc:
+        logger.debug("Weixin scoped secret lookup failed for %s: %s", name, exc)
         return ""
 
 
@@ -69,13 +74,14 @@ def _coerce_float(value: Any, default: float) -> float:
 
 @dataclass
 class WeixinConfig:
+    """Normalized settings consumed by the Weixin runtime and media helpers."""
+
     enabled: bool = False
     account_id: str = ""
     token: str = ""
     base_url: str = ILINK_BASE_URL
     dm_policy: str = "open"
-    allow_from: list[str] = field(default_factory=list)
-    group_policy: str = "disabled"
+    allowed_users: list[str] = field(default_factory=list)
     session_scope: str = "user"
     max_message_length: int = 2000
     send_chunk_delay_seconds: float = 1.5
@@ -95,6 +101,7 @@ class WeixinConfig:
 
     @classmethod
     def from_config(cls, config: dict | None) -> "WeixinConfig":
+        """Build a runtime config from project config plus selected environment values."""
         root = config or {}
         channels = root.get("channels", {}) if isinstance(root.get("channels"), dict) else {}
         raw = channels.get("weixin", {}) if isinstance(channels.get("weixin"), dict) else {}
@@ -108,8 +115,7 @@ class WeixinConfig:
             token=str(_authorized_secret_env("WEIXIN_TOKEN", env) or "").strip(),
             base_url=str(raw.get("base_url") or env("WEIXIN_BASE_URL") or ILINK_BASE_URL).strip().rstrip("/"),
             dm_policy=str(raw.get("dm_policy") or env("WEIXIN_DM_POLICY") or "open").strip().lower(),
-            allow_from=_coerce_list(raw.get("allow_from") if raw.get("allow_from") is not None else env("WEIXIN_ALLOWED_USERS")),
-            group_policy=str(raw.get("group_policy") or "disabled").strip().lower(),
+            allowed_users=_coerce_list(raw.get("allowed_users") if raw.get("allowed_users") is not None else env("WEIXIN_ALLOWED_USERS")),
             session_scope=str(raw.get("session_scope") or "user").strip().lower(),
             max_message_length=_coerce_int(raw.get("max_message_length"), 2000),
             send_chunk_delay_seconds=_coerce_float(raw.get("send_chunk_delay_seconds"), 1.5),
@@ -125,10 +131,11 @@ class WeixinConfig:
             media_download_timeout_seconds=_coerce_float(raw.get("media_download_timeout_seconds"), 60.0),
             media_upload_timeout_seconds=_coerce_float(raw.get("media_upload_timeout_seconds"), 120.0),
             media_max_bytes=_coerce_int(raw.get("media_max_bytes"), 100 * 1024 * 1024),
-            toolsets=list(raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]),
+            toolsets=_coerce_list(raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]),
         )
 
     def validate(self) -> list[str]:
+        """Return user-facing configuration errors without exposing secret values."""
         errors: list[str] = []
         if not self.account_id:
             errors.append(f"WEIXIN_ACCOUNT_ID is required in {display_mclaw_path('.env')}")
@@ -136,8 +143,6 @@ class WeixinConfig:
             errors.append(f"WEIXIN_TOKEN is required in {display_mclaw_path('.env')}")
         if self.dm_policy not in {"open", "allowlist", "disabled"}:
             errors.append("channels.weixin.dm_policy must be one of: open, allowlist, disabled")
-        if self.group_policy != "disabled":
-            errors.append("channels.weixin.group_policy must remain disabled in the private-chat release")
         if self.session_scope not in {"chat", "user", "chat_user"}:
             errors.append("channels.weixin.session_scope must be one of: chat, user, chat_user")
         if self.media_download_timeout_seconds <= 0:

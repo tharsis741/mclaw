@@ -18,6 +18,7 @@ from mclaw.cli.slash_completer import slash_token_before_cursor
 
 
 def _trim_to_width(text: str, width: int) -> str:
+    """Trim display text by terminal cell width rather than Python character count."""
     if width <= 0:
         return ""
     result: list[str] = []
@@ -32,6 +33,7 @@ def _trim_to_width(text: str, width: int) -> str:
 
 
 def _pad_to_width(text: str, width: int) -> str:
+    """Right-pad text to a terminal cell width for prompt_toolkit fragments."""
     return text + " " * max(0, width - get_cwidth(text))
 
 
@@ -46,6 +48,7 @@ class SlashCompletionMenuControl(UIControl):
         return False
 
     def _visible_items(self):
+        """Return the scroll window for completions only while editing a slash token."""
         buffer = get_app().current_buffer
         state = buffer.complete_state
         if not state or not state.completions or slash_token_before_cursor(buffer.document) is None:
@@ -58,6 +61,7 @@ class SlashCompletionMenuControl(UIControl):
         return visible, selected, start, len(completions)
 
     def preferred_width(self, max_available_width: int) -> int | None:
+        """Reserve enough space for command and metadata columns without overlaying input."""
         visible, _selected, _start, _total = self._visible_items()
         if not visible:
             return min(max_available_width, 1)
@@ -69,6 +73,7 @@ class SlashCompletionMenuControl(UIControl):
         return min(max_available_height, self._max_height)
 
     def create_content(self, width: int, height: int) -> UIContent:
+        """Render completion rows as fixed-width command and metadata cells."""
         visible, selected, start, _total = self._visible_items()
         command_width = self._command_width(visible, width)
         meta_width = self._meta_width(command_width, width)
@@ -116,9 +121,8 @@ def build_classic_root_container(
     tray keeps the composer position stable while avoiding Float overlays that
     can cover the input in classic non-fullscreen mode.
 
-    Classic intentionally does not allocate a fake transcript body. Rich output
-    is written to terminal scrollback; a full-screen blank body would be redrawn
-    over those answers on every prompt_toolkit refresh.
+    Classic keeps terminal scrollback as the transcript. A placeholder body would
+    redraw over Rich-rendered answers on every prompt_toolkit refresh.
     """
 
     status_bar = Window(

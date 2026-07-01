@@ -2,11 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stable identifier helpers for scheduler job and run records."""
+"""ID helpers for scheduler rows."""
 
 from __future__ import annotations
 
-import random
+import secrets
 import uuid
 
 
@@ -23,4 +23,10 @@ def new_target_id(prefix: str = "target") -> str:
 
 
 def new_pairing_code() -> str:
-    return f"SC-{random.randint(100000, 999999)}"
+    """Return a short code intended for manual channel-target binding."""
+    return f"SC-{secrets.randbelow(900000) + 100000}"
+
+
+def normalize_pairing_code(value: str) -> str:
+    """Canonicalize pairing codes before persistence and lookup."""
+    return str(value or "").strip().upper()

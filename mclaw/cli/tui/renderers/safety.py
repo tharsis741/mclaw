@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Render rollback, checkpoint, and file-safety command output."""
+"""Rollback and checkpoint TUI rendering."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ class SafetyRenderer:
         self._panel_sink = panel_sink
 
     def render_panel_model(self, panel: PanelModel, *, border_style: str | None = None) -> None:
+        """Render a panel through the sink when tests or alternate shells provide one."""
         if self._panel_sink is not None:
             self._panel_sink(panel)
             return
@@ -53,6 +54,7 @@ class SafetyRenderer:
         )
 
     def render_rollback_groups(self, groups: list, workspace: str) -> None:
+        """Render user-facing rollback groups rather than raw journal operations."""
         if not groups:
             self.render_panel_model(PanelModel(
                 title="M-Claw 文件安全层 / Rollback",
@@ -115,6 +117,7 @@ class SafetyRenderer:
         ))
 
     def render_rollback_operations(self, operations: list, workspace: str) -> None:
+        """Render raw operation-level rollback entries for advanced inspection."""
         if not operations:
             self.render_panel_model(PanelModel(
                 title="M-Claw 文件安全层 / 底层操作",
@@ -130,7 +133,7 @@ class SafetyRenderer:
         for idx, op in enumerate(operations, 1):
             rows.append((
                 str(idx),
-                str(op.get("operation_id") or op.get("op_id") or "")[:8],
+                str(op.get("operation_id") or "")[:8],
                 self._action_label(op),
                 self._target_summary(op),
                 "可同步" if op.get("message_id_before_turn") is not None else "仅文件",
@@ -157,13 +160,14 @@ class SafetyRenderer:
                 spacer_block(),
                 section_block("命令"),
                 command_block([
-                    ("/rollback op <N>", "只撤销某一个底层操作"),
-                    ("/rollback op diff <N>", "查看某一个底层操作差异"),
+                    ("/rollback ops <N>", "只撤销某一个底层操作"),
+                    ("/rollback ops diff <N>", "查看某一个底层操作差异"),
                 ]),
             ),
         ))
 
     def render_project_checkpoints(self, checkpoints: list, workspace: str) -> None:
+        """Render raw checkpoint restore options with their broader restore risk."""
         meta_rows = [
             ("工作区", workspace or "当前目录"),
             ("类型", "原始 checkpoint，高级恢复入口"),
@@ -213,6 +217,7 @@ class SafetyRenderer:
         ))
 
     def render_project_restore_prompt(self, checkpoint_ref: str, file_path: str = "") -> None:
+        """Ask for explicit confirmation before raw checkpoint restore."""
         target = f" {file_path}" if file_path else ""
         self.render_panel_model(PanelModel(
             title="M-Claw 文件安全层 / 需要确认",
@@ -250,7 +255,7 @@ class SafetyRenderer:
                 ("扫描工作区", str(detail.get("scanned", 0))),
                 ("删除孤儿项", str(detail.get("deleted_orphan", 0))),
                 ("删除过期项", str(detail.get("deleted_stale", 0))),
-                ("释放空间", f"{int(detail.get('bytes_freed', 0) or 0)} bytes"),
+                ("释放空间", self._format_bytes(int(detail.get("bytes_freed", 0) or 0))),
                 ("错误", str(detail.get("errors", 0))),
             ]),),
         ))
@@ -274,8 +279,8 @@ class SafetyRenderer:
             namespace="file_safety",
             tone="success",
             blocks=(key_value_block([
-                ("已删除", str(bool(result.get("deleted")))),
-                ("释放空间", f"{int(result.get('bytes_freed', 0) or 0)} bytes"),
+                ("已删除", "是" if result.get("deleted") else "否"),
+                ("释放空间", self._format_bytes(int(result.get("bytes_freed", 0) or 0))),
             ]),),
         ))
 
@@ -289,8 +294,9 @@ class SafetyRenderer:
         ))
 
     def render_diff_result(self, result: dict) -> None:
+        """Render rollback diff output with context impact and bounded text length."""
         if not result.get("success"):
-            self.render_notice("Diff", str(result.get("error") or "diff failed"), kind="danger")
+            self.render_notice("Diff", str(result.get("error") or "差异生成失败"), kind="danger")
             return
         items = []
         impact = result.get("context_impact") or {}
@@ -336,14 +342,15 @@ class SafetyRenderer:
         ))
 
     def render_rollback_result(self, result: dict, *, grouped: bool = True, ref_label: str = "") -> None:
+        """Render the final rollback outcome, including conflicts and context changes."""
         rows = []
         if grouped:
             group = result.get("group") or {}
             count = len(group.get("operations") or []) or result.get("operation_count", 1)
             rows.append(("结果", f"已撤销第 {ref_label} 条变更，共处理 {count} 个文件操作。"))
         else:
-            op_id = (result.get("operation") or {}).get("operation_id") or (result.get("operation") or {}).get("op_id")
-            rows.append(("结果", f"已撤销底层操作 {op_id}。"))
+            operation_id = (result.get("operation") or {}).get("operation_id")
+            rows.append(("结果", f"已撤销底层操作 {operation_id}。"))
         if result.get("rollback_id"):
             rows.append(("反悔", "输入 /rollback undo 即可恢复撤销前状态。"))
         backups = result.get("conflict_backups") or []
@@ -389,7 +396,17 @@ class SafetyRenderer:
             return f"{date[-5:]} {clock}" if date else clock
         return text[:16]
 
+    @staticmethod
+    def _format_bytes(value: int) -> str:
+        size = max(0, int(value or 0))
+        if size < 1024:
+            return f"{size} B"
+        if size < 1024 * 1024:
+            return f"{size / 1024:.1f} KB"
+        return f"{size / (1024 * 1024):.1f} MB"
+
     def _rollback_group_label(self, operations: list) -> str:
+        """Summarize a group using user-facing action and target labels."""
         if not operations:
             return "未知变更"
         actions = [self._action_label(op) for op in operations]

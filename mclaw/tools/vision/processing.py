@@ -11,12 +11,11 @@ import logging
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-def _detect_image_mime_type(image_path: Path) -> Optional[str]:
+def _detect_image_mime_type(image_path: Path) -> str | None:
     """Return a MIME type when the file looks like a supported image."""
     try:
         with image_path.open("rb") as f:
@@ -45,6 +44,7 @@ def _detect_image_mime_type(image_path: Path) -> Optional[str]:
 
 
 def _rgb_for_jpeg(img):
+    """Convert image modes to JPEG-safe RGB while preserving transparency."""
     if img.mode == "RGB":
         return img
     if img.mode in ("RGBA", "LA") or "transparency" in img.info:
@@ -118,7 +118,8 @@ def _compress_image_if_needed(
         return image_path
 
 
-def _image_to_base64_data_url(image_path: Path, mime_type: Optional[str] = None) -> str:
+def _image_to_base64_data_url(image_path: Path, mime_type: str | None = None) -> str:
+    """Encode an image file into the data URL format expected by chat models."""
     data = image_path.read_bytes()
     encoded = base64.b64encode(data).decode("ascii")
     mime = mime_type or "image/jpeg"

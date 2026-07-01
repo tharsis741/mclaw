@@ -31,6 +31,7 @@ class RuntimeBackgroundCoordinator:
         self.hooks = hooks
 
     def drain_completion_events(self) -> None:
+        """Process all queued completion events before returning to chat input."""
         while True:
             event = self.hooks.pop_completion_event()
             if event is None:
@@ -38,6 +39,7 @@ class RuntimeBackgroundCoordinator:
             self._handle_event(event)
 
     def _handle_event(self, event: dict[str, Any]) -> None:
+        """Render the event and run one isolated background follow-up turn."""
         event_type = str(event.get("event_type") or "process_complete")
         cmd = str(event.get("command") or "")[:60]
         if event_type in {"process_complete", "watcher_complete"}:

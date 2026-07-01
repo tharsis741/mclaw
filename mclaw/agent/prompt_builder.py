@@ -10,14 +10,11 @@ disclosure: the system prompt lists installed Skills, and detailed instructions
 are loaded only when the model needs a specific Skill.
 """
 
-import hashlib
-import json
 import logging
 import threading
 from collections import OrderedDict
 from datetime import datetime
-from pathlib import Path
-from typing import Any, List, Optional, Set
+from typing import List, Optional, Set
 
 from mclaw.constants import get_mclaw_home, get_skills_dir
 from mclaw.platform import get_platform_info
@@ -28,6 +25,15 @@ logger = logging.getLogger(__name__)
 _SKILLS_PROMPT_CACHE_MAX = 8
 _SKILLS_PROMPT_CACHE: "OrderedDict[tuple, str]" = OrderedDict()
 _SKILLS_PROMPT_CACHE_LOCK = threading.Lock()
+SKILL_TOOL_NAMES = frozenset(
+    {
+        "skills_list",
+        "skill_tree",
+        "skill_view",
+        "skill_search",
+        "skill_manage",
+    }
+)
 
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
@@ -72,62 +78,14 @@ PLATFORM_HINTS = {
 }
 
 
-# ── Snapshot helpers (disk layer for skills prompt cache) ──────────────────
-
-_SNAPSHOT_VERSION = 4
-_SNAPSHOT_NAME = ".skills_prompt_snapshot.json"
-
-
-def _snapshot_path() -> Path:
-    return get_skills_dir() / _SNAPSHOT_NAME
-
-
-def _snapshot_hash(content: str, cache_key_tuple: tuple) -> str:
-    """Compute a combined hash of content and cache key for integrity."""
-    sig = f"{content}|{cache_key_tuple}"
-    return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:16]
-
-
-def _load_snapshot(cache_key_tuple: tuple) -> Optional[str]:
-    """Load skills prompt from disk snapshot if hash matches.
-
-    Returns None if snapshot is missing, corrupt, or version mismatch.
-    """
-    snap_path = _snapshot_path()
-    if not snap_path.exists():
-        return None
-    try:
-        data = json.loads(snap_path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    if data.get("version") != _SNAPSHOT_VERSION:
-        return None
-    expected_hash = _snapshot_hash(data.get("content", ""), cache_key_tuple)
-    if data.get("skills_hash") != expected_hash:
-        return None
-    return data.get("content")
-
-
-def _save_snapshot(cache_key_tuple: tuple, content: str) -> None:
-    """Write skills prompt snapshot to disk with version + hash."""
-    try:
-        snap_path = _snapshot_path()
-        sig = _snapshot_hash(content, cache_key_tuple)
-        data = {
-            "version": _SNAPSHOT_VERSION,
-            "skills_hash": sig,
-            "content": content,
-            "saved_at": datetime.now().isoformat(),
-        }
-        snap_path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-    except OSError:
-        pass  # snapshot is best-effort, non-critical
-
-
-def _available_skill_lines(config: "dict | None" = None) -> list[str]:
+def _available_skill_lines(
+    config: "dict | None" = None,
+    disabled: "set[str] | frozenset[str] | None" = None,
+) -> list[str]:
+    """Return enabled Skill index lines without loading full Skill instructions."""
     from mclaw.skills_hub.skill_store import list_skills
 
-    disabled = get_disabled_skill_names(config=config)
+    disabled = disabled if disabled is not None else get_disabled_skill_names(config=config)
     lines: list[str] = []
     for item in list_skills():
         name = str(item.get("name") or "").strip()
@@ -139,6 +97,7 @@ def _available_skill_lines(config: "dict | None" = None) -> list[str]:
 
 
 def build_skill_identity_prompt(skill_lines: list[str]) -> str:
+    """Build the installed-Skill index block used for progressive disclosure."""
     body = "\n".join(skill_lines)
     return (
         "## Skills\n\n"
@@ -167,6 +126,7 @@ def _available_tool_lines(available_tool_names: "list[str] | None") -> list[str]
 
 
 def build_available_tools_prompt(available_tool_names: "list[str] | None") -> str:
+    """Describe only the tools exposed to this session."""
     tool_lines = "\n".join(_available_tool_lines(available_tool_names))
     if not tool_lines:
         return ""
@@ -179,6 +139,7 @@ def build_available_tools_prompt(available_tool_names: "list[str] | None") -> st
 
 
 def build_skill_usage_prompt(*, has_skill_view: bool) -> str:
+    """Describe how the model should load and apply Skill instructions."""
     if not has_skill_view:
         return (
             "## 使用 Skill\n\n"
@@ -245,6 +206,7 @@ def build_skill_search_prompt(*, has_skill_search: bool) -> str:
 
 
 def build_secret_runtime_prompt(*, has_secret_request: bool) -> str:
+    """Describe scoped runtime credential requests when the secret tool is exposed."""
     if not has_secret_request:
         return ""
     return (
@@ -258,6 +220,7 @@ def build_secret_runtime_prompt(*, has_secret_request: bool) -> str:
 
 
 def build_delegation_prompt(*, has_delegate_task: bool) -> str:
+    """Describe when a task may be delegated to isolated subagents."""
     if not has_delegate_task:
         return ""
     return (
@@ -292,21 +255,19 @@ def build_skills_system_prompt(
     available_toolsets: "Set[str] | None" = None,
     config: "dict | None" = None,
 ) -> str:
-    """Build the Skill 2.0 prompt block from mclaw_skill.yaml index rows."""
-    exposed_tools = (
-        {"skills_list", "skill_tree", "skill_view", "skill_search", "skill_manage"}
-        if available_tools is None
-        else set(available_tools)
-    )
-    if not exposed_tools.intersection({"skills_list", "skill_tree", "skill_view", "skill_search", "skill_manage"}):
+    """Build the Skill prompt block from mclaw_skill.yaml index rows."""
+    exposed_tools = SKILL_TOOL_NAMES if available_tools is None else set(available_tools)
+    if not exposed_tools.intersection(SKILL_TOOL_NAMES):
         return ""
 
     skills_dir = get_skills_dir()
+    disabled_skill_names = frozenset(get_disabled_skill_names(config=config))
     cache_key = (
-        "skill2",
+        "skill_prompt",
         str(skills_dir.resolve()),
         tuple(sorted(exposed_tools)),
         tuple(sorted(available_toolsets or [])),
+        tuple(sorted(disabled_skill_names)),
     )
     with _SKILLS_PROMPT_CACHE_LOCK:
         cached = _SKILLS_PROMPT_CACHE.get(cache_key)
@@ -354,7 +315,7 @@ def build_skills_system_prompt(
     sections = [
         "# Skill 使用与维护规则",
         "",
-        build_skill_identity_prompt(_available_skill_lines(config=config)),
+        build_skill_identity_prompt(_available_skill_lines(config=config, disabled=disabled_skill_names)),
         "",
         "## 1. Skill 工具",
         "",
@@ -377,22 +338,13 @@ def build_skills_system_prompt(
         _SKILLS_PROMPT_CACHE.move_to_end(cache_key)
         while len(_SKILLS_PROMPT_CACHE) > _SKILLS_PROMPT_CACHE_MAX:
             _SKILLS_PROMPT_CACHE.popitem(last=False)
-    if result:
-        _save_snapshot(cache_key, result)
     return result
 
 
-def clear_skills_system_prompt_cache(clear_snapshot: bool = False) -> None:
-    """Clear the in-process skills prompt cache and optionally the disk snapshot."""
+def clear_skills_system_prompt_cache() -> None:
+    """Clear the in-process skills prompt cache."""
     with _SKILLS_PROMPT_CACHE_LOCK:
         _SKILLS_PROMPT_CACHE.clear()
-    if clear_snapshot:
-        snap = _snapshot_path()
-        if snap.exists():
-            try:
-                snap.unlink()
-            except OSError:
-                pass
 
 
 def load_soul_md() -> Optional[str]:
@@ -403,19 +355,8 @@ def load_soul_md() -> Optional[str]:
     try:
         content = soul_path.read_text(encoding="utf-8").strip()
         return content if content else None
-    except Exception:
+    except (OSError, UnicodeError):
         return None
-
-
-def _detect_runtime_shell(config: "dict | None" = None) -> tuple[str, str | None]:
-    """Return the shell used by terminal tool and an optional command hint."""
-    from mclaw.runtime.manager import RuntimeManager
-
-    runtime = RuntimeManager.current(config)
-    return (
-        f"{runtime.kind}:{runtime.shell.name}",
-        f"Commands execute through {runtime.kind} using {runtime.shell.name}.",
-    )
 
 
 def _build_platform_block(model: str = "", config: "dict | None" = None) -> str:
@@ -518,9 +459,7 @@ def build_system_prompt(
 
     # 6. Skills index — progressive disclosure (only when skills tools are available)
     if tool_names:
-        has_skills = any(
-            t in ("skills_list", "skill_tree", "skill_view", "skill_search", "skill_manage") for t in tool_names
-        )
+        has_skills = bool(SKILL_TOOL_NAMES.intersection(tool_names))
         if has_skills:
             skills_block = build_skills_system_prompt(
                 available_tools=tool_names,

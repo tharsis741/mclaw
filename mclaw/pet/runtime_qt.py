@@ -10,6 +10,7 @@ This module is imported only inside the sidecar process.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import time
@@ -25,6 +26,8 @@ REST_STATE = PetState.IDLE.value
 SLEEP_STATE = PetState.SLEEPING.value
 QUIET_REST_STATES = {PetState.IDLE.value, PetState.SLEEPING.value}
 QUIET_EVENTS = {"app_started"}
+
+logger = logging.getLogger(__name__)
 
 
 STATE_BY_EVENT = {
@@ -70,7 +73,7 @@ EVENT_MESSAGES = {
     "manual_state": "手动测试，状态切过去了！",
     "pet_clicked": "戳到我了，继续执行！",
     "position_reset": "位置已重置，我挪回默认位置！",
-    "file_dropped": "吃到文件了！我转给 MClaw 分析！",
+    "file_dropped": "吃到文件了！我转给 M-Claw 分析！",
 }
 
 STATE_MESSAGES = {
@@ -91,9 +94,11 @@ STATE_MESSAGES = {
 
 
 def run_pet(event_queue, command_queue, runtime_config: dict) -> None:
+    """Run the Qt event loop and bridge queue events into the pet window."""
     try:
         from PySide6 import QtCore, QtGui, QtWidgets
-    except Exception:
+    except Exception as exc:
+        logger.debug("PySide6 pet runtime import failed: %s", exc)
         return
 
     app = QtWidgets.QApplication([])
@@ -105,6 +110,7 @@ def run_pet(event_queue, command_queue, runtime_config: dict) -> None:
     window.show()
 
     def pump() -> None:
+        """Drain queued controller events without blocking the Qt UI thread."""
         while True:
             try:
                 raw = event_queue.get_nowait()
@@ -120,6 +126,7 @@ def run_pet(event_queue, command_queue, runtime_config: dict) -> None:
             window.handle_event(event)
 
     def watch_parent() -> None:
+        """Exit the sidecar when the owning M-Claw process disappears."""
         if not parent_watch.is_alive():
             _quit_pet(app, window)
 
@@ -137,6 +144,8 @@ def run_pet(event_queue, command_queue, runtime_config: dict) -> None:
 
 
 class _ParentProcessWatch:
+    """Track parent-process liveness across Windows and POSIX runtimes."""
+
     def __init__(self, parent_pid: int = 0):
         self.parent_pid = int(parent_pid or 0)
         self._windows_handle = _windows_open_process(self.parent_pid) if os.name == "nt" else None
@@ -153,14 +162,15 @@ class _ParentProcessWatch:
 
 
 def _parent_process_alive(parent_pid: int = 0) -> bool:
+    """Best-effort parent process probe that fails open on ambiguous errors."""
     try:
         import multiprocessing as _mp
 
         parent = _mp.parent_process()
         if parent is not None:
             return parent.is_alive()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Parent process probe failed: %s", exc)
 
     if not parent_pid:
         return True
@@ -175,7 +185,8 @@ def _parent_process_alive(parent_pid: int = 0) -> bool:
         return False
     except PermissionError:
         return True
-    except Exception:
+    except Exception as exc:
+        logger.debug("POSIX parent pid probe failed for %s: %s", parent_pid, exc)
         return True
 
 
@@ -187,7 +198,8 @@ def _windows_open_process(pid: int):
 
         kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         return kernel32.OpenProcess(0x101000, False, int(pid)) or None
-    except Exception:
+    except Exception as exc:
+        logger.debug("Windows OpenProcess failed for pet parent pid %s: %s", pid, exc)
         return None
 
 
@@ -206,7 +218,8 @@ def _windows_handle_alive(process) -> bool:
         if not kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
             return False
         return exit_code.value == 259
-    except Exception:
+    except Exception as exc:
+        logger.debug("Windows process handle probe failed: %s", exc)
         return False
 
 
@@ -215,8 +228,8 @@ def _windows_close_handle(process) -> None:
         import ctypes
 
         ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(process)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Windows CloseHandle failed: %s", exc)
 
 
 def _windows_pid_alive(pid: int) -> bool:
@@ -226,7 +239,8 @@ def _windows_pid_alive(pid: int) -> bool:
             import ctypes
 
             return ctypes.get_last_error() == 5
-        except Exception:
+        except Exception as exc:
+            logger.debug("Windows last-error probe failed: %s", exc)
             return False
     try:
         return _windows_handle_alive(process)
@@ -235,6 +249,7 @@ def _windows_pid_alive(pid: int) -> bool:
 
 
 def _quit_pet(app, window=None) -> None:
+    """Hide UI surfaces and request Qt application shutdown."""
     try:
         if window is not None:
             tray = getattr(window, "tray", None)
@@ -244,19 +259,22 @@ def _quit_pet(app, window=None) -> None:
             if widget is not None:
                 widget.hide()
                 widget.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Pet window close failed: %s", exc)
     try:
         app.quit()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("Pet application quit failed: %s", exc)
 
 
 def _drag_state_for_dx(dx: int) -> str:
+    """Map horizontal drag direction to a directional running animation."""
     return PetState.RUNNING_LEFT.value if dx < 0 else PetState.RUNNING_RIGHT.value
 
 
 class _PetWindow:
+    """Own the Qt widgets, animation state, tray menu, and sidecar commands."""
+
     def __init__(self, QtCore, QtGui, QtWidgets, asset_dir: Path, config: dict, command_queue=None):
         self.QtCore = QtCore
         self.QtGui = QtGui
@@ -335,6 +353,7 @@ class _PetWindow:
         self.window.show()
 
     def handle_event(self, event: PetEvent) -> None:
+        """Apply one runtime event to animation state and optional bubble text."""
         self._mark_activity()
         next_state = event.state or STATE_BY_EVENT.get(event.type)
         if next_state:
@@ -344,6 +363,7 @@ class _PetWindow:
         self._set_bubble(event)
 
     def set_state(self, state: str) -> None:
+        """Switch animation state, falling back to rest for unknown manifest states."""
         if state not in self.states:
             state = REST_STATE
         if state != self.state:
@@ -354,6 +374,7 @@ class _PetWindow:
             self._render_frame()
 
     def _advance(self) -> None:
+        """Advance animation frames and return non-looping states to rest."""
         if self._should_sleep():
             self.set_state(SLEEP_STATE)
             self._render_frame()
@@ -408,6 +429,7 @@ class _PetWindow:
         self.bubble_label.setVisible(bool(bubble_height))
 
     def _set_bubble(self, event: PetEvent) -> None:
+        """Show transient event text without changing animation ownership."""
         if not self.config.get("show_bubble", True):
             return
         state = event.state or STATE_BY_EVENT.get(event.type) or self.state
@@ -421,6 +443,7 @@ class _PetWindow:
             self.tray.setToolTip(f"M-Claw pet: {label}")
 
     def _refresh_bubble(self) -> None:
+        """Refresh or hide the bubble once event-specific text expires."""
         if not self.config.get("show_bubble", True):
             return
         if self.last_event_text and time.monotonic() < self.bubble_until:
@@ -475,6 +498,7 @@ class _PetWindow:
         return int(1000 / fps)
 
     def _place_window(self) -> None:
+        """Place the pet using saved position, explicit coordinates, or corner defaults."""
         remembered = _load_position()
         if remembered:
             self.window.move(remembered["x"], remembered["y"])
@@ -540,6 +564,7 @@ class _PetWindow:
             event.ignore()
 
     def _drop_event(self, event) -> None:
+        """Forward local file drops to the main process through the command queue."""
         self._mark_activity()
         paths = []
         for url in event.mimeData().urls():
@@ -558,8 +583,8 @@ class _PetWindow:
             return
         try:
             command_queue.put_nowait({"type": "file_drop", "paths": paths, "ts": time.time()})
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Pet file-drop command enqueue failed: %s", exc)
 
     def _context_menu(self, event) -> None:
         menu = self._build_menu()
@@ -609,8 +634,6 @@ class _PetWindow:
             self._set_bubble(PetEvent(type="pet_clicked", state=PetState.JUMPING.value))
         elif self.state in (PetState.RUNNING.value, PetState.REVIEW.value):
             self._set_bubble(PetEvent(type="pet_clicked", state=self.state))
-        elif self.state == PetState.WAITING.value:
-            self._set_bubble(PetEvent(type="pet_clicked", state=self.state))
         else:
             self.set_state(PetState.JUMPING.value)
             self._set_bubble(PetEvent(type="pet_clicked", state=PetState.JUMPING.value))
@@ -619,8 +642,8 @@ class _PetWindow:
         self._mark_activity()
         try:
             _state_path().unlink(missing_ok=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Pet saved position reset failed: %s", exc)
         self.config["x"] = None
         self.config["y"] = None
         self._place_window()
@@ -672,6 +695,7 @@ def _sleep_after_seconds(config: dict) -> float:
 
 
 def _event_detail(event: PetEvent) -> str:
+    """Return concise event-specific detail text for the speech bubble."""
     if event.type == "tool_started":
         tool = (event.payload or {}).get("tool") or event.text
         return f"工具：{_short_text(tool, 28)}" if tool else ""
@@ -688,9 +712,8 @@ def _short_text(text: object, limit: int) -> str:
         return ""
     return value[: max(0, limit - 1)] + "…" if len(value) > limit else value
 
-def _load_manifest(asset_dir: Path) -> dict:
-    import json
 
+def _load_manifest(asset_dir: Path) -> dict:
     path = asset_dir / "pet.json"
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -700,6 +723,7 @@ def _state_path() -> Path:
 
 
 def _load_position() -> dict | None:
+    """Load a previously saved window position from M-Claw state."""
     path = _state_path()
     try:
         if not path.exists():
@@ -709,25 +733,15 @@ def _load_position() -> dict | None:
         y = data.get("y")
         if isinstance(x, int) and isinstance(y, int):
             return {"x": x, "y": y}
-    except Exception:
+    except Exception as exc:
+        logger.debug("Pet saved position load failed: %s", exc)
         return None
     return None
 
 
 def _save_position(x: int, y: int) -> None:
+    """Persist the current window position best-effort."""
     try:
         atomic_json_write(_state_path(), {"x": int(x), "y": int(y), "updated_at": time.time()})
-    except Exception:
-        pass
-
-
-
-
-
-
-
-
-
-
-
-
+    except Exception as exc:
+        logger.debug("Pet saved position write failed: %s", exc)

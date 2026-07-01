@@ -7,10 +7,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any
 
 
 class MemoryProvider(ABC):
+    """Contract for memory backends that can add prompt context and tools."""
+
     @property
     @abstractmethod
     def name(self) -> str:
@@ -33,8 +35,9 @@ class MemoryProvider(ABC):
         return ""
 
     @abstractmethod
-    def get_tool_schemas(self) -> List[Dict[str, Any]]:
+    def get_tool_schemas(self) -> list[dict[str, Any]]:
         """Return tool schemas owned by this provider."""
 
-    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+    def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:
+        """Handle a memory tool call owned by this provider."""
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")

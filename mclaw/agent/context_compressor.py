@@ -16,7 +16,7 @@ than only to local token estimates.
 
 import logging
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from mclaw.prompts.compression import build_context_compression_prompt
 
@@ -31,8 +31,8 @@ SUMMARY_PREFIX = (
     "from where things left off, and avoid repeating work:"
 )
 
-# Placeholder used when old tool results are pruned.
-_PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+# Placeholder used when earlier tool results are pruned.
+_PRUNED_TOOL_PLACEHOLDER = "[Earlier tool output cleared to save context space]"
 
 # Summary token budget controls.
 _MIN_SUMMARY_TOKENS = 2000
@@ -49,6 +49,7 @@ _TOOL_ARGS_HEAD = 1200    # chars kept from the start of tool-call arguments
 
 
 def estimate_tokens_rough(text: str) -> int:
+    """Estimate tokens cheaply for compression heuristics, not billing."""
     if not text:
         return 0
     # Chinese chars ≈ 1 token each; ASCII ≈ 0.25 tokens each.
@@ -58,41 +59,54 @@ def estimate_tokens_rough(text: str) -> int:
     return max(1, chinese + int(ascii_chars / 4))
 
 
-def estimate_messages_tokens(messages: List[Dict]) -> int:
+def _content_to_text(content: Any) -> str:
+    """Convert provider message content blocks into text for local accounting."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                parts.append(str(block.get("text") or block.get("content") or ""))
+        return " ".join(part for part in parts if part)
+    return str(content)
+
+
+def estimate_messages_tokens(messages: list[dict]) -> int:
+    """Estimate prompt pressure across message content and tool-call payloads."""
     total = 0
     for msg in messages:
-        content = msg.get("content", "") or ""
-        if isinstance(content, list):
-            content = " ".join(
-                str(b.get("text", "") or b.get("content", ""))
-                for b in content if isinstance(b, dict)
-            )
+        content = _content_to_text(msg.get("content"))
         total += estimate_tokens_rough(content)
-        total += estimate_tokens_rough(msg.get("reasoning_content", ""))
+        total += estimate_tokens_rough(_content_to_text(msg.get("reasoning_content")))
         if msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
-                fn = tc.get("function", {})
-                total += estimate_tokens_rough(fn.get("name", ""))
-                total += estimate_tokens_rough(fn.get("arguments", ""))
+                if isinstance(tc, dict):
+                    fn = tc.get("function", {})
+                    total += estimate_tokens_rough(_content_to_text(fn.get("name")))
+                    total += estimate_tokens_rough(_content_to_text(fn.get("arguments")))
     return total
 
 
 def get_context_length(model: str, base_url: str = "", api_key: str = "", provider: str = "") -> int:
     """Resolve context length for a model.
 
-    Delegates to context_metadata for 8-level resolution:
-    config override → persistent cache → custom /models →
-    Anthropic API → models.dev → DEFAULT_CONTEXT_LENGTHS → 128K fallback.
+    Delegates to context_metadata for cached lengths, provider discovery,
+    models.dev, built-in defaults, and the 128K fallback.
     """
     from mclaw.agent.context_metadata import get_model_context_length
     return get_model_context_length(model, base_url, api_key, provider=provider)
 
 
 class ContextCompressor:
-    """Manages context window pressure by summarizing old turns.
+    """Manages context window pressure by summarizing earlier turns.
 
     Algorithm:
-      1. Prune old tool results (cheap, no LLM call)
+      1. Prune earlier tool results (cheap, no LLM call)
       2. Protect head messages (system + first exchange)
       3. Find tail boundary by token budget (~20% of context)
       4. Summarize middle turns with structured LLM prompt
@@ -111,13 +125,14 @@ class ContextCompressor:
         api_mode: str = "chat_completions",
         provider: str = "",
         quiet_mode: bool = False,
-        summary_model_override: str = None,
+        summary_model_override: str | None = None,
         summary_provider_override: str = "",
         summary_base_url_override: str = "",
         summary_api_key_override: str = "",
         summary_api_mode_override: str = "",
         summary_timeout: int = 180,
         session_id: str = "",
+        config: dict[str, Any] | None = None,
     ):
         self.model = model
         self.base_url = base_url
@@ -140,18 +155,19 @@ class ContextCompressor:
             parsed_summary_timeout = 180
         self.summary_timeout = max(30, min(parsed_summary_timeout, 600))
         self.session_id = session_id
+        self.config = config if isinstance(config, dict) else None
 
         self._refresh_context_budgets()
         self.compression_count = 0
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
+        self.last_total_tokens = 0
 
         self._summary_failure_cooldown_until: float = 0.0
-        self._previous_summary: Optional[str] = None
-        self._context_probed: bool = False
+        self._previous_summary: str | None = None
 
-        # Circuit breaker: one compaction per turn. The caller clears it
-        # before the next API call.
+        # Circuit breaker for a single API iteration. The agent loop clears it
+        # before each new provider call.
         self._compressed_this_turn: bool = False
 
         if not quiet_mode:
@@ -167,6 +183,7 @@ class ContextCompressor:
             )
 
     def _refresh_context_budgets(self) -> None:
+        """Recalculate compression thresholds from the active provider context size."""
         self.context_length = get_context_length(
             self.model,
             self.base_url,
@@ -189,33 +206,32 @@ class ContextCompressor:
         provider: str = "",
     ) -> None:
         """Apply a runtime model switch and recompute context budgets."""
-        old_model = self.model
-        old_context_length = self.context_length
-        old_threshold_tokens = self.threshold_tokens
+        previous_model = self.model
+        previous_context_length = self.context_length
+        previous_threshold_tokens = self.threshold_tokens
 
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.api_mode = api_mode
         self.provider = provider
-        self._context_probed = False
         self._refresh_context_budgets()
 
         logger.info(
             "Context compressor reconfigured: model=%s context_length=%d "
-            "threshold=%d provider=%s base_url=%s (was model=%s "
+            "threshold=%d provider=%s base_url=%s (previous model=%s "
             "context_length=%d threshold=%d)",
             self.model,
             self.context_length,
             self.threshold_tokens,
             self.provider or "none",
             self.base_url or "none",
-            old_model,
-            old_context_length,
-            old_threshold_tokens,
+            previous_model,
+            previous_context_length,
+            previous_threshold_tokens,
         )
 
-    def update_from_response(self, usage: Dict[str, Any]) -> None:
+    def update_from_response(self, usage: dict[str, Any]) -> None:
         """Store real token counts from API response.
 
         Called by core.py after each API call.
@@ -224,56 +240,25 @@ class ContextCompressor:
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", 0)
 
-    def should_compress(self, total_tokens: int = None) -> bool:
-        """Check if compression should fire.
+    def prune(self, messages: list[dict]) -> tuple[list[dict], int]:
+        """Lightweight pre-pass: replace earlier tool results with placeholders.
 
-        total_tokens: prompt + completion from the most recent API call.
-        Falls back to last_prompt_tokens if not provided.
-
-        The context window is shared between input and output, so we check
-        the combined total against threshold_tokens.
-        """
-        if self._compressed_this_turn:
-            return False
-        if total_tokens is None:
-            total_tokens = self.last_prompt_tokens + self.last_completion_tokens
-        return total_tokens >= self.threshold_tokens
-
-    def should_compress_preflight(self, messages: List[Dict]) -> bool:
-        """Quick pre-flight check using rough estimate (before API call)."""
-        rough_estimate = estimate_messages_tokens(messages)
-        return rough_estimate >= self.threshold_tokens
-
-    def get_status(self) -> Dict[str, Any]:
-        """Return compression status for display/logging."""
-        return {
-            "last_prompt_tokens": self.last_prompt_tokens,
-            "last_completion_tokens": self.last_completion_tokens,
-            "threshold_tokens": self.threshold_tokens,
-            "context_length": self.context_length,
-            "usage_percent": min(100, ((self.last_prompt_tokens + self.last_completion_tokens) / self.context_length * 100)) if self.context_length else 0,
-            "compression_count": self.compression_count,
-        }
-
-    def prune(self, messages: List[Dict]) -> tuple[List[Dict], int]:
-        """Lightweight pre-pass: replace old tool results with placeholders.
-
-        Safe to call every turn — it only touches messages outside the
+        Safe to call every turn: it only touches messages outside the
         protected tail window and never drops data silently.
 
         Returns (pruned_messages, pruned_count).
         """
-        return self._prune_old_tool_results(
+        return self._prune_earlier_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
         )
 
-    def _prune_old_tool_results(
-        self, messages: List[Dict], protect_tail_count: int,
+    def _prune_earlier_tool_results(
+        self, messages: list[dict], protect_tail_count: int,
         protect_tail_tokens: int,
-    ) -> tuple[List[Dict], int]:
-        """Replace old tool result contents with a short placeholder.
+    ) -> tuple[list[dict], int]:
+        """Replace earlier tool result contents with a short placeholder.
 
         Walks backward protecting recent messages by token budget.
         Returns (pruned_messages, pruned_count).
@@ -290,12 +275,12 @@ class ContextCompressor:
         min_protect = min(protect_tail_count, len(result) - 1)
         for i in range(len(result) - 1, -1, -1):
             msg = result[i]
-            content = msg.get("content") or ""
+            content = _content_to_text(msg.get("content"))
             msg_tokens = estimate_tokens_rough(content) + 10
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    msg_tokens += estimate_tokens_rough(args)
+                    msg_tokens += estimate_tokens_rough(_content_to_text(args))
             if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
                 boundary = i
                 break
@@ -321,7 +306,7 @@ class ContextCompressor:
     # Content serialization for summarizer (with head+tail truncation)
     # ------------------------------------------------------------------
 
-    def _serialize_for_summary(self, turns: List[Dict]) -> str:
+    def _serialize_for_summary(self, turns: list[dict]) -> str:
         """Serialize turns with head+tail truncation.
 
         Preserves both the beginning and end of long content so that
@@ -330,11 +315,11 @@ class ContextCompressor:
         parts = []
         for msg in turns:
             role = msg.get("role", "unknown")
-            content = msg.get("content") or ""
+            content = _content_to_text(msg.get("content"))
 
             # Tool results: head+tail truncation
             if role == "tool":
-                tool_id = msg.get("tool_call_id", "")
+                tool_id = _content_to_text(msg.get("tool_call_id"))
                 if len(content) > _CONTENT_MAX:
                     content = content[:_CONTENT_HEAD] + "\n...[truncated]...\n" + content[-_CONTENT_TAIL:]
                 parts.append(f"[TOOL RESULT {tool_id}]: {content}")
@@ -350,8 +335,8 @@ class ContextCompressor:
                     for tc in tool_calls:
                         if isinstance(tc, dict):
                             fn = tc.get("function", {})
-                            name = fn.get("name", "?")
-                            args = fn.get("arguments", "")
+                            name = _content_to_text(fn.get("name")) or "?"
+                            args = _content_to_text(fn.get("arguments"))
                             if len(args) > _TOOL_ARGS_MAX:
                                 args = args[:_TOOL_ARGS_HEAD] + "..."
                             tc_parts.append(f"  {name}({args})")
@@ -371,7 +356,7 @@ class ContextCompressor:
         return "\n\n".join(parts)
 
     def _find_tail_cut_by_tokens(
-        self, messages: List[Dict], head_end: int,
+        self, messages: list[dict], head_end: int,
         token_budget: int | None = None,
     ) -> int:
         """Walk backward from the end, accumulating tokens until budget is reached.
@@ -391,12 +376,12 @@ class ContextCompressor:
 
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
-            content = msg.get("content") or ""
+            content = _content_to_text(msg.get("content"))
             msg_tokens = estimate_tokens_rough(content) + 10
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
-                    msg_tokens += estimate_tokens_rough(args)
+                    msg_tokens += estimate_tokens_rough(_content_to_text(args))
             if accumulated + msg_tokens > soft_ceiling and (n - i) >= min_tail:
                 break
             accumulated += msg_tokens
@@ -417,19 +402,19 @@ class ContextCompressor:
         return max(cut_idx, head_end + 1)
 
     @staticmethod
-    def _align_boundary_forward(messages: List[Dict], idx: int) -> int:
-        """Advance idx past any tool result messages so we don't split a group."""
+    def _align_boundary_forward(messages: list[dict], idx: int) -> int:
+        """Advance idx past tool result messages to keep each group intact."""
         while idx < len(messages) and messages[idx].get("role") == "tool":
             idx += 1
         return idx
 
     @staticmethod
-    def _align_boundary_backward(messages: List[Dict], idx: int) -> int:
+    def _align_boundary_backward(messages: list[dict], idx: int) -> int:
         """Pull idx backward to avoid splitting a tool_call / result group.
 
         If boundary falls in the middle of a tool-result group, walk backward
         to the parent assistant message so the whole group is included in
-        the summarized region rather than being split.
+        the summarized region as a complete group.
         """
         if idx <= 0 or idx >= len(messages):
             return idx
@@ -440,13 +425,13 @@ class ContextCompressor:
             idx = check
         return idx
 
-    def _compute_summary_budget(self, turns_to_summarize: List[Dict]) -> int:
+    def _compute_summary_budget(self, turns_to_summarize: list[dict]) -> int:
         """Scale summary token budget with the amount of content being compressed."""
         content_tokens = estimate_messages_tokens(turns_to_summarize)
         budget = int(content_tokens * _SUMMARY_RATIO)
         return max(_MIN_SUMMARY_TOKENS, min(budget, self.max_summary_tokens))
 
-    def _generate_summary(self, turns_to_summarize: List[Dict]) -> Optional[str]:
+    def _generate_summary(self, turns_to_summarize: list[dict]) -> str | None:
         """Generate a structured summary of compacted conversation turns."""
         now = time.monotonic()
         if now < self._summary_failure_cooldown_until:
@@ -497,6 +482,7 @@ class ContextCompressor:
             return None
 
     def _resolve_summary_api_mode(self) -> str:
+        """Choose the API protocol for summary calls from overrides or provider metadata."""
         if self.summary_api_mode:
             return self.summary_api_mode
         summary_provider = (self.summary_provider or "").strip()
@@ -507,12 +493,16 @@ class ContextCompressor:
                 if provider_def and getattr(provider_def, "api_mode", ""):
                     self.summary_api_mode = provider_def.api_mode
                     return self.summary_api_mode
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug(
+                    "Summary provider API mode resolution failed for %s: %s",
+                    summary_provider,
+                    exc,
+                )
         return self.api_mode
 
-    def _get_summarize_credentials(self) -> tuple:
-        """Resolve API credentials for summarization, falling back to env vars.
+    def _get_summarize_credentials(self) -> tuple[str | None, str]:
+        """Resolve summary credentials from overrides, summary provider, or active provider.
 
         self.api_key may be empty when ContextCompressor is created during
         Agent.__init__ before resolve_provider() has been called.
@@ -529,13 +519,13 @@ class ContextCompressor:
                     provider=summary_provider,
                     base_url=self.summary_base_url,
                     api_key=self.summary_api_key,
-                    config=getattr(self, "config", None),
+                    config=self.config,
                 )
                 if resolved.get("api_key") or resolved.get("base_url"):
                     self.summary_api_mode = resolved.get("api_mode") or self.summary_api_mode
                     return resolved.get("api_key") or "", resolved.get("base_url") or ""
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Summary provider resolution failed for %s: %s", summary_provider, exc)
 
         if self.api_key:
             return self.api_key, self.base_url
@@ -544,7 +534,8 @@ class ContextCompressor:
             key = resolve_api_key(self.provider) if self.provider else None
             url = resolve_base_url(self.provider) if self.provider else ""
             return key, url
-        except Exception:
+        except Exception as exc:
+            logger.debug("Active provider credential resolution for summary failed: %s", exc)
             return None, ""
 
     def _summarize_openai(self, prompt: str, budget: int) -> str:
@@ -586,7 +577,7 @@ class ContextCompressor:
         return f"{SUMMARY_PREFIX}\n{summary}"
 
     @staticmethod
-    def _sanitize_tool_pairs(messages: List[Dict]) -> List[Dict]:
+    def _sanitize_tool_pairs(messages: list[dict]) -> list[dict]:
         """Remove orphaned tool results and insert stubs for missing results."""
         # Collect call IDs that survived compression.
         surviving_call_ids = set()
@@ -614,7 +605,7 @@ class ContextCompressor:
             ]
             logger.info("Compression sanitizer: removed %d orphaned tool result(s)", len(orphaned_results))
 
-        # 2. Add stub results for orphaned calls
+        # Add stub results for surviving calls whose results were summarized away.
         surviving_call_ids = set()
         for msg in messages:
             if msg.get("role") == "assistant":
@@ -632,25 +623,24 @@ class ContextCompressor:
 
         missing_results = surviving_call_ids - result_call_ids
         if missing_results:
-            patched: List[Dict] = []
+            patched: list[dict] = []
             for msg in messages:
                 patched.append(msg)
                 if msg.get("role") == "assistant" and msg.get("tool_calls"):
                     for tc in msg.get("tool_calls") or []:
                         tc_id = tc.get("id", "") if isinstance(tc, dict) else getattr(tc, "id", "") or ""
                         if tc_id in missing_results:
-                            tool_name = tc.get("function", {}).get("name", "unknown") if isinstance(tc, dict) else getattr(getattr(tc, "function", None), "name", "unknown")
                             patched.append({
                                 "role": "tool",
                                 "tool_call_id": tc_id,
-                                "content": "[Result from earlier conversation — see context summary above]",
+                                "content": "[Result from earlier conversation; see context summary above]",
                             })
             messages = patched
             logger.info("Compression sanitizer: added %d stub tool result(s)", len(missing_results))
 
         return messages
 
-    def compress(self, messages: List[Dict]) -> List[Dict]:
+    def compress(self, messages: list[dict]) -> list[dict]:
         """Compress conversation history.
 
         Returns a new list with middle turns replaced by a structured summary.
@@ -662,21 +652,21 @@ class ContextCompressor:
 
         logger.info("[COMPRESSION START] messages=%d threshold=%d", n, self.threshold_tokens)
 
-        # Phase 1: prune old tool results as a cheap pre-pass.
-        logger.info("[COMPRESSION] Phase 1: pruning old tool results")
-        messages, pruned_count = self._prune_old_tool_results(
+        # Phase 1: prune earlier tool results as a cheap pre-pass.
+        logger.info("[COMPRESSION] Phase 1: pruning earlier tool results")
+        messages, pruned_count = self._prune_earlier_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
         )
         if pruned_count:
-            logger.info("Pre-compression: pruned %d old tool result(s)", pruned_count)
+            logger.info("Pre-compression: pruned %d earlier tool result(s)", pruned_count)
 
         # Phase 2: Determine boundaries
         logger.info("[COMPRESSION] Phase 2: determining boundaries")
         compress_start = self._align_boundary_forward(messages, self.protect_first_n)
 
-        # Protect the tail by token budget instead of fixed message count.
+        # Protect recent tail messages with a token budget.
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
         # If the boundary lands on a tool result, move it backward so the
         # tool_call/result pair is summarized together.
@@ -698,6 +688,13 @@ class ContextCompressor:
         summary = self._generate_summary(turns_to_summarize)
         logger.info("[COMPRESSION] summary generated: len=%d", len(summary) if summary else 0)
 
+        if not summary:
+            logger.warning(
+                "Summary generation unavailable; keeping conversation turns and "
+                "skipping summary-based compaction"
+            )
+            return messages
+
         # Phase 4: Assemble compressed messages
         logger.info("[COMPRESSION] Phase 4: assembling compressed messages")
         compressed = []
@@ -713,16 +710,6 @@ class ContextCompressor:
                     "rather than re-doing work.]"
                 )
             compressed.append(msg)
-
-        # If model summarization fails, insert a static fallback marker.
-        if not summary:
-            logger.warning("Summary generation failed — inserting static fallback context marker")
-            n_dropped = compress_end - compress_start
-            summary = (
-                f"{SUMMARY_PREFIX}\n"
-                f"Summary generation was unavailable. {n_dropped} conversation turns were "
-                f"removed to free context space but could not be summarized."
-            )
 
         # Choose a summary role that avoids adjacent same-role messages.
         last_head_role = messages[compress_start - 1].get("role", "user") if compress_start > 0 else "user"
@@ -763,7 +750,7 @@ class ContextCompressor:
         try:
             from mclaw.tools.read_tracker import reset_file_dedup
             reset_file_dedup(task_id=self.session_id or None)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("File-read dedup reset after compression failed: %s", exc)
 
         return compressed

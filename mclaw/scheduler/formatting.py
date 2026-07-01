@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Markdown formatting for scheduler run outputs."""
+"""Markdown formatting for scheduler run outputs.
+
+The scheduler writes two kinds of artifacts: a full diagnostic run report and,
+optionally, a final-response-only file requested by the job's delivery settings.
+Path helpers keep those file naming rules in one place.
+"""
 
 from __future__ import annotations
 
@@ -19,10 +24,12 @@ from mclaw.scheduler.models import SchedulerJob, SchedulerRun
 
 
 def default_output_dir() -> Path:
+    """Return the default diagnostic report directory under M-Claw home."""
     return get_mclaw_home() / "scheduler" / "output"
 
 
 def output_path_for_run(output_dir: str | Path | None, job: SchedulerJob, run: SchedulerRun) -> Path:
+    """Build the diagnostic report path for a completed scheduler run."""
     root = Path(output_dir).expanduser() if output_dir else default_output_dir()
     ts = datetime.fromtimestamp(run.started_at or run.created_at, timezone.utc).strftime("%Y%m%d_%H%M%S")
     safe_run_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", run.id)
@@ -36,6 +43,7 @@ def final_response_path_for_run(
     *,
     filename_template: str = "",
 ) -> Path:
+    """Resolve a job-configured final-response path against its workdir."""
     raw = str(path_spec or "").strip()
     if not raw:
         raise ValueError("final_response_path is empty")
@@ -60,6 +68,7 @@ def write_run_output(
     job: SchedulerJob,
     run: SchedulerRun,
 ) -> str:
+    """Write the full Markdown run report and return its filesystem path."""
     path = output_path_for_run(output_dir, job, run)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_run_output(job=job, run=run), encoding="utf-8")
@@ -73,6 +82,7 @@ def write_final_response_output(
     run: SchedulerRun,
     filename_template: str = "",
 ) -> str:
+    """Write only the final assistant response for delivery-side exports."""
     path = final_response_path_for_run(path_spec, job, run, filename_template=filename_template)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(run.final_response or "", encoding="utf-8")
@@ -80,6 +90,7 @@ def write_final_response_output(
 
 
 def render_run_output(*, job: SchedulerJob, run: SchedulerRun) -> str:
+    """Render the diagnostic Markdown body for a scheduler run."""
     lines = [
         "# Scheduler Run",
         "",
@@ -150,6 +161,7 @@ def _final_response_output_summary(result: dict[str, Any]) -> str:
 
 
 def _render_final_response_filename(template: str, *, job: SchedulerJob, run: SchedulerRun) -> str:
+    """Render a safe filename from date, job, and run template tokens."""
     raw = str(template or "").strip()
     if not raw:
         raise ValueError("final_response_filename_template is empty")
@@ -184,10 +196,12 @@ def _render_final_response_filename(template: str, *, job: SchedulerJob, run: Sc
 
 
 def _template_datetime(*, job: SchedulerJob, run: SchedulerRun) -> datetime:
+    """Choose the scheduler-local timestamp used by filename templates."""
     timestamp = run.scheduled_for if run.scheduled_for is not None else (run.started_at or run.created_at)
     tz_name = getattr(getattr(job, "schedule", None), "timezone", "") or "UTC"
     try:
         tz = ZoneInfo(str(tz_name))
     except ZoneInfoNotFoundError:
+        # Filename rendering should not fail because a saved timezone is stale.
         tz = timezone.utc
     return datetime.fromtimestamp(float(timestamp or 0), tz)

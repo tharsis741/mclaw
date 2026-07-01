@@ -24,11 +24,15 @@ def _hash(value: str, length: int = 24) -> str:
 
 @dataclass(frozen=True)
 class RoutedSession:
+    """Resolved session binding for a Weixin peer event."""
+
     session_key: str
     session_id: str
 
 
 class WeixinSessionRouter:
+    """Map Weixin chat/user identities to stable M-Claw session ids."""
+
     def __init__(self, *, account_id: str, session_db: SessionDB, scope: str = "user") -> None:
         self.account_id = account_id
         self.session_db = session_db
@@ -36,6 +40,7 @@ class WeixinSessionRouter:
         self._overrides: dict[str, str] = {}
 
     def route(self, source: ChannelSource, *, model: str = "") -> RoutedSession:
+        """Return the existing or deterministic session for an inbound source."""
         session_key = self.session_key(source)
         session_id = self._overrides.get(session_key)
         if not session_id:
@@ -49,6 +54,7 @@ class WeixinSessionRouter:
         return RoutedSession(session_key=session_key, session_id=session_id)
 
     def new_session(self, source: ChannelSource, *, model: str = "") -> RoutedSession:
+        """Create a fresh session override for the same Weixin peer binding."""
         session_key = self.session_key(source)
         session_id = f"weixin_{_hash(session_key + ':' + uuid.uuid4().hex)}"
         self._overrides[session_key] = session_id
@@ -61,6 +67,7 @@ class WeixinSessionRouter:
         return RoutedSession(session_key=session_key, session_id=session_id)
 
     def session_key(self, source: ChannelSource) -> str:
+        """Build a privacy-preserving key from the configured Weixin routing scope."""
         account = source.account_id or self.account_id
         if self.scope == "chat":
             basis = f"chat:{source.chat_id}"

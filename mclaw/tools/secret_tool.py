@@ -81,6 +81,7 @@ SECRET_REQUEST_SCHEMA = {
 
 
 def _handle_secret_request_many(args: dict, **kwargs) -> str:
+    """Bridge model tool calls to the scoped secret authorization service."""
     parent_agent = kwargs.get("parent_agent")
     callback = getattr(parent_agent, "secret_request_callback", None) if parent_agent is not None else None
     if not callable(callback):
@@ -102,6 +103,6 @@ registry.register(
     toolset="credentials",
     schema=SECRET_REQUEST_SCHEMA,
     handler=_handle_secret_request_many,
-    description="请求密钥授权",
+    description="Request scoped secret authorization",
     emoji="🔐",
 )

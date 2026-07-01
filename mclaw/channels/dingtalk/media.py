@@ -48,7 +48,7 @@ _DOWNLOAD_URL_KEYS = (
     "mediaUrl",
     "media_url",
 )
-_FILENAME_KEYS = ("fileName", "file_name", "name", "file_name", "title")
+_FILENAME_KEYS = ("fileName", "file_name", "name", "title")
 _NESTED_MEDIA_KEYS = (
     "content",
     "media",
@@ -74,6 +74,8 @@ _NESTED_MEDIA_KEYS = (
 
 @dataclass(frozen=True)
 class DingTalkMediaRef:
+    """Download handle extracted from a DingTalk message payload."""
+
     kind: str
     download_code: str = ""
     url: str = ""
@@ -83,6 +85,8 @@ class DingTalkMediaRef:
 
 @dataclass(frozen=True)
 class DingTalkMediaAttachment:
+    """Local cached media artifact passed to the agent as context."""
+
     kind: str
     mime_type: str
     path: str = ""
@@ -91,10 +95,12 @@ class DingTalkMediaAttachment:
     error: str = ""
 
     def to_dict(self) -> dict[str, Any]:
+        """Serialize attachment metadata for raw message context."""
         return asdict(self)
 
 
 def extract_text(message: Any) -> str:
+    """Extract user-visible text from DingTalk SDK and raw payload shapes."""
     text = getattr(message, "text", None) or ""
     if hasattr(text, "content"):
         content = str(text.content or "").strip()
@@ -127,6 +133,7 @@ def extract_text(message: Any) -> str:
 
 
 def extract_media_refs(message: Any) -> list[DingTalkMediaRef]:
+    """Collect media download references across SDK fields and raw payloads."""
     refs: list[DingTalkMediaRef] = []
     msg_type = str(getattr(message, "message_type", None) or getattr(message, "msgtype", "") or "").strip()
     raw_payload = _raw_payload(message)
@@ -233,6 +240,7 @@ def _extract_media_refs_from_mapping(data: dict[str, Any], *, fallback_msg_type:
 
 
 def _iter_media_candidates(data: dict[str, Any], *, _path: tuple[str, ...] = (), _depth: int = 0) -> list[tuple[dict[str, Any], tuple[str, ...]]]:
+    """Walk nested DingTalk payload fragments that may contain media handles."""
     candidates: list[tuple[dict[str, Any], tuple[str, ...]]] = [(data, _path)]
     if _depth >= 4:
         return candidates
@@ -297,11 +305,8 @@ def _raw_payload(message: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def has_media(message: Any) -> bool:
-    return bool(extract_media_refs(message))
-
-
 def format_media_for_agent(attachments: list[DingTalkMediaAttachment]) -> str:
+    """Render cached attachment paths as tool-ready guidance for the agent."""
     if not attachments:
         return ""
     lines = ["## DingTalk Attachments"]
@@ -331,12 +336,15 @@ def format_media_for_agent(attachments: list[DingTalkMediaAttachment]) -> str:
 
 
 class DingTalkMediaCache:
+    """Download and cache DingTalk inbound media within configured safety limits."""
+
     def __init__(self, *, config: DingTalkConfig, client: Any) -> None:
         self.config = config
         self.client = client
         self.root = _cache_root(config)
 
     async def collect(self, message: Any, *, message_id: str = "") -> list[DingTalkMediaAttachment]:
+        """Download every media reference found on a message, preserving failures."""
         if not self.config.media_cache_enabled:
             return []
         attachments: list[DingTalkMediaAttachment] = []
@@ -352,6 +360,7 @@ class DingTalkMediaCache:
         message_id: str,
         index: int,
     ) -> DingTalkMediaAttachment:
+        """Resolve a download code or URL and persist the bounded media payload."""
         try:
             url = ref.url
             if not url and ref.download_code:
@@ -382,6 +391,7 @@ class DingTalkMediaCache:
             )
 
     def _write_cache(self, data: bytes, *, ref: DingTalkMediaRef, message_id: str, index: int) -> Path:
+        """Write media bytes under the per-client daily cache directory."""
         day = datetime.now().strftime("%Y%m%d")
         cache_dir = self.root / self.config.client_id / day
         cache_dir.mkdir(parents=True, exist_ok=True)
@@ -432,6 +442,7 @@ def _safe_stem(value: str) -> str:
 
 
 def _assert_download_url(url: str) -> None:
+    """Validate URL shape before handing it to the DingTalk download client."""
     parsed = urlparse(url)
     if parsed.scheme.lower() not in {"http", "https"}:
         raise ValueError("DingTalk media download URL must use http or https")

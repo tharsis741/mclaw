@@ -21,6 +21,7 @@ from pathlib import Path
 
 
 class SearchProfile:
+    """Search provider cascade bound to the active runtime path policy."""
     def __init__(self, runtime: object) -> None:
         self.runtime = runtime
         self.provider = self._select_provider()
@@ -30,6 +31,7 @@ class SearchProfile:
         return str(getattr(self.runtime, "kind", ""))
 
     def _select_provider(self) -> str:
+        """Choose the fastest available search backend for this host."""
         if shutil.which("rg"):
             return "rg"
         if self.kind == "windows" and (shutil.which("powershell.exe") or shutil.which("pwsh")):
@@ -46,6 +48,7 @@ class SearchProfile:
         file_pattern: str | None = None,
         limit: int = 50,
     ) -> str:
+        """Search a directory after path authorization and provider fallback."""
         decision = self.runtime.paths.check("search", directory)
         if not decision.allowed:
             raise PermissionError(decision.error_message())
@@ -140,6 +143,7 @@ class SearchProfile:
         return "\n".join(matches) if matches else "[no matches found]"
 
     def _python_regex(self, root: str, pattern: str, file_pattern: str | None, limit: int) -> str:
+        """Final pure-Python fallback with scan and file-size guards."""
         try:
             compiled = re.compile(pattern)
         except re.error as exc:
@@ -170,6 +174,7 @@ class SearchProfile:
 
     @staticmethod
     def _cap_lines(lines: list[str], limit: int) -> str:
+        """Apply a consistent result cap across provider outputs."""
         if not lines:
             return "[no matches found]"
         if len(lines) <= limit:

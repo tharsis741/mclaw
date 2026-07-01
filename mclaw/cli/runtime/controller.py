@@ -19,9 +19,8 @@ from .workers import RuntimeWorkerSupervisor
 class RuntimeController:
     """Stable interface used by classic TUI to drive an interactive runtime.
 
-    The current implementation adapts the existing InteractiveChat host. This
-    keeps TUI code off host private fields while the runtime is extracted
-    into a dedicated object in the next refactor step.
+    The controller exposes runtime state and host operations through a narrow
+    boundary so frontends do not depend on host private fields.
     """
 
     def __init__(self, host: Any) -> None:
@@ -75,12 +74,19 @@ class RuntimeController:
         return bool(self.runtime.agent_running)
 
     def subscribe(self, handler: Callable[[MClawEvent], None]) -> Callable[[], None]:
+        """Attach a frontend observer to the runtime event stream."""
         return self.event_bus.subscribe(handler)
 
     def request_exit(self, *, force_no_flush: bool = False) -> None:
+        """Ask the runtime loop to stop, optionally skipping session flush."""
         self.runtime.request_exit(force_no_flush=force_no_flush)
 
     def interrupt_or_request_exit(self, *, now: float | None = None, double_tap_seconds: float = 2.0) -> str:
+        """Map an interrupt keypress to exit, interrupt, or force-exit intent.
+
+        A second interrupt inside ``double_tap_seconds`` exits without flushing
+        so a stuck tool or model call does not block the terminal shutdown path.
+        """
         if not self.is_running:
             self.request_exit()
             return "exit"
@@ -98,29 +104,26 @@ class RuntimeController:
         return "interrupt"
 
     def request_status_snapshot(self) -> None:
+        """Ask the host to publish its current runtime status."""
         getattr(self._host, "_emit_status_snapshot")()
 
     def start_runtime_threads(self, *, invalidate, exit_ui, is_ui_running):
-        hook_factory = getattr(self._host, "build_runtime_worker_hooks", None)
-        if callable(hook_factory):
-            hooks = hook_factory(
-                invalidate=invalidate,
-                exit_ui=exit_ui,
-                is_ui_running=is_ui_running,
-            )
-            supervisor = RuntimeWorkerSupervisor(self.runtime, hooks)
-            return supervisor.start()
-        return getattr(self._host, "_start_runtime_threads")(
+        """Build host worker hooks and start runtime-owned background threads."""
+        hooks = self._host.build_runtime_worker_hooks(
             invalidate=invalidate,
             exit_ui=exit_ui,
             is_ui_running=is_ui_running,
         )
+        supervisor = RuntimeWorkerSupervisor(self.runtime, hooks)
+        return supervisor.start()
 
     def shutdown_runtime_threads(self, process_thread, anim_thread) -> None:
+        """Delegate ordered worker shutdown back to the host implementation."""
         getattr(self._host, "_shutdown_runtime_threads")(process_thread, anim_thread)
 
 
 def get_runtime_controller(host: Any) -> RuntimeController:
+    """Return the cached controller for a host, creating one on first use."""
     controller = getattr(host, "_runtime_controller", None)
     if isinstance(controller, RuntimeController):
         return controller

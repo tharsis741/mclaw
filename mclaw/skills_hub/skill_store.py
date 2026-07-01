@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Enabled Skill 2.0 create/read/update/delete service."""
+"""Enabled Skill create/read/update/delete service."""
 
 from __future__ import annotations
 
@@ -30,11 +30,9 @@ from mclaw.skills_hub.paths import (
     validate_relative_skill_path,
     validate_skill_name,
 )
-from mclaw.skills_hub.schema import SkillSchemaError, validate_evolution, validate_skill_yaml
 from mclaw.skills_hub.security import review_skill_package
 from mclaw.skills_hub.skill_yaml_store import (
     build_skill_yaml,
-    extract_short_description,
     read_skill_yaml,
     touch_skill_yaml,
     write_skill_yaml,
@@ -77,6 +75,8 @@ def _validate_skill_md(
     *,
     allow_placeholder: bool = False,
 ) -> None:
+    """Validate the root Skill instructions and frontmatter contract."""
+
     text = str(skill_md or "")
     if not text.strip():
         raise SkillStoreError("skill_md cannot be empty.")
@@ -113,6 +113,8 @@ def _validate_package(
     expected_status: str = "enabled",
     allow_placeholder: bool = False,
 ) -> dict[str, Any]:
+    """Validate service-owned sidecars and the root Skill document together."""
+
     for required in SIDECAR_FILENAMES:
         if not (skill_dir / required).exists():
             raise SkillStoreError(f"{required} is required.")
@@ -129,9 +131,11 @@ def _validate_package(
 
 
 def clear_skills_cache() -> None:
+    """Best-effort invalidation for runtime prompt and CLI registry caches."""
+
     try:
         from mclaw.agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
+        clear_skills_system_prompt_cache()
     except Exception:
         pass
     try:
@@ -142,6 +146,8 @@ def clear_skills_cache() -> None:
 
 
 def list_skills() -> list[dict[str, Any]]:
+    """Return enabled Skills that pass the service-layer package validator."""
+
     root = get_enabled_skills_dir()
     skills: list[dict[str, Any]] = []
     if not root.exists():
@@ -166,6 +172,8 @@ def list_skills() -> list[dict[str, Any]]:
 
 
 def get_skill_record(name: str) -> dict[str, Any]:
+    """Resolve one enabled Skill and return its validated store record."""
+
     target = get_enabled_skills_dir() / validate_skill_name(name)
     if not target.is_dir():
         raise SkillStoreError(f"Skill '{name}' not found.")
@@ -179,6 +187,8 @@ def get_skill_record(name: str) -> dict[str, Any]:
 
 
 def view_skill(name: str, file_path: str | None = None) -> dict[str, Any]:
+    """Read either a mutable Skill file or the composed Skill overview payload."""
+
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
     if file_path:
@@ -219,6 +229,8 @@ def view_skill(name: str, file_path: str | None = None) -> dict[str, Any]:
 
 
 def tree_skill(name: str, *, max_entries: int = 500) -> dict[str, Any]:
+    """Return a bounded tree view with sidecar and runtime artifact markers."""
+
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
     try:
@@ -303,6 +315,8 @@ def create_skill(
     initial_evolution: dict[str, Any] | None = None,
     actor: str = "main_agent",
 ) -> dict[str, Any]:
+    """Create and enable a complete agent-authored Skill through a draft package."""
+
     name = validate_skill_name(name)
     _validate_skill_md(skill_md, name)
     ensure_runtime_roots()
@@ -311,6 +325,8 @@ def create_skill(
     tx_root = get_skill_drafting_dir() / tx_id
     package = tx_root / "skill"
     with file_lock(_lock_path(name)):
+        # Creation uses a draft directory first so failed validation or review leaves
+        # no partial enabled Skill behind.
         if target.exists():
             raise SkillStoreError(f"Skill '{name}' already exists at {target}.")
         try:
@@ -350,6 +366,8 @@ def create_skill_scaffold(
     user_intent: str | None = None,
     actor: str = "main_agent",
 ) -> dict[str, Any]:
+    """Create an editable Skill scaffold while allowing the placeholder body."""
+
     name = validate_skill_name(name)
     description = str(user_intent or short_description or "").strip()
     if not description:
@@ -404,6 +422,8 @@ def create_skill_scaffold(
 
 
 def edit_skill(*, name: str, skill_md: str, actor: str = "main_agent") -> dict[str, Any]:
+    """Replace SKILL.md after validation and security review, rolling back on failure."""
+
     _validate_skill_md(skill_md, name)
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
@@ -424,6 +444,8 @@ def edit_skill(*, name: str, skill_md: str, actor: str = "main_agent") -> dict[s
 
 
 def patch_skill(*, name: str, old_text: str, new_text: str, actor: str = "main_agent") -> dict[str, Any]:
+    """Patch a unique SKILL.md span and restore the original file if review fails."""
+
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
     skill_path = skill_dir / "SKILL.md"
@@ -457,6 +479,8 @@ def write_skill_file(
     overwrite: bool = False,
     actor: str = "main_agent",
 ) -> dict[str, Any]:
+    """Write a mutable support file and rescan the package before committing it."""
+
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
     rel = validate_mutable_skill_path(file_path)
@@ -472,6 +496,8 @@ def write_skill_file(
             target.write_text(content or "", encoding="utf-8")
         else:
             raise SkillStoreError("encoding must be text or base64.")
+        # Managed support files can change the effective Skill behavior, so each
+        # write is reviewed before caches are refreshed.
         review = review_skill_package(skill_dir, source="agent_created")
         if review.get("verdict") == "dangerous":
             raise SkillStoreError(f"Security scan blocked this skill: {review.get('summary')}")
@@ -493,6 +519,8 @@ def write_skill_file(
 
 
 def validate_skill(*, name: str) -> dict[str, Any]:
+    """Run the full enabled Skill contract and security review checks."""
+
     name = validate_skill_name(name)
     skill_dir = get_enabled_skills_dir() / name
     if not skill_dir.is_dir():
@@ -524,6 +552,8 @@ def validate_skill(*, name: str) -> dict[str, Any]:
 
 
 def remove_skill_file(*, name: str, file_path: str, actor: str = "main_agent") -> dict[str, Any]:
+    """Remove a mutable Skill support file with rollback on metadata update failure."""
+
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
     rel = validate_mutable_skill_path(file_path)
@@ -542,6 +572,8 @@ def remove_skill_file(*, name: str, file_path: str, actor: str = "main_agent") -
 
 
 def delete_skill(*, name: str) -> dict[str, Any]:
+    """Delete an enabled Skill under the same per-Skill mutation lock."""
+
     name = validate_skill_name(name)
     target = get_enabled_skills_dir() / name
     with file_lock(_lock_path(name)):
@@ -561,6 +593,8 @@ def evolution_update(
     content: str | None = None,
     old_text: str | None = None,
 ) -> dict[str, Any]:
+    """Delegate an evolution memory update after resolving the enabled Skill."""
+
     record = get_skill_record(name)
     result = update_evolution(
         Path(record["path"]),

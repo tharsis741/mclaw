@@ -14,6 +14,7 @@ _interrupt_event = threading.Event()
 
 
 def set_interrupt(active: bool) -> None:
+    """Set or clear the process-wide interrupt flag checked by tools."""
     if active:
         _interrupt_event.set()
     else:
@@ -21,4 +22,5 @@ def set_interrupt(active: bool) -> None:
 
 
 def is_interrupted() -> bool:
+    """Return whether a user interrupt is currently active."""
     return _interrupt_event.is_set()

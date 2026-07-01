@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, List
+from typing import Any
 
 from mclaw.safety.path_resolver import extract_absolute_paths_from_command, repair_common_mojibake
 
@@ -39,10 +39,12 @@ _REDIRECT_OVERWRITE = re.compile(r'[^>]>[^>]|^>[^>]')
 
 @dataclass
 class MutationIntent:
+    """Normalized description of whether a tool call may change files."""
+
     mutates: bool
     action: str
     raw_command: str = ""
-    target_paths: List[str] = None
+    target_paths: list[str] | None = None
     confidence: str = "detected"
 
     def __post_init__(self) -> None:
@@ -50,9 +52,10 @@ class MutationIntent:
             self.target_paths = []
 
 
-def detect_mutation(tool_name: str, arguments: Dict[str, Any]) -> MutationIntent:
+def detect_mutation(tool_name: str, arguments: dict[str, Any]) -> MutationIntent:
+    """Classify tool-call arguments before safety policy and checkpointing."""
     if tool_name in {"write_file", "patch", "edit_file", "delete_file"}:
-        path = arguments.get("file_path") or arguments.get("path")
+        path = arguments.get("path")
         return MutationIntent(True, tool_name, target_paths=[path] if path else [])
     if tool_name == "skill_manage":
         action = str(arguments.get("action") or "skill_manage")
@@ -63,22 +66,25 @@ def detect_mutation(tool_name: str, arguments: Dict[str, Any]) -> MutationIntent
     raw = repair_common_mojibake(str(arguments.get("command") or ""))
     if not is_destructive_terminal_command(raw):
         return MutationIntent(False, "read", raw_command=raw)
+    target_paths = extract_absolute_paths_from_command(raw)
     return MutationIntent(
         True,
         terminal_action(raw),
         raw_command=raw,
-        target_paths=extract_absolute_paths_from_command(raw),
-        confidence="targeted" if extract_absolute_paths_from_command(raw) else "workspace",
+        target_paths=target_paths,
+        confidence="targeted" if target_paths else "workspace",
     )
 
 
 def is_destructive_terminal_command(command: str) -> bool:
+    """Detect shell forms that can mutate files even when paths are implicit."""
     if not command:
         return False
     return bool(_DESTRUCTIVE_TERMINAL_PATTERNS.search(command) or _REDIRECT_OVERWRITE.search(command))
 
 
 def terminal_action(command: str) -> str:
+    """Map a destructive terminal command into the policy action vocabulary."""
     command = repair_common_mojibake(command or "").lower()
     if re.search(r'\b(rm|del|erase|remove-item|ri|rmdir|rd)\b', command):
         if re.search(r'(-r|-recurse|/s)\b', command):

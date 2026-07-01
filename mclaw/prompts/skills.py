@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Prompt builders for Skill discovery, usage, and evolution flows."""
+"""Skill runtime prompt builders."""
 
 from __future__ import annotations
 
@@ -14,7 +14,11 @@ def build_skill_invocation_system(
     skill_content: str,
     user_intent: str = "",
 ) -> str:
-    """Build the system-context block injected for slash-invoked Skills."""
+    """Build the model-only context block injected for slash-invoked Skills.
+
+    This prompt carries the selected Skill instructions into the current turn
+    without mutating Skill metadata or the user's installed Skill files.
+    """
     intent = str(user_intent or "").strip()
     intent_block = f"\nUser Intent:\n{intent}\n" if intent else ""
     return (
@@ -32,9 +36,15 @@ def build_skill_import_confirmation_context(
     confirmation: dict[str, Any],
     result: dict[str, Any],
 ) -> str:
-    """Build the runtime context recorded after a Skill install confirmation."""
+    """Build runtime context that summarizes a completed Skill install decision.
+
+    The returned text is conversation state for the next model turn, so it
+    includes audit and security-review pointers while avoiding raw artifact
+    contents.
+    """
 
     def _format_source(value: Any) -> str:
+        """Collapse structured source metadata into a compact audit label."""
         if isinstance(value, dict):
             source_type = str(value.get("type") or "").strip()
             original = str(value.get("original") or "").strip()
@@ -49,7 +59,7 @@ def build_skill_import_confirmation_context(
         or confirmation.get("name")
         or "(unknown)"
     )
-    drafting_id = confirmation.get("drafting_id") or confirmation.get("staging_id") or ""
+    drafting_id = confirmation.get("drafting_id") or ""
     path = str(result.get("path") or "").strip()
     error = str(result.get("error") or "").strip()
     source = _format_source(result.get("source") or confirmation.get("source"))

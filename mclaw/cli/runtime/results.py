@@ -34,6 +34,7 @@ class RuntimeTurnResultCoordinator:
         self.hooks = hooks
 
     def handle_result(self, result: dict[str, Any]) -> None:
+        """Render terminal output and dispatch post-turn continuation intents."""
         display_text = self.select_display_text(
             result,
             stream_text=self.hooks.stream_text(),
@@ -62,6 +63,7 @@ class RuntimeTurnResultCoordinator:
 
     @staticmethod
     def select_display_text(result: dict[str, Any], *, stream_text: str, stream_started: bool) -> str:
+        """Choose the text to render after a turn, preserving confirmation prompts."""
         response = str(result.get("final_response") or "")
         streamed = str(stream_text or "").strip() if stream_started else ""
         if result.get("pending_skill_import_confirmation") or result.get("pending_delegate"):

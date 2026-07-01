@@ -26,6 +26,7 @@ def _sh_quote(value: str) -> str:
 
 @dataclass(frozen=True)
 class ShellProfile:
+    """Command wrapping profile for one shell family."""
     name: str
     executable: str
     family: str
@@ -34,6 +35,7 @@ class ShellProfile:
     supports_tty: bool = False
 
     def script(self, command: str, cwd: str | Path) -> str:
+        """Wrap a command with cwd setup, exit-code capture, and cwd reporting."""
         cwd_text = str(cwd)
         if self.family == "powershell":
             return "\n".join(
@@ -61,5 +63,6 @@ class ShellProfile:
         )
 
     def argv(self, command: str, cwd: str | Path) -> list[str]:
+        """Return the executable argv used by subprocess."""
         script = self.script(command, cwd)
         return [self.executable, *self.args_prefix, script]

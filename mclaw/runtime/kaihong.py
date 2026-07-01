@@ -22,6 +22,7 @@ from mclaw.runtime.shell import ShellProfile
 
 @dataclass(frozen=True)
 class LaunchDomain:
+    """Runtime launch context observed on a Kaihong/OpenHarmony device."""
     name: str
     stdin_tty: bool
     stdout_tty: bool
@@ -43,6 +44,7 @@ class LaunchDomain:
 
 
 class KaihongRuntime(Runtime):
+    """Runtime profile for constrained device-local Kaihong shells."""
     kind = "kaihong"
     release_root = Path("/data/local/release")
 
@@ -85,6 +87,7 @@ class KaihongRuntime(Runtime):
         *,
         allowed_sensitive: set[str] | None = None,
     ) -> dict[str, str]:
+        """Build the release-root environment needed by device-local commands."""
         env = sanitize_subprocess_env(os.environ, allowed_sensitive=allowed_sensitive)
         release = str(self.release_root)
         env.update(
@@ -124,10 +127,12 @@ class KaihongRuntime(Runtime):
         return env
 
     def prompt_os_label(self, os_name: str, os_release: str) -> str:
+        """Expose the device OS identity while preserving the Linux kernel detail."""
         return f"Kaihong/OpenHarmony (Linux kernel {os_release})"
 
     @staticmethod
     def probe_launch_domain() -> LaunchDomain:
+        """Infer whether the runtime was launched from TTY, hdc, or a service."""
         stdin_tty = bool(sys.stdin and sys.stdin.isatty())
         stdout_tty = bool(sys.stdout and sys.stdout.isatty())
         size = shutil.get_terminal_size(fallback=(0, 0))

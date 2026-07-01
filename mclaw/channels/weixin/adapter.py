@@ -71,6 +71,8 @@ def _is_stale_session_ret(ret: Any, errcode: Any, errmsg: Any) -> bool:
 
 
 class TypingTicketCache:
+    """Short-lived cache for Weixin typing tickets returned by getconfig."""
+
     def __init__(self, ttl_seconds: float = 600.0) -> None:
         self.ttl_seconds = ttl_seconds
         self._cache: dict[str, tuple[str, float]] = {}
@@ -91,6 +93,7 @@ class TypingTicketCache:
 
 
 def _extract_text(item_list: list[dict[str, Any]]) -> str:
+    """Extract text or voice transcript text from Weixin item payloads."""
     parts: list[str] = []
     for item in item_list:
         if item.get("type") == ITEM_TEXT:
@@ -115,6 +118,7 @@ def _extract_text(item_list: list[dict[str, Any]]) -> str:
 
 
 def _guess_chat_type(message: dict[str, Any], account_id: str) -> tuple[str, str]:
+    """Infer whether an iLink payload represents a private chat or a room."""
     room_id = str(message.get("room_id") or message.get("chat_room_id") or "").strip()
     to_user_id = str(message.get("to_user_id") or "").strip()
     if room_id:
@@ -125,6 +129,8 @@ def _guess_chat_type(message: dict[str, Any], account_id: str) -> tuple[str, str
 
 
 class WeixinAdapter:
+    """Normalize Weixin iLink payloads and route them through M-Claw sessions."""
+
     def __init__(
         self,
         *,
@@ -147,13 +153,15 @@ class WeixinAdapter:
         self.media_cache = WeixinMediaCache(config=config, client=client)
 
     def is_dm_allowed(self, sender_id: str) -> bool:
+        """Apply the configured private-chat policy before any agent work starts."""
         if self.config.dm_policy == "disabled":
             return False
         if self.config.dm_policy == "allowlist":
-            return sender_id in self.config.allow_from
+            return sender_id in self.config.allowed_users
         return True
 
     async def process_message(self, message: dict[str, Any]) -> AgentTurnResult | None:
+        """Process one inbound iLink message into commands, binds, or an agent turn."""
         sender_id = str(message.get("from_user_id") or "").strip()
         if not sender_id or sender_id == self.config.account_id:
             return None
@@ -203,6 +211,7 @@ class WeixinAdapter:
 
         context_token = str(message.get("context_token") or "").strip()
         if context_token:
+            # Persist the latest token so future replies stay in the same iLink context.
             self.token_store.set(self.config.account_id, sender_id, context_token)
         await self._maybe_fetch_typing_ticket(sender_id, context_token or None)
 
@@ -303,6 +312,7 @@ class WeixinAdapter:
         sender_id: str,
         context_token: str,
     ) -> AgentTurnResult | None:
+        """Bind a scheduler target before the text reaches the general agent loop."""
         command = parse_schedule_bind_command(text)
         if command is None:
             return None
@@ -320,6 +330,7 @@ class WeixinAdapter:
         return AgentTurnResult(session_id="scheduler-bind", final_response=result.message)
 
     def _agent_event_callback(self, chat_id: str):
+        """Create a callback that reports saved skill updates back to Weixin."""
         async def _callback(_session_id: str, event: dict[str, Any]) -> None:
             if event.get("type") != "skills_saved":
                 return
@@ -330,6 +341,7 @@ class WeixinAdapter:
         return _callback
 
     async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> None:
+        """Send the final agent result or error back to the originating chat."""
         if result.error:
             await self.send(message.source.chat_id, f"Error: {result.error}")
             return
@@ -338,9 +350,11 @@ class WeixinAdapter:
             await self.send(message.source.chat_id, text)
 
     def _session_context_text(self, source: ChannelSource) -> str:
+        """Build the channel-specific system context for this Weixin turn."""
         return build_channel_context("weixin", user_id=source.user_id or "")
 
     async def send(self, chat_id: str, content: str) -> SendResult:
+        """Send chunked text while preserving and repairing Weixin context tokens."""
         context_token = self.token_store.get(self.config.account_id, chat_id)
         last_message_id: str | None = None
         chunks = split_text_for_weixin(content, self.config.max_message_length)
@@ -375,6 +389,7 @@ class WeixinAdapter:
         caption: str = "",
         force_file_attachment: bool = False,
     ) -> SendResult:
+        """Encrypt, upload, and send a local file through Weixin media APIs."""
         path = Path(file_path).expanduser().resolve()
         if not path.is_file():
             return SendResult(success=False, error=f"File not found: {file_path}")
@@ -388,6 +403,7 @@ class WeixinAdapter:
             media_type, item_builder = prepare_outbound_media(path, force_file_attachment=force_file_attachment)
             upload_payload = build_upload_payload(path, plaintext)
             ciphertext = aes128_ecb_encrypt(plaintext, upload_payload["aes_key"])
+            # Weixin requires the upload reservation before the encrypted bytes are sent.
             upload_response = await self.client.get_upload_url(
                 to_user_id=chat_id,
                 media_type=media_type,
@@ -416,12 +432,10 @@ class WeixinAdapter:
                 rawfilemd5=upload_payload["rawfilemd5"],
             )
 
-            last_message_id: str | None = None
             if caption:
                 caption_result = await self.send(chat_id, caption)
                 if not caption_result.success:
                     return caption_result
-                last_message_id = caption_result.message_id
 
             context_token = self.token_store.get(self.config.account_id, chat_id)
             last_message_id = f"mclaw-weixin-{uuid.uuid4().hex}"
@@ -449,6 +463,7 @@ class WeixinAdapter:
         context_token: str | None,
         client_id: str,
     ) -> str | None:
+        """Send one text chunk with retry and stale context-token recovery."""
         last_error: Exception | None = None
         retried_without_token = False
         for attempt in range(self.config.send_chunk_retries + 1):
@@ -492,6 +507,7 @@ class WeixinAdapter:
         raise last_error
 
     async def _maybe_fetch_typing_ticket(self, user_id: str, context_token: str | None) -> None:
+        """Fetch a typing ticket opportunistically for a peer."""
         if self.typing_cache.get(user_id):
             return
         try:
@@ -502,6 +518,7 @@ class WeixinAdapter:
             logger.debug("weixin get_config failed for %s", user_id[:8])
 
     async def send_typing(self, chat_id: str) -> None:
+        """Send typing-start if a cached Weixin typing ticket is available."""
         ticket = self.typing_cache.get(chat_id)
         if not ticket:
             return
@@ -511,6 +528,7 @@ class WeixinAdapter:
             logger.debug("weixin typing start failed for %s", chat_id[:8])
 
     async def stop_typing(self, chat_id: str) -> None:
+        """Send typing-stop if a cached Weixin typing ticket is available."""
         ticket = self.typing_cache.get(chat_id)
         if not ticket:
             return

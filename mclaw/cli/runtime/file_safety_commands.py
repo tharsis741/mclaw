@@ -11,6 +11,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from mclaw.utils import is_truthy_value
+
 
 @dataclass(frozen=True)
 class RuntimeFileSafetyCommandHooks:
@@ -46,6 +48,7 @@ class RuntimeFileSafetyCommandCoordinator:
         self.hooks = hooks
 
     def handle_rollback(self, raw_args: str = "") -> None:
+        """Route `/rollback` subcommands through checkpoint and operation rollback APIs."""
         mgr = self.hooks.get_checkpoint_manager()
         if mgr is None:
             self.hooks.render_notice("Rollback", "当前没有可用 agent session。", "", "warning")
@@ -85,7 +88,7 @@ class RuntimeFileSafetyCommandCoordinator:
             self._handle_undo(coordinator, cwd, rest)
             return
 
-        if lower in {"restore", "redo"} or command in {"恢复", "还原"}:
+        if lower == "restore":
             self._handle_restore_group(coordinator, cwd, rest)
             return
 
@@ -104,6 +107,7 @@ class RuntimeFileSafetyCommandCoordinator:
         self.hooks.render_rollback_result(result, True, command)
 
     def handle_checkpoints(self, raw_args: str = "") -> None:
+        """Route `/checkpoints` maintenance commands through host-provided hooks."""
         args = str(raw_args or "").split()
         subcmd = args[0].lower() if args else "status"
 
@@ -117,7 +121,7 @@ class RuntimeFileSafetyCommandCoordinator:
                 retention_days = int(cp_cfg.get("prune_retention_days", 30)) if isinstance(cp_cfg, dict) else 30
             except (TypeError, ValueError):
                 retention_days = 30
-            delete_orphans = bool(cp_cfg.get("delete_orphans", True)) if isinstance(cp_cfg, dict) else True
+            delete_orphans = is_truthy_value(cp_cfg.get("delete_orphans", True), True) if isinstance(cp_cfg, dict) else True
             self.hooks.render_checkpoints_prune(self.hooks.prune_checkpoints(retention_days, delete_orphans))
             return
 
@@ -140,6 +144,7 @@ class RuntimeFileSafetyCommandCoordinator:
         options: dict[str, Any],
         context_mode: str,
     ) -> None:
+        """Handle raw checkpoint restore paths that bypass operation-level rollback."""
         project_args, project_confirmed = self.strip_yes_flag(project_args)
         project_command, project_rest = self.split_ref_and_rest(project_args)
         if not project_command:
@@ -173,12 +178,13 @@ class RuntimeFileSafetyCommandCoordinator:
             return
         result = mgr.restore(cwd, target_hash, file_path=file_path)
         if not result.get("success"):
-            self.hooks.render_notice("Checkpoint 恢复", str(result.get("error") or "restore failed"), "", "danger")
+            self.hooks.render_notice("Checkpoint 恢复", str(result.get("error") or "恢复失败"), "", "danger")
             return
         self.hooks.render_project_restore_result(result, file_path)
         self.hooks.restore_chat_context(result.get("metadata") or {}, context_mode)
 
     def _handle_ops_rollback(self, coordinator: Any, cwd: str, rest: str, *, context_mode: str, ref_label: str) -> None:
+        """Handle low-level operation rollback and diff commands."""
         op_command, op_rest = self.split_ref_and_rest(rest)
         if not op_command:
             operations = coordinator.list_operations(session_id=None, workspace=cwd)
@@ -198,6 +204,7 @@ class RuntimeFileSafetyCommandCoordinator:
         self.hooks.render_rollback_result(result, False, ref_label)
 
     def _handle_undo(self, coordinator: Any, cwd: str, rest: str) -> None:
+        """Restore a previously rolled-back group or rollback transaction."""
         target_ref, _ = self.split_ref_and_rest(rest)
         if target_ref and target_ref.isdigit():
             result = coordinator.restore_group(target_ref, session_id=None, workspace=cwd)
@@ -232,6 +239,7 @@ class RuntimeFileSafetyCommandCoordinator:
         self.hooks.render_notice("Rollback", f"已恢复第 {target_ref} 条已撤销变更。", "", "success")
 
     def _handle_turn_rollback(self, coordinator: Any, cwd: str, rest: str, *, context_mode: str) -> None:
+        """Rollback every journaled operation in one conversation turn."""
         target_ref, _ = self.split_ref_and_rest(rest)
         if not target_ref:
             self.hooks.render_notice("Rollback", "用法: /rollback turn <N|turn_id>", "", "warning")
@@ -246,6 +254,7 @@ class RuntimeFileSafetyCommandCoordinator:
             self.hooks.render_notice("Rollback", f"已同步整理聊天上下文：隐藏 {context.get('invalidated', 0)} 条相关消息。", "", "success")
 
     def _handle_group_diff(self, coordinator: Any, cwd: str, rest: str) -> None:
+        """Show a diff for a user-visible rollback group when possible."""
         target_ref, _ = self.split_ref_and_rest(rest)
         if not target_ref:
             self.hooks.render_notice("Rollback", "用法：/rollback diff <编号>", "", "warning")
@@ -260,13 +269,14 @@ class RuntimeFileSafetyCommandCoordinator:
             )
             return
         if group and group.get("operations"):
-            op_ref = group["operations"][0].get("operation_id") or group["operations"][0].get("op_id")
+            op_ref = group["operations"][0].get("operation_id")
             self.hooks.render_diff_result(coordinator.diff_operation(op_ref, session_id=None, workspace=cwd))
         else:
             self.hooks.render_diff_result(coordinator.diff_operation(target_ref, session_id=None, workspace=cwd))
 
     @staticmethod
     def split_ref_and_rest(raw_args: str) -> tuple[str, str]:
+        """Split the first command/reference token from the remaining argument string."""
         parts = (raw_args or "").strip().split(maxsplit=1)
         if not parts:
             return "", ""
@@ -275,6 +285,7 @@ class RuntimeFileSafetyCommandCoordinator:
 
     @staticmethod
     def parse_rollback_options(raw_args: str) -> tuple[dict[str, Any], str]:
+        """Parse rollback flags while preserving the remaining command payload."""
         try:
             tokens = shlex.split(raw_args or "", posix=False)
         except ValueError:
@@ -285,11 +296,7 @@ class RuntimeFileSafetyCommandCoordinator:
         while i < len(tokens):
             token = tokens[i].strip()
             lower = token.lower()
-            if lower in {"--fs-only"}:
-                options["context"] = "off"
-                i += 1
-                continue
-            if lower in {"--yes", "-y"}:
+            if lower == "--yes":
                 options["yes"] = True
                 i += 1
                 continue
@@ -297,21 +304,9 @@ class RuntimeFileSafetyCommandCoordinator:
                 options["context"] = tokens[i + 1].strip("'\"").lower()
                 i += 2
                 continue
-            if lower.startswith("--context="):
-                options["context"] = token.split("=", 1)[1].strip("'\"").lower()
-                i += 1
-                continue
             if lower in {"--dir", "--path"} and i + 1 < len(tokens):
                 options[lower[2:]] = tokens[i + 1].strip("'\"")
                 i += 2
-                continue
-            if lower.startswith("--dir="):
-                options["dir"] = token.split("=", 1)[1].strip("'\"")
-                i += 1
-                continue
-            if lower.startswith("--path="):
-                options["path"] = token.split("=", 1)[1].strip("'\"")
-                i += 1
                 continue
             remaining = tokens[i:]
             break
@@ -319,6 +314,7 @@ class RuntimeFileSafetyCommandCoordinator:
 
     @staticmethod
     def strip_yes_flag(raw_args: str) -> tuple[str, bool]:
+        """Remove confirmation flags used by project checkpoint restore."""
         try:
             tokens = shlex.split(raw_args or "", posix=False)
         except ValueError:
@@ -326,7 +322,7 @@ class RuntimeFileSafetyCommandCoordinator:
         kept = []
         confirmed = False
         for token in tokens:
-            if token.strip().lower() in {"--yes", "-y"}:
+            if token.strip().lower() == "--yes":
                 confirmed = True
             else:
                 kept.append(token.strip("'\""))

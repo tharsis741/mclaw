@@ -27,6 +27,7 @@ def _compact_text(text: str) -> str:
 
 
 def _description_lines(text: str, *, width: int = _SKILLS_DESC_WIDTH) -> list[str]:
+    """Normalize Skill descriptions into stable terminal-width display lines."""
     compact = _compact_text(text)
     if not compact:
         return ["暂无描述。"]
@@ -40,6 +41,7 @@ def _description_lines(text: str, *, width: int = _SKILLS_DESC_WIDTH) -> list[st
 
 
 def _format_skills_list_payload(payload: dict[str, Any]) -> str:
+    """Render the skills_list JSON contract as compact slash-command help."""
     skills = payload.get("skills") or []
     count = payload.get("count", len(skills))
 

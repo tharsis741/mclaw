@@ -21,6 +21,7 @@ class InteractiveSessionLockError(RuntimeError):
 
 
 def _is_process_alive(pid: int) -> bool:
+    """Best-effort liveness probe used before removing a stale session lock."""
     if pid <= 0:
         return False
     if os.name == "nt":
@@ -42,6 +43,7 @@ def _is_process_alive(pid: int) -> bool:
 
 
 def _lock_name(session_id: str) -> str:
+    """Hash session IDs so lock filenames never expose raw session identifiers."""
     digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:24]
     return f"{digest}.lock"
 
@@ -56,6 +58,7 @@ class InteractiveSessionLock:
         self._acquired = False
 
     def acquire(self) -> None:
+        """Create the lock file atomically or fail when a live owner exists."""
         self.root.mkdir(parents=True, exist_ok=True)
         payload = {
             "pid": os.getpid(),
@@ -73,6 +76,7 @@ class InteractiveSessionLock:
         self._acquired = True
 
     def release(self) -> None:
+        """Remove the lock only when it is still owned by this process."""
         if not self._acquired:
             return
         try:
@@ -86,6 +90,7 @@ class InteractiveSessionLock:
             self._acquired = False
 
     def _handle_existing_lock(self) -> None:
+        """Reject live owners and clear stale or unreadable lock files."""
         data = self._read_lock()
         pid = int(data.get("pid") or 0)
         if pid and _is_process_alive(pid):
@@ -98,6 +103,7 @@ class InteractiveSessionLock:
         self.path.unlink(missing_ok=True)
 
     def _read_lock(self) -> dict[str, Any]:
+        """Read lock metadata, treating corrupt files as stale candidates."""
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}

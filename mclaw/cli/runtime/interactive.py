@@ -26,15 +26,18 @@ class InteractiveRuntime:
     last_interrupt_at: float = 0.0
 
     def submit_text(self, text: str) -> None:
+        """Queue user text for the runtime loop without binding to a TUI widget."""
         if text:
             self.pending_input.put(text)
 
     def request_exit(self, *, force_no_flush: bool = False) -> None:
+        """Set the cooperative exit flag used by worker and UI loops."""
         if force_no_flush:
             self.force_exit_no_flush = True
         self.should_exit = True
 
     def interrupt_window_hit(self, *, now: float | None = None, seconds: float = 2.0) -> bool:
+        """Return True when two interrupt requests arrive inside the force-exit window."""
         current = time.time() if now is None else now
         if current - float(self.last_interrupt_at or 0.0) < seconds:
             return True

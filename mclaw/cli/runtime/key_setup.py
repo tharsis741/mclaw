@@ -10,6 +10,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from mclaw.cli.config import mask_api_key
+
 
 @dataclass(frozen=True)
 class RuntimeKeySetupHooks:
@@ -34,6 +36,7 @@ class RuntimeKeySetupCoordinator:
         self.hooks = hooks
 
     def complete(self, setup: dict[str, Any] | None, api_key: str) -> None:
+        """Persist the entered key and retry the operation that requested it."""
         if not api_key:
             self.hooks.render_missing_key()
             return
@@ -41,16 +44,24 @@ class RuntimeKeySetupCoordinator:
             self.hooks.render_model_error("缺少待处理的密钥配置请求。")
             return
 
-        env_var = str(setup.get("env_var") or "")
+        env_var = str(setup.get("env_var") or "").strip()
+        if not env_var:
+            message = "缺少待保存的环境变量名。"
+            if setup.get("_search_backend"):
+                self.hooks.render_search_error(message)
+            else:
+                self.hooks.render_model_error(message)
+            return
         self.hooks.save_env_value(env_var, api_key)
         if setup.get("_search_backend") and env_var:
+            # Web search keys must be authorized for the scoped tool after save.
             try:
                 from mclaw.runtime.secrets import authorize
 
                 authorize("tool:web_search", [env_var])
             except Exception:
                 pass
-        self.hooks.render_key_saved(env_var, self._mask_key(api_key))
+        self.hooks.render_key_saved(env_var, mask_api_key(api_key))
 
         if setup.get("_search_backend"):
             result = self.hooks.retry_search_backend()
@@ -68,7 +79,3 @@ class RuntimeKeySetupCoordinator:
             self.hooks.render_model_error(str(getattr(result, "error_message", "") or "模型切换失败。"))
             return
         self.hooks.apply_model_switch(result, bool(setup.get("is_global")))
-
-    @staticmethod
-    def _mask_key(api_key: str) -> str:
-        return api_key[:6] + "..." if len(api_key) > 6 else "***"

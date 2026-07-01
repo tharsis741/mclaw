@@ -2,7 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inbound Weixin media download and cache helpers."""
+"""Download, decrypt, and cache inbound Weixin media attachments.
+
+Weixin event payloads carry several media shapes and CDN URL variants. This
+module adapts those protocol details into local files that the agent can safely
+reference in prompts and tool calls.
+"""
 
 from __future__ import annotations
 
@@ -41,6 +46,8 @@ WEIXIN_CDN_ALLOWLIST: frozenset[str] = frozenset(
 
 @dataclass(frozen=True)
 class WeixinMediaAttachment:
+    """Agent-facing description of one cached or failed Weixin media item."""
+
     kind: str
     mime_type: str
     path: str = ""
@@ -53,10 +60,12 @@ class WeixinMediaAttachment:
 
 
 def has_media_items(item_list: list[dict[str, Any]]) -> bool:
+    """Return whether an item list contains direct or referenced media payloads."""
     return any(item.get("type") in {ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO} for item in _iter_media_items(item_list))
 
 
 def media_dedup_key(sender_id: str, item_list: list[dict[str, Any]]) -> str:
+    """Build a stable dedup key from Weixin media references rather than text content."""
     refs: list[str] = []
     for item in _iter_media_items(item_list):
         item_type = str(item.get("type") or "")
@@ -76,6 +85,7 @@ def media_dedup_key(sender_id: str, item_list: list[dict[str, Any]]) -> str:
 
 
 def format_media_for_agent(attachments: list[WeixinMediaAttachment]) -> str:
+    """Render cached attachments as prompt context with suggested follow-up tools."""
     if not attachments:
         return ""
 
@@ -110,12 +120,15 @@ def format_media_for_agent(attachments: list[WeixinMediaAttachment]) -> str:
 
 
 class WeixinMediaCache:
+    """Resolve Weixin media references into bounded local cache files."""
+
     def __init__(self, *, config: WeixinConfig, client: Any) -> None:
         self.config = config
         self.client = client
         self.root = _cache_root(config)
 
     async def collect(self, item_list: list[dict[str, Any]], *, message_id: str = "") -> list[WeixinMediaAttachment]:
+        """Download every media-bearing item, returning per-item failures as attachments."""
         if not self.config.media_cache_enabled:
             return []
         attachments: list[WeixinMediaAttachment] = []
@@ -124,6 +137,7 @@ class WeixinMediaCache:
         return attachments
 
     async def _download_item(self, item: dict[str, Any], *, message_id: str, index: int) -> WeixinMediaAttachment:
+        """Fetch, optionally decrypt, size-check, and cache one Weixin media item."""
         kind = _kind_for_type(item.get("type"))
         filename = _filename_for_item(item)
         mime_type = _mime_for_item(item, filename)
@@ -144,6 +158,7 @@ class WeixinMediaCache:
                 )
             aes_key = _aes_key_for_item(item, media)
             if aes_key:
+                # Weixin may provide encrypted CDN bytes; decrypt after the size guard.
                 raw = _aes128_ecb_decrypt(raw, _parse_aes_key(aes_key))
             path = self._write_cache(raw, kind=kind, filename=filename, mime_type=mime_type, message_id=message_id, index=index)
             return WeixinMediaAttachment(
@@ -183,6 +198,7 @@ def _cache_root(config: WeixinConfig) -> Path:
 
 
 def _iter_media_items(item_list: list[dict[str, Any]]):
+    """Yield direct media items and media nested inside quoted/reference messages."""
     for item in item_list:
         if not isinstance(item, dict):
             continue
@@ -239,6 +255,7 @@ def _mime_for_item(item: dict[str, Any], filename: str) -> str:
 
 
 def _download_url(*, cdn_base_url: str, encrypted_query_param: str | None, full_url: str | None) -> str:
+    """Resolve Weixin's encrypted-query or full-URL media reference into a safe CDN URL."""
     if encrypted_query_param:
         url = f"{cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
         _assert_weixin_cdn_url(url)
@@ -250,6 +267,7 @@ def _download_url(*, cdn_base_url: str, encrypted_query_param: str | None, full_
 
 
 def _assert_weixin_cdn_url(url: str) -> None:
+    """Reject media URLs outside the known Weixin CDN surface."""
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     host = parsed.hostname or ""
@@ -260,6 +278,7 @@ def _assert_weixin_cdn_url(url: str) -> None:
 
 
 def _aes_key_for_item(item: dict[str, Any], media: dict[str, Any]) -> str:
+    """Normalize image-specific hex keys and media-level keys to the API form."""
     image_aes_hex = str((item.get("image_item") or {}).get("aeskey") or "")
     if image_aes_hex:
         try:
@@ -270,6 +289,7 @@ def _aes_key_for_item(item: dict[str, Any], media: dict[str, Any]) -> str:
 
 
 def _parse_aes_key(aes_key_b64: str) -> bytes:
+    """Decode Weixin AES key variants into the 16-byte key used for media decryption."""
     decoded = base64.b64decode(aes_key_b64)
     if len(decoded) == 16:
         return decoded
@@ -281,6 +301,7 @@ def _parse_aes_key(aes_key_b64: str) -> bytes:
 
 
 def _aes128_ecb_decrypt(ciphertext: bytes, key: bytes) -> bytes:
+    """Decrypt Weixin CDN media bytes and remove PKCS-style padding when present."""
     try:
         from cryptography.hazmat.backends import default_backend
         from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes

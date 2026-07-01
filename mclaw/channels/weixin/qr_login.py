@@ -18,6 +18,8 @@ QR_TIMEOUT_MS = 35_000
 
 
 class QRLoginClient(Protocol):
+    """Protocol used to run QR login with either the real or a test iLink client."""
+
     async def get_bot_qrcode(self, *, bot_type: str = "3", timeout_ms: int = QR_TIMEOUT_MS) -> dict: ...
     async def get_qrcode_status(
         self,
@@ -30,6 +32,8 @@ class QRLoginClient(Protocol):
 
 @dataclass(frozen=True)
 class WeixinLoginCredentials:
+    """Credentials returned by a confirmed iLink QR login."""
+
     account_id: str
     token: str
     base_url: str
@@ -37,6 +41,7 @@ class WeixinLoginCredentials:
 
 
 def _redirect_base_url(host: str) -> str:
+    """Normalize a QR-login redirect host into an HTTPS base URL."""
     raw = host.strip().rstrip("/")
     if not raw:
         return ILINK_BASE_URL
@@ -58,6 +63,7 @@ def _render_qr(scan_data: str, print_fn: Callable[[str], None]) -> None:
 
 
 def _save_credentials(account_store: WeixinAccountStore, credentials: WeixinLoginCredentials) -> None:
+    """Persist confirmed login credentials through the account store."""
     account_store.save_account(
         credentials.account_id,
         {
@@ -125,6 +131,7 @@ async def qr_login(
             elif status == "scaned_but_redirect":
                 redirect_host = str(status_response.get("redirect_host") or "").strip()
                 if redirect_host:
+                    # Regional iLink hosts can own the confirmation phase after scan.
                     current_base_url = _redirect_base_url(redirect_host)
             elif status == "expired":
                 refresh_count += 1
@@ -165,6 +172,7 @@ def _show_qr(
     print_fn: Callable[[str], None],
     render_qr: bool,
 ) -> None:
+    """Print the scan URL and optional terminal QR representation."""
     scan_data = qrcode_url or qrcode_value
     print_fn("请使用微信扫描二维码并确认登录:")
     if qrcode_url:
@@ -174,6 +182,7 @@ def _show_qr(
 
 
 def _credentials_from_status(response: dict) -> WeixinLoginCredentials | None:
+    """Extract the credential fields from a confirmed QR status response."""
     account_id = str(response.get("ilink_bot_id") or "").strip()
     token = str(response.get("bot_token") or "").strip()
     base_url = str(response.get("baseurl") or ILINK_BASE_URL).strip().rstrip("/")

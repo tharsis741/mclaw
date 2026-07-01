@@ -2,7 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Delivery service for scheduler run final responses."""
+"""Delivery service for scheduler run final responses.
+
+The service is intentionally synchronous from the scheduler engine's point of
+view, while adapting to channel clients that may expose async send methods.
+"""
 
 from __future__ import annotations
 
@@ -21,6 +25,8 @@ logger = logging.getLogger(__name__)
 
 
 class DeliveryService:
+    """Routes a completed run response to local, DingTalk, or Weixin targets."""
+
     def __init__(
         self,
         *,
@@ -38,9 +44,11 @@ class DeliveryService:
         self.target_manager = TargetManager()
 
     def deliver(self, job: SchedulerJob, run: SchedulerRun, content: str) -> dict[str, Any]:
+        """Deliver using the job's configured delivery spec."""
         return self.deliver_one(job.delivery, job, run, content)
 
     def deliver_one(self, spec: DeliverySpec, job: SchedulerJob, run: SchedulerRun, content: str) -> dict[str, Any]:
+        """Validate the target and retry external delivery attempts."""
         target = self.store.get_target(spec.target_id)
         if not target:
             return {"success": False, "status": "target_missing", "error": f"target not found: {spec.target_id}"}
@@ -62,7 +70,17 @@ class DeliveryService:
                 "output_path": run.output_path,
             }
 
-        retry_count = max(1, int(spec.retry_count or 1))
+        try:
+            retry_count = int(spec.retry_count)
+        except (TypeError, ValueError) as exc:
+            return {"success": False, "status": "invalid_delivery", "target_id": target.id, "error": str(exc)}
+        if retry_count < 1:
+            return {
+                "success": False,
+                "status": "invalid_delivery",
+                "target_id": target.id,
+                "error": "delivery.retry_count must be >= 1",
+            }
         delays = [0, 2, 5, 10]
         attempts: list[dict[str, Any]] = []
         last: dict[str, Any] = {}
@@ -96,6 +114,7 @@ class DeliveryService:
         }
 
     def _deliver_external(self, target, job: SchedulerJob, run: SchedulerRun, content: str) -> dict[str, Any]:
+        """Adapt scheduler delivery payloads to channel-specific client APIs."""
         if target.type == "dingtalk_group":
             if self.dingtalk_client is None:
                 return {"success": False, "error": "DingTalk client is not configured"}
@@ -128,6 +147,7 @@ class DeliveryService:
         return {"success": False, "error": f"unsupported target type: {target.type}"}
 
     def _deliver_weixin(self, target, content: str) -> dict[str, Any]:
+        """Send Weixin text with context-token recovery for stale routes."""
         if self.weixin_client is None:
             return {"success": False, "error": "Weixin client is not configured"}
         _ensure_client_open(self.weixin_client)
@@ -149,21 +169,24 @@ class DeliveryService:
         if stale and context_token:
             if self.weixin_token_store is not None:
                 self.weixin_token_store.clear(target.account_id, target.chat_id)
+            # Retry once without the stale context token so the channel can recover.
+            retry_client_id = f"mclaw-scheduler-{uuid.uuid4().hex}"
             response = _await_if_needed(
                 self.weixin_client.send_text(
                     to_user_id=target.chat_id,
                     text=content,
-                    client_id=f"mclaw-scheduler-{uuid.uuid4().hex}",
+                    client_id=retry_client_id,
                     context_token=None,
                 )
             )
             success, error, _stale = _weixin_response_state(response)
             if success:
-                return {"success": True, "message_id": client_id, "response": response, "stale_token_retried": True}
+                return {"success": True, "message_id": retry_client_id, "response": response, "stale_token_retried": True}
         return {"success": False, "error": error, "response": response}
 
 
 def _await_if_needed(value: Any) -> Any:
+    """Resolve awaitables for scheduler code that runs in worker threads."""
     if not inspect.isawaitable(value):
         return value
     try:
@@ -176,6 +199,7 @@ def _await_if_needed(value: Any) -> Any:
 
     import concurrent.futures
 
+    # A running loop cannot be nested, so wait on a short-lived helper thread.
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(lambda: asyncio.run(_runner(value)))
         return future.result()
@@ -192,7 +216,7 @@ def _ensure_client_open(client: Any) -> None:
 
 def _send_result_dict(result: Any) -> dict[str, Any]:
     if isinstance(result, dict):
-        return {"success": bool(result.get("success")), **result}
+        return {**result, "success": bool(result.get("success"))}
     success = bool(getattr(result, "success", False))
     payload = {"success": success}
     message_id = getattr(result, "message_id", None)
@@ -207,12 +231,28 @@ def _send_result_dict(result: Any) -> dict[str, Any]:
 def _weixin_response_state(response: Any) -> tuple[bool, str, bool]:
     if not isinstance(response, dict):
         return False, str(response), False
-    ret = response.get("ret", response.get("errcode", 0))
+    ret = response.get("ret")
+    errcode = response.get("errcode")
     errmsg = str(response.get("errmsg") or response.get("message") or "")
+    ret_code = _response_code(ret)
+    errcode_code = _response_code(errcode)
+    success = _response_code_ok(ret, ret_code) and _response_code_ok(errcode, errcode_code)
+    stale = (
+        ret_code == -14
+        or errcode_code == -14
+        or ((ret_code == -2 or errcode_code == -2) and errmsg.strip().lower() == "unknown error")
+    )
+    return success, errmsg or f"ret={ret} errcode={errcode}", stale
+
+
+def _response_code(value: Any) -> int | None:
+    if value is None or value == "":
+        return None
     try:
-        code = int(ret or 0)
+        return int(value)
     except (TypeError, ValueError):
-        code = 0
-    success = code == 0
-    stale = code == -14 or (code == -2 and errmsg.strip().lower() == "unknown error")
-    return success, errmsg or f"ret={ret}", stale
+        return None
+
+
+def _response_code_ok(value: Any, code: int | None) -> bool:
+    return value is None or value == "" or code == 0

@@ -2,7 +2,7 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""External Skill install lifecycle for Skill 2.0."""
+"""External Skill install lifecycle."""
 
 from __future__ import annotations
 
@@ -59,6 +59,8 @@ def _lock_path(name: str) -> Path:
 
 
 def _read_manifest(drafting_id: str) -> tuple[Path, dict[str, Any]]:
+    """Load the prepared install manifest for a drafting package."""
+
     did = validate_drafting_id(drafting_id)
     root = get_skill_drafting_dir() / did
     manifest_path = root / "import_manifest.yaml"
@@ -69,6 +71,8 @@ def _read_manifest(drafting_id: str) -> tuple[Path, dict[str, Any]]:
 
 
 def _write_manifest(drafting_root: Path, manifest: dict[str, Any]) -> None:
+    """Persist the import manifest that drives confirmation and enablement."""
+
     validate_manifest(manifest)
     (drafting_root / "import_manifest.yaml").write_text(
         yaml.safe_dump(manifest, allow_unicode=True, sort_keys=False),
@@ -81,6 +85,8 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 def _relative_file_inventory(root: Path) -> list[str]:
+    """Return a stable relative file list for install audit records."""
+
     files: list[str] = []
     for path in sorted(root.rglob("*")):
         if path.is_file():
@@ -107,6 +113,8 @@ def _write_install_audit(
     confirmed_at: str,
     enabled_at: str | None = None,
 ) -> Path:
+    """Write the audit artifact that links confirmation, review, and target files."""
+
     source = _source_summary(manifest.get("source"))
     audit = {
         "schema_version": 1,
@@ -146,6 +154,8 @@ def _write_install_audit(
 
 
 def _compact_findings(review: dict[str, Any], *, limit: int = 5) -> list[dict[str, Any]]:
+    """Return a short, serializable finding summary for confirmation prompts."""
+
     findings = review.get("findings")
     if not isinstance(findings, list):
         return []
@@ -167,6 +177,8 @@ def _compact_findings(review: dict[str, Any], *, limit: int = 5) -> list[dict[st
 
 
 def _read_root_skill_md(package: Path) -> str:
+    """Read the required root SKILL.md from a materialized package."""
+
     skill_md = package / "SKILL.md"
     if not skill_md.exists():
         raise SkillStoreError("Source package must contain root SKILL.md.")
@@ -174,6 +186,8 @@ def _read_root_skill_md(package: Path) -> str:
 
 
 def _read_package_metadata(package: Path, skill_md: str, fallback: str) -> tuple[str, str]:
+    """Resolve Skill name and summary from sidecar metadata or SKILL.md frontmatter."""
+
     if (package / "mclaw_skill.yaml").is_file():
         data = read_skill_yaml(package)
         name = validate_skill_name(str(data.get("name") or "").strip())
@@ -191,6 +205,8 @@ def _read_package_metadata(package: Path, skill_md: str, fallback: str) -> tuple
 
 
 def _fallback_name(resolved: ResolvedSource, source: str) -> str:
+    """Choose a deterministic fallback name from the resolved source identity."""
+
     if resolved.slug:
         return resolved.slug
     if resolved.package_root:
@@ -203,12 +219,16 @@ def _fallback_name(resolved: ResolvedSource, source: str) -> str:
 
 
 def install_prepare(source: str, user_intent: str | None = None) -> dict[str, Any]:
+    """Materialize an external Skill into drafting state and request confirmation."""
+
     ensure_runtime_roots()
     resolved = resolve_source(source)
     did = _drafting_id()
     drafting_root = get_skill_drafting_dir() / did
     package = drafting_root / "skill"
     try:
+        # External content stays in the drafting root until validation, dependency
+        # hints, and security review have all completed.
         materialize_source(resolved, package)
         skill_md = _read_root_skill_md(package)
         name, short_description = _read_package_metadata(package, skill_md, _fallback_name(resolved, source))
@@ -291,6 +311,8 @@ def install_prepare(source: str, user_intent: str | None = None) -> dict[str, An
 
 
 def enable_drafting(drafting_id: str) -> dict[str, Any]:
+    """Promote a reviewed drafting package into the enabled Skills root."""
+
     drafting_root, manifest = _read_manifest(drafting_id)
     skill_name = validate_skill_name(str(manifest.get("skill_name") or ""))
     package = drafting_root / "skill"
@@ -311,6 +333,7 @@ def enable_drafting(drafting_id: str) -> dict[str, Any]:
     audit_path: Path | None = None
     target_review_path: Path | None = None
     with file_lock(_lock_path(skill_name)):
+        # The per-Skill lock makes the package move and rollback boundary process-safe.
         if target.exists():
             raise SkillStoreError(f"Skill '{skill_name}' already exists at {target}.")
         moved = False
@@ -365,6 +388,8 @@ def enable_drafting(drafting_id: str) -> dict[str, Any]:
 
 
 def cancel_drafting(drafting_id: str) -> dict[str, Any]:
+    """Discard a prepared install package before it is enabled."""
+
     drafting_root, manifest = _read_manifest(drafting_id)
     shutil.rmtree(drafting_root, ignore_errors=True)
     return {
@@ -376,6 +401,8 @@ def cancel_drafting(drafting_id: str) -> dict[str, Any]:
 
 
 def security_review(drafting_id: str) -> dict[str, Any]:
+    """Re-run the security review for a still-drafted external Skill."""
+
     drafting_root, manifest = _read_manifest(drafting_id)
     package = drafting_root / "skill"
     if not package.is_dir():
