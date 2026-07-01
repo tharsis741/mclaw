@@ -18,44 +18,58 @@
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Kaihong%20OS%20%7C%20M--Robots%20OS-6f42c1">
 </p>
 
-**M-Claw 是面向具身智能、端侧运行时与机器人协作场景设计的 Agent Runtime，旨在将模型、工具、记忆、Skill、安全策略、任务调度与设备控制组织为一个可运行的机器人行动系统，并探索“一机一脑，多脑协同”的架构，让 Agent 从对话走向真实任务，从软件工具走向物理设备。**
+**M-Claw 是面向具身智能与机器人协作的 Agent Runtime，连接语言模型与物理世界执行系统，将模型能力、工具链、空间记忆与设备控制组织为统一运行时，使 Agent 能够直接在真实环境中完成任务，并支持“一机一脑、多脑协同”的分布式智能架构。**
 
 > 当前版本：1.0.0  
 > 开源协议：Apache-2.0  
 > 当前安装方式：源码安装
 
-## 当前能力
-
-**1.0.0 聚焦“智能体运行时”的最小可用闭环：在本地桌面与机器人控制场景中，让 M-CLAW 能够安全地读取上下文、调用工具、执行命令、沉淀记忆、加载 Skill，并通过 Skill 连接真实机器人设备。**
-
-它的系统边界可以概括为：
-
-- **Agent Runtime**：负责模型调用、工具调度、上下文压缩、会话状态、记忆召回、后台审查和中断恢复。
-- **Tool Runtime**：提供文件、终端、后台进程、搜索、视觉、浏览器、凭据、通道和子代理委派能力。
-- **Skill Runtime**：将可复用流程封装为 Skill，并通过 `SKILL.md`、`mclaw_skill.yaml` 和 `skill_evolution.json` 管理能力记忆。
-- **Safety Runtime**：通过 PathPolicy、Scoped Secret、Checkpoint、Rollback 和 Operation Journal 降低本地执行风险。
-
 ## Roadmap
 
-**M-Claw 将从 1.0.0 的单机智能体运行时，逐步演进为面向分布式机器人群体智能的操作底座。**
+**M-CLAW 将从单机 Agent Runtime 逐步演进为分布式机器人执行网络与统一任务控制平面，构建面向具身智能的可编排运行时基础设施。**
 
-### 2026.06 | **1.0.0 桌面端原型版发布**
+### 2026.06 | **1.0.0 单机智能体运行时**
 
-完成原型能力展示，验证M-Claw原型版在 M-Robots OS 上运行、执行日常办公与开发任务，并形成“智能体运行时 + 机器人控制”的最小可用闭环。
+完成最小智能体运行时闭环，在 M-Robots OS 上验证“模型驱动执行 + 工具调用 + 记忆 + Skill 扩展 + 机器人控制”的端到端执行链路。
 
-### 2026.09 | **1.1.0 多机协同**
+### 2026.09 | **1.1.0 分布式运行时协同网络**
 
-探索多 M-Claw Runtime 之间的智能体协同协议，让不同机器人能够交换任务、状态和能力，在保持本地自治的同时完成协作任务。同时引入动作边界与安全验证能力，并探索“脑-小脑”异步控制架构：M-Claw Runtime 作为机器人本地大脑，负责理解意图、规划任务和协同决策；底层控制模块作为小脑，负责高频、稳定、实时的动作执行。
+引入多 M-CLAW Runtime 协同机制，构建分布式执行网络，支持不同设备/机器人之间的任务分发、状态同步与能力共享。
 
-### 2026.10 | **1.2.0 Mycelium 机器人控制中心以及生态建设**
+同时建立“脑-小脑”分层控制架构：
 
-v1.2.0 将推出 M-CLAW Mycelium 机器人控制中心，统一管理机器人状态、任务队列、Skill 调用、后台执行、任务恢复与失败反馈，让机器人任务从一次性指令执行升级为可持续调度、可复盘、可演化的任务流。
+- 运行时（大脑）：负责意图理解、任务规划与跨节点协同决策。
+- 控制模块（小脑）：负责高频、稳定、实时的动作执行。
 
-同时，M-Claw 将引入 Skill Hub 生态机制，让开发者可以围绕机器人动作、办公流程、行业工具和设备控制发布、安装、更新和复用 Skill。
 
-### 2026.12 | **2.0.0 空间智能体**
+### 2026.10 | **1.2.0 Mycelium 控制平台与 Skill 生态**
 
-面向空间记忆、位置建模、跨机器人协同调度和万物互联集群治理发展。M-Claw 将从单一设备控制走向空间级智能体，使 Agent 能够理解环境、记忆位置、协调多台机器人和多类智能设备，在真实空间中完成更复杂的自动化任务。
+构建统一任务控制平台（Mycelium Control Panel），实现对机器人、设备、Skill 与执行任务的集中调度与生命周期管理，使任务从“单次执行”升级为“可持续调度与可演化任务流”。
+
+同时推出 Skill Hub 生态系统，支持 Skill 的发布、安装、更新与复用，使 M-CLAW 从执行运行时扩展为具备开发者生态的具身智能基础设施。
+
+### 2026.12 | **2.0.0 空间智能体运行时**
+
+面向空间记忆建模、环境感知与多机器人协同调度，M-CLAW 从单设备 Agent Runtime 演进为空间智能体运行时，使系统能够在统一空间表示下理解环境状态、维护位置记忆，并在多机器人与多设备之间进行任务协调与执行编排。
+在该阶段，M-CLAW 引入“空间作为运行时状态”的核心抽象，将物理环境建模为可计算的空间结构（Spatial State），并在此基础上实现跨设备的任务分解、路径规划与协同执行。
+
+能力演进包括：
+
+- 空间记忆：构建环境与位置的持续性记忆，使 Agent 能够在时间维度上累积空间状态与变化。
+- 空间建模：将物理环境抽象为可计算的空间图结构，用于支持定位、关系建模与任务规划。
+- 跨机器人调度：在统一空间状态下进行任务分配与执行协调，实现多设备协同操作。
+- 分布式空间执行：支持多 Agent 在同一空间语义下进行协同执行与状态同步，形成空间级任务网络。
+
+## 当前能力
+
+**1.0.0 定义了 M-CLAW 的最小智能体运行时闭环，在本地桌面与机器人控制环境中提供统一执行框架，使 Agent 能够在同一运行时内完成上下文感知、工具调用、指令执行、记忆持久化与 Skill 扩展，并形成从语言输入到物理执行的闭环执行机制。**
+
+M-CLAW 运行时架构由四个逻辑层构成：
+
+- **Agent Runtime Core**：负责统一执行循环与状态管理，驱动模型推理、任务调度与工具编排，并维护会话状态、记忆生命周期与执行恢复机制。
+- **Tool Runtime**：提供面向外部环境的执行接口，包括系统操作、文件与进程管理、网络与浏览器交互以及子代理调用等，用于支持 Agent 与数字世界的交互能力。
+- **Skill Layer**：提供可复用能力单元的抽象与运行时加载机制，将复杂任务流程模块化，并作为扩展接口连接机器人设备与物理执行能力。
+- **Safety Runtime**：作为跨层执行控制与约束机制，对所有运行时操作进行策略约束、执行审计与状态回滚控制，以降低本地与物理执行风险。
 
 ## 能力概览
 
@@ -78,7 +92,7 @@ M-Claw 当前已经包含：
 
 不同模型的实际可用能力取决于 Provider endpoint 与模型自身对工具调用、流式输出、视觉输入等能力的支持。
 
-首次启动建议通过 `mclaw setup` 配置默认模型和 Provider。CLI、微信网关和钉钉网关都会从当前配置解析可用模型、Provider、API Key 和自定义 endpoint；如果缺少模型或密钥，会提示继续配置，不会隐式注入内置默认模型。
+首次启动建议通过 `mclaw setup` 配置默认模型和 Provider。CLI、微信网关和钉钉网关都会从当前配置解析可用模型、Provider、API Key 和自定义 endpoint；
 
 ## 智能体循环
 
@@ -144,22 +158,25 @@ M-Claw 当前已经包含：
 
 ## Skill as Memory
 
-**1.0.0版本定义了Skill级的记忆系统，并在运行时中长期维护。**
+**M-CLAW 1.0.0 定义了 Skill 作为运行时可演化的能力单元，用于封装可复用的任务执行逻辑，并在运行过程中持续积累执行经验与行为优化信息。**
 
-每个 Skill 可以包含：
+### Skill 结构定义
+每个 Skill 由以下组成：
 
-- `SKILL.md`：主要执行说明，定义 Skill 做什么、何时使用、如何执行。
-- `mclaw_skill.yaml`：Skill 元数据。
-- `skill_evolution.json`：Skill 的经验记录，包括适配摘要、用户偏好、已知失败和运行注意事项。
-- `scripts/`、`references/`、模板或资源文件：可选的执行资产。
+- `SKILL.md（执行语义层）`：定义 Skill 的功能边界、适用场景与执行逻辑，是 Skill 的行为定义层。
+- `mclaw_skill.yaml（元数据层）`：描述 Skill 的基本信息。
+- `skill_evolution.json（演化记忆层）`：记录 Skill 在运行过程中的经验状态，包括适配结果、用户偏好、失败案例与执行注意事项，是 Skill 的运行时经验沉淀层。
+- `执行资产`：包括 scripts、references、模板或其他运行时资源，用于支持 Skill 的实际执行能力。
 
-所有 Skill 写操作都通过 `skill_manage` 完成。普通文件工具和终端工具会阻止直接修改 M-Claw 管理的 Skill 存储，避免能力包被绕过校验地改坏。
+### Skill 写入与治理机制
 
-**M-Claw 1.0.0 已经具备 Skill 演化基础：**
+所有 Skill 写操作都通过 `skill_manage` 工具集完成。禁止通过普通文件工具和终端工具直接修改 Skill 存储，以确保能力单元的一致性与安全性。
 
-- `skill_manage(action="evolution_update")` 可更新 Skill 演化记录。
-- 后台审查线程可在配置轮次后触发记忆审查和 Skill 演化审查。
-- 后台审查仅开放受限工具白名单，降低自动写入 Skill 的风险。
+### Skill 能力演化
+
+- `skill_manage(action="evolution_update")` 用于更新 Skill 的运行时经验状态。
+- 后台审查机制周期性触发 Skill 使用情况分析与演化建议生成。
+- 后后台线程仅允许访问受限工具白名单，以降低自动修改 Skill 的风险。
 
 
 ## 安全策略与可恢复执行
@@ -199,18 +216,17 @@ KaihongRuntime 会禁用 checkpoint、桌面宠物和浏览器自动化，并保
 
 M-Claw 支持以下交互入口：
 
-- **CLI/TUI**：基于 Rich 与 prompt_toolkit 的交互式终端体验。
+- **CLI/TUI**：基于 Rich 与 prompt_toolkit 终端交互入口。
 - **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word、push-to-talk 和一次性录音模式。
 - **Scheduler**：本地定时任务引擎，支持 due detection、queued run、并发策略、失败计数、输出文件和投递结果。
 - **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
 
-`/schedule` 支持一次性、每日、每周、每月、间隔和 cron 任务。每周任务的 weekday 可填写英文星期或数字：`1` 到 `7` 对应 Monday 到 Sunday，`0` 按 Monday 处理；每月任务的日期超过当月天数时，会在执行时落到当月最后一天。定时任务投递到微信或钉钉前，需要先完成 `mclaw weixin login` 或 `mclaw dingtalk login`，并保持对应网关进程运行。
 
-## 命令入口
+## 终端命令入口
 
 ```bash
-mclaw                         # 启动交互式 Agent Runtime
-mclaw setup                   # 配置模型、工具、通道和可选能力
+mclaw                         # 启动Agent Runtime
+mclaw setup                   # 首次配置
 mclaw doctor                  # 检查核心运行时、工具能力和 IM 通道状态
 mclaw help                    # 查看命令指引
 mclaw resume                  # 恢复最近一次会话
@@ -283,7 +299,7 @@ run mclaw
 要求：
 
 - Python 3.11 或更新版本。
-- Windows/Linux 桌面环境建议安装 Git，并确保 `git` 已加入 `PATH`。源码获取、版本管理以及 Checkpoint/Rollback 会使用 Git；未安装时 checkpoint 能力会被禁用。Kaihong OS/M-Robots OS当前禁用 checkpoint，不要求 Git。
+- Windows/Linux 桌面环境建议安装 Git，并确保 `git` 已加入 `PATH`。源码获取、版本管理以及 Checkpoint/Rollback 会使用 Git；未安装时 checkpoint 能力会被禁用。Kaihong OS/M-Robots OS当前禁用 checkpoint，不要求安装 Git。
 - 如需使用浏览器自动化，需要安装 Playwright 管理的 Chromium。
 - 安装完成后可运行 `mclaw doctor` 验证核心运行时、工具能力和 IM 通道状态。若 Browser Tools 显示未配置，请确认 Chromium 安装命令运行在安装 M-Claw 的同一个 Python 环境中。
 - 部分内置 Skill 可能仍需要按场景安装额外工具链。
