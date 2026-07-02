@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/rich%20logo.png" alt="M-CLAW Rich Logo" width="100%">
+  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
 </p>
 
 <h2 align="center">自进化空间智能体<br>Self-Evolving Robot Intelligence</h2>
