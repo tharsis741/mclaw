@@ -310,4 +310,8 @@ M-Claw 将围绕 Skill Hub 构建开放技能生态。开发者可以面向办�
 
 ## License
 
-Apache-2.0. See `LICENSE` for details.
+M-Claw 基于 Apache-2.0 发布，详见 [LICENSE](LICENSE)。
+
+第三方开源声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+项目致谢见 [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md)。

@@ -9,7 +9,11 @@ description = "Robot agent runtime for M-Robots OS"
 readme = "README.zh-CN.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = [
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md",
+    "ACKNOWLEDGEMENTS.md",
+]
 authors = [
     { name = "Shenzhen Kaihong Digital Industry Development Co., Ltd." },
 ]
