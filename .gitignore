@@ -48,6 +48,10 @@ credentials/
 tmp/
 temp/
 
+# graphify outputs and scratch files
+graphify-out/
+.graphify_*
+
 # Editor and OS files
 .vscode/
 .idea/
