@@ -188,6 +188,78 @@ def _append_feature_checks(results: list[CheckResult], cfg: dict | None) -> None
             results.append(CheckResult(name, True, "not enabled; optional"))
 
 
+def _append_provider_checks(results: list[CheckResult], cfg: dict | None) -> None:
+    """Report registry catalog metadata and the typed active provider result."""
+    try:
+        from mclaw.providers.registry import iter_runtime_profiles
+        from mclaw.providers.resolver import ProviderResolutionError, resolve_provider_runtime_context
+    except Exception as exc:
+        results.append(
+            CheckResult(
+                "provider registry",
+                False,
+                f"failed to import provider metadata: {type(exc).__name__}: {exc}",
+                "Check mclaw.providers imports.",
+            )
+        )
+        return
+
+    profiles = tuple(iter_runtime_profiles())
+    callable_setup = sum(entry.callable for profile in profiles for entry in profile.setup_profiles)
+    results.append(
+        CheckResult(
+            "provider registry",
+            True,
+            f"canonical={len(profiles)}; callable_setup={callable_setup}",
+        )
+    )
+
+    config = cfg if isinstance(cfg, dict) else {}
+    try:
+        context = resolve_provider_runtime_context(
+            model=str(config.get("model") or ""),
+            provider=str(config.get("active_provider") or ""),
+            setup_profile_id=str(config.get("active_provider_profile") or ""),
+            config=config,
+        )
+    except ProviderResolutionError as exc:
+        profile = next((item for item in profiles if item.name == exc.provider), None)
+        display_name = profile.display_name if profile else (exc.provider or "unresolved")
+        credential_names = "/".join(profile.env_vars) if profile else exc.key_env_var
+        detail = f"provider={display_name}; code={exc.code}; {exc.message}"
+        if credential_names:
+            detail += f"; credential_candidates={credential_names}"
+        fix = f"Configure {credential_names or 'the active provider'} and rerun mclaw doctor."
+        if exc.key_url:
+            fix += f" Key setup: {exc.key_url}"
+        results.append(CheckResult("agent provider", False, detail, fix))
+        return
+    except Exception as exc:
+        results.append(
+            CheckResult(
+                "agent provider",
+                False,
+                f"provider resolution failed: {type(exc).__name__}",
+                "Check active provider configuration and mclaw.providers.resolver.",
+            )
+        )
+        return
+
+    profile = context.profile
+    results.append(
+        CheckResult(
+            "agent provider",
+            True,
+            (
+                f"provider={profile.name}; display={profile.display_name}; model={context.model}; "
+                f"api_mode={context.api_mode}; base_url={context.safe_base_url}; "
+                f"credential_source={context.auth_source or 'none'}; "
+                f"credential_candidates={'/'.join(profile.env_vars) or 'optional'}"
+            ),
+        )
+    )
+
+
 def _exists_env_path(name: str) -> tuple[bool, str]:
     value = os.environ.get(name, "").strip().strip('"')
     if not value:
@@ -498,6 +570,7 @@ def run_doctor() -> list[CheckResult]:
         results.append(CheckResult("runtime", False, f"failed: {type(exc).__name__}: {exc}", "Check mclaw.runtime imports."))
     _append_secret_allowlist_check(results)
     _append_feature_checks(results, cfg)
+    _append_provider_checks(results, cfg)
 
     try:
         from mclaw.platform import get_platform_info

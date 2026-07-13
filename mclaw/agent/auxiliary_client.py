@@ -10,19 +10,21 @@ but "auto" should inherit the active agent credentials and model.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
 
-
-def _task_config(task: str, parent_agent: Any = None) -> dict[str, Any]:
-    """Read task-specific auxiliary config from the live agent or disk config."""
+def _runtime_config(parent_agent: Any = None) -> dict[str, Any]:
     cfg = getattr(parent_agent, "config", None) if parent_agent is not None else None
     if not cfg:
         from mclaw.cli.config import load_config
 
         cfg = load_config(strict=True)
+    return cfg if isinstance(cfg, dict) else {}
+
+
+def _task_config(task: str, parent_agent: Any = None) -> dict[str, Any]:
+    """Read task-specific auxiliary config from the live agent or disk config."""
+    cfg = _runtime_config(parent_agent)
     aux = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
     task_cfg = aux.get(task, {}) if isinstance(aux, dict) else {}
     return task_cfg if isinstance(task_cfg, dict) else {}
@@ -39,78 +41,68 @@ def _coerce_timeout(value: Any, default: float = 60.0) -> float:
     return min(timeout, 600.0)
 
 
-def _resolve_auxiliary_credentials(task: str, parent_agent: Any = None) -> dict[str, Any]:
-    """Resolve task credentials while allowing `auto` to inherit the parent agent.
+def _resolve_auxiliary_runtime(task: str, parent_agent: Any = None):
+    """Resolve one independent or parent-inherited auxiliary runtime."""
+    from mclaw.providers.resolver import (
+        default_model_for_provider,
+        resolve_provider_runtime_context,
+        restore_provider_runtime_context,
+    )
 
-    Auxiliary work must be independently configurable, but the default path is
-    intentionally cheap: reuse the already-selected provider, model, endpoint,
-    and API mode from the interactive agent.
-    """
     task_cfg = _task_config(task, parent_agent)
     provider = str(task_cfg.get("provider") or "auto").strip()
     model = str(task_cfg.get("model") or "").strip()
     base_url = str(task_cfg.get("base_url") or "").strip()
     timeout = _coerce_timeout(task_cfg.get("timeout"), default=60.0)
-
-    parent_provider = str(getattr(parent_agent, "provider", "") or "")
-    parent_model = str(getattr(parent_agent, "model", "") or "")
-    parent_base_url = str(getattr(parent_agent, "base_url", "") or "")
-    parent_api_key = str(getattr(parent_agent, "api_key", "") or "")
-    parent_api_mode = str(getattr(parent_agent, "api_mode", "") or "chat_completions")
+    config = _runtime_config(parent_agent)
+    parent_runtime = getattr(parent_agent, "provider_runtime", None)
 
     if provider in ("", "auto"):
-        return {
-            "provider": parent_provider,
-            "model": model or parent_model,
-            "base_url": base_url or parent_base_url,
-            "api_key": parent_api_key,
-            "api_mode": parent_api_mode,
-            "timeout": timeout,
-        }
+        if base_url:
+            if parent_runtime is None:
+                raise RuntimeError("An auxiliary base_url with provider=auto requires a parent runtime")
+            custom_provider = (
+                "custom_anthropic"
+                if parent_runtime.api_mode == "anthropic_messages"
+                else "custom"
+            )
+            context = resolve_provider_runtime_context(
+                provider=custom_provider,
+                model=model or parent_runtime.model,
+                base_url=base_url,
+                api_key=parent_runtime.api_key,
+                config=config,
+            )
+        elif parent_runtime is not None:
+            context = (
+                restore_provider_runtime_context(
+                    parent_runtime.snapshot(),
+                    model=model,
+                    api_key=parent_runtime.api_key,
+                    config=config,
+                )
+                if model and model != parent_runtime.model
+                else parent_runtime
+            )
+        else:
+            context = resolve_provider_runtime_context(model=model, config=config)
+        return context, timeout
 
-    from mclaw.cli.auth import PROVIDER_REGISTRY, resolve_api_key, resolve_base_url
-
-    provider_cfg = PROVIDER_REGISTRY.get(provider)
-    inherited_model = parent_model if provider == parent_provider else ""
-    return {
-        "provider": provider,
-        "model": model or inherited_model,
-        "base_url": base_url or resolve_base_url(provider),
-        "api_key": resolve_api_key(provider) or parent_api_key,
-        "api_mode": provider_cfg.api_mode if provider_cfg else "chat_completions",
-        "timeout": timeout,
-    }
+    target_model = model or default_model_for_provider(provider, config=config)
+    context = resolve_provider_runtime_context(
+        provider=provider,
+        model=target_model,
+        base_url=base_url,
+        config=config,
+    )
+    return context, timeout
 
 
-def extract_content_or_reasoning(response: Any) -> str:
-    """Extract text from OpenAI-compatible or Anthropic-compatible responses."""
-    try:
-        choices = getattr(response, "choices", None)
-        if choices:
-            msg = choices[0].message
-            content = getattr(msg, "content", None) or ""
-            reasoning = getattr(msg, "reasoning_content", None) or ""
-            return (content or reasoning or "").strip()
-    except (AttributeError, IndexError, TypeError) as exc:
-        logger.debug("OpenAI-compatible auxiliary response parsing failed: %s", exc)
-
-    try:
-        blocks = getattr(response, "content", None)
-        if isinstance(blocks, str):
-            return blocks.strip()
-        if isinstance(blocks, list):
-            parts: list[str] = []
-            for block in blocks:
-                text = getattr(block, "text", None)
-                if text is None and isinstance(block, dict):
-                    text = block.get("text")
-                if text:
-                    parts.append(str(text))
-            return "\n".join(parts).strip()
-    except (AttributeError, TypeError) as exc:
-        logger.debug("Anthropic-compatible auxiliary response parsing failed: %s", exc)
-
-    return ""
+def extract_content_or_reasoning(result: Any) -> str:
+    """Extract display text from one normalized model-call result."""
+    content = str(getattr(result, "content", "") or "")
+    reasoning = getattr(result, "reasoning", None)
+    return (content or (reasoning.text if reasoning and reasoning.text else "")).strip()
 
 
 def call_auxiliary_llm(
@@ -121,74 +113,21 @@ def call_auxiliary_llm(
     max_tokens: int = 4000,
 ) -> str:
     """Call the configured auxiliary model for a named task."""
-    creds = _resolve_auxiliary_credentials(task, parent_agent)
-    model = creds.get("model") or ""
-    if not model:
-        raise RuntimeError(f"No model configured for auxiliary task '{task}'")
+    from mclaw.agent.transports.base import ModelCallOptions
+    from mclaw.agent.transports.factory import create_transport
 
-    api_mode = creds.get("api_mode") or "chat_completions"
-    if api_mode == "anthropic_messages":
-        try:
-            import anthropic
-        except ImportError as exc:
-            raise RuntimeError("anthropic package is required for Anthropic auxiliary calls") from exc
-
-        system = ""
-        anth_messages = []
-        # Anthropic Messages accepts system text separately and only user or
-        # assistant turns in the messages array.
-        for msg in messages:
-            if msg.get("role") == "system" and not system:
-                system = msg.get("content") or ""
-            else:
-                anth_messages.append({
-                    "role": "assistant" if msg.get("role") == "assistant" else "user",
-                    "content": msg.get("content") or "",
-                })
-
-        anth_model = model
-        if anth_model.lower().startswith("anthropic/"):
-            anth_model = anth_model[len("anthropic/"):]
-        anth_model = anth_model.replace(".", "-")
-
-        client = anthropic.Anthropic(
-            api_key=creds.get("api_key") or anthropic.NOT_GIVEN,
-            base_url=creds.get("base_url") or anthropic.NOT_GIVEN,
-            max_retries=0,
-            timeout=creds.get("timeout") or 60,
-        )
-        kwargs = {
-            "model": anth_model,
-            "messages": anth_messages,
-            "max_tokens": max_tokens,
-        }
-        if system:
-            kwargs["system"] = system
-        return extract_content_or_reasoning(client.messages.create(**kwargs))
-
-    try:
-        import openai
-    except ImportError as exc:
-        raise RuntimeError("openai package is required for auxiliary calls") from exc
-
-    client = openai.OpenAI(
-        api_key=creds.get("api_key") or openai.NOT_GIVEN,
-        base_url=creds.get("base_url") or openai.NOT_GIVEN,
-        max_retries=0,
-        timeout=creds.get("timeout") or 60,
+    context, timeout = _resolve_auxiliary_runtime(task, parent_agent)
+    result = create_transport(context).call(
+        messages=messages,
+        tools=[],
+        options=ModelCallOptions(
+            timeout=timeout,
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+            source="auxiliary",
+            cache_plan=None,
+        ),
     )
-    kwargs = {
-        "model": model,
-        "messages": messages,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    try:
-        return extract_content_or_reasoning(client.chat.completions.create(**kwargs))
-    except Exception as exc:
-        if exc.__class__.__name__ == "BadRequestError" and "temperature" in str(exc).lower():
-            # Some OpenAI-compatible endpoints reject temperature for fixed-mode
-            # reasoning models; retry without changing the caller's prompt.
-            kwargs.pop("temperature", None)
-            return extract_content_or_reasoning(client.chat.completions.create(**kwargs))
-        raise
+    if result.usage is not None and parent_agent is not None:
+        parent_agent._record_usage(result.usage)
+    return extract_content_or_reasoning(result)

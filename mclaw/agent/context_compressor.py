@@ -16,9 +16,14 @@ than only to local token estimates.
 
 import logging
 import time
-from typing import Any
+from dataclasses import replace
+from typing import Any, Callable
 
+from mclaw.agent.transports.base import ModelCallOptions
+from mclaw.agent.transports.factory import create_transport
+from mclaw.agent.usage import UsageRecord
 from mclaw.prompts.compression import build_context_compression_prompt
+from mclaw.providers.runtime import ProviderRuntimeContext
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +87,10 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
     for msg in messages:
         content = _content_to_text(msg.get("content"))
         total += estimate_tokens_rough(content)
-        total += estimate_tokens_rough(_content_to_text(msg.get("reasoning_content")))
+        reasoning = msg.get("reasoning")
+        if reasoning is None:
+            reasoning = msg.get("reasoning_content")
+        total += estimate_tokens_rough(_content_to_text(reasoning))
         if msg.get("tool_calls"):
             for tc in msg["tool_calls"]:
                 if isinstance(tc, dict):
@@ -90,16 +98,6 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
                     total += estimate_tokens_rough(_content_to_text(fn.get("name")))
                     total += estimate_tokens_rough(_content_to_text(fn.get("arguments")))
     return total
-
-
-def get_context_length(model: str, base_url: str = "", api_key: str = "", provider: str = "") -> int:
-    """Resolve context length for a model.
-
-    Delegates to context_metadata for cached lengths, provider discovery,
-    models.dev, built-in defaults, and the 128K fallback.
-    """
-    from mclaw.agent.context_metadata import get_model_context_length
-    return get_model_context_length(model, base_url, api_key, provider=provider)
 
 
 class ContextCompressor:
@@ -115,30 +113,27 @@ class ContextCompressor:
 
     def __init__(
         self,
-        model: str,
+        provider_runtime: ProviderRuntimeContext,
+        context_window: int,
         threshold_percent: float = 0.50,
         protect_first_n: int = 3,
         protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
-        base_url: str = "",
-        api_key: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
         quiet_mode: bool = False,
         summary_model_override: str | None = None,
         summary_provider_override: str = "",
         summary_base_url_override: str = "",
         summary_api_key_override: str = "",
-        summary_api_mode_override: str = "",
         summary_timeout: int = 180,
         session_id: str = "",
         config: dict[str, Any] | None = None,
+        usage_callback: Callable[[UsageRecord], None] | None = None,
     ):
-        self.model = model
-        self.base_url = base_url
-        self.api_key = api_key
-        self.api_mode = api_mode
-        self.provider = provider
+        if not isinstance(provider_runtime, ProviderRuntimeContext):
+            raise TypeError("provider_runtime must be a ProviderRuntimeContext")
+        if type(context_window) is not int or context_window <= 0:
+            raise ValueError("context_window must be a positive integer")
+        self.provider_runtime = provider_runtime
         self.protect_first_n = protect_first_n
         self.protect_last_n = protect_last_n
         self.threshold_percent = threshold_percent
@@ -148,7 +143,6 @@ class ContextCompressor:
         self.summary_provider = summary_provider_override or ""
         self.summary_base_url = summary_base_url_override or ""
         self.summary_api_key = summary_api_key_override or ""
-        self.summary_api_mode = summary_api_mode_override or ""
         try:
             parsed_summary_timeout = int(summary_timeout or 180)
         except (TypeError, ValueError):
@@ -156,8 +150,11 @@ class ContextCompressor:
         self.summary_timeout = max(30, min(parsed_summary_timeout, 600))
         self.session_id = session_id
         self.config = config if isinstance(config, dict) else None
+        self._usage_callback = usage_callback
+        self._summary_runtime: ProviderRuntimeContext | None = None
+        self._summary_transport = None
 
-        self._refresh_context_budgets()
+        self._refresh_context_budgets(context_window)
         self.compression_count = 0
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
@@ -175,21 +172,17 @@ class ContextCompressor:
                 "Context compressor initialized: model=%s context_length=%d "
                 "threshold=%d (%.0f%%) target_ratio=%.0f%% tail_budget=%d "
                 "summary_timeout=%ds provider=%s base_url=%s",
-                model, self.context_length, self.threshold_tokens,
+                self.provider_runtime.model, self.context_length, self.threshold_tokens,
                 threshold_percent * 100, self.summary_target_ratio * 100,
                 self.tail_token_budget,
                 self.summary_timeout,
-                provider or "none", base_url or "none",
+                self.provider_runtime.provider or "none",
+                self.provider_runtime.base_url or "none",
             )
 
-    def _refresh_context_budgets(self) -> None:
+    def _refresh_context_budgets(self, context_window: int) -> None:
         """Recalculate compression thresholds from the active provider context size."""
-        self.context_length = get_context_length(
-            self.model,
-            self.base_url,
-            self.api_key,
-            self.provider,
-        )
+        self.context_length = context_window
         self.threshold_tokens = int(self.context_length * self.threshold_percent)
         self.tail_token_budget = int(self.threshold_tokens * self.summary_target_ratio)
         self.max_summary_tokens = min(
@@ -198,34 +191,33 @@ class ContextCompressor:
 
     def reconfigure_model(
         self,
-        model: str,
+        provider_runtime: ProviderRuntimeContext,
         *,
-        base_url: str = "",
-        api_key: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
+        context_window: int,
     ) -> None:
-        """Apply a runtime model switch and recompute context budgets."""
-        previous_model = self.model
+        """Apply a resolved runtime switch without performing I/O."""
+        previous_model = self.provider_runtime.model
         previous_context_length = self.context_length
         previous_threshold_tokens = self.threshold_tokens
 
-        self.model = model
-        self.base_url = base_url
-        self.api_key = api_key
-        self.api_mode = api_mode
-        self.provider = provider
-        self._refresh_context_budgets()
+        if not isinstance(provider_runtime, ProviderRuntimeContext):
+            raise TypeError("provider_runtime must be a ProviderRuntimeContext")
+        if type(context_window) is not int or context_window <= 0:
+            raise ValueError("context_window must be a positive integer")
+        self.provider_runtime = provider_runtime
+        self._refresh_context_budgets(context_window)
+        self._summary_runtime = None
+        self._summary_transport = None
 
         logger.info(
             "Context compressor reconfigured: model=%s context_length=%d "
             "threshold=%d provider=%s base_url=%s (previous model=%s "
             "context_length=%d threshold=%d)",
-            self.model,
+            self.provider_runtime.model,
             self.context_length,
             self.threshold_tokens,
-            self.provider or "none",
-            self.base_url or "none",
+            self.provider_runtime.provider or "none",
+            self.provider_runtime.base_url or "none",
             previous_model,
             previous_context_length,
             previous_threshold_tokens,
@@ -236,9 +228,15 @@ class ContextCompressor:
 
         Called by core.py after each API call.
         """
-        self.last_prompt_tokens = usage.get("prompt_tokens", 0) or usage.get("input_tokens", 0)
-        self.last_completion_tokens = usage.get("completion_tokens", 0)
-        self.last_total_tokens = usage.get("total_tokens", 0)
+        if not isinstance(usage, dict):
+            raise TypeError("usage must be a dictionary")
+        self.last_prompt_tokens = int(
+            usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0
+        )
+        self.last_completion_tokens = int(
+            usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0
+        )
+        self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
 
     def prune(self, messages: list[dict]) -> tuple[list[dict], int]:
         """Lightweight pre-pass: replace earlier tool results with placeholders.
@@ -451,13 +449,12 @@ class ContextCompressor:
         )
 
         try:
-            summary_api_mode = self._resolve_summary_api_mode()
-            logger.info("[_generate_summary] calling summarization API (mode=%s)", summary_api_mode)
+            logger.info(
+                "[_generate_summary] calling summarization API (mode=%s)",
+                self._summary_context().api_mode,
+            )
             _summarize_start = time.monotonic()
-            if summary_api_mode == "anthropic_messages":
-                summary = self._summarize_anthropic(prompt, summary_budget)
-            else:
-                summary = self._summarize_openai(prompt, summary_budget)
+            summary = self._summarize(prompt, summary_budget)
             _summarize_elapsed = time.monotonic() - _summarize_start
             logger.info("[_generate_summary] summarization API returned in %.2fs, got_summary=%s", _summarize_elapsed, bool(summary))
             if summary:
@@ -481,100 +478,66 @@ class ContextCompressor:
             self._summary_failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN_SECONDS
             return None
 
-    def _resolve_summary_api_mode(self) -> str:
-        """Choose the API protocol for summary calls from overrides or provider metadata."""
-        if self.summary_api_mode:
-            return self.summary_api_mode
-        summary_provider = (self.summary_provider or "").strip()
-        if summary_provider and summary_provider != "auto":
-            try:
-                from mclaw.cli.auth import PROVIDER_REGISTRY
-                provider_def = PROVIDER_REGISTRY.get(summary_provider)
-                if provider_def and getattr(provider_def, "api_mode", ""):
-                    self.summary_api_mode = provider_def.api_mode
-                    return self.summary_api_mode
-            except Exception as exc:
-                logger.debug(
-                    "Summary provider API mode resolution failed for %s: %s",
-                    summary_provider,
-                    exc,
-                )
-        return self.api_mode
+    def _summary_context(self) -> ProviderRuntimeContext:
+        if self._summary_runtime is not None:
+            return self._summary_runtime
 
-    def _get_summarize_credentials(self) -> tuple[str | None, str]:
-        """Resolve summary credentials from overrides, summary provider, or active provider.
-
-        self.api_key may be empty when ContextCompressor is created during
-        Agent.__init__ before resolve_provider() has been called.
-        """
-        if self.summary_api_key or self.summary_base_url:
-            return self.summary_api_key or self.api_key, self.summary_base_url or self.base_url
-
-        summary_provider = (self.summary_provider or "").strip()
-        if summary_provider and summary_provider != "auto":
-            try:
-                from mclaw.cli.auth import resolve_provider
-                resolved = resolve_provider(
-                    model=self.summary_model or self.model,
-                    provider=summary_provider,
-                    base_url=self.summary_base_url,
-                    api_key=self.summary_api_key,
-                    config=self.config,
-                )
-                if resolved.get("api_key") or resolved.get("base_url"):
-                    self.summary_api_mode = resolved.get("api_mode") or self.summary_api_mode
-                    return resolved.get("api_key") or "", resolved.get("base_url") or ""
-            except Exception as exc:
-                logger.warning("Summary provider resolution failed for %s: %s", summary_provider, exc)
-
-        if self.api_key:
-            return self.api_key, self.base_url
-        try:
-            from mclaw.cli.auth import resolve_api_key, resolve_base_url
-            key = resolve_api_key(self.provider) if self.provider else None
-            url = resolve_base_url(self.provider) if self.provider else ""
-            return key, url
-        except Exception as exc:
-            logger.debug("Active provider credential resolution for summary failed: %s", exc)
-            return None, ""
-
-    def _summarize_openai(self, prompt: str, budget: int) -> str:
-        import openai
-        logger.info("[_summarize_openai] creating client for model=%s", self.summary_model or self.model)
-        key, url = self._get_summarize_credentials()
-        client = openai.OpenAI(api_key=key or openai.NOT_GIVEN, base_url=url or openai.NOT_GIVEN)
-        logger.info("[_summarize_openai] calling API (timeout=%s)", self.summary_timeout)
-        resp = client.chat.completions.create(
-            model=self.summary_model or self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=budget * 2,
-            timeout=self.summary_timeout,
+        from mclaw.providers.resolver import (
+            default_model_for_provider,
+            resolve_provider_runtime_context,
         )
-        logger.info("[_summarize_openai] API returned")
-        content = resp.choices[0].message.content or ""
-        summary = content.strip()
-        return f"{SUMMARY_PREFIX}\n{summary}"
 
-    def _summarize_anthropic(self, prompt: str, budget: int) -> str:
-        import anthropic
-        logger.info("[_summarize_anthropic] creating client for model=%s", self.summary_model or self.model)
-        key, url = self._get_summarize_credentials()
-        client = anthropic.Anthropic(api_key=key or anthropic.NOT_GIVEN, base_url=url or anthropic.NOT_GIVEN)
-        model = self.summary_model or self.model
-        if model.lower().startswith("anthropic/"):
-            model = model[len("anthropic/"):]
-        model = model.replace(".", "-")
-        logger.info("[_summarize_anthropic] calling API (timeout=%s)", self.summary_timeout)
-        resp = client.messages.create(
+        provider = self.summary_provider.strip()
+        model = self.summary_model.strip()
+        if not provider or provider == "auto":
+            if not self.summary_base_url:
+                normalized_model = self.provider_runtime.profile.normalize_model(
+                    model or self.provider_runtime.model
+                )
+                self._summary_runtime = replace(
+                    self.provider_runtime,
+                    model=normalized_model,
+                    api_key=self.summary_api_key or self.provider_runtime.api_key,
+                    reasoning_config=None,
+                )
+                return self._summary_runtime
+            provider = (
+                "custom_anthropic"
+                if self.provider_runtime.api_mode == "anthropic_messages"
+                else "custom"
+            )
+            model = model or self.provider_runtime.model
+            api_key = self.summary_api_key or self.provider_runtime.api_key
+        else:
+            model = model or default_model_for_provider(provider, config=self.config)
+            api_key = self.summary_api_key
+
+        self._summary_runtime = resolve_provider_runtime_context(
+            provider=provider,
             model=model,
-            max_tokens=budget * 2,
-            messages=[{"role": "user", "content": prompt}],
-            timeout=self.summary_timeout,
+            base_url=self.summary_base_url,
+            api_key=api_key,
+            config=self.config,
         )
-        logger.info("[_summarize_anthropic] API returned")
-        content = resp.content[0].text if resp.content else ""
-        summary = content.strip()
-        return f"{SUMMARY_PREFIX}\n{summary}"
+        return self._summary_runtime
+
+    def _summarize(self, prompt: str, budget: int) -> str:
+        if self._summary_transport is None:
+            self._summary_transport = create_transport(self._summary_context())
+        result = self._summary_transport.call(
+            messages=[{"role": "user", "content": prompt}],
+            tools=[],
+            options=ModelCallOptions(
+                timeout=float(self.summary_timeout),
+                max_output_tokens=budget * 2,
+                source="summary",
+                cache_plan=None,
+            ),
+        )
+        if result.usage is not None and self._usage_callback is not None:
+            self._usage_callback(result.usage)
+        summary = result.content.strip()
+        return f"{SUMMARY_PREFIX}\n{summary}" if summary else ""
 
     @staticmethod
     def _sanitize_tool_pairs(messages: list[dict]) -> list[dict]:

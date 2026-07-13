@@ -14,12 +14,15 @@ import logging
 import re
 from typing import Any
 
-from mclaw.tools.search.credentials import is_dashscope_configured
+from mclaw.tools.search.credentials import (
+    DASHSCOPE_BASE_URL,
+    QWEN_CREDENTIAL_HINT,
+    is_dashscope_configured,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MODEL = "qwen3.5-plus"
-_DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 _MAX_WEB_SEARCH_CHARS = 12_000
 _NO_LIVE_SEARCH_PHRASES = (
     "无法访问互联网",
@@ -83,7 +86,7 @@ def search(
         {"success": bool, "results": str, "_backend": "dashscope", "_hint": str}
     """
     api_key = creds.get("api_key", "")
-    base_url = creds.get("base_url", "") or _DEFAULT_BASE_URL
+    base_url = creds.get("base_url", "") or DASHSCOPE_BASE_URL
     model = creds.get("model", "") or _DEFAULT_MODEL
 
     # Non-positive timeout means "use the strategy default".
@@ -96,11 +99,11 @@ def search(
             "success": False,
             "results": (
                 "No API key available for web search. "
-                "Set DASHSCOPE_API_KEY or QWEN_API_KEY in the M-Claw home .env file."
+                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
             ),
             "_backend": "dashscope",
             "_hint": (
-                "Set DASHSCOPE_API_KEY or QWEN_API_KEY in the M-Claw home .env file."
+                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
             ),
         }
 
@@ -117,11 +120,11 @@ def search(
                 "web_search requires a DashScope API key (百炼). "
                 "The current API key does not appear to be for DashScope, "
                 "so enable_search (联网搜索) cannot work. "
-                "Set DASHSCOPE_API_KEY or QWEN_API_KEY in the M-Claw home .env file."
+                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
             ),
             "_backend": "dashscope",
             "_hint": (
-                "Set DASHSCOPE_API_KEY or QWEN_API_KEY in the M-Claw home .env file."
+                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
             ),
         }
 
@@ -235,9 +238,9 @@ def search(
         logger.error("DashScope search auth error: %s", e)
         return {
             "success": False,
-            "results": f"Authentication failed. Check your DASHSCOPE_API_KEY. Error: {e}",
+            "results": f"Authentication failed. Check {QWEN_CREDENTIAL_HINT}. Error: {e}",
             "_backend": "dashscope",
-            "_hint": "Check your DASHSCOPE_API_KEY.",
+            "_hint": f"Check {QWEN_CREDENTIAL_HINT}.",
         }
     except openai.APIError as e:
         logger.error("DashScope search API error: %s", e)

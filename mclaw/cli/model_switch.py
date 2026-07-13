@@ -15,36 +15,27 @@ Shared by the interactive /model command and key-setup retry flow.
 """
 
 import shlex
-from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Any
 
-from mclaw.cli.auth import (
-    PROVIDER_REGISTRY,
-    resolve_api_key,
-    resolve_base_url,
-)
-from mclaw.cli.config import get_env_value, load_config, save_config
+from mclaw.cli.config import load_config, save_config
 from mclaw.cli.model_resolver import resolve_model_input
-from mclaw.cli.provider_profiles import find_provider_profile, profile_help_lines
+from mclaw.providers.registry import PROVIDER_REGISTRY
+from mclaw.providers.resolver import ProviderResolutionError, resolve_provider_runtime_context
+from mclaw.providers.runtime import ProviderRuntimeContext
 
 @dataclass
 class ModelSwitchResult:
     """Transport-neutral result for applying a switch or requesting credentials."""
 
     success: bool
-    new_model: str = ""
-    target_provider: str = ""
-    provider_changed: bool = False
-    api_key: str = ""
-    base_url: str = ""
-    api_mode: str = ""
+    runtime_context: ProviderRuntimeContext | None = None
     error_message: str = ""
     info_message: str = ""
     needs_api_key: bool = False
     key_env_var: str = ""
     key_url: str = ""
     provider_display_name: str = ""
-    provider_profile: str = ""
 
 
 class ModelFlagParseError(ValueError):
@@ -89,22 +80,12 @@ def parse_model_flags(raw: str) -> tuple[str, str, str, bool]:
 
 def switch_model(
     model_input: str,
-    current_provider: str,
-    current_base_url: str = "",
-    current_api_key: str = "",
+    current_runtime: ProviderRuntimeContext,
     explicit_provider: str = "",
     explicit_profile: str = "",
-    print_fn: Callable = print,
-    user_providers: dict | None = None,
+    config: dict[str, Any] | None = None,
 ) -> ModelSwitchResult:
-    """Core model-switching pipeline.
-
-    Resolution:
-      1. If --provider given → use that provider directly
-      2. Otherwise → detect provider from model name
-      3. Check credentials and return needs_api_key when missing
-      4. Build result with all info needed to rebuild API client
-    """
+    """Resolve one model switch to a complete live provider context."""
     new_model = model_input.strip()
     if not new_model:
         return ModelSwitchResult(
@@ -112,191 +93,89 @@ def switch_model(
             error_message="未指定模型。用法: /model <模型名> [--provider <供应商>]",
         )
 
-    user_providers = user_providers or {}
-
-    # Step 1: resolve the model name and target provider.
-
+    raw_user_providers = config.get("providers", {}) if isinstance(config, dict) else {}
+    user_providers = raw_user_providers if isinstance(raw_user_providers, dict) else {}
     resolution = resolve_model_input(
         new_model,
         provider_input=explicit_provider,
-        current_provider=current_provider,
+        current_provider=current_runtime.provider,
         user_providers=user_providers,
     )
     if not resolution.ok:
         return ModelSwitchResult(
             success=False,
-            new_model=resolution.model,
-            target_provider=resolution.provider,
             error_message=resolution.message,
         )
 
     new_model = resolution.model
     target_provider = resolution.provider
     resolution_note = resolution.message if resolution.status == "unverified" else ""
-
-    # Step 2: handle user-defined providers from config.yaml.
-
-    if target_provider in user_providers:
-        up = _resolve_user_provider_for_switch(target_provider, user_providers[target_provider])
-        display_name = up.get("display_name") or target_provider
-        if not up.get("key_env_var"):
-            return ModelSwitchResult(
-                success=False,
-                new_model=new_model,
-                target_provider=target_provider,
-                error_message=f"自定义接入方 {display_name} 缺少 api_key_env 配置。",
-            )
-        if not up.get("api_key"):
-            return ModelSwitchResult(
-                success=False,
-                new_model=new_model,
-                target_provider=target_provider,
-                error_message=f"缺少 {display_name} 的 API 密钥。",
-                needs_api_key=True,
-                key_env_var=up.get("key_env_var", ""),
-                provider_display_name=display_name,
-            )
-        info = f"已切换至 {new_model}（{target_provider}）"
-        if resolution_note:
-            info = f"{info}\n{resolution_note}"
-        return ModelSwitchResult(
-            success=True,
-            new_model=new_model,
-            target_provider=target_provider,
-            provider_changed=(target_provider != current_provider),
-            api_key=up.get("api_key", ""),
-            base_url=up.get("base_url", ""),
-            api_mode=up.get("api_mode", "chat_completions"),
-            info_message=info,
+    setup_entry = next(
+        (
+            entry
+            for entry in getattr(PROVIDER_REGISTRY.get(target_provider), "setup_profiles", ())
+            if entry.id.casefold() == explicit_profile.casefold()
+        ),
+        None,
+    ) if explicit_profile else None
+    same_runtime = (
+        target_provider == current_runtime.provider and not explicit_profile
+    ) or bool(
+        setup_entry
+        and setup_entry.callable
+        and setup_entry.runtime_provider == current_runtime.provider
+    )
+    resolver_config = dict(config or {})
+    if same_runtime and current_runtime.reasoning_config is None:
+        resolver_config.pop("reasoning", None)
+    try:
+        context = resolve_provider_runtime_context(
+            model=new_model,
+            provider=target_provider,
+            setup_profile_id=explicit_profile,
+            base_url=current_runtime.base_url if same_runtime else "",
+            api_key=current_runtime.api_key if same_runtime else "",
+            reasoning_config=(
+                dict(current_runtime.reasoning_config)
+                if same_runtime and current_runtime.reasoning_config is not None
+                else None
+            ),
+            config=resolver_config,
         )
-
-    # Step 3: check whether the current provider can be kept.
-
-    if not target_provider:
+    except ProviderResolutionError as exc:
+        profile = PROVIDER_REGISTRY.get(exc.provider or target_provider)
+        user_profile = user_providers.get(exc.provider or target_provider, {})
+        display_name = (
+            profile.display_name
+            if profile
+            else str(user_profile.get("display_name") or exc.provider or target_provider)
+        )
         return ModelSwitchResult(
             success=False,
-            new_model=new_model,
-            error_message=(
-                "M-Claw 无法判断这个模型应该通过哪个接入方调用。\n"
-                "请指定接入方，例如：/model <模型名> --provider openai\n"
-                "如果不确定模型 ID，请到对应大模型平台官网查看官方模型 ID。"
+            error_message=str(exc),
+            needs_api_key=exc.code == "missing_credential",
+            key_env_var=exc.key_env_var,
+            key_url=exc.key_url,
+            provider_display_name=display_name,
+        )
+
+    if same_runtime:
+        context = replace(
+            context,
+            base_url_source=current_runtime.base_url_source,
+            auth_source=(
+                current_runtime.auth_source
+                if context.api_key == current_runtime.api_key
+                else context.auth_source
             ),
         )
-
-    # Step 4: resolve credentials and prompt when missing.
-
-    pcfg = PROVIDER_REGISTRY.get(target_provider)
-    if not pcfg:
-        return ModelSwitchResult(
-            success=False,
-            new_model=new_model,
-            target_provider=target_provider,
-            error_message=f"未识别接入方: {target_provider}",
-        )
-
-    profile_id = ""
-    profile = find_provider_profile(target_provider, explicit_profile)
-    if profile is None:
-        return ModelSwitchResult(
-            success=False,
-            new_model=new_model,
-            target_provider=target_provider,
-            error_message=(
-                f"未知接口类型: {explicit_profile}\n"
-                f"{pcfg.display_name} 可用接口:\n"
-                + "\n".join(f"- {line}" for line in profile_help_lines(target_provider))
-            ),
-        )
-    profile_id = profile.id
-    if explicit_profile and not profile.callable:
-        return ModelSwitchResult(
-            success=False,
-            new_model=new_model,
-            target_provider=target_provider,
-            provider_profile=profile_id,
-            error_message=(
-                f"{pcfg.display_name} 的 {profile.label} 不能直接作为 M-Claw 调用接口。\n"
-                f"{profile.note}\n"
-                "请改用官方 API profile，或配置自定义兼容接口。"
-            ),
-        )
-
-    same_provider = target_provider == current_provider
-    api_key = current_api_key if same_provider and current_api_key else resolve_api_key(target_provider)
-    base_url = current_base_url if same_provider and current_base_url else resolve_base_url(target_provider)
-
-    if not api_key:
-        if current_provider in ("custom", "custom_anthropic") and not explicit_provider:
-            # The detected provider differs from the current custom endpoint.
-            # Warn the user clearly, but still allow it (the custom endpoint
-            # may proxy multiple providers).
-            print_fn("")
-            print_fn(f"  ⚠ '{new_model}' 看起来属于 {pcfg.display_name}，")
-            print_fn(f"    但尚未配置 {pcfg.display_name} 的 API 密钥。")
-            print_fn(f"    请求将发送至当前接口: {current_base_url}")
-            print_fn(f"    如需使用 {pcfg.display_name} 官方 API:")
-            print_fn(f"      /model {new_model} --provider {target_provider}")
-            print_fn("")
-            return ModelSwitchResult(
-                success=True,
-                new_model=new_model,
-                target_provider=current_provider,
-                provider_changed=False,
-                api_key=current_api_key,
-                base_url=current_base_url,
-                api_mode="",
-                info_message=f"模型名 → {new_model}（仍使用 {current_base_url}）",
-            )
-
-        return ModelSwitchResult(
-            success=False,
-            new_model=new_model,
-            target_provider=target_provider,
-            error_message=f"缺少 {pcfg.display_name} 的 API 密钥。",
-            needs_api_key=True,
-            key_env_var=pcfg.api_key_env_vars[0] if pcfg.api_key_env_vars else "",
-            key_url=pcfg.key_url,
-            provider_display_name=pcfg.display_name,
-            provider_profile=profile_id,
-        )
-
-    provider_changed = (target_provider != current_provider)
-    info = f"已切换至 {new_model}（{pcfg.display_name}）"
-    if profile_id and profile_id != "api":
-        info = f"{info} / {profile_id}"
+    info = f"已切换至 {context.model}（{context.profile.display_name}）"
     if resolution_note:
         info = f"{info}\n{resolution_note}"
-
-    return ModelSwitchResult(
-        success=True,
-        new_model=new_model,
-        target_provider=target_provider,
-        provider_changed=provider_changed,
-        api_key=api_key,
-        base_url=base_url,
-        api_mode=pcfg.api_mode,
-        info_message=info,
-        provider_profile=profile_id,
-    )
+    return ModelSwitchResult(success=True, runtime_context=context, info_message=info)
 
 
-def _resolve_user_provider_for_switch(provider_name: str, provider_cfg) -> dict:
-    """Resolve a config.yaml provider entry for the /model switching path."""
-    item = provider_cfg if isinstance(provider_cfg, dict) else {}
-    env_var = str(item.get("api_key_env") or "").strip()
-    api_key = get_env_value(env_var) or "" if env_var else ""
-    return {
-        "provider": provider_name,
-        "display_name": str(item.get("display_name") or provider_name),
-        "model": str(item.get("model") or ""),
-        "api_key": api_key,
-        "key_env_var": env_var,
-        "base_url": str(item.get("base_url") or "").rstrip("/"),
-        "api_mode": str(item.get("api_mode") or "chat_completions"),
-    }
-
-
-def persist_model_choice(model: str, provider: str = "", profile: str = "") -> None:
+def persist_model_choice(model: str, provider: str = "") -> None:
     """Save model (and optionally provider) to config.yaml.
 
     Always writes active_provider. An empty provider leaves provider resolution
@@ -307,6 +186,6 @@ def persist_model_choice(model: str, provider: str = "", profile: str = "") -> N
     config = load_config(strict=True)
     config["model"] = model
     config["active_provider"] = provider
-    config["active_provider_profile"] = profile
+    config["active_provider_profile"] = ""
     upsert_fallback_provider_model(config, provider, model)
     save_config(config)

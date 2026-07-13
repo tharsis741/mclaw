@@ -19,6 +19,7 @@ pip-wheel-metadata/
 MANIFEST
 
 # Test, coverage, and type-check caches
+/tests/
 .pytest_cache/
 .coverage
 .coverage.*

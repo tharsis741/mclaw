@@ -8,18 +8,18 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mclaw.providers.runtime import ProviderRuntimeContext
 
 
 @dataclass(frozen=True)
 class RuntimeModelCommandHooks:
     """Host operations used by the UI-neutral model command flow."""
 
-    current_provider: Callable[[], str]
-    current_model: Callable[[], str]
-    current_base_url: Callable[[], str]
-    current_api_key: Callable[[], str]
-    user_providers: Callable[[], dict[str, Any]]
+    current_runtime: Callable[[], ProviderRuntimeContext]
+    config: Callable[[], dict[str, Any]]
     switch_model: Callable[..., Any]
     parse_model_flags: Callable[[str], tuple[str, str, str, bool]]
     render_model_status: Callable[[str, str], None]
@@ -27,7 +27,6 @@ class RuntimeModelCommandHooks:
     render_model_error: Callable[[str], None]
     remember_pending_key_setup: Callable[[dict[str, Any]], None]
     apply_model_switch: Callable[[Any, bool], None]
-    print_fn: Callable[..., Any] = print
 
 
 class RuntimeModelCommandCoordinator:
@@ -40,9 +39,10 @@ class RuntimeModelCommandCoordinator:
         """Resolve `/model` input and either apply it or request credentials."""
         raw_args = str(raw_args or "").strip()
         if not raw_args:
+            runtime = self.hooks.current_runtime()
             self.hooks.render_model_status(
-                self.hooks.current_model(),
-                self.hooks.current_provider(),
+                runtime.model,
+                runtime.provider,
             )
             return
 
@@ -54,13 +54,10 @@ class RuntimeModelCommandCoordinator:
 
         result = self.hooks.switch_model(
             model_input=model_name,
-            current_provider=self.hooks.current_provider(),
-            current_base_url=self.hooks.current_base_url(),
-            current_api_key=self.hooks.current_api_key(),
+            current_runtime=self.hooks.current_runtime(),
             explicit_provider=explicit_provider,
             explicit_profile=explicit_profile,
-            print_fn=self.hooks.print_fn,
-            user_providers=self.hooks.user_providers(),
+            config=self.hooks.config(),
         )
 
         if not getattr(result, "success", False):
@@ -69,7 +66,6 @@ class RuntimeModelCommandCoordinator:
                 # records enough context to retry the same switch after key entry.
                 self.hooks.remember_pending_key_setup({
                     "model": model_name,
-                    "provider": getattr(result, "target_provider", ""),
                     "env_var": getattr(result, "key_env_var", ""),
                     "key_url": getattr(result, "key_url", ""),
                     "display_name": getattr(result, "provider_display_name", ""),

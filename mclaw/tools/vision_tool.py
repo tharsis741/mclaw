@@ -135,7 +135,7 @@ def vision_analyze(
             return tool_error(
                 "No API key available for vision analysis. "
                 "Call secret_request_many(required_for='tool:vision_analyze', ...) "
-                "or rerun setup to authorize DASHSCOPE_API_KEY/QWEN_API_KEY.",
+                "or rerun setup to authorize a registry-declared Qwen credential.",
                 success=False,
             )
 

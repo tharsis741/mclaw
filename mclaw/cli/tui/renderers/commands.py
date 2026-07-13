@@ -194,6 +194,9 @@ class CommandsRenderer:
     def render_usage(self, *, agent, model: str, session_start: datetime) -> None:
         elapsed = (datetime.now() - session_start).total_seconds()
         total = agent.session_input_tokens + agent.session_output_tokens
+        cache_read = getattr(agent, "session_cache_read_tokens", 0)
+        cache_write = getattr(agent, "session_cache_write_tokens", 0)
+        reasoning = getattr(agent, "session_reasoning_tokens", 0)
         self._panel_model(PanelModel(
             title="M-Claw 会话用量",
             namespace="usage",
@@ -203,6 +206,9 @@ class CommandsRenderer:
                 ("API 调用", agent.session_api_calls),
                 ("输入", f"{agent.session_input_tokens:,} tokens"),
                 ("输出", f"{agent.session_output_tokens:,} tokens"),
+                ("缓存读取", f"{cache_read:,} tokens"),
+                ("缓存写入", f"{cache_write:,} tokens"),
+                ("推理", f"{reasoning:,} tokens"),
                 ("合计", f"{total:,} tokens"),
             ]),),
         ))

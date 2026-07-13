@@ -9,13 +9,15 @@ from __future__ import annotations
 from typing import Any, Dict
 
 from mclaw.cli.config import get_env_value, load_config, mask_api_key
+from mclaw.providers.normalization import normalize_provider_key
+from mclaw.providers.registry import get_runtime_profile
 
 CN_REALTIME_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 INTL_REALTIME_URL = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
 
 DEFAULT_ASR_CONFIG: Dict[str, Any] = {
     "enabled": "auto",
-    "provider": "dashscope",
+    "provider": "qwen",
     "backend": "qwen_realtime",
     "model": "qwen3-asr-flash-realtime",
     "websocket_url": "",
@@ -42,6 +44,7 @@ DEFAULT_ASR_CONFIG: Dict[str, Any] = {
     "push_to_talk_behavior": "tap_once",
 }
 _ASR_REQUIRED_FOR = "runtime:asr"
+_QWEN_PROVIDER_KEYS = {"qwen", "qwen-intl"}
 
 
 def _authorized_env_value(name: str) -> str:
@@ -102,12 +105,26 @@ def _is_dashscope_target(section: dict) -> bool:
     base_url = str(section.get("base_url") or "").lower()
     websocket_url = str(section.get("websocket_url") or "").lower()
     return (
-        provider in ("dashscope", "qwen")
+        normalize_provider_key(provider) in _QWEN_PROVIDER_KEYS
         or backend in ("qwen_realtime", "dashscope_realtime")
         or model.startswith("qwen")
         or "dashscope" in base_url
         or "dashscope" in websocket_url
     )
+
+
+def _qwen_profile(section: dict, *, region_explicit: bool):
+    """Select canonical Qwen metadata from explicit endpoint, region, or provider."""
+    endpoint = f"{section.get('base_url') or ''} {section.get('websocket_url') or ''}".lower()
+    if "dashscope-intl" in endpoint:
+        return get_runtime_profile("qwen-intl")
+    if "dashscope.aliyuncs.com" in endpoint:
+        return get_runtime_profile("qwen")
+    if region_explicit:
+        region = str(section.get("region") or "").lower()
+        return get_runtime_profile("qwen-intl" if region in {"intl", "international", "global"} else "qwen")
+    provider = normalize_provider_key(str(section.get("provider") or ""))
+    return get_runtime_profile(provider if provider in _QWEN_PROVIDER_KEYS else "qwen")
 
 
 def _default_realtime_url(region: str) -> str:
@@ -129,24 +146,28 @@ def resolve_asr_config(parent_agent=None, config: dict | None = None) -> Dict[st
     result["enabled_mode"] = enabled_mode
 
     wants_dashscope = _is_dashscope_target(result)
-    result["credential_provider"] = "qwen" if wants_dashscope else str(result.get("provider") or "")
+    profile = _qwen_profile(result, region_explicit="region" in asr_cfg) if wants_dashscope else None
+    if profile:
+        result["provider"] = profile.name
+    result["credential_provider"] = profile.name if profile else str(result.get("provider") or "")
     result["dedicated_target"] = bool(wants_dashscope)
     result["key_source"] = ""
 
     result["api_key"] = ""
-    if wants_dashscope:
-        dashscope_key = _authorized_env_value("DASHSCOPE_API_KEY")
-        qwen_key = _authorized_env_value("QWEN_API_KEY")
-        if dashscope_key:
-            result["api_key"] = dashscope_key
-            result["key_source"] = "DASHSCOPE_API_KEY"
-        elif qwen_key:
-            result["api_key"] = qwen_key
-            result["key_source"] = "QWEN_API_KEY"
+    if profile:
+        result["key_source"], result["api_key"] = next(
+            ((name, value) for name in profile.env_vars if (value := _authorized_env_value(name))),
+            ("", ""),
+        )
 
     if not result.get("websocket_url"):
         env_url = get_env_value("DASHSCOPE_REALTIME_URL")
-        result["websocket_url"] = env_url or _default_realtime_url(str(result.get("region") or "cn"))
+        default_url = (
+            INTL_REALTIME_URL
+            if profile and profile.name == "qwen-intl"
+            else _default_realtime_url(str(result.get("region") or "cn"))
+        )
+        result["websocket_url"] = env_url or default_url
 
     if not isinstance(result.get("wake_words"), list):
         result["wake_words"] = list(DEFAULT_ASR_CONFIG["wake_words"])

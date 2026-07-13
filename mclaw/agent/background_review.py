@@ -167,6 +167,7 @@ def spawn_background_review(
 
     prompt = _prompt_for(review_memory, review_skills)
     session_id = getattr(parent, "session_id", None)
+    provider_runtime = parent.provider_runtime
     logger.info(
         "Background review scheduled: session=%s memory=%s skills=%s messages=%d",
         session_id,
@@ -174,6 +175,9 @@ def spawn_background_review(
         review_skills,
         len(messages_snapshot or []),
     )
+
+    def _record_review_usage(record: Any) -> None:
+        parent._record_usage(record, include_in_turn=False)
 
     def _run_review() -> None:
         review_agent = None
@@ -188,11 +192,8 @@ def spawn_background_review(
                 # The review runs as a cloned agent so background memory and
                 # Skill updates cannot mutate the parent's turn state directly.
                 review_agent = parent.__class__(
-                    model=parent.model,
-                    api_key=parent.api_key,
-                    base_url=parent.base_url,
-                    api_mode=parent.api_mode,
-                    provider=parent.provider,
+                    provider_runtime=provider_runtime,
+                    usage_sink=_record_review_usage,
                     session_db=None,
                     session_id=getattr(parent, "session_id", None),
                     system_prompt=_parent_system_prompt(parent, messages_snapshot),
@@ -219,6 +220,7 @@ def spawn_background_review(
                     review_agent.run_conversation(
                         user_message=prompt,
                         conversation_history=messages_snapshot,
+                        call_source="background_review",
                     )
 
             if review_skills and review_agent is not None:
@@ -227,6 +229,9 @@ def spawn_background_review(
                     prior_snapshot=messages_snapshot,
                 )
                 if skill_summary:
+                    mark_prompt_epoch_dirty = getattr(parent, "mark_prompt_epoch_dirty", None)
+                    if callable(mark_prompt_epoch_dirty):
+                        mark_prompt_epoch_dirty()
                     logger.info("Skill review saved: %s", skill_summary["summary"])
                     display_text = skill_summary["text"]
                     parent._emit_event(
@@ -257,6 +262,9 @@ def spawn_background_review(
             if review_memory:
                 try:
                     parent._refresh_memory_snapshot()
+                    mark_prompt_epoch_dirty = getattr(parent, "mark_prompt_epoch_dirty", None)
+                    if callable(mark_prompt_epoch_dirty):
+                        mark_prompt_epoch_dirty()
                     logger.info("Background memory review refreshed parent memory snapshot")
                 except Exception as refresh_exc:
                     logger.debug("Background memory review snapshot refresh failed: %s", refresh_exc)

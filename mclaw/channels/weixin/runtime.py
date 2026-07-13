@@ -23,6 +23,7 @@ from mclaw.channels.weixin.dedup import MessageDeduplicator
 from mclaw.channels.weixin.ilink_client import ILinkClient
 from mclaw.channels.weixin.outbound_registry import unregister_weixin_outbound_targets_for_adapter
 from mclaw.channels.weixin.runtime_lock import WeixinRuntimeLock
+from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.channels.weixin.session_router import WeixinSessionRouter
 from mclaw.state import SessionDB
 
@@ -36,11 +37,7 @@ class WeixinRuntime:
         self,
         *,
         config: dict,
-        model: str,
-        api_key: str,
-        base_url: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
+        provider_runtime: ProviderRuntimeContext,
         session_db: SessionDB | None = None,
         account_store: WeixinAccountStore | None = None,
         token_store: ContextTokenStore | None = None,
@@ -60,11 +57,7 @@ class WeixinRuntime:
             timeout_ms=self.weixin_config.api_timeout_ms,
         )
         self.runner = runner or AgentRunner(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode,
-            provider=provider,
+            provider_runtime=provider_runtime,
             config=config,
             enabled_toolsets=self.weixin_config.toolsets,
             session_db=self.session_db,

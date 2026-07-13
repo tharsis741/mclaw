@@ -13,10 +13,16 @@ from __future__ import annotations
 import os
 from collections.abc import Callable
 
+from mclaw.providers.registry import get_runtime_profile
 from mclaw.tools.search.config import effective_config
 
 WEB_SEARCH_REQUIRED_FOR = "tool:web_search"
-_DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_QWEN_PROFILE = get_runtime_profile("qwen")
+DASHSCOPE_BASE_URL = _QWEN_PROFILE.base_url
+QWEN_CREDENTIAL_ENV_VARS = _QWEN_PROFILE.env_vars
+QWEN_CREDENTIAL_HINT = " or ".join(
+    dict.fromkeys((*QWEN_CREDENTIAL_ENV_VARS, *get_runtime_profile("qwen-intl").env_vars))
+)
 
 
 def env_value(key: str, default: str = "") -> str:
@@ -67,9 +73,20 @@ def resolve_dashscope_creds(
     except Exception:
         pass
 
-    result["api_key"] = authorized_env_value("DASHSCOPE_API_KEY") or authorized_env_value("QWEN_API_KEY")
     if not result["base_url"]:
-        result["base_url"] = env_value("DASHSCOPE_BASE_URL", _DASHSCOPE_BASE_URL)
+        intl_profile = get_runtime_profile("qwen-intl")
+        result["base_url"] = (
+            env_value(_QWEN_PROFILE.base_url_env_var)
+            or env_value(intl_profile.base_url_env_var)
+            or _QWEN_PROFILE.base_url
+        )
+    profile = get_runtime_profile(
+        "qwen-intl" if "dashscope-intl" in result["base_url"].lower() else "qwen"
+    )
+    result["api_key"] = next(
+        (value for name in profile.env_vars if (value := authorized_env_value(name))),
+        "",
+    )
     return result
 
 

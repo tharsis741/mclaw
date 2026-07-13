@@ -100,5 +100,12 @@ include = ["mclaw", "mclaw.*"]
 [tool.setuptools.package-data]
 mclaw = [
     "skills/**/*",
+    "skills/**/.rels",
     "pet/assets/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+mclaw = [
+    "**/__pycache__/*",
+    "**/*.pyc",
 ]

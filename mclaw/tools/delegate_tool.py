@@ -563,52 +563,60 @@ def _build_child_agent(
         prepared_goal, prepared_context, workspace_path=workspace_path, max_iterations=max_iterations
     )
 
-    # Inherit parent provider credentials unless delegation overrides them.
-    parent_api_key = getattr(parent_agent, "api_key", None) or ""
-    parent_base_url = getattr(parent_agent, "base_url", None) or ""
-    parent_model = getattr(parent_agent, "model", None) or ""
-    parent_provider = getattr(parent_agent, "provider", None) or ""
-    parent_api_mode = getattr(parent_agent, "api_mode", None) or "chat_completions"
     delegation_cfg = parent_config.get("delegation", {}) if isinstance(parent_config, dict) else {}
+    delegation_cfg = delegation_cfg if isinstance(delegation_cfg, dict) else {}
+    parent_runtime = parent_agent.provider_runtime
+    child_model = str(delegation_cfg.get("model") or "").strip()
+    child_provider = str(delegation_cfg.get("provider") or "").strip()
+    child_base_url = str(delegation_cfg.get("base_url") or "").strip()
 
-    child_model = delegation_cfg.get("model") or parent_model
-    child_api_key = parent_api_key
-    child_base_url = parent_base_url
-    child_provider = parent_provider
-    child_api_mode = parent_api_mode
-
-    has_delegation_auth_override = any(
-        delegation_cfg.get(k) for k in ("provider", "base_url")
+    from mclaw.providers.resolver import (
+        default_model_for_provider,
+        resolve_provider_runtime_context,
+        restore_provider_runtime_context,
     )
-    if has_delegation_auth_override:
-        try:
-            from mclaw.cli.auth import resolve_provider
-            resolved = resolve_provider(
-                model=child_model,
-                provider=delegation_cfg.get("provider") or "",
-                base_url=delegation_cfg.get("base_url") or "",
-                api_key="",
+
+    inherited_provider = not child_provider or child_provider.casefold() == "auto"
+    if inherited_provider:
+        if child_base_url:
+            custom_provider = (
+                "custom_anthropic"
+                if parent_runtime.api_mode == "anthropic_messages"
+                else "custom"
+            )
+            child_runtime = resolve_provider_runtime_context(
+                model=child_model or parent_runtime.model,
+                provider=custom_provider,
+                base_url=child_base_url,
+                api_key=parent_runtime.api_key,
                 config=parent_config if isinstance(parent_config, dict) else None,
             )
-            child_model = resolved.get("model") or child_model
-            child_api_key = resolved.get("api_key") or child_api_key
-            child_base_url = resolved.get("base_url") or child_base_url
-            child_provider = resolved.get("provider") or child_provider
-            child_api_mode = resolved.get("api_mode") or child_api_mode
-        except Exception as exc:
-            logger.warning(
-                "[subagent-%d] delegation provider override failed, using parent credentials: %s",
-                task_index,
-                exc,
+        elif child_model:
+            child_runtime = restore_provider_runtime_context(
+                parent_runtime.snapshot(),
+                config=parent_config if isinstance(parent_config, dict) else None,
+                model=child_model,
+                api_key=parent_runtime.api_key,
             )
+        else:
+            child_runtime = parent_runtime
+    else:
+        target_model = child_model
+        if not target_model:
+            target_model = default_model_for_provider(
+                child_provider,
+                config=parent_config if isinstance(parent_config, dict) else None,
+            )
+        child_runtime = resolve_provider_runtime_context(
+            model=target_model,
+            provider=child_provider,
+            base_url=child_base_url,
+            config=parent_config if isinstance(parent_config, dict) else None,
+        )
 
     # Create the child agent.
     child = MClaw(
-        model=child_model,
-        api_key=child_api_key,
-        base_url=child_base_url,
-        api_mode=child_api_mode,
-        provider=child_provider,
+        provider_runtime=child_runtime,
         system_prompt=child_prompt,          # inject lightweight prompt directly
         skip_memory=True,                    # disable the memory subsystem
         enabled_toolsets=child_toolsets,     # restricted toolset
@@ -619,15 +627,6 @@ def _build_child_agent(
         workspace=getattr(parent_agent, "workspace_path", None),
         config=parent_config,
     )
-
-    # Reuse context compressor metadata to avoid duplicate network lookups.
-    # Children use the same model as the parent unless overridden above.
-    parent_compressor = getattr(parent_agent, "context_compressor", None)
-    if parent_compressor and child.context_compressor:
-        child.context_compressor.context_length = parent_compressor.context_length
-        child.context_compressor.threshold_tokens = parent_compressor.threshold_tokens
-        child.context_compressor.last_prompt_tokens = parent_compressor.last_prompt_tokens
-        child.context_compressor.last_completion_tokens = parent_compressor.last_completion_tokens
 
     # Install the already-filtered tool definitions without rediscovery.
     child.tools = safe_tool_defs
@@ -694,7 +693,10 @@ def _run_single_child(
         # Run the child without parent conversation history.
         logger.info("[subagent-%d] entering run_conversation", task_index)
         effective_goal = getattr(child, "_prepared_goal", None) or goal
-        result = child.run_conversation(user_message=effective_goal)
+        result = child.run_conversation(
+            user_message=effective_goal,
+            call_source="delegation",
+        )
         logger.info("[subagent-%d] run_conversation returned", task_index)
 
         duration = round(time.monotonic() - child_start, 2)

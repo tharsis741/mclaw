@@ -21,6 +21,7 @@ from mclaw.channels.dingtalk.runtime_lock import DingTalkRuntimeLock
 from mclaw.channels.dingtalk.session_router import DingTalkSessionRouter
 from mclaw.channels.dingtalk.stream_client import DingTalkClient
 from mclaw.channels.runner import AgentRunner
+from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
 
 logger = logging.getLogger(__name__)
@@ -33,11 +34,7 @@ class DingTalkRuntime:
         self,
         *,
         config: dict,
-        model: str,
-        api_key: str,
-        base_url: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
+        provider_runtime: ProviderRuntimeContext,
         session_db: SessionDB | None = None,
         client: DingTalkClient | None = None,
         runner: AgentRunner | None = None,
@@ -49,11 +46,7 @@ class DingTalkRuntime:
         self.session_db = session_db or SessionDB()
         self.client = client or DingTalkClient(self.dingtalk_config)
         self.runner = runner or AgentRunner(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode,
-            provider=provider,
+            provider_runtime=provider_runtime,
             config=config,
             enabled_toolsets=self.dingtalk_config.toolsets,
             session_db=self.session_db,

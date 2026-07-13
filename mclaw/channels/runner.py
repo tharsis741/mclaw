@@ -18,6 +18,8 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from mclaw.channels.base import AgentTurnResult, ChannelMessage
+from mclaw.providers.resolver import restore_session_runtime_context
+from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
 
 logger = logging.getLogger(__name__)
@@ -35,11 +37,7 @@ class AgentRunner:
     def __init__(
         self,
         *,
-        model: str,
-        api_key: str,
-        base_url: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
+        provider_runtime: ProviderRuntimeContext,
         config: dict | None = None,
         enabled_toolsets: list[str] | None = None,
         session_db: SessionDB | None = None,
@@ -47,11 +45,7 @@ class AgentRunner:
         max_cached_agents: int = 128,
         cache_idle_ttl_seconds: float = 3600.0,
     ) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
-        self.api_mode = api_mode
-        self.provider = provider
+        self.startup_provider_runtime = provider_runtime
         self.config = config or {}
         self.enabled_toolsets = enabled_toolsets or self.config.get("toolsets", ["mclaw-required"])
         self.session_db = session_db or SessionDB()
@@ -161,9 +155,10 @@ class AgentRunner:
         extra_system: str = "",
     ) -> AgentTurnResult:
         """Run one MClaw conversation turn on a worker thread."""
-        agent = self._get_or_create_agent(session_id=session_id)
-        self._active_agents[session_id] = agent
+        agent: MClaw | None = None
         try:
+            agent = self._get_or_create_agent(session_id=session_id)
+            self._active_agents[session_id] = agent
             result = await asyncio.to_thread(
                 agent.run_conversation,
                 user_message=message.text,
@@ -182,10 +177,11 @@ class AgentRunner:
             return AgentTurnResult(session_id=session_id, error=str(exc))
         finally:
             self._active_agents.pop(session_id, None)
-            if session_id in self._cancelled_sessions:
-                self._agents.pop(session_id, None)
-            else:
-                self._touch_agent(session_id, agent)
+            if agent is not None:
+                if session_id in self._cancelled_sessions:
+                    self._agents.pop(session_id, None)
+                else:
+                    self._touch_agent(session_id, agent)
 
     def _get_or_create_agent(self, *, session_id: str) -> "MClaw":
         """Return an existing session agent or create one bound to channel config."""
@@ -193,18 +189,17 @@ class AgentRunner:
 
         now = time.time()
         self._evict_idle(now)
+        provider_runtime = self._runtime_for_session(session_id)
         cached = self._agents.get(session_id)
         if cached:
             agent, _ = cached
-            self._agents.move_to_end(session_id)
-            self._agents[session_id] = (agent, now)
-            return agent
+            if agent.provider_runtime.fingerprint() == provider_runtime.fingerprint():
+                self._agents.move_to_end(session_id)
+                self._agents[session_id] = (agent, now)
+                return agent
+            self._agents.pop(session_id, None)
         agent = MClaw(
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            api_mode=self.api_mode,
-            provider=self.provider,
+            provider_runtime=provider_runtime,
             session_db=self.session_db,
             session_id=session_id,
             enabled_toolsets=self.enabled_toolsets,
@@ -216,6 +211,17 @@ class AgentRunner:
         self._agents[session_id] = (agent, now)
         self._enforce_cache_cap()
         return agent
+
+    def _runtime_for_session(self, session_id: str) -> ProviderRuntimeContext:
+        """Restore session model state before consulting the in-memory agent cache."""
+        snapshot = self.session_db.get_model_config(session_id)
+        row = self.session_db.get_session(session_id) or {}
+        return restore_session_runtime_context(
+            snapshot,
+            config=self.config,
+            row_model=str(row.get("model") or ""),
+            fallback_context=self.startup_provider_runtime,
+        )
 
     def _emit_agent_event(self, session_id: str, event: dict[str, Any]) -> None:
         """Bridge synchronous agent callbacks back into the channel event loop."""

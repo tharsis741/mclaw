@@ -18,6 +18,8 @@ import time
 import uuid
 from typing import Any, Callable
 
+from mclaw.providers.resolver import restore_session_runtime_context
+from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.scheduler.formatting import default_output_dir, write_run_output
 from mclaw.scheduler.models import SchedulerJob, SchedulerRun
 from mclaw.state import SessionDB
@@ -31,11 +33,7 @@ class SchedulerRunner:
     def __init__(
         self,
         *,
-        model: str = "",
-        api_key: str = "",
-        base_url: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
+        provider_runtime: ProviderRuntimeContext,
         config: dict[str, Any] | None = None,
         session_db: SessionDB | None = None,
         store: Any = None,
@@ -43,11 +41,7 @@ class SchedulerRunner:
         agent_factory: Callable[..., Any] | None = None,
         print_fn: Callable[..., None] | None = None,
     ) -> None:
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
-        self.api_mode = api_mode
-        self.provider = provider
+        self.startup_provider_runtime = provider_runtime
         self.config = config or {}
         self.session_db = session_db or SessionDB()
         self.store = store
@@ -127,7 +121,7 @@ class SchedulerRunner:
         self.session_db.create_session(
             session_id=session_id,
             source="scheduler",
-            model=self.model,
+            model=self.startup_provider_runtime.model,
             workspace=job.workdir or None,
         )
         return session_id
@@ -141,13 +135,10 @@ class SchedulerRunner:
 
     def _make_agent(self, *, job: SchedulerJob, run: SchedulerRun, session_id: str) -> Any:
         """Construct the agent with scheduler-scoped platform and tool settings."""
+        provider_runtime = self._runtime_for_session(session_id)
         if self.agent_factory is not None:
             return self.agent_factory(
-                model=self.model,
-                api_key=self.api_key,
-                base_url=self.base_url,
-                api_mode=self.api_mode,
-                provider=self.provider,
+                provider_runtime=provider_runtime,
                 session_db=self.session_db,
                 session_id=session_id,
                 enabled_toolsets=job.enabled_toolsets,
@@ -160,11 +151,7 @@ class SchedulerRunner:
         from mclaw.agent.core import MClaw
 
         return MClaw(
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            api_mode=self.api_mode,
-            provider=self.provider,
+            provider_runtime=provider_runtime,
             session_db=self.session_db,
             session_id=session_id,
             enabled_toolsets=job.enabled_toolsets,
@@ -173,6 +160,17 @@ class SchedulerRunner:
             workspace=job.workdir or None,
             config=self.config,
             print_fn=self.print_fn,
+        )
+
+    def _runtime_for_session(self, session_id: str) -> ProviderRuntimeContext:
+        """Restore a persisted session or bootstrap it from the startup context."""
+        snapshot = self.session_db.get_model_config(session_id)
+        row = self.session_db.get_session(session_id) or {}
+        return restore_session_runtime_context(
+            snapshot,
+            config=self.config,
+            row_model=str(row.get("model") or ""),
+            fallback_context=self.startup_provider_runtime,
         )
 
     def _scheduler_context(self, job: SchedulerJob, run: SchedulerRun) -> str:

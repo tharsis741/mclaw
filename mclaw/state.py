@@ -518,6 +518,30 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def switch_active_session(
+        self,
+        current_session_id: str,
+        target_session_id: str,
+        *,
+        end_reason: str,
+    ) -> None:
+        """End the current session and reopen the target in one transaction."""
+        def _do(conn):
+            ended = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+                (time.time(), end_reason, current_session_id),
+            )
+            if ended.rowcount != 1:
+                raise ValueError(f"Session not found: {current_session_id}")
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
+                (target_session_id,),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Session not found: {target_session_id}")
+
+        self._execute_write(_do)
+
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         def _do(conn):
             conn.execute(
@@ -525,6 +549,39 @@ class SessionDB:
                 (system_prompt, session_id),
             )
         self._execute_write(_do)
+
+    def update_model_config(
+        self,
+        session_id: str,
+        *,
+        model: str,
+        model_config: Dict[str, Any],
+    ) -> None:
+        """Atomically persist the active model and its secret-free runtime snapshot."""
+        serialized = json.dumps(model_config, ensure_ascii=False)
+        self._execute_write(
+            lambda conn: conn.execute(
+                "UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
+                (model, serialized, session_id),
+            )
+        )
+
+    def get_model_config(self, session_id: str) -> Dict[str, Any]:
+        """Load a runtime snapshot, rejecting corrupt or non-object JSON."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        if not row or not row["model_config"] or not row["model_config"].strip():
+            return {}
+        try:
+            model_config = json.loads(row["model_config"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"Invalid model_config for session {session_id!r}") from exc
+        if not isinstance(model_config, dict):
+            raise ValueError(f"Invalid model_config for session {session_id!r}: expected JSON object")
+        return model_config
 
     def update_token_counts(
         self, session_id: str, input_tokens: int = 0, output_tokens: int = 0,

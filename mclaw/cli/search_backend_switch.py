@@ -15,6 +15,11 @@ from typing import Callable
 
 from mclaw.cli.config import ConfigError, get_env_value, load_config, save_config
 from mclaw.constants import display_mclaw_path
+from mclaw.providers.registry import get_runtime_profile
+
+
+_QWEN_PROFILE = get_runtime_profile("qwen")
+_QWEN_CREDENTIAL_HINT = " or ".join(_QWEN_PROFILE.env_vars)
 
 
 @dataclass
@@ -92,7 +97,10 @@ def switch_search_backend(
         if not _dashscope_available():
             return BackendSwitchResult(
                 success=False,
-                error_message=f"DashScope 未配置。请在 {display_mclaw_path('.env')} 设置 DASHSCOPE_API_KEY 或 QWEN_API_KEY。",
+                error_message=(
+                    f"DashScope 未配置。请在 {display_mclaw_path('.env')} 设置 "
+                    f"{_QWEN_CREDENTIAL_HINT}。"
+                ),
             )
 
     # Save selection.
@@ -112,7 +120,7 @@ def switch_search_backend(
 
 def _dashscope_available() -> bool:
     """Return whether any supported DashScope-compatible key is configured."""
-    return bool(get_env_value("DASHSCOPE_API_KEY") or get_env_value("QWEN_API_KEY"))
+    return any(bool(get_env_value(name)) for name in _QWEN_PROFILE.env_vars)
 
 
 def _tavily_available() -> bool:

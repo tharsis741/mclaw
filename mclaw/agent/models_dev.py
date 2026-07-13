@@ -20,8 +20,8 @@ from typing import Any
 
 import requests
 
-from mclaw.cli.provider_profiles import resolve_models_dev_provider as _resolve_profile_provider
 from mclaw.constants import get_mclaw_home
+from mclaw.providers.registry import PROVIDER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -211,7 +211,20 @@ def lookup_models_dev_context(provider: str, model: str) -> int | None:
 
 def resolve_models_dev_provider(provider: str, profile_id: str = "") -> str:
     """Resolve M-Claw provider/profile to a raw models.dev provider id."""
-    return _resolve_profile_provider(provider, profile_id)
+    profile = PROVIDER_REGISTRY.get(provider)
+    if not profile:
+        return provider
+    requested = str(profile_id or "").strip().casefold()
+    if requested:
+        entry = next(
+            (item for item in profile.setup_profiles if item.id.casefold() == requested),
+            None,
+        )
+        if entry:
+            if entry.callable and entry.runtime_provider in PROVIDER_REGISTRY:
+                return PROVIDER_REGISTRY[entry.runtime_provider].models_dev_provider
+            return entry.models_dev_provider
+    return profile.models_dev_provider
 
 
 def list_models_dev_provider(provider_id: str, *, limit: int = 20) -> list[str]:

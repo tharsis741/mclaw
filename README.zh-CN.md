@@ -87,7 +87,7 @@ M-Claw 当前已经包含：
 **M-Claw 支持在当前会话中动态切换模型和 Provider，并在不改动 Agent Loop 的情况下进入同一套运行流程。**
 
 - **模型目录**：基于 [models.dev](https://models.dev/) 获取模型 ID、Provider 归属和上下文长度等元数据；当前公开目录包含 145 个 provider、5,246 条模型记录。
-- **Provider 配置**：内置 29 个可配置 provider key，覆盖主流国内外模型服务、托管平台和路由器，并支持用户自定义 OpenAI-compatible/Anthropic message endpoint。
+- **Provider 配置**：内置 31 个可配置 provider key，覆盖主流国内外模型服务、托管平台和路由器，并支持用户自定义 OpenAI-compatible/Anthropic message endpoint。
 - **协议调用**：根据 Provider 使用 OpenAI-compatible 或 Anthropic Messages 接口，支撑模型切换、上下文预算、流式输出和工具调用流程。
 
 不同模型的实际可用能力取决于 Provider endpoint 与模型自身对工具调用、流式输出、视觉输入等能力的支持。

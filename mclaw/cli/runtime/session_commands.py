@@ -8,7 +8,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mclaw.providers.runtime import ProviderRuntimeContext
 
 
 RESUME_LATEST_SESSION = "__latest__"
@@ -19,19 +22,16 @@ class RuntimeSessionCommandHooks:
     """Host operations used by UI-neutral session command flows."""
 
     current_session_id: Callable[[], str]
-    set_current_session_id: Callable[[str], None]
     resolve_session_id: Callable[[str], str | None]
     get_messages_as_conversation: Callable[[str], list[dict[str, Any]]]
-    end_session: Callable[[str, str], None]
-    reopen_session: Callable[[str], None]
-    init_agent: Callable[[], None]
-    set_agent_messages: Callable[[list[dict[str, Any]]], None]
+    get_model_config: Callable[[str], dict[str, Any]]
+    restore_runtime_context: Callable[[dict[str, Any], str], ProviderRuntimeContext]
+    apply_resume: Callable[[str, ProviderRuntimeContext, list[dict[str, Any]]], None]
     get_session: Callable[[str], dict[str, Any] | None]
     set_session_title: Callable[[str, str], bool]
     export_session: Callable[[str], dict[str, Any] | None]
     save_session_export: Callable[[str, dict[str, Any]], str]
     render_notice: Callable[[str, str, str, str], None]
-    switch_session_lock: Callable[[str], bool] | None = None
 
 
 class RuntimeSessionCommandCoordinator:
@@ -52,20 +52,22 @@ class RuntimeSessionCommandCoordinator:
             self.hooks.render_notice("M-Claw 会话", f"未找到会话: {session_ref}", "", "danger")
             return
 
-        if resolved != self.hooks.current_session_id() and self.hooks.switch_session_lock:
-            # Session locks move before state mutation so two TUIs cannot attach
-            # to the same persisted conversation.
-            if not self.hooks.switch_session_lock(resolved):
-                return
-
-        history = self.hooks.get_messages_as_conversation(resolved)
-        self.hooks.end_session(self.hooks.current_session_id(), "user_resume")
-        self.hooks.set_current_session_id(resolved)
-        self.hooks.reopen_session(resolved)
-        self.hooks.init_agent()
-        self.hooks.set_agent_messages(history)
-
         session = self.hooks.get_session(resolved)
+        if not session:
+            self.hooks.render_notice("M-Claw 会话", f"未找到会话: {session_ref}", "", "danger")
+            return
+        try:
+            snapshot = self.hooks.get_model_config(resolved)
+            context = self.hooks.restore_runtime_context(
+                snapshot,
+                str(session.get("model") or ""),
+            )
+            history = self.hooks.get_messages_as_conversation(resolved)
+            self.hooks.apply_resume(resolved, context, history)
+        except Exception as exc:
+            self.hooks.render_notice("M-Claw 会话", f"恢复会话失败: {exc}", "", "danger")
+            return
+
         title = str(session.get("title", "") if session else "")
         self.hooks.render_notice(
             "M-Claw 会话",

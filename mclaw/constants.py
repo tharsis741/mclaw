@@ -54,7 +54,7 @@ def display_mclaw_path(*parts: str) -> str:
     return _display_path(path)
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:
@@ -67,8 +67,3 @@ def parse_reasoning_effort(effort: str) -> dict | None:
     if effort in VALID_REASONING_EFFORTS:
         return {"enabled": True, "effort": effort}
     return None
-
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
-OPENROUTER_MODELS_URL = f"{OPENROUTER_BASE_URL}/models"
-OPENROUTER_CHAT_URL = f"{OPENROUTER_BASE_URL}/chat/completions"

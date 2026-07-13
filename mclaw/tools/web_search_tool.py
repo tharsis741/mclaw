@@ -17,7 +17,11 @@ from typing import Any
 from mclaw.cli.config import ConfigError
 from mclaw.tools.registry import registry, tool_error
 from mclaw.tools.search.config import load_search_config
-from mclaw.tools.search.credentials import dashscope_creds_ok, tavily_creds_ok
+from mclaw.tools.search.credentials import (
+    QWEN_CREDENTIAL_HINT,
+    dashscope_creds_ok,
+    tavily_creds_ok,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ def diagnose_web_search_requirements(config: dict | None = None) -> dict:
     if backend == "dashscope":
         if dashscope_ok:
             return {"available": True, "reason": "DashScope web search credentials configured", "fix": ""}
-        return {"available": False, "reason": "web_search backend=dashscope but DASHSCOPE_API_KEY/QWEN_API_KEY is missing or not authorized", "fix": "Call secret_request_many(required_for='tool:web_search', ...) or rerun setup."}
+        return {"available": False, "reason": f"web_search backend=dashscope but {QWEN_CREDENTIAL_HINT} is missing or not authorized", "fix": "Call secret_request_many(required_for='tool:web_search', ...) or rerun setup."}
     if backend == "auto":
         if tavily_ok:
             return {"available": True, "reason": "auto backend will use Tavily", "fix": ""}
@@ -52,7 +56,7 @@ def diagnose_web_search_requirements(config: dict | None = None) -> dict:
         return {
             "available": False,
             "reason": "web_search backend=auto but no Tavily or DashScope key was found",
-            "fix": "Set TAVILY_API_KEY, DASHSCOPE_API_KEY, or QWEN_API_KEY in the M-Claw home .env file.",
+            "fix": f"Set TAVILY_API_KEY or one of {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file.",
         }
     return {"available": False, "reason": f"unknown web_search backend: {backend}", "fix": "Use backend tavily, dashscope, or auto."}
 

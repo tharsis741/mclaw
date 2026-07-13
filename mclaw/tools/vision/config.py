@@ -9,10 +9,15 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from mclaw.providers.registry import get_runtime_profile
+
 VISION_REQUIRED_FOR = "tool:vision_analyze"
 
 DEFAULT_PROVIDER = "qwen"
-DASHSCOPE_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+_QWEN_PROFILE = get_runtime_profile(DEFAULT_PROVIDER)
+DASHSCOPE_BASE_URL = _QWEN_PROFILE.base_url
+QWEN_BASE_URL_ENV_VAR = _QWEN_PROFILE.base_url_env_var
+QWEN_CREDENTIAL_ENV_VARS = _QWEN_PROFILE.env_vars
 QWEN_DEFAULT_MODEL = "qwen-vl-max"
 
 DEFAULT_VISION_TIMEOUT = 30.0

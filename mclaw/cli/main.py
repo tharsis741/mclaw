@@ -80,6 +80,14 @@ class _MClawArgumentParser(argparse.ArgumentParser):
         raise SystemExit(2)
 
 
+def _add_runtime_selector_args(parser: argparse.ArgumentParser, *, inherited: bool = False) -> None:
+    default = argparse.SUPPRESS if inherited else ""
+    parser.add_argument("--model", default=default, help="覆盖模型 ID")
+    parser.add_argument("--provider", default=default, help="覆盖接入方")
+    parser.add_argument("--base-url", default=default, help="覆盖 API endpoint")
+    parser.add_argument("--api-key", default=default, help="覆盖本次运行的 API key")
+
+
 def _prompt_secret(prompt: str) -> str:
     """Prompt for a secret; echo one '*' per typed character when interactive."""
     if os.name != "nt":
@@ -406,10 +414,87 @@ def _first_run_check() -> bool:
     return True
 
 
+def _resolve_configured_runtime(args, config: dict):
+    """Resolve CLI/config selectors to the one live provider runtime object."""
+    from mclaw.cli.model_resolver import resolve_model_input
+    from mclaw.providers.normalization import normalize_provider_key
+    from mclaw.providers.resolver import resolve_provider_runtime_context
+
+    explicit_model = str(getattr(args, "model", "") or "").strip()
+    explicit_provider = str(getattr(args, "provider", "") or "")
+    user_providers = config.get("providers", {})
+    user_providers = user_providers if isinstance(user_providers, dict) else {}
+    configured_provider = normalize_provider_key(
+        str(config.get("active_provider", "") or ""),
+        user_providers,
+    )
+    model = explicit_model or str(config.get("model", "") or "")
+    provider = explicit_provider or configured_provider
+    setup_profile_id = (
+        "" if explicit_provider else str(config.get("active_provider_profile", "") or "")
+    )
+    if model:
+        intent = resolve_model_input(
+            model,
+            provider_input=(explicit_provider if explicit_model else provider),
+            current_provider=configured_provider,
+            user_providers=user_providers,
+        )
+        if not intent.ok:
+            raise ValueError(intent.message)
+        model, provider = intent.model, intent.provider
+        if provider != configured_provider:
+            setup_profile_id = ""
+    return resolve_provider_runtime_context(
+        model=model,
+        provider=provider,
+        setup_profile_id=setup_profile_id,
+        base_url=str(getattr(args, "base_url", "") or ""),
+        api_key=str(getattr(args, "api_key", "") or ""),
+        config=config,
+    )
+
+
+def _resolve_startup_runtime(args, config: dict, workspace: str):
+    """Restore a requested session selector before validating startup credentials."""
+    resume_ref = str(getattr(args, "resume", "") or "")
+    if not resume_ref:
+        return _resolve_configured_runtime(args, config), ""
+
+    from mclaw.providers.resolver import restore_provider_runtime_context
+    from mclaw.state import SessionDB
+
+    db = SessionDB()
+    try:
+        if resume_ref == RESUME_LATEST_SESSION:
+            session_id = db.latest_session_id(source="cli", workspace=workspace)
+        else:
+            session_id = db.resolve_session_id(resume_ref, workspace=workspace)
+        if not session_id:
+            print_plain(f"  未找到可恢复的会话: {resume_ref}，已开始新会话。")
+            return _resolve_configured_runtime(args, config), ""
+
+        session = db.get_session(session_id)
+        if not session:
+            raise ValueError(f"Session not found: {session_id}")
+        snapshot = db.get_model_config(session_id)
+        explicit_model = str(getattr(args, "model", "") or "")
+        context = restore_provider_runtime_context(
+            snapshot,
+            config=config,
+            model=explicit_model or (str(session.get("model") or "") if not snapshot else ""),
+            provider=str(getattr(args, "provider", "") or ""),
+            base_url=str(getattr(args, "base_url", "") or ""),
+            api_key=str(getattr(args, "api_key", "") or ""),
+        )
+        return context, session_id
+    finally:
+        db.close()
+
+
 def _run_chat(args):
     """Resolve first-run setup, provider credentials, and then enter the TUI."""
     from mclaw.cli.config import load_merged_config, ensure_mclaw_home, ConfigError
-    from mclaw.cli.auth import resolve_provider
     from mclaw.cli.colors import Colors, color
 
     ensure_mclaw_home()
@@ -420,7 +505,7 @@ def _run_chat(args):
         print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
-    if first_run:
+    if first_run and not getattr(args, "resume", None):
         _run_setup(args)
         try:
             provider_configured = _has_any_provider_configured()
@@ -461,42 +546,16 @@ def _run_chat(args):
 
     config["_launch_cwd"] = os.getcwd()
 
-    model = getattr(args, "model", "") or config.get("model", "")
-    provider_name = getattr(args, "provider", "") or config.get("active_provider", "")
-
-    resolved = resolve_provider(
-        model=model,
-        provider=provider_name,
-        base_url=getattr(args, "base_url", ""),
-        api_key=getattr(args, "api_key", ""),
-        config=config,
-    )
-
-    if not resolved["api_key"]:
-        print_plain(color(
-            "\n  未找到 API 密钥。请设置以下环境变量之一:\n"
-            "    OPENROUTER_API_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY 或 GOOGLE_API_KEY\n"
-            "  或运行: mclaw setup\n",
-            Colors.RED,
-        ))
+    try:
+        provider_runtime, resume_id = _resolve_startup_runtime(args, config, os.getcwd())
+    except (ValueError, ConfigError) as exc:
+        print_plain(color(f"\n  模型接入配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
-    if not resolved["model"]:
-        print_plain(color(
-            "\n  未指定模型。请运行 mclaw setup 配置默认模型。\n",
-            Colors.RED,
-        ))
-        sys.exit(1)
-
-    resume_id = getattr(args, "resume", None) or ""
     enabled_toolsets = config.get("toolsets", ["mclaw-required"])
     from mclaw.cli.app import run_interactive
     run_interactive(
-        model=resolved["model"],
-        api_key=resolved["api_key"],
-        base_url=resolved["base_url"],
-        api_mode=resolved["api_mode"],
-        provider=resolved["provider"],
+        provider_runtime=provider_runtime,
         resume_session_id=resume_id,
         enabled_toolsets=enabled_toolsets,
         config=config,
@@ -507,7 +566,6 @@ def _run_weixin(args):
     """Run the Weixin private-chat gateway."""
     import asyncio
 
-    from mclaw.cli.auth import resolve_provider
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.config import ConfigError, ensure_mclaw_home, load_merged_config
     from mclaw.channels.weixin import WeixinRuntime
@@ -520,29 +578,15 @@ def _run_weixin(args):
         print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
-    model = getattr(args, "model", "") or config.get("model", "")
-    provider_name = getattr(args, "provider", "") or config.get("active_provider", "")
-    resolved = resolve_provider(
-        model=model,
-        provider=provider_name,
-        base_url=getattr(args, "base_url", ""),
-        api_key=getattr(args, "api_key", ""),
-        config=config,
-    )
-    if not resolved["api_key"]:
-        print_plain(color("\n  未找到 API 密钥。请先运行 mclaw setup 配置模型供应商。\n", Colors.RED))
-        sys.exit(1)
-    if not resolved["model"]:
-        print_plain(color("\n  未指定模型。请先运行 mclaw setup 配置默认模型。\n", Colors.RED))
+    try:
+        provider_runtime = _resolve_configured_runtime(args, config)
+    except ValueError as exc:
+        print_plain(color(f"\n  模型接入配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
     runtime = WeixinRuntime(
         config=config,
-        model=resolved["model"],
-        api_key=resolved["api_key"],
-        base_url=resolved["base_url"],
-        api_mode=resolved["api_mode"],
-        provider=resolved["provider"],
+        provider_runtime=provider_runtime,
     )
     errors = runtime.weixin_config.validate()
     if errors:
@@ -660,7 +704,6 @@ def _run_dingtalk(args):
 
     from mclaw.channels.dingtalk import DingTalkRuntime
     from mclaw.channels.dingtalk.runtime_lock import DingTalkRuntimeLockError
-    from mclaw.cli.auth import resolve_provider
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.config import ConfigError, ensure_mclaw_home, load_merged_config
 
@@ -671,29 +714,15 @@ def _run_dingtalk(args):
         print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
-    model = getattr(args, "model", "") or config.get("model", "")
-    provider_name = getattr(args, "provider", "") or config.get("active_provider", "")
-    resolved = resolve_provider(
-        model=model,
-        provider=provider_name,
-        base_url=getattr(args, "base_url", ""),
-        api_key=getattr(args, "api_key", ""),
-        config=config,
-    )
-    if not resolved["api_key"]:
-        print_plain(color("\n  未找到 API 密钥。请先运行 mclaw setup 配置模型供应商。\n", Colors.RED))
-        sys.exit(1)
-    if not resolved["model"]:
-        print_plain(color("\n  未指定模型。请先运行 mclaw setup 配置默认模型。\n", Colors.RED))
+    try:
+        provider_runtime = _resolve_configured_runtime(args, config)
+    except ValueError as exc:
+        print_plain(color(f"\n  模型接入配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
 
     runtime = DingTalkRuntime(
         config=config,
-        model=resolved["model"],
-        api_key=resolved["api_key"],
-        base_url=resolved["base_url"],
-        api_mode=resolved["api_mode"],
-        provider=resolved["provider"],
+        provider_runtime=provider_runtime,
     )
     errors = runtime.dingtalk_config.validate()
     if errors:
@@ -1176,8 +1205,7 @@ def _run_setup_impl(args):
 
     config["model"] = default["model"]
     config["active_provider"] = default["provider"]
-    if default.get("profile"):
-        config["active_provider_profile"] = default["profile"]
+    config["active_provider_profile"] = default.get("profile", "")
     for result in configured.values():
         upsert_fallback_provider_model(config, result.get("provider", ""), result.get("model", ""))
     save_config(config)
@@ -1376,19 +1404,19 @@ def _run_setup_capability_selection(config: dict) -> None:
 def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors) -> bool:
     """Configure web_search with Tavily as the preferred source."""
     from mclaw.cli import config as cli_config
+    from mclaw.providers.registry import get_runtime_profile
     from mclaw.runtime.secrets import authorize
 
     required_for = "tool:web_search"
+    qwen_profile = get_runtime_profile("qwen")
+    qwen_env_vars = qwen_profile.env_vars
+    qwen_primary_env = qwen_env_vars[0]
 
     def _configured(name: str) -> bool:
         return bool(str(cli_config.get_env_value(name) or "").strip())
 
     def _existing_dashscope_env() -> str:
-        if _configured("DASHSCOPE_API_KEY"):
-            return "DASHSCOPE_API_KEY"
-        if _configured("QWEN_API_KEY"):
-            return "QWEN_API_KEY"
-        return ""
+        return next((name for name in qwen_env_vars if _configured(name)), "")
 
     def _ensure_web_config() -> None:
         auxiliary = config.setdefault("auxiliary", {})
@@ -1435,18 +1463,18 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
     elif tavily_ready:
         choice = _setup_input("  是否配置 Qwen/DashScope API 作为第二搜索源? [y/N]: ").lower()
         if choice == "y":
-            print_plain(color("  DashScope API key 可在 https://dashscope.console.aliyun.com/apiKey 获取。", Colors.DIM))
+            print_plain(color(f"  DashScope API key 可在 {qwen_profile.key_url} 获取。", Colors.DIM))
             values = _prompt_secret_batch(
-                ["DASHSCOPE_API_KEY"],
+                [qwen_primary_env],
                 prompt=color("  DashScope API Key: ", Colors.YELLOW),
                 print_plain=print_plain,
                 color=color,
                 Colors=Colors,
             )
-            if values and values.get("DASHSCOPE_API_KEY"):
-                cli_config.save_env_value("DASHSCOPE_API_KEY", values["DASHSCOPE_API_KEY"])
-                authorize(required_for, ["DASHSCOPE_API_KEY"])
-                dashscope_env = "DASHSCOPE_API_KEY"
+            if values and values.get(qwen_primary_env):
+                cli_config.save_env_value(qwen_primary_env, values[qwen_primary_env])
+                authorize(required_for, [qwen_primary_env])
+                dashscope_env = qwen_primary_env
                 print_plain(color("  网页搜索: DashScope 第二搜索源已保存并授权。", Colors.DIM))
             else:
                 print_plain(color("  已跳过 DashScope 第二搜索源。", Colors.DIM))
@@ -1956,8 +1984,18 @@ def _setup_api_key_provider(
     from mclaw.cli.auth import PROVIDER_REGISTRY, resolve_base_url
     from mclaw.cli.provider_profiles import get_provider_profile
 
-    current_key = get_env_value(env_var) or ""
     profile = get_provider_profile(provider_key, profile_id)
+    runtime_provider = profile.runtime_provider or provider_key
+    runtime_config = PROVIDER_REGISTRY.get(runtime_provider)
+    if runtime_config is None:
+        raise ValueError(
+            f"Setup profile {provider_key}/{profile.id} has no runtime provider: "
+            f"{runtime_provider}"
+        )
+    # A setup profile is only a presentation selector. Persist and hydrate the
+    # canonical runtime target so a later startup never has to reinterpret it.
+    env_var = runtime_config.api_key_env_vars[0] if runtime_config.api_key_env_vars else env_var
+    current_key = get_env_value(env_var) or ""
 
     print_plain()
     print_plain(_setup_label("接入方") + color(display_name, Colors.GREEN))
@@ -1979,59 +2017,61 @@ def _setup_api_key_provider(
         print_plain(color("  未提供模型名，跳过。", Colors.YELLOW))
         return None
     config["model"] = model_name
-    config["active_provider"] = provider_key
-    config["active_provider_profile"] = profile.id
+    config["active_provider"] = runtime_provider
+    config["active_provider_profile"] = ""
     save_config(config)
     print_plain(_setup_label("模型") + color(model_name, Colors.GREEN))
     print_plain()
-    pcfg = PROVIDER_REGISTRY.get(provider_key)
     return {
-        "provider": provider_key,
-        "profile": profile.id,
+        "provider": runtime_provider,
+        "profile": "",
         "model": model_name,
         "api_key": api_key,
-        "base_url": resolve_base_url(provider_key),
-        "api_mode": pcfg.api_mode if pcfg else "chat_completions",
+        "base_url": resolve_base_url(runtime_provider),
+        "api_mode": runtime_config.api_mode,
     }
 
 
-def _probe_models(base_url: str, api_key: str) -> list | None:
-    """Probe an OpenAI-compatible endpoint for available models."""
-    import httpx
-    try:
-        headers = {}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        with httpx.Client(timeout=10) as client:
-            resp = client.get(f"{base_url}/models", headers=headers)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-        models = data.get("data", [])
-        return [m["id"] for m in models if isinstance(m, dict) and "id" in m]
-    except Exception:
-        return None
+def _probe_models(
+    base_url: str,
+    api_key: str,
+    *,
+    api_mode: str = "chat_completions",
+) -> list[str] | None:
+    """Probe a custom endpoint through the shared provider metadata helper."""
+    from mclaw.agent.context_metadata import probe_provider_models
+    from mclaw.providers.base import default_models_url
+    from mclaw.providers.generic import (
+        GenericAnthropicCompatibleProfile,
+        GenericOpenAICompatibleProfile,
+    )
+
+    anthropic = api_mode == "anthropic_messages"
+    profile_type = (
+        GenericAnthropicCompatibleProfile if anthropic else GenericOpenAICompatibleProfile
+    )
+    normalized_url = base_url.rstrip("/")
+    profile = profile_type(
+        name="custom_anthropic" if anthropic else "custom",
+        display_name="Custom Anthropic" if anthropic else "Custom OpenAI-compatible",
+        provider_kind="host",
+        api_mode=api_mode,
+        auth_scheme="anthropic_x_api_key" if anthropic else "bearer",
+        credential_required=False,
+        base_url=normalized_url,
+        base_url_required=True,
+        models_url=default_models_url(normalized_url, api_mode),
+    )
+    return probe_provider_models(profile, base_url=normalized_url, api_key=api_key)
 
 
 def _probe_anthropic(base_url: str, api_key: str) -> bool:
-    """Probe an Anthropic-compatible endpoint. Returns True if reachable."""
-    import httpx
-    try:
-        headers = {
-            "x-api-key": api_key or "",
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        payload = {
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 1,
-            "messages": [{"role": "user", "content": "hi"}],
-        }
-        with httpx.Client(timeout=15) as client:
-            resp = client.post(f"{base_url}/v1/messages", headers=headers, json=payload)
-        return resp.status_code in (200, 400, 401, 403, 429)
-    except Exception:
-        return False
+    """Return whether the shared Anthropic-compatible model probe succeeded."""
+    return _probe_models(
+        base_url,
+        api_key,
+        api_mode="anthropic_messages",
+    ) is not None
 
 
 def main():
@@ -2052,13 +2092,16 @@ def main():
         description="M-Claw — 跨平台桌面 CLI AI 智能体",
         add_help=False,
     )
+    _add_runtime_selector_args(parser)
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("help", help=argparse.SUPPRESS)
     resume_parser = subparsers.add_parser("resume", help="恢复历史会话")
     resume_parser.add_argument("session_id", nargs="?", default=RESUME_LATEST_SESSION, help="可选会话 ID 或前缀")
+    _add_runtime_selector_args(resume_parser, inherited=True)
     subparsers.add_parser("setup", help="运行初始设置向导")
     subparsers.add_parser("doctor", help="检查运行环境、依赖、工具和通道配置")
     weixin_parser = subparsers.add_parser("weixin", help="启动微信私聊网关")
+    _add_runtime_selector_args(weixin_parser, inherited=True)
     weixin_subparsers = weixin_parser.add_subparsers(dest="weixin_command")
     weixin_login_parser = weixin_subparsers.add_parser("login", help="扫码登录微信 iLink Bot")
     weixin_login_parser.add_argument("--bot-type", default="3", help="iLink bot_type，默认 3")
@@ -2066,6 +2109,7 @@ def main():
     weixin_login_parser.add_argument("--no-qr", action="store_true", help="只打印二维码链接，不渲染终端二维码")
     weixin_login_parser.add_argument("--connect", action="store_true", help="扫码成功后立即启动微信私聊网关")
     dingtalk_parser = subparsers.add_parser("dingtalk", help="启动钉钉 Stream 网关")
+    _add_runtime_selector_args(dingtalk_parser, inherited=True)
     dingtalk_subparsers = dingtalk_parser.add_subparsers(dest="dingtalk_command")
     dingtalk_subparsers.add_parser("login", help="配置钉钉 Stream 网关凭据")
     dingtalk_nested_check_parser = dingtalk_subparsers.add_parser("check", help="检查钉钉 Stream 网关依赖和配置")

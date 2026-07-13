@@ -62,6 +62,7 @@ from mclaw.prompts.slash_intents import (
     build_skill_creation_intent,
     build_skill_install_intent,
 )
+from mclaw.providers.runtime import ProviderRuntimeContext
 
 from mclaw.cli.colors import Colors
 from mclaw.cli.tui.assets import (
@@ -321,26 +322,43 @@ class InteractiveChat:
     def _app(self, value) -> None:
         self.__dict__["_prompt_app"] = value
 
+    @property
+    def provider_runtime(self) -> ProviderRuntimeContext:
+        agent_runtime = getattr(getattr(self, "agent", None), "provider_runtime", None)
+        return agent_runtime or self.pending_provider_runtime
+
+    @property
+    def model(self) -> str:
+        return self.provider_runtime.model
+
+    @property
+    def provider(self) -> str:
+        return self.provider_runtime.provider
+
+    @property
+    def api_key(self) -> str:
+        return self.provider_runtime.api_key
+
+    @property
+    def base_url(self) -> str:
+        return self.provider_runtime.base_url
+
+    @property
+    def api_mode(self) -> str:
+        return self.provider_runtime.api_mode
+
     def __init__(
         self,
-        model: str,
-        api_key: str,
-        base_url: str,
-        api_mode: str,
-        provider: str,
+        provider_runtime: ProviderRuntimeContext,
         session_id: str = None,
         resume_session_id: str = None,
         enabled_toolsets: list = None,
         config: dict | None = None,
     ):
         """Initialize a session, bind renderers, and create the agent runtime."""
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
-        self.api_mode = api_mode
-        self.provider = provider
         self.enabled_toolsets = enabled_toolsets
         self.config = config or {}
+        self.pending_provider_runtime = provider_runtime
         display_cfg = self.config.get("display", {}) if isinstance(self.config, dict) else {}
         self._live_status_animation = is_truthy_value(display_cfg.get("live_status_animation"), default=True)
         self._project_name = ""
@@ -439,6 +457,7 @@ class InteractiveChat:
 
         # Resume previous session if requested
         self._resume_history = []
+        resume_resolved = False
         if resume_session_id:
             requested_resume = str(resume_session_id)
             if requested_resume == RESUME_LATEST_SESSION:
@@ -448,7 +467,7 @@ class InteractiveChat:
             if resolved:
                 self.session_id = resolved
                 self._resume_history = self._session_db.get_messages_as_conversation(resolved)
-                self._session_db.reopen_session(resolved)
+                resume_resolved = True
             else:
                 if requested_resume == RESUME_LATEST_SESSION:
                     self._get_runtime_renderer().warning("没有可恢复的历史会话，已开始新会话。")
@@ -458,6 +477,7 @@ class InteractiveChat:
         try:
             self._acquire_session_lock(self.session_id)
         except Exception:
+            self._release_session_lock()
             self._session_db.close()
             raise
 
@@ -474,6 +494,8 @@ class InteractiveChat:
         self.agent = None
         try:
             self._init_agent()
+            if resume_resolved:
+                self._session_db.reopen_session(self.session_id)
             self.pet.start_if_enabled()
         except Exception:
             self._release_session_lock()
@@ -545,18 +567,6 @@ class InteractiveChat:
         self._session_lock = new_lock
         if old_lock:
             old_lock.release()
-
-    def _try_switch_session_lock(self, session_id: str) -> bool:
-        try:
-            self._switch_session_lock(session_id)
-            return True
-        except InteractiveSessionLockError as exc:
-            self._get_commands_renderer().render_notice(
-                "M-Claw 会话",
-                str(exc),
-                kind="danger",
-            )
-            return False
 
     def _release_session_lock(self) -> None:
         lock = getattr(self, "_session_lock", None)
@@ -656,8 +666,8 @@ class InteractiveChat:
     def _format_subagent_goal(self, goal: str, max_len: int = 72) -> str:
         return self._get_status_renderer().format_subagent_goal(goal, max_len=max_len)
 
-    def _init_agent(self):
-        """Create the core agent and attach UI callbacks for one session."""
+    def _create_agent(self, provider_runtime: ProviderRuntimeContext, session_id: str):
+        """Construct one agent without mutating the active interactive state."""
         from mclaw.agent.core import MClaw
 
         agent_cfg = self.config.get("agent", {}) if isinstance(self.config, dict) else {}
@@ -666,14 +676,10 @@ class InteractiveChat:
         except (TypeError, ValueError):
             max_iterations = 90
 
-        self.agent = MClaw(
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            api_mode=self.api_mode,
-            provider=self.provider,
+        agent = MClaw(
+            provider_runtime=provider_runtime,
             session_db=self._session_db,
-            session_id=self.session_id,
+            session_id=session_id,
             enabled_toolsets=self.enabled_toolsets,
             stream_callback=self._on_stream_delta,
             tool_callback=self._on_tool_start,
@@ -686,12 +692,17 @@ class InteractiveChat:
             config=self.config,
         )
 
+        agent._delegate_progress_callback = self._delegate_progress_callback
+        agent.secret_request_callback = self._secret_request_many_prompt
+        return agent
+
+    def _init_agent(self):
+        """Create the core agent and attach UI callbacks for one session."""
+        self.agent = self._create_agent(self.pending_provider_runtime, self.session_id)
+
         if self._resume_history:
             self._set_agent_messages(self._resume_history)
-
-        # Register subagent progress callback
-        self.agent._delegate_progress_callback = self._delegate_progress_callback
-        self.agent.secret_request_callback = self._secret_request_many_prompt
+            self._resume_history = []
 
     def _secret_request_many_prompt(self, required_for: str, needs: list[dict]) -> dict:
         """Normalize tool secret requests before handing them to the TUI prompt."""
@@ -1515,6 +1526,10 @@ class InteractiveChat:
                 self.skill_registry.invalidate()
             except Exception:
                 pass
+            agent = getattr(self, "agent", None)
+            mark_prompt_epoch_dirty = getattr(agent, "mark_prompt_epoch_dirty", None)
+            if callable(mark_prompt_epoch_dirty):
+                mark_prompt_epoch_dirty()
 
         return RuntimeSkillImportConfirmationCoordinator(
             RuntimeSkillImportConfirmationHooks(
@@ -1660,6 +1675,7 @@ class InteractiveChat:
     def _get_scheduler_coordinator(self):
         coordinator = getattr(self, "_scheduler_coordinator", None)
         if coordinator is not None:
+            self._refresh_scheduler_provider_runtime()
             return coordinator
         from mclaw.cli.runtime.scheduler import RuntimeSchedulerCoordinator
         from mclaw.scheduler.delivery import DeliveryService
@@ -1679,11 +1695,7 @@ class InteractiveChat:
             weixin_token_store=weixin_token_store,
         )
         runner = SchedulerRunner(
-            model=self.model,
-            api_key=self.api_key,
-            base_url=self.base_url,
-            api_mode=self.api_mode,
-            provider=self.provider,
+            provider_runtime=self.provider_runtime,
             config=self.config,
             session_db=self._session_db,
             store=store,
@@ -1717,6 +1729,13 @@ class InteractiveChat:
         self._scheduler_coordinator = coordinator
         return coordinator
 
+    def _refresh_scheduler_provider_runtime(self) -> None:
+        """Keep the cached scheduler runner aligned with the active live context."""
+        coordinator = getattr(self, "_scheduler_coordinator", None)
+        runner = getattr(getattr(coordinator, "engine", None), "runner", None)
+        if runner is not None:
+            runner.startup_provider_runtime = self.provider_runtime
+
     def _build_scheduler_dingtalk_client(self):
         try:
             from mclaw.channels.dingtalk.config import DingTalkConfig
@@ -1745,6 +1764,43 @@ class InteractiveChat:
         except Exception:
             return None, None
 
+    def _apply_resume(
+        self,
+        target_session_id: str,
+        provider_runtime: ProviderRuntimeContext,
+        history: list[dict],
+    ) -> None:
+        """Atomically replace the active session after target setup succeeds."""
+        current_session_id = self.session_id
+        current_lock = self._session_lock
+        target_lock = current_lock
+        if target_session_id != current_session_id:
+            target_lock = InteractiveSessionLock(target_session_id)
+            target_lock.acquire()
+
+        try:
+            target_agent = self._create_agent(provider_runtime, target_session_id)
+            target_agent.messages = history
+            target_agent.session_user_messages = self._count_user_messages(history)
+            self._session_db.switch_active_session(
+                current_session_id,
+                target_session_id,
+                end_reason="user_resume",
+            )
+        except Exception:
+            if target_lock is not current_lock and target_lock:
+                target_lock.release()
+            raise
+
+        self.session_id = target_session_id
+        self.agent = target_agent
+        self.pending_provider_runtime = target_agent.provider_runtime
+        self._session_lock = target_lock
+        self._resume_history = []
+        self._refresh_scheduler_provider_runtime()
+        if current_lock is not target_lock and current_lock:
+            current_lock.release()
+
     def _get_session_command_coordinator(self):
         from mclaw.cli.runtime.session_commands import RuntimeSessionCommandCoordinator, RuntimeSessionCommandHooks
 
@@ -1762,20 +1818,26 @@ class InteractiveChat:
             out_file.write_text(json.dumps(export, indent=2, default=str), encoding="utf-8")
             return str(out_file)
 
+        def _restore_runtime(snapshot: dict, row_model: str) -> ProviderRuntimeContext:
+            from mclaw.providers.resolver import restore_session_runtime_context
+
+            return restore_session_runtime_context(
+                snapshot,
+                config=self.config,
+                row_model=row_model,
+                fallback_context=self.provider_runtime,
+            )
         return RuntimeSessionCommandCoordinator(
             RuntimeSessionCommandHooks(
                 current_session_id=lambda: self.session_id,
-                set_current_session_id=lambda session_id: setattr(self, "session_id", session_id),
                 resolve_session_id=lambda session_ref: self._session_db.resolve_session_id(
                     session_ref,
                     workspace=self.workspace_path,
                 ),
                 get_messages_as_conversation=self._session_db.get_messages_as_conversation,
-                end_session=self._session_db.end_session,
-                reopen_session=self._session_db.reopen_session,
-                switch_session_lock=self._try_switch_session_lock,
-                init_agent=self._init_agent,
-                set_agent_messages=self._set_agent_messages,
+                get_model_config=self._session_db.get_model_config,
+                restore_runtime_context=_restore_runtime,
+                apply_resume=self._apply_resume,
                 get_session=self._session_db.get_session,
                 set_session_title=self._session_db.set_session_title,
                 export_session=self._session_db.export_session,
@@ -1900,11 +1962,8 @@ class InteractiveChat:
 
         RuntimeModelCommandCoordinator(
             RuntimeModelCommandHooks(
-                current_provider=lambda: self.provider,
-                current_model=lambda: self.model,
-                current_base_url=lambda: self.base_url,
-                current_api_key=lambda: self.api_key,
-                user_providers=lambda: self.config.get("providers", {}) if isinstance(self.config, dict) else {},
+                current_runtime=lambda: self.provider_runtime,
+                config=lambda: self.config,
                 switch_model=switch_model,
                 parse_model_flags=parse_model_flags,
                 render_model_status=lambda model, provider: self._get_commands_renderer().render_model_status(
@@ -1922,7 +1981,6 @@ class InteractiveChat:
                 ),
                 remember_pending_key_setup=lambda setup: setattr(self, "_pending_key_setup", setup),
                 apply_model_switch=self._apply_model_switch,
-                print_fn=_cprint,
             )
         ).handle_model_switch(raw_args)
 
@@ -1931,24 +1989,16 @@ class InteractiveChat:
         from mclaw.cli.config import ConfigError
         from mclaw.cli.model_switch import persist_model_choice
 
-        self.model = result.new_model
-        self.provider = result.target_provider
-        self.api_key = result.api_key
-        self.base_url = result.base_url
-        if result.api_mode:
-            self.api_mode = result.api_mode
-
-        self.agent.switch_model(
-            new_model=result.new_model,
-            new_provider=result.target_provider,
-            api_key=result.api_key,
-            base_url=result.base_url,
-            api_mode=result.api_mode,
-        )
+        context = result.runtime_context
+        if context is None:
+            raise ValueError("Successful model switch is missing a runtime context")
+        self.agent.switch_model(context)
+        self.pending_provider_runtime = self.agent.provider_runtime
+        self._refresh_scheduler_provider_runtime()
 
         if is_global:
             try:
-                persist_model_choice(result.new_model, result.target_provider, result.provider_profile)
+                persist_model_choice(context.model, context.provider)
             except ConfigError as exc:
                 self._get_commands_renderer().render_notice(
                     "M-Claw 模型",
@@ -1982,13 +2032,10 @@ class InteractiveChat:
 
             return switch_model(
                 model_input=pending_setup["model"],
-                current_provider=self.provider,
-                current_base_url=self.base_url,
-                current_api_key=self.api_key,
+                current_runtime=self.provider_runtime,
                 explicit_provider=pending_setup["explicit_provider"],
                 explicit_profile=pending_setup.get("explicit_profile", ""),
-                print_fn=_cprint,
-                user_providers=self.config.get("providers", {}) if isinstance(self.config, dict) else {},
+                config=self.config,
             )
 
         RuntimeKeySetupCoordinator(
@@ -3150,11 +3197,7 @@ class InteractiveChat:
 
 
 def run_interactive(
-    model: str,
-    api_key: str,
-    base_url: str,
-    api_mode: str,
-    provider: str,
+    provider_runtime: ProviderRuntimeContext,
     resume_session_id: str = None,
     enabled_toolsets: list = None,
     config: dict | None = None,
@@ -3177,11 +3220,7 @@ def run_interactive(
 
     try:
         chat = InteractiveChat(
-            model=model,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode,
-            provider=provider,
+            provider_runtime=provider_runtime,
             resume_session_id=resume_session_id,
             enabled_toolsets=enabled_toolsets,
             config=config,

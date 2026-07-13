@@ -17,8 +17,8 @@ import re
 from dataclasses import dataclass, field
 
 from mclaw.agent import models_dev
-from mclaw.cli.auth import PROVIDER_REGISTRY, detect_provider_for_model as _detect_provider_for_model
-from mclaw.cli.provider_profiles import get_default_provider_profile
+from mclaw.providers.normalization import normalize_provider_key
+from mclaw.providers.registry import PROVIDER_REGISTRY
 
 
 @dataclass
@@ -49,38 +49,7 @@ class ModelResolution:
 
 def resolve_provider_key(provider_input: str, user_providers: dict | None = None) -> str:
     """Resolve user-entered provider text to M-Claw's canonical provider key."""
-    raw = str(provider_input or "").strip()
-    if not raw:
-        return ""
-    user_providers = user_providers or {}
-
-    if raw in user_providers or raw in PROVIDER_REGISTRY:
-        return raw
-
-    lowered = raw.lower()
-    for name in user_providers:
-        if name.lower() == lowered:
-            return name
-    for name in PROVIDER_REGISTRY:
-        if name.lower() == lowered:
-            return name
-
-    compact = _compact_provider_name(raw)
-    for name, cfg in user_providers.items():
-        display = str(cfg.get("display_name") or name)
-        if compact in {_compact_provider_name(name), _compact_provider_name(display)}:
-            return name
-    for name, cfg in PROVIDER_REGISTRY.items():
-        aliases = {_compact_provider_name(alias) for alias in getattr(cfg, "aliases", [])}
-        provider_names = {
-            _compact_provider_name(name),
-            _compact_provider_name(cfg.display_name),
-            *aliases,
-        }
-        if compact in provider_names:
-            return name
-
-    return raw
+    return normalize_provider_key(provider_input, user_providers)
 
 
 def resolve_model_input(
@@ -297,8 +266,8 @@ def _load_catalog() -> list[dict[str, str]]:
 
 def _models_dev_to_mclaw_provider() -> dict[str, str]:
     reverse: dict[str, str] = {}
-    for mclaw_provider in PROVIDER_REGISTRY:
-        dev_provider = get_default_provider_profile(mclaw_provider).models_dev_provider
+    for mclaw_provider, profile in PROVIDER_REGISTRY.items():
+        dev_provider = profile.models_dev_provider
         if dev_provider and dev_provider not in reverse:
             reverse[dev_provider] = mclaw_provider
 
@@ -359,9 +328,16 @@ def _is_routable_provider(provider: str, user_providers: dict) -> bool:
     return provider in PROVIDER_REGISTRY or provider in user_providers
 
 
+def _detect_provider_for_model(model: str) -> str | None:
+    lowered = str(model or "").casefold()
+    matches = {
+        name
+        for name, profile in PROVIDER_REGISTRY.items()
+        if profile.provider_kind == "direct"
+        and any(lowered.startswith(prefix.casefold()) for prefix in profile.model_prefixes)
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def _model_key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
-
-
-def _compact_provider_name(value: str) -> str:
-    return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())

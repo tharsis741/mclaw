@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
+from mclaw.providers.registry import get_runtime_profile
+
 
 class FeatureState(str, Enum):
     """Availability state exposed by runtime capability checks."""
@@ -163,6 +165,11 @@ class FeatureSpec:
         return data
 
 
+_QWEN_CREDENTIAL_GROUPS = (
+    get_runtime_profile("qwen").env_vars,
+    get_runtime_profile("qwen-intl").env_vars,
+)
+
 FEATURES: dict[str, FeatureSpec] = {
     "web_search": FeatureSpec(
         name="web_search",
@@ -170,7 +177,7 @@ FEATURES: dict[str, FeatureSpec] = {
         display_name="网页搜索",
         description="优先通过 Tavily 搜索网页，可选 DashScope/Qwen 作为第二搜索源。",
         toolset="web",
-        requires_any=(("TAVILY_API_KEY",), ("DASHSCOPE_API_KEY", "QWEN_API_KEY")),
+        requires_any=(("TAVILY_API_KEY",), *_QWEN_CREDENTIAL_GROUPS),
     ),
     "vision_analyze": FeatureSpec(
         name="vision_analyze",
@@ -178,7 +185,7 @@ FEATURES: dict[str, FeatureSpec] = {
         display_name="视觉分析",
         description="通过 Qwen 视觉模型分析图片。",
         toolset="vision",
-        requires_any=(("DASHSCOPE_API_KEY", "QWEN_API_KEY"),),
+        requires_any=_QWEN_CREDENTIAL_GROUPS,
     ),
     "asr": FeatureSpec(
         name="asr",
@@ -186,7 +193,7 @@ FEATURES: dict[str, FeatureSpec] = {
         display_name="语音输入",
         description="通过 DashScope/Qwen 实时语音识别启用麦克风输入。",
         config_path="auxiliary.asr.enabled",
-        requires_any=(("DASHSCOPE_API_KEY", "QWEN_API_KEY"),),
+        requires_any=_QWEN_CREDENTIAL_GROUPS,
     ),
 }
 

@@ -188,6 +188,12 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "active_provider_profile": "",
     "providers": {},
     "fallback_providers": [],
+    "reasoning": {
+        "effort": "",
+    },
+    "prompt_cache": {
+        "enabled": True,
+    },
     "toolsets": ["mclaw-required"],
     "tools": {
         "disabled": [],
@@ -245,7 +251,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         },
         "asr": {
             "enabled": "auto",
-            "provider": "dashscope",
+            "provider": "qwen",
             "backend": "qwen_realtime",
             "model": "qwen3-asr-flash-realtime",
             "websocket_url": "",
@@ -253,7 +259,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "ca_bundle": "auto",
             "recorder_backend": "auto",
             "arecord_device": "auto",
-            "region": "cn",
             "language": "zh",
             "sample_rate": 16000,
             "input_audio_format": "pcm",

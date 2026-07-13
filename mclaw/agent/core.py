@@ -19,19 +19,24 @@ import time
 import uuid
 from typing import Any, Callable, Dict, List, Optional, Set
 
-import anthropic
-import openai
-
 from mclaw.agent.background_review import spawn_background_review
+from mclaw.agent.context_metadata import resolve_context_length
 from mclaw.agent.context_compressor import ContextCompressor
 from mclaw.agent.memory_manager import MemoryManager
+from mclaw.agent.prompt_cache import build_prompt_cache_plan
 from mclaw.agent.prompt_builder import build_system_prompt
-from mclaw.prompts.background import build_memory_flush_system_prompt
-from mclaw.agent.retry_utils import (
-    get_retry_after,
-    is_retryable_error,
-    jittered_backoff,
+from mclaw.agent.retry_utils import jittered_backoff
+from mclaw.agent.token_budget import estimate_request_budget
+from mclaw.agent.transports.base import (
+    ModelCallError,
+    ModelCallOptions,
+    ModelCallResult,
+    ReasoningTrace,
 )
+from mclaw.agent.transports.factory import create_transport
+from mclaw.agent.usage import UsageRecord
+from mclaw.prompts.background import build_memory_flush_system_prompt
+from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
 from mclaw.tools.interrupt import set_interrupt
 
@@ -40,6 +45,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRIES = 5
 
 SKILL_WRITE_ACTIONS = frozenset({
+    "create_scaffold",
     "create",
     "edit",
     "patch",
@@ -80,18 +86,16 @@ def _redact_log_secrets(value: Any) -> Any:
 class MClaw:
     """Stateful agent facade for one conversation session.
 
-    ``MClaw`` owns the canonical message list, provider client, tool registry,
+    ``MClaw`` owns the canonical message list, bound transport, tool registry,
     memory/compression helpers, checkpoint metadata, and callback hooks used by
     CLI, channel, and scheduler runtimes.
     """
 
     def __init__(
         self,
-        model: str = "",
-        api_key: str = "",
-        base_url: str = "",
-        api_mode: str = "chat_completions",
-        provider: str = "",
+        *,
+        provider_runtime: ProviderRuntimeContext,
+        usage_sink: Callable[[UsageRecord], None] | None = None,
         system_prompt: str = "",
         session_db: SessionDB = None,
         session_id: str = None,
@@ -111,11 +115,11 @@ class MClaw:
         config: dict | None = None,
     ):
         """Create session-scoped runtime state without starting a model call."""
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
-        self.api_mode = api_mode
-        self.provider = provider
+        if not isinstance(provider_runtime, ProviderRuntimeContext):
+            raise TypeError("provider_runtime must be a ProviderRuntimeContext")
+        self.provider_runtime = provider_runtime
+        self.transport = create_transport(provider_runtime)
+        self._usage_sink = usage_sink
         self.system_prompt = system_prompt
         self.max_iterations = max_iterations
         self.platform = platform
@@ -138,7 +142,7 @@ class MClaw:
 
         self.messages: List[Dict[str, Any]] = []
         self._interrupted = False
-        self._is_anthropic = api_mode == "anthropic_messages"
+        self._prompt_epoch_dirty = False
 
         # Memory subsystem.
         self._memory_manager: Optional[MemoryManager] = None
@@ -158,8 +162,13 @@ class MClaw:
         self._turns_since_evolution_review: int = 0
 
         # Token usage tracking.
+        self._usage_lock = threading.Lock()
+        self._turn_usage: dict[str, int] | None = None
         self.session_input_tokens = 0
         self.session_output_tokens = 0
+        self.session_cache_read_tokens = 0
+        self.session_cache_write_tokens = 0
+        self.session_reasoning_tokens = 0
         self.session_api_calls = 0
         self.session_user_messages = 0
 
@@ -207,15 +216,13 @@ class MClaw:
             )
             summary_api_key = ""
 
+            context_window = resolve_context_length(self.provider_runtime)
             self.context_compressor = ContextCompressor(
-                model=self.model,
+                provider_runtime=self.provider_runtime,
+                context_window=context_window,
                 threshold_percent=compression_threshold,
                 protect_last_n=compression_protect_last_n,
                 summary_target_ratio=compression_target_ratio,
-                base_url=self.base_url,
-                api_key=self.api_key,
-                api_mode=self.api_mode,
-                provider=self.provider,
                 session_id=self.session_id,
                 summary_model_override=summary_model,
                 summary_provider_override=summary_provider,
@@ -223,6 +230,7 @@ class MClaw:
                 summary_api_key_override=summary_api_key,
                 summary_timeout=compression_summary_timeout,
                 config=self.config,
+                usage_callback=self._record_usage,
             )
         else:
             self.context_compressor = None
@@ -237,42 +245,53 @@ class MClaw:
             self._init_memory()
             self._sync_memory_tool_schema()
 
-        # Build clients: empty base_url must become None/NOT_GIVEN.
-        # 60s HTTP timeout: long enough for most APIs, short enough that a hung
-        # request releases quickly when the user presses Ctrl+C.
-        _HTTP_TIMEOUT = 60.0
-        if self._is_anthropic:
-            self.anthropic_client = anthropic.Anthropic(
-                api_key=self.api_key,
-                base_url=self.base_url or anthropic.NOT_GIVEN,
-                max_retries=0,
-                timeout=_HTTP_TIMEOUT,
-            )
-            self.client = None
-        else:
-            self.client = openai.OpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url or openai.NOT_GIVEN,
-                max_retries=0,
-                timeout=_HTTP_TIMEOUT,
-            )
-            self.anthropic_client = None
-
         # Create the session record in the database.
         if self._session_db:
             self._session_db.create_session(
                 session_id=self.session_id,
                 source=self.platform,
                 model=self.model,
+                model_config=self.provider_runtime.snapshot(),
                 system_prompt=self.system_prompt,
                 parent_session_id=parent_session_id,
                 workspace=self.workspace_path or None,
+            )
+            row = self._session_db.get_session(self.session_id) or {}
+            self.session_input_tokens = int(row.get("input_tokens") or 0)
+            self.session_output_tokens = int(row.get("output_tokens") or 0)
+            self.session_cache_read_tokens = int(row.get("cache_read_tokens") or 0)
+            self.session_cache_write_tokens = int(row.get("cache_write_tokens") or 0)
+            self.session_reasoning_tokens = int(row.get("reasoning_tokens") or 0)
+            self._session_db.update_model_config(
+                self.session_id,
+                model=self.model,
+                model_config=self.provider_runtime.snapshot(),
             )
             if hasattr(self._session_db, "count_user_messages"):
                 try:
                     self.session_user_messages = self._session_db.count_user_messages(self.session_id)
                 except Exception:
                     self.session_user_messages = 0
+
+    @property
+    def model(self) -> str:
+        return self.provider_runtime.model
+
+    @property
+    def provider(self) -> str:
+        return self.provider_runtime.provider
+
+    @property
+    def api_key(self) -> str:
+        return self.provider_runtime.api_key
+
+    @property
+    def base_url(self) -> str:
+        return self.provider_runtime.base_url
+
+    @property
+    def api_mode(self) -> str:
+        return self.provider_runtime.api_mode
 
     def _discover_tools(self):
         """Load the active tool schemas and validation set for this session."""
@@ -429,54 +448,57 @@ class MClaw:
         if not msgs or len(msgs) < 3:
             return
 
-        flush_system = build_memory_flush_system_prompt()
-
-        # Build flush messages from the most recent user/assistant exchanges.
-        flush_msgs = []
+        flush_msgs = [
+            {"role": "system", "content": build_memory_flush_system_prompt()}
+        ]
         for msg in msgs[-8:]:
             if msg.get("role") in ("user", "assistant"):
                 flush_msgs.append(msg)
-
-        # Save original tool state.
-        original_tools = self.tools
-        original_valid = self.valid_tool_names
+        memory_tools = self._memory_manager.get_all_tool_schemas()
+        if not memory_tools:
+            return
+        transport = self.transport
+        provider_runtime = self.provider_runtime
+        cache_enabled = bool(
+            self.config.get("prompt_cache", {}).get("enabled", True)
+        )
+        cancelled = threading.Event()
 
         def _run_flush():
             try:
-                # Keep only memory tools during the flush call.
-                memory_schema = self._memory_manager.get_all_tool_schemas()
-                self.tools = memory_schema
-                self.valid_tool_names = self._memory_manager.get_all_tool_names()
-
-                # Run one API call with the flush prompt.
-                if self._is_anthropic:
-                    api_model = self._normalize_anthropic_model(self.model)
-                    max_output = self._get_anthropic_max_output(api_model)
-                    sys_part, conv = self._split_anthropic_messages(flush_msgs)
-                    combined_sys = (sys_part + "\n\n" + flush_system) if sys_part else flush_system
-                    response = self.anthropic_client.messages.create(
-                        model=api_model,
-                        max_tokens=max_output,
-                        system=combined_sys,
-                        messages=conv,
-                        tools=self._convert_tools_to_anthropic(),
+                self._record_api_attempt(
+                    include_in_turn=not cancelled.is_set(),
+                )
+                result = transport.call(
+                    messages=flush_msgs,
+                    tools=memory_tools,
+                    options=ModelCallOptions(
+                        timeout=float(timeout) if timeout and timeout > 0 else 30.0,
+                        source="memory_flush",
+                        cache_plan=build_prompt_cache_plan(
+                            messages=flush_msgs,
+                            tools=memory_tools,
+                            context=provider_runtime,
+                            session_id=self.session_id,
+                            enabled=cache_enabled,
+                        ),
+                    ),
+                    interrupted=lambda: cancelled.is_set() or self._interrupted,
+                )
+                if result.usage is not None:
+                    self._record_usage(
+                        result.usage,
+                        include_in_turn=not cancelled.is_set(),
                     )
-                    _, tool_calls, _ = self._parse_anthropic(response)
-                else:
-                    api_msgs = [{"role": "system", "content": flush_system}] + flush_msgs
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=api_msgs,
-                        tools=self.tools,
-                    )
-                    _, tool_calls, _, _ = self._parse_openai(response)
+                if result.interrupted or cancelled.is_set():
+                    return
 
                 # Parse tool calls directly and route them through MemoryManager
                 # without asking the model for a second decision.
-                if tool_calls:
+                if result.tool_calls:
                     from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES
 
-                    for tc in tool_calls:
+                    for tc in result.tool_calls:
                         fn = tc.get("function", {})
                         tool_name = fn.get("name")
                         if tool_name not in MEMORY_TOOL_NAMES:
@@ -507,13 +529,10 @@ class MClaw:
             thread.start()
             thread.join(timeout=timeout)
             if thread.is_alive():
+                cancelled.set()
                 logger.debug("flush_memories timed out after %.1fs", timeout)
         else:
             _run_flush()
-
-        # Restore tool state whether the flush succeeded or timed out.
-        self.tools = original_tools
-        self.valid_tool_names = original_valid
 
     # Background memory and Skill review.
 
@@ -570,24 +589,17 @@ class MClaw:
         except Exception:
             logger.warning("agent event callback failed", exc_info=True)
 
-    def _strip_event_visible_content(self, text: str) -> str:
-        """Remove provider reasoning tags before emitting UI-visible event text."""
-        text = str(text or "")
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
-        text = re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL | re.IGNORECASE)
-        return text.strip()
-
     def _assistant_round_visible_content(
         self,
         content: str,
         reasoning_content: str | None = None,
     ) -> tuple[str, str]:
         """Choose the safest visible payload for an intermediate assistant event."""
-        visible_content = self._strip_event_visible_content(content)
+        visible_content = str(content or "").strip()
         if visible_content:
             return visible_content, "content"
 
-        reasoning_visible = self._strip_event_visible_content(reasoning_content or "")
+        reasoning_visible = str(reasoning_content or "").strip()
         if reasoning_visible:
             return reasoning_visible, "reasoning_content"
 
@@ -667,68 +679,47 @@ class MClaw:
         )
         return temp_marker
 
-    def switch_model(self, new_model: str, new_provider: str = "",
-                     api_key: str = "", base_url: str = "", api_mode: str = ""):
-        """Switch model/provider in-place, rebuilding the API client only when needed."""
-        old_api_mode = self.api_mode
-        old_key = self.api_key
-        old_url = self.base_url
-
-        self.model = new_model
-        if new_provider:
-            self.provider = new_provider
-        if api_key:
-            self.api_key = api_key
-        if base_url:
-            self.base_url = base_url
-        if api_mode:
-            self.api_mode = api_mode
-            self._is_anthropic = api_mode == "anthropic_messages"
-
-        needs_rebuild = (
-            api_mode and api_mode != old_api_mode
-            or self.api_key != old_key
-            or self.base_url != old_url
-        )
-
-        if needs_rebuild:
-            _HTTP_TIMEOUT = 60.0
-            if self._is_anthropic:
-                self.anthropic_client = anthropic.Anthropic(
-                    api_key=self.api_key,
-                    base_url=self.base_url or anthropic.NOT_GIVEN,
-                    max_retries=0,
-                    timeout=_HTTP_TIMEOUT,
-                )
-                self.client = None
-            else:
-                self.client = openai.OpenAI(
-                    api_key=self.api_key,
-                    base_url=self.base_url or openai.NOT_GIVEN,
-                    max_retries=0,
-                    timeout=_HTTP_TIMEOUT,
-                )
-                self.anthropic_client = None
-            logger.info(
-                "API client rebuilt: model=%s provider=%s base_url=%s",
-                self.model, self.provider, self.base_url,
+    def switch_model(self, context: ProviderRuntimeContext) -> None:
+        """Atomically activate one already-resolved provider runtime."""
+        if not isinstance(context, ProviderRuntimeContext):
+            raise TypeError("context must be a ProviderRuntimeContext")
+        next_transport = create_transport(context)
+        next_context_window = resolve_context_length(context)
+        next_system_prompt = self._build_system_prompt(model=context.model)
+        if self._session_db:
+            self._session_db.update_model_config(
+                self.session_id,
+                model=context.model,
+                model_config=context.snapshot(),
             )
 
-        # Rebuild the system prompt with the new model name and update messages.
-        new_sys = self._build_system_prompt()
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = new_sys
-
+        self.provider_runtime = context
+        self.transport = next_transport
+        self._replace_system_message(next_system_prompt)
+        self._prompt_epoch_dirty = False
         if self.context_compressor:
             self.context_compressor.reconfigure_model(
-                self.model,
-                base_url=self.base_url,
-                api_key=self.api_key,
-                api_mode=self.api_mode,
-                provider=self.provider,
+                context,
+                context_window=next_context_window,
             )
 
-    def _build_system_prompt(self) -> str:
+    def _replace_system_message(self, content: str) -> None:
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = content
+
+    def mark_prompt_epoch_dirty(self) -> None:
+        """Request a system-prompt rebuild after an out-of-band prompt source change."""
+        self._prompt_epoch_dirty = True
+
+    def _refresh_prompt_epoch(self, messages: List[Dict[str, Any]]) -> None:
+        content = self._build_system_prompt()
+        if messages and messages[0].get("role") == "system":
+            messages[0]["content"] = content
+        else:
+            messages.insert(0, {"role": "system", "content": content})
+        self._prompt_epoch_dirty = False
+
+    def _build_system_prompt(self, *, model: str | None = None) -> str:
         """Assemble the current system prompt from platform, tools, and memory."""
         if self.system_prompt:
             return self.system_prompt
@@ -749,7 +740,7 @@ class MClaw:
 
         return build_system_prompt(
             agent_platform=self.platform,
-            model=self.model,
+            model=model or self.model,
             memory_block=memory_block,
             tool_names=self.valid_tool_names,
             available_toolsets=avail_toolsets,
@@ -766,6 +757,8 @@ class MClaw:
         disable_tools: bool = False,
         extra_system: str = "",
         advance_background_review: bool = True,
+        *,
+        call_source: str = "turn",
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -776,9 +769,20 @@ class MClaw:
         self.clear_interrupt()
         self._memory_changed_in_turn = False
         self._skills_changed_in_turn = False
+        with self._usage_lock:
+            self._turn_usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "api_calls": 0,
+            }
 
         # Subagents pass None when they should not inherit the parent history.
         messages = list(conversation_history if conversation_history is not None else [])
+        if self._prompt_epoch_dirty:
+            self._refresh_prompt_epoch(messages)
 
         # Reset prior token counts for fresh sessions so heavy previous tasks
         # do not trigger unnecessary preventive compression.
@@ -788,8 +792,6 @@ class MClaw:
 
         if not messages or messages[0].get("role") != "system":
             system_prompt_text = self._build_system_prompt()
-            if extra_system:
-                system_prompt_text += "\n\n" + extra_system
             logger.info("[SYSTEM PROMPT]\n%s", system_prompt_text)
             messages.insert(0, {"role": "system", "content": system_prompt_text})
 
@@ -819,6 +821,12 @@ class MClaw:
                 self._recalled_memory = ""
         else:
             self._recalled_memory = ""
+        dynamic_system_context = "\n\n".join(
+            part for part in (extra_system, self._recalled_memory) if part
+        )
+        cache_enabled = bool(
+            self.config.get("prompt_cache", {}).get("enabled", True)
+        )
 
         if self._session_db:
             self._session_db.append_message(
@@ -838,29 +846,30 @@ class MClaw:
             self.session_user_messages += 1
 
         api_call_count = 0
+        assistant_iteration_count = 0
         final_response = ""
         final_response_recorded = False
         interrupted = False
         assistant_rounds = []
+        final_result: ModelCallResult | None = None
 
         # Temporarily disable tools when disable_tools=True (e.g. synthesis turn)
         original_tools = self.tools
         if disable_tools:
             self.tools = []
 
-        while api_call_count < self.max_iterations:
-            logger.info("[LOOP] starting iteration %d", api_call_count + 1)
+        while assistant_iteration_count < self.max_iterations:
+            assistant_iteration_count += 1
+            logger.info("[LOOP] starting iteration %d", assistant_iteration_count)
             if self._interrupted:
                 interrupted = True
                 break
-
-            api_call_count += 1
 
             # Subagent diagnostics: log each API iteration to locate stalls.
             if getattr(self, "_delegate_depth", 0) > 0:
                 logger.info(
                     "[subagent-%s] API iteration %d/%d",
-                    getattr(self, "session_id", "?")[-6:], api_call_count, self.max_iterations
+                    getattr(self, "session_id", "?")[-6:], assistant_iteration_count, self.max_iterations
                 )
 
             # Clear the per-turn compression circuit breaker before the next API call.
@@ -873,37 +882,51 @@ class MClaw:
             if self.context_compressor:
                 cc = self.context_compressor
                 if not cc._compressed_this_turn:
-                    from mclaw.agent.context_compressor import estimate_messages_tokens
                     logger.info("[LOOP] estimating tokens for preventive compression")
-                    estimated = estimate_messages_tokens(messages)
-                    logger.info("[LOOP] estimated=%d last_prompt=%d last_completion=%d", estimated, cc.last_prompt_tokens, cc.last_completion_tokens)
-                    # Check against the larger of the estimate and last real usage.
-                    real_tokens = cc.last_prompt_tokens + cc.last_completion_tokens
-                    check_tokens = max(estimated, real_tokens)
-                    if check_tokens >= cc.threshold_tokens:
-                        logger.info("[LOOP] preventive compression triggered (check=%d >= threshold=%d)", check_tokens, cc.threshold_tokens)
+                    budget = estimate_request_budget(
+                        messages=messages,
+                        tools=self.tools,
+                        dynamic_system_context=dynamic_system_context,
+                        context=self.provider_runtime,
+                        context_window=cc.context_length,
+                    )
+                    logger.info(
+                        "[LOOP] estimated=%d output_budget=%d last_prompt=%d last_completion=%d",
+                        budget.input_tokens,
+                        budget.output_budget,
+                        cc.last_prompt_tokens,
+                        cc.last_completion_tokens,
+                    )
+                    check_tokens = max(budget.input_tokens, cc.last_prompt_tokens)
+                    compression_limit = min(
+                        cc.threshold_tokens,
+                        max(1, budget.context_window - budget.output_budget),
+                    )
+                    if check_tokens >= compression_limit:
+                        logger.info("[LOOP] preventive compression triggered (check=%d >= threshold=%d)", check_tokens, compression_limit)
                         self._emit_status("Compressing context...")
-                        self.flush_memories()
+                        self.flush_memories(messages)
                         messages = cc.compress(messages)
                         logger.info("[LOOP] compression done")
                         self._refresh_memory_snapshot()
                         logger.info("[LOOP] memory snapshot refreshed")
-                        new_sys = self._build_system_prompt()
-                        if messages and messages[0].get("role") == "system":
-                            messages[0]["content"] = new_sys
+                        self._refresh_prompt_epoch(messages)
                         cc._compressed_this_turn = True
                     else:
-                        logger.info("[LOOP] no preventive compression needed (check=%d < threshold=%d)", check_tokens, cc.threshold_tokens)
+                        logger.info("[LOOP] no preventive compression needed (check=%d < threshold=%d)", check_tokens, compression_limit)
 
             # ── API call with retry ──
-            response = None
+            result: ModelCallResult | None = None
             retry_count = 0
+            context_retry_used = False
 
             while retry_count < MAX_RETRIES:
                 if self._interrupted:
                     interrupted = True
                     break
                 try:
+                    if self._prompt_epoch_dirty:
+                        self._refresh_prompt_epoch(messages)
                     # Log the full message list before API calls to diagnose context growth.
                     try:
                         _msgs_log = []
@@ -934,26 +957,41 @@ class MClaw:
 
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] 开始 API 调用", getattr(self, "session_id", "?")[-6:])
-                    if self._is_anthropic:
-                        response = self._call_anthropic(messages)
-                    else:
-                        response = self._call_openai(messages)
+                    api_call_count += 1
+                    self._record_api_attempt()
+                    result = self.transport.call(
+                        messages=messages,
+                        tools=self.tools,
+                        options=ModelCallOptions(
+                            stream=bool(self._stream_callback),
+                            timeout=30.0,
+                            source=call_source,
+                            dynamic_system_context=dynamic_system_context,
+                            cache_plan=build_prompt_cache_plan(
+                                messages=messages,
+                                tools=self.tools,
+                                context=self.provider_runtime,
+                                session_id=self.session_id,
+                                enabled=cache_enabled,
+                            ),
+                        ),
+                        stream_callback=self._stream_callback,
+                        interrupted=lambda: self._interrupted,
+                    )
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
                     break
-                except Exception as e:
-                    err_str = str(e).lower()
+                except ModelCallError as error:
                     # Context overflow: compress once, then retry.
-                    is_context_limit = (
-                        ("context" in err_str and "limit" in err_str)
-                        or "2013" in str(e)
-                        or "too large" in err_str
-                        or "entity too large" in err_str
-                    )
-                    if is_context_limit and self.context_compressor and retry_count == 0:
+                    if (
+                        error.context_limit
+                        and self.context_compressor
+                        and not context_retry_used
+                    ):
+                        context_retry_used = True
                         # Retry once after compression without consuming normal retry budget.
                         self._emit_status("Context overflow — compressing and retrying...")
-                        self.flush_memories()
+                        self.flush_memories(messages)
                         from mclaw.agent.context_compressor import estimate_messages_tokens
                         before_tokens = estimate_messages_tokens(messages)
                         compressed_messages = self.context_compressor.compress(messages)
@@ -968,18 +1006,19 @@ class MClaw:
                         else:
                             messages = compressed_messages
                             self._refresh_memory_snapshot()
-                            new_sys = self._build_system_prompt()
-                            if messages and messages[0].get("role") == "system":
-                                messages[0]["content"] = new_sys
+                            self._refresh_prompt_epoch(messages)
                             self.context_compressor._compressed_this_turn = True
                             continue  # retry with compressed messages
-                    if is_retryable_error(e) and retry_count < MAX_RETRIES - 1:
+                    if error.retryable and retry_count < MAX_RETRIES - 1:
                         retry_count += 1
-                        retry_after = get_retry_after(e)
-                        wait = retry_after or jittered_backoff(retry_count)
+                        wait = (
+                            error.retry_after
+                            if error.retry_after is not None
+                            else jittered_backoff(retry_count)
+                        )
                         logger.warning(
                             "API error (attempt %d/%d), retrying in %.1fs: %s",
-                            retry_count, MAX_RETRIES, wait, e,
+                            retry_count, MAX_RETRIES, wait, error,
                         )
                         self._emit_status(f"重试中，等待 {wait:.0f}s...")
                         deadline = time.time() + wait
@@ -988,9 +1027,11 @@ class MClaw:
                                 break
                             time.sleep(0.2)
                         continue
-                    logger.error("API error (non-retryable): %s", e)
-                    final_response = f"API Error: {e}"
+                    logger.error("API error (non-retryable): %s", error)
+                    final_response = f"API Error: {error}"
                     self.messages = messages
+                    if disable_tools:
+                        self.tools = original_tools
                     return {
                         "final_response": final_response,
                         "messages": messages,
@@ -998,32 +1039,24 @@ class MClaw:
                         "session_id": self.session_id,
                         "api_calls": api_call_count,
                         "assistant_rounds": assistant_rounds,
+                        "token_usage": self._finish_turn_usage(),
                     }
 
             if self._interrupted:
                 interrupted = True
 
-            if interrupted or response is None:
+            if result is not None and result.usage is not None:
+                self._record_usage(result.usage)
+            if result is not None and result.interrupted:
+                interrupted = True
+
+            if interrupted or result is None:
                 break
 
-            # ── Track token usage ──
-            self._track_usage(response)
-            self.session_api_calls += 1
-
-            # Feed measured API token usage back into the compressor.
-            usage = getattr(response, "usage", None)
-            if usage and self.context_compressor:
-                self.context_compressor.update_from_response({
-                    "prompt_tokens": getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0),
-                    "completion_tokens": getattr(usage, "completion_tokens", 0),
-                })
-
-            # ── Parse response ──
-            if self._is_anthropic:
-                assistant_content, tool_calls, finish = self._parse_anthropic(response)
-                reasoning_content = None
-            else:
-                assistant_content, tool_calls, finish, reasoning_content = self._parse_openai(response)
+            assistant_content = result.content
+            tool_calls = result.tool_calls
+            finish = result.finish_reason
+            reasoning_text = result.reasoning.text if result.reasoning else None
 
             finish_after_cleanup = (
                 bool(assistant_content and assistant_content.strip())
@@ -1032,10 +1065,10 @@ class MClaw:
             round_event = self._build_assistant_round_event(
                 api_call_index=api_call_count,
                 content=assistant_content,
-                reasoning_content=reasoning_content,
+                reasoning_content=reasoning_text,
                 tool_calls=tool_calls,
                 finish_reason=finish,
-                was_streamed=bool(self._stream_callback),
+                was_streamed=result.was_streamed,
                 is_final_override=True if finish_after_cleanup else None,
             )
             assistant_rounds.append(round_event)
@@ -1049,6 +1082,8 @@ class MClaw:
                         self.session_id, "assistant",
                         content=assistant_content,
                         tool_calls=[tc for tc in tool_calls],
+                        finish_reason=finish,
+                        **(result.reasoning.to_message_fields() if result.reasoning else {}),
                         turn_id=self._checkpoint_turn_id,
                     )
 
@@ -1059,7 +1094,7 @@ class MClaw:
                     tool_calls,
                     messages,
                     assistant_content=assistant_content,
-                    reasoning_content=reasoning_content,
+                    reasoning=result.reasoning,
                 )
                 logger.info("[POST-TOOL] _execute_tool_calls returned, pending=%s", pending_result is not None)
                 if pending_result is not None:
@@ -1068,6 +1103,8 @@ class MClaw:
                     if disable_tools:
                         self.tools = original_tools
                     pending_result["assistant_rounds"] = assistant_rounds
+                    pending_result["api_calls"] = api_call_count
+                    pending_result["token_usage"] = self._finish_turn_usage()
                     return pending_result
 
                 if finish_after_cleanup:
@@ -1095,9 +1132,10 @@ class MClaw:
                 final_response = ""
 
             assistant_msg = {"role": "assistant", "content": final_response}
-            if reasoning_content:
-                assistant_msg["reasoning_content"] = reasoning_content
+            if result.reasoning:
+                assistant_msg.update(result.reasoning.to_message_fields())
             messages.append(assistant_msg)
+            final_result = result
             if getattr(self, "_delegate_depth", 0) > 0:
                 logger.info("[subagent-%s] no tool_calls, breaking loop", self.session_id[-6:])
             break
@@ -1110,10 +1148,17 @@ class MClaw:
                 self.session_id,
                 "assistant",
                 content=final_response,
+                finish_reason=final_result.finish_reason if final_result else None,
+                **(
+                    final_result.reasoning.to_message_fields()
+                    if final_result and final_result.reasoning
+                    else {}
+                ),
                 turn_id=self._checkpoint_turn_id,
             )
 
         self.messages = messages
+        turn_usage = self._finish_turn_usage()
 
         _should_review_skills = False
         completed_user_turn = bool(advance_background_review and not interrupted and final_response)
@@ -1174,652 +1219,21 @@ class MClaw:
             "interrupted": interrupted,
             "completed": bool(not interrupted and final_response),
             "assistant_rounds": assistant_rounds,
+            "token_usage": turn_usage,
             "skills_changed": bool(getattr(self, "_skills_changed_in_turn", False)),
         }
 
-    # ── OpenAI API calls ──
-
-    def _call_openai(self, messages: List[Dict]):
-        """Call an OpenAI-compatible provider and normalize streaming timeouts."""
-        logger.info("[_call_openai] start model=%s stream=%s", self.model, bool(self._stream_callback))
-        api_messages = self._prepare_openai_messages(messages)
-        kwargs = {"model": self.model, "messages": api_messages, "timeout": 30}
-        if self.tools:
-            kwargs["tools"] = self.tools
-
-        # MiniMax extended reasoning field keeps reasoning separate from visible content.
-        if self.provider in ("minimax", "minimax-cn"):
-            kwargs["extra_body"] = {"reasoning_split": True}
-
-        if self._stream_callback:
-            logger.info("[_call_openai] entering streaming path")
-            result = self._openai_streaming(kwargs)
-            logger.info("[_call_openai] streaming returned")
-            return result
-
-        # Non-streaming path uses a watchdog thread for hard timeout enforcement.
-        # httpx/openai timeouts can fail on half-open TCP or load-balancer keep-alive edges.
-        logger.info("[_call_openai] entering non-streaming path")
-        result_container: list = [None]
-        def _run():
-            try:
-                result_container[0] = self.client.chat.completions.create(**kwargs)
-            except Exception as exc:
-                result_container[0] = exc
-
-        t = threading.Thread(target=_run, daemon=True)
-        t.start()
-        logger.info("[_call_openai] watchdog thread started, waiting max 90s")
-        deadline = time.monotonic() + 90
-        while t.is_alive():
-            if self._interrupted:
-                logger.info("[_call_openai] interrupted while waiting for non-streaming response")
-                return None
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            t.join(timeout=min(0.2, remaining))
-        logger.info("[_call_openai] watchdog join returned, result_type=%s", type(result_container[0]).__name__ if result_container[0] is not None else "None")
-        if self._interrupted and result_container[0] is None:
-            return None
-        if isinstance(result_container[0], Exception):
-            raise result_container[0]
-        if result_container[0] is None:
-            raise openai.APITimeoutError(request=None)
-        return result_container[0]
-
-    def _prepare_openai_messages(self, messages: List[Dict]) -> List[Dict]:
-        """Clean messages for the OpenAI API.
-
-        Entries are new dicts (from dict comprehension), so mutating them
-        here does NOT alter the canonical ``messages`` list.
-        """
-        api_msgs = []
-        for msg in messages:
-            clean = {k: v for k, v in msg.items() if not k.startswith("_")}
-            clean.pop("finish_reason", None)
-            api_msgs.append(clean)
-        # Inject recalled memory into the system message only for this API call.
-        if self._recalled_memory and api_msgs and api_msgs[0].get("role") == "system":
-            base = api_msgs[0].get("content", "")
-            api_msgs[0]["content"] = f"{base}\n\n{self._recalled_memory}" if base else self._recalled_memory
-        return api_msgs
-
-    def _openai_streaming(self, kwargs) -> Any:
-        """Stream with callbacks, return assembled response.
-
-        Uses a background producer thread so the main loop can enforce a
-        per-chunk stall timeout.  SSE connections can hang indefinitely when
-        the server stops sending data but keeps the TCP socket open; the
-        standard ``for chunk in stream`` would block forever.  By pulling
-        chunks through a Queue we can bail out after N seconds of inactivity.
-        """
-        import queue as _queue
-        import threading as _threading
-
-        kwargs["stream"] = True
-        _create_start = time.monotonic()
-        logger.info("[_openai_streaming] starting create() watchdog")
-
-        # create() watchdog uses the same protection as the non-streaming path.
-        stream = None
-        create_exc: list = [None]
-        def _run_create():
-            nonlocal stream
-            for attempt in range(MAX_RETRIES):
-                try:
-                    kwargs["stream_options"] = {"include_usage": True}
-                    stream = self.client.chat.completions.create(**kwargs)
-                    return
-                except openai.APITimeoutError as exc:
-                    # Timeout responses complete this attempt immediately.
-                    create_exc[0] = exc
-                    return
-                except openai.RateLimitError as exc:
-                    if attempt < MAX_RETRIES - 1:
-                        retry_after = get_retry_after(exc)
-                        wait = retry_after or jittered_backoff(attempt)
-                        logger.warning(
-                            "Rate limit (attempt %d/%d), retrying in %.1fs: %s",
-                            attempt + 1, MAX_RETRIES, wait, exc,
-                        )
-                        time.sleep(wait)
-                        continue
-                    create_exc[0] = exc
-                    return
-                except (openai.BadRequestError, openai.APIError):
-                    # Fallback for providers that do not support stream_options.
-                    try:
-                        kwargs.pop("stream_options", None)
-                        stream = self.client.chat.completions.create(**kwargs)
-                        return
-                    except openai.APITimeoutError as exc:
-                        create_exc[0] = exc
-                        return
-                    except Exception as exc:
-                        if is_retryable_error(exc) and attempt < MAX_RETRIES - 1:
-                            retry_after = get_retry_after(exc)
-                            wait = retry_after or jittered_backoff(attempt)
-                            logger.warning(
-                                "API fallback retry (attempt %d/%d), waiting %.1fs: %s",
-                                attempt + 1, MAX_RETRIES, wait, exc,
-                            )
-                            time.sleep(wait)
-                            continue
-                        create_exc[0] = exc
-                        return
-                except Exception as exc:
-                    if is_retryable_error(exc) and attempt < MAX_RETRIES - 1:
-                        retry_after = get_retry_after(exc)
-                        wait = retry_after or jittered_backoff(attempt)
-                        logger.warning(
-                            "API create retry (attempt %d/%d), waiting %.1fs: %s",
-                            attempt + 1, MAX_RETRIES, wait, exc,
-                        )
-                        time.sleep(wait)
-                        continue
-                    create_exc[0] = exc
-                    return
-
-        _create_thread = _threading.Thread(target=_run_create, daemon=True)
-        _create_thread.start()
-        CREATE_TIMEOUT = 90
-        POLL_INTERVAL = 0.2
-        _create_deadline = time.monotonic() + CREATE_TIMEOUT
-        while _create_thread.is_alive():
-            if self._interrupted:
-                logger.info("[_openai_streaming] interrupted during create() watchdog")
-                return None
-            _remaining = _create_deadline - time.monotonic()
-            if _remaining <= 0:
-                break
-            _create_thread.join(timeout=min(POLL_INTERVAL, _remaining))
-        _create_elapsed = time.monotonic() - _create_start
-        if create_exc[0] is not None:
-            logger.error("[_openai_streaming] create() raised exception after %.1fs: %s", _create_elapsed, create_exc[0])
-            raise create_exc[0]
-        if stream is None:
-            logger.error("[_openai_streaming] create() timed out after %.1fs", _create_elapsed)
-            raise openai.APITimeoutError(request=None)
-        logger.info("[_openai_streaming] create() done in %.2fs", _create_elapsed)
-        getattr(self, "_emit_status", lambda msg: None)("Waiting for response...")
-
-        chunk_q: "_queue.Queue[Any | None]" = _queue.Queue()
-        producer_exc: list = [None]
-        producer_done = _threading.Event()
-
-        def _producer():
-            try:
-                for chunk in stream:
-                    if self._interrupted:
-                        break
-                    chunk_q.put(chunk)
-            except Exception as exc:
-                producer_exc[0] = exc
-            finally:
-                producer_done.set()
-
-        _threading.Thread(target=_producer, daemon=True).start()
-        logger.info("[_openai_streaming] producer thread started")
-
-        content_chunks = []
-        reasoning_chunks = []
-        tool_calls_map: Dict[int, Dict] = {}
-        usage = None
-        finish_reason = None
-        stream_start = time.monotonic()
-        SAFETY_TIMEOUT = 300       # 5 min hard ceiling for entire stream
-        STALL_TIMEOUT = 60         # 60 s without meaningful content -> bail
-        GRACE_AFTER_FINISH = 3     # fast exit once finish_reason seen + queue drained
-        chunk_count = 0
-        _first_chunk_at: float | None = None
-        _last_meaningful_at = stream_start
-        _finish_reason_at: float | None = None
-
-        logger.info("[_openai_streaming] entering consumer loop")
-        while not producer_done.is_set() or not chunk_q.empty():
-            if self._interrupted:
-                logger.info("[_openai_streaming] interrupted; closing stream")
-                break
-
-            # Global streaming lifecycle guard.
-            now = time.monotonic()
-            elapsed = now - stream_start
-            if elapsed > SAFETY_TIMEOUT:
-                logger.warning("[STREAM TIMEOUT] Breaking SSE stream after %ds", SAFETY_TIMEOUT)
-                break
-
-            if finish_reason and chunk_q.empty() and _finish_reason_at is not None:
-                if now - _finish_reason_at >= GRACE_AFTER_FINISH:
-                    logger.info("[STREAM] Fast exit after finish_reason (grace=%ds)", GRACE_AFTER_FINISH)
-                    break
-
-            if now - _last_meaningful_at > STALL_TIMEOUT:
-                logger.warning("[STREAM STALL] No meaningful content for %ds, breaking", STALL_TIMEOUT)
-                break
-
-            # Poll in short intervals so Ctrl+C is observed quickly; do not block
-            # here for the full stall timeout.
-            try:
-                chunk = chunk_q.get(timeout=POLL_INTERVAL)
-            except _queue.Empty:
-                continue
-
-            # Producer finished and sent the sentinel value.
-            if chunk is None:
-                break
-
-            chunk_count += 1
-            if _first_chunk_at is None:
-                _first_chunk_at = time.monotonic() - stream_start
-                logger.info("[STREAM] first chunk after %.2fs", _first_chunk_at)
-
-            if self._interrupted:
-                break
-            if not chunk.choices and hasattr(chunk, "usage") and chunk.usage:
-                usage = chunk.usage
-                continue
-            if not chunk.choices:
-                # SSE keep-alive empty chunk — check meaningful-content stall
-                if time.monotonic() - _last_meaningful_at > STALL_TIMEOUT:
-                    logger.warning("[STREAM STALL] No meaningful content for %ds, breaking", STALL_TIMEOUT)
-                    break
-                continue
-
-            delta = chunk.choices[0].delta
-            if chunk.choices[0].finish_reason:
-                finish_reason = chunk.choices[0].finish_reason
-                if _finish_reason_at is None:
-                    _finish_reason_at = time.monotonic()
-
-            # Track whether the current chunk carried a meaningful payload.
-            _had_meaningful = False
-
-            if delta and delta.content:
-                _had_meaningful = True
-                content_chunks.append(delta.content)
-                if self._stream_callback:
-                    self._stream_callback(delta.content)
-
-            # MiniMax reasoning is collected separately from assistant text
-            # because reasoning_split=True separates the two streams.
-            if delta and getattr(delta, "reasoning_content", None):
-                _had_meaningful = True
-                reasoning_chunks.append(delta.reasoning_content)
-            elif delta and hasattr(delta, "reasoning_details") and delta.reasoning_details:
-                _had_meaningful = True
-                # Some providers send reasoning as a list of detail objects.
-                for detail in delta.reasoning_details:
-                    if hasattr(detail, "text") and detail.text:
-                        reasoning_chunks.append(detail.text)
-                    elif isinstance(detail, str):
-                        reasoning_chunks.append(detail)
-
-            if delta and delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = getattr(tc_delta, "index", None)
-                    if idx is None:
-                        continue
-                    if idx not in tool_calls_map:
-                        tool_calls_map[idx] = {
-                            "id": tc_delta.id or "",
-                            "type": "function",
-                            "function": {"name": "", "arguments": ""},
-                        }
-                    entry = tool_calls_map[idx]
-                    if tc_delta.id:
-                        entry["id"] = tc_delta.id
-                    if tc_delta.function:
-                        if tc_delta.function.name:
-                            _had_meaningful = True
-                            entry["function"]["name"] += tc_delta.function.name
-                        if tc_delta.function.arguments:
-                            _had_meaningful = True
-                            entry["function"]["arguments"] += tc_delta.function.arguments
-
-            if _had_meaningful:
-                _last_meaningful_at = time.monotonic()
-            else:
-                # Empty choices.delta or no payload — still subject to stall timeout
-                if time.monotonic() - _last_meaningful_at > STALL_TIMEOUT:
-                    logger.warning("[STREAM STALL] No meaningful content for %ds, breaking", STALL_TIMEOUT)
-                    break
-
-        logger.info("[_openai_streaming] consumer loop exited")
-
-        # Close the underlying HTTP response to release the connection. The
-        # producer thread may still be blocked in ``for chunk in stream``; closing
-        # the stream can unblock it and let the thread exit.
-        logger.info("[_openai_streaming] closing stream")
-        try:
-            stream.close()
-        except Exception:
-            pass
-
-        _total_stream_time = time.monotonic() - stream_start
-        logger.info(
-            "[STREAM] finished: total=%.2fs chunks=%d first_chunk=%s finish_reason=%s content_len=%d",
-            _total_stream_time,
-            chunk_count,
-            f"{_first_chunk_at:.2f}s" if _first_chunk_at else "N/A",
-            finish_reason or "none",
-            len("".join(content_chunks)),
-        )
-
-        # Treat a stream that stalls before any payload as a timeout, so callers
-        # know the server did not respond normally.
-        if (
-            not self._interrupted
-            and not content_chunks
-            and not reasoning_chunks
-            and not tool_calls_map
-            and not finish_reason
-        ):
-            logger.error("[STREAM] Stall timeout with zero content — treating as timeout")
-            raise openai.APITimeoutError(request=None)
-
-        # Build a normalized response object.
-        class _Msg:
-            pass
-        msg = _Msg()
-        msg.content = "".join(content_chunks) or None
-        msg.reasoning_content = "".join(reasoning_chunks) or None
-        msg.tool_calls = None
-        if tool_calls_map:
-            tcs = []
-            for idx in sorted(tool_calls_map):
-                tc_data = tool_calls_map[idx]
-                tc = _Msg()
-                tc.id = tc_data["id"]
-                tc.type = "function"
-                fn = _Msg()
-                fn.name = tc_data["function"]["name"]
-                fn.arguments = tc_data["function"]["arguments"]
-                tc.function = fn
-                tcs.append(tc)
-            msg.tool_calls = tcs
-
-        class _Choice:
-            pass
-        choice = _Choice()
-        choice.message = msg
-        choice.finish_reason = finish_reason
-
-        class _Response:
-            pass
-        resp = _Response()
-        resp.choices = [choice]
-        # Estimate usage locally if the provider omitted it from the stream.
-        # (skip estimation when interrupted — partial output gives bad estimates)
-        if usage is None and not self._interrupted:
-            usage = self._estimate_streaming_usage(
-                kwargs.get("messages", []), msg
-            )
-        resp.usage = usage
-        logger.info("[_openai_streaming] returning assembled response")
-        return resp
-
-    def _parse_openai(self, response) -> tuple:
-        """Extract visible content, reasoning, tools, and finish state from OpenAI."""
-        msg = response.choices[0].message
-        content = msg.content or ""
-        reasoning = getattr(msg, "reasoning_content", None) or getattr(msg, "reasoning", None)
-        tool_calls = None
-        if msg.tool_calls:
-            tool_calls = []
-            for tc in msg.tool_calls:
-                tool_calls.append({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
-                    },
-                })
-        finish = getattr(response.choices[0], "finish_reason", None)
-        return content, tool_calls, finish, reasoning
-
-    # ── Anthropic API calls ──
-
-    @staticmethod
-    def _normalize_anthropic_model(model: str) -> str:
-        """Normalize model name for the Anthropic API.
-
-        - Strip 'anthropic/' prefix (OpenRouter format)
-        - Convert dots to hyphens (claude-sonnet-4.6 → claude-sonnet-4-6)
-        """
-        if model.lower().startswith("anthropic/"):
-            model = model[len("anthropic/"):]
-        model = model.replace(".", "-")
-        return model
-
-    @staticmethod
-    def _get_anthropic_max_output(model: str) -> int:
-        """Look up max output tokens for an Anthropic model."""
-        limits = {
-            "claude-opus-4-6": 128_000,
-            "claude-sonnet-4-6": 64_000,
-            "claude-opus-4-5": 32_000,
-            "claude-sonnet-4-5": 16_384,
-            "claude-sonnet-4-0": 16_384,
-            "claude-sonnet-4": 16_384,
-            "claude-3-5-sonnet": 8_192,
-            "claude-3-5-haiku": 8_192,
-            "claude-3-opus": 4_096,
-            "claude-3-haiku": 4_096,
-        }
-        m = model.lower()
-        best_key, best_val = "", 8_192
-        for key, val in limits.items():
-            if key in m and len(key) > len(best_key):
-                best_key, best_val = key, val
-        return best_val
-
-    def _call_anthropic(self, messages: List[Dict]):
-        """Call an Anthropic-compatible provider using converted messages/tools."""
-        system, conv = self._split_anthropic_messages(messages)
-        api_model = self._normalize_anthropic_model(self.model)
-        max_output = self._get_anthropic_max_output(api_model)
-        kwargs = {"model": api_model, "max_tokens": max_output, "messages": conv}
-        if system:
-            kwargs["system"] = system
-        if self.tools:
-            kwargs["tools"] = self._convert_tools_to_anthropic()
-
-        if self._stream_callback:
-            return self._anthropic_streaming(kwargs)
-        return self.anthropic_client.messages.create(**kwargs)
-
-    def _convert_tools_to_anthropic(self) -> List[dict]:
-        """Convert OpenAI-format tool definitions to Anthropic format."""
-        result = []
-        for tool_def in self.tools:
-            fn = tool_def.get("function", {})
-            result.append({
-                "name": fn.get("name", ""),
-                "description": fn.get("description", ""),
-                "input_schema": fn.get("parameters", {"type": "object", "properties": {}}),
-            })
-        return result
-
-    def _split_anthropic_messages(self, messages: List[Dict]):
-        """Convert canonical OpenAI-style history into Anthropic message blocks."""
-        system = ""
-        conv = []
-        for msg in messages:
-            if msg["role"] == "system":
-                system = msg.get("content", "")
-            elif msg["role"] == "tool":
-                conv.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id", ""),
-                        "content": msg.get("content", ""),
-                    }],
-                })
-            elif msg["role"] == "assistant" and msg.get("tool_calls"):
-                content_blocks = []
-                if msg.get("content"):
-                    content_blocks.append({"type": "text", "text": msg["content"]})
-                for tc in msg["tool_calls"]:
-                    fn = tc.get("function", {})
-                    try:
-                        input_data = json.loads(fn.get("arguments", "{}"))
-                    except json.JSONDecodeError:
-                        input_data = {}
-                    content_blocks.append({
-                        "type": "tool_use",
-                        "id": tc.get("id", ""),
-                        "name": fn.get("name", ""),
-                        "input": input_data,
-                    })
-                conv.append({"role": "assistant", "content": content_blocks})
-            else:
-                conv.append({"role": msg["role"], "content": msg.get("content", "")})
-        # Inject recalled memory into system only for this API call.
-        if self._recalled_memory:
-            system = f"{system}\n\n{self._recalled_memory}" if system else self._recalled_memory
-        return system, conv
-
-    def _anthropic_streaming(self, kwargs):
-        """Stream Anthropic-compatible responses without blocking interrupt.
-
-        Anthropic SDK stream iteration and ``get_final_message()`` can block
-        inside the HTTP read when a provider keeps an SSE connection half-open.
-        Run those calls in a daemon producer so the conversation loop can honor
-        user interrupts and recover from stalls.
-        """
-        import queue as _queue
-        import threading as _threading
-
-        event_q: "_queue.Queue[tuple[str, Any]]" = _queue.Queue()
-        producer_done = _threading.Event()
-        stream_holder: list[Any] = [None]
-        content_chunks: list[str] = []
-
-        def _producer():
-            try:
-                with self.anthropic_client.messages.stream(**kwargs) as stream:
-                    stream_holder[0] = stream
-                    event_q.put(("started", None))
-                    for text in stream.text_stream:
-                        if self._interrupted:
-                            break
-                        event_q.put(("text", text))
-                    if not self._interrupted:
-                        event_q.put(("final", stream.get_final_message()))
-            except Exception as exc:
-                event_q.put(("error", exc))
-            finally:
-                producer_done.set()
-
-        getattr(self, "_emit_status", lambda msg: None)("Waiting for response...")
-        _threading.Thread(target=_producer, daemon=True).start()
-        logger.info("[_anthropic_streaming] producer thread started")
-
-        stream_start = time.monotonic()
-        last_event_at = stream_start
-        response = None
-        producer_exc = None
-        timed_out = False
-        SAFETY_TIMEOUT = 300
-        STALL_TIMEOUT = 60
-        POLL_INTERVAL = 0.2
-
-        while not producer_done.is_set() or not event_q.empty():
-            if self._interrupted:
-                logger.info("[_anthropic_streaming] interrupted; closing stream")
-                break
-
-            now = time.monotonic()
-            if now - stream_start > SAFETY_TIMEOUT:
-                logger.warning("[ANTHROPIC STREAM TIMEOUT] Breaking stream after %ds", SAFETY_TIMEOUT)
-                timed_out = True
-                break
-            if now - last_event_at > STALL_TIMEOUT:
-                logger.warning("[ANTHROPIC STREAM STALL] No event for %ds, breaking", STALL_TIMEOUT)
-                timed_out = True
-                break
-
-            try:
-                event_type, payload = event_q.get(timeout=POLL_INTERVAL)
-            except _queue.Empty:
-                continue
-
-            last_event_at = time.monotonic()
-            if event_type == "started":
-                continue
-            if event_type == "text":
-                content_chunks.append(payload)
-                if self._stream_callback:
-                    self._stream_callback(payload)
-                continue
-            if event_type == "final":
-                response = payload
-                break
-            if event_type == "error":
-                producer_exc = payload
-                break
-
-        stream = stream_holder[0]
-        if stream is not None:
-            try:
-                stream.close()
-            except Exception:
-                pass
-
-        if response is not None:
-            return response
-        if producer_exc is not None and not self._interrupted:
-            raise producer_exc
-        if timed_out and not content_chunks:
-            raise TimeoutError("Anthropic stream stalled before returning content")
-
-        class _Block:
-            type = "text"
-
-            def __init__(self, text: str):
-                self.text = text
-
-        class _Response:
-            pass
-
-        partial = _Response()
-        partial.content = [_Block("".join(content_chunks))]
-        partial.stop_reason = "interrupted" if self._interrupted else "stream_stalled"
-        partial.usage = None
-        logger.info("[_anthropic_streaming] returning partial response stop_reason=%s", partial.stop_reason)
-        return partial
-
-    def _parse_anthropic(self, response) -> tuple:
-        """Extract assistant text and tool_use blocks from Anthropic responses."""
-        content_parts = []
-        tool_calls = []
-        for block in response.content:
-            if block.type == "text":
-                content_parts.append(block.text)
-            elif block.type == "tool_use":
-                tool_calls.append({
-                    "id": block.id,
-                    "type": "function",
-                    "function": {
-                        "name": block.name,
-                        "arguments": json.dumps(block.input),
-                    },
-                })
-        content = "".join(content_parts)
-        finish = getattr(response, "stop_reason", None)
-        return content, tool_calls if tool_calls else None, finish
-
     # ── Tool execution ──
 
-    def _build_assistant_msg(self, content: str, tool_calls: List[Dict], reasoning_content: str = None) -> Dict:
-        msg = {"role": "assistant", "tool_calls": tool_calls}
-        if content:
-            msg["content"] = content
-        if reasoning_content:
-            msg["reasoning_content"] = reasoning_content
+    def _build_assistant_msg(
+        self,
+        content: str,
+        tool_calls: List[Dict],
+        reasoning: ReasoningTrace | None = None,
+    ) -> Dict:
+        msg = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+        if reasoning:
+            msg.update(reasoning.to_message_fields())
         return msg
 
     def _execute_tool_calls(
@@ -1827,7 +1241,7 @@ class MClaw:
         tool_calls: List[Dict],
         messages: List[Dict],
         assistant_content: str = "",
-        reasoning_content: str = None,
+        reasoning: ReasoningTrace | None = None,
     ):
         """Dispatch tool calls and append normalized results to the conversation.
 
@@ -1858,7 +1272,7 @@ class MClaw:
         assistant_msg = self._build_assistant_msg(
             assistant_content or "",
             tool_calls,
-            reasoning_content=reasoning_content,
+            reasoning=reasoning,
         )
         messages.append(assistant_msg)
 
@@ -1940,24 +1354,26 @@ class MClaw:
             self._tool_end_callback()
             logger.info("[POST-TOOL] _tool_end_callback returned")
 
-        if getattr(self, "_memory_review_round", 0) > 0:
+        memory_prompt_changed = False
+        try:
+            from mclaw.tools.memory_tool import MEMORY_WRITE_TOOL_NAMES
+        except Exception as exc:
+            logger.debug("Memory write metadata unavailable: %s", exc)
+            MEMORY_WRITE_TOOL_NAMES = set()
+        for tc, result in zip(tool_calls, results):
+            fn = tc.get("function", {})
+            if fn.get("name") not in MEMORY_WRITE_TOOL_NAMES:
+                continue
             try:
-                from mclaw.tools.memory_tool import MEMORY_WRITE_TOOL_NAMES
-            except Exception as exc:
-                logger.debug("Memory write metadata unavailable: %s", exc)
-                MEMORY_WRITE_TOOL_NAMES = set()
-            for tc, result in zip(tool_calls, results):
-                fn = tc.get("function", {})
-                if fn.get("name") not in MEMORY_WRITE_TOOL_NAMES:
-                    continue
-                try:
-                    result_data = json.loads(result)
-                    if result_data.get("success"):
-                        self._memory_changed_in_turn = True
+                result_data = json.loads(result)
+                if result_data.get("success"):
+                    self._memory_changed_in_turn = True
+                    memory_prompt_changed = True
+                    if getattr(self, "_memory_review_round", 0) > 0:
                         self._turns_since_memory_review = 0
-                        break
-                except (json.JSONDecodeError, TypeError, AttributeError) as exc:
-                    logger.debug("Memory write result could not be parsed: %s", exc)
+                    break
+            except (json.JSONDecodeError, TypeError, AttributeError) as exc:
+                logger.debug("Memory write result could not be parsed: %s", exc)
 
         # Reset the Skill review counter only after skill_manage truly succeeds.
         # The counter may have been pre-reset before execution; this is the final correction.
@@ -1977,6 +1393,7 @@ class MClaw:
 
         pending_delegate_data = None
         pending_skill_import_confirmation = None
+        skill_prompt_changed = False
 
         # Append tool results in call order.
         for i, tc in enumerate(tool_calls):
@@ -2005,6 +1422,7 @@ class MClaw:
                     result_data = json.loads(result)
                     if result_data.get("success") and action in SKILL_WRITE_ACTIONS:
                         self._skills_changed_in_turn = True
+                        skill_prompt_changed = True
                     if (
                         result_data.get("requires_confirmation")
                         and result_data.get("confirmation_type") == "skill_enable_drafting"
@@ -2022,6 +1440,9 @@ class MClaw:
                     turn_id=self._checkpoint_turn_id,
                     operation_id=getattr(self, "_tool_operation_ids", {}).get(tc["id"]),
                 )
+
+        if memory_prompt_changed or skill_prompt_changed:
+            self._refresh_prompt_epoch(messages)
 
         # Update prompt-token estimates after tool execution so the compressor
         # and status bar reflect the current message size.
@@ -2069,82 +1490,49 @@ class MClaw:
 
     # ── Usage tracking ──
 
-    @staticmethod
-    def _estimate_streaming_usage(messages: List[Dict], response_msg) -> Any:
-        """Estimate token usage when the streaming API doesn't return usage data.
+    def _record_api_attempt(self, *, include_in_turn: bool = True) -> None:
+        with self._usage_lock:
+            self.session_api_calls += 1
+            if include_in_turn and self._turn_usage is not None:
+                self._turn_usage["api_calls"] += 1
 
-        Returns a usage-like object with prompt_tokens, completion_tokens,
-        total_tokens, and _estimated=True.
-        """
-        from mclaw.agent.context_compressor import estimate_messages_tokens, estimate_tokens_rough
+    def _record_usage(
+        self,
+        record: UsageRecord,
+        *,
+        include_in_turn: bool = True,
+    ) -> None:
+        if not isinstance(record, UsageRecord):
+            raise TypeError("record must be a UsageRecord")
+        delta = record.to_counter_delta()
+        with self._usage_lock:
+            for name, value in delta.items():
+                setattr(self, f"session_{name}", getattr(self, f"session_{name}") + value)
+                if include_in_turn and self._turn_usage is not None:
+                    self._turn_usage[name] += value
 
-        class _EstimatedUsage:
-            pass
-
-        prompt_t = max(1, estimate_messages_tokens(messages))
-
-        # Completion state includes content and tool calls.
-        comp_text = ""
-        if response_msg is not None:
-            content = getattr(response_msg, "content", None) or ""
-            comp_text += str(content)
-            tool_calls = getattr(response_msg, "tool_calls", None) or []
-            for tc in tool_calls:
-                fn = getattr(tc, "function", None)
-                if fn:
-                    comp_text += getattr(fn, "name", "") or ""
-                    comp_text += getattr(fn, "arguments", "") or ""
-
-        comp_t = max(1, estimate_tokens_rough(comp_text))
-
-        usage = _EstimatedUsage()
-        usage.prompt_tokens = prompt_t
-        usage.completion_tokens = comp_t
-        usage.total_tokens = prompt_t + comp_t
-        usage._estimated = True
-        return usage
-
-    @staticmethod
-    def _obj_to_dict(obj) -> Any:
-        """Serialize a response object (SDK or bare) to a plain dict/list."""
-        if isinstance(obj, list):
-            return [MClaw._obj_to_dict(v) for v in obj]
-        if isinstance(obj, dict):
-            return {k: MClaw._obj_to_dict(v) for k, v in obj.items()}
-        if hasattr(obj, "model_dump"):
-            return obj.model_dump()
-        if hasattr(obj, "to_dict"):
-            return obj.to_dict()
-        if hasattr(obj, "dict"):
-            return obj.dict()
-        if hasattr(obj, "__dict__"):
-            return {k: MClaw._obj_to_dict(v) for k, v in vars(obj).items()}
-        return obj
-
-    def _track_usage(self, response):
-        """Record provider token usage after redacting verbose response logs."""
-        # Log the full response object for usage, model, choices, and related fields.
-        try:
-            resp_dict = self._obj_to_dict(response)
-            logger.info("[API RESPONSE] %s", json.dumps(_redact_log_secrets(resp_dict), ensure_ascii=False, default=str))
-        except Exception as e:
-            logger.debug("Failed to serialize response for logging: %s", e)
-
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return
-        input_t = getattr(usage, "prompt_tokens", 0) or getattr(usage, "input_tokens", 0) or 0
-        output_t = getattr(usage, "completion_tokens", 0) or getattr(usage, "output_tokens", 0) or 0
-        self.session_input_tokens += input_t
-        self.session_output_tokens += output_t
-
-        if self._session_db:
+        if self._session_db and delta:
             try:
-                self._session_db.update_token_counts(
-                    self.session_id,
-                    input_tokens=input_t,
-                    output_tokens=output_t,
-                    model=self.model,
-                )
+                self._session_db.update_token_counts(self.session_id, **delta)
             except Exception:
-                pass
+                logger.warning("Failed to persist provider usage", exc_info=True)
+        if self.context_compressor and record.source == "turn":
+            self.context_compressor.update_from_response(record.to_compressor_update())
+        if self._usage_sink is not None:
+            try:
+                self._usage_sink(record)
+            except Exception:
+                logger.warning("Usage sink failed", exc_info=True)
+
+    def _finish_turn_usage(self) -> dict[str, int]:
+        with self._usage_lock:
+            usage = self._turn_usage or {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "reasoning_tokens": 0,
+                "api_calls": 0,
+            }
+            self._turn_usage = None
+            return dict(usage)
