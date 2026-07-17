@@ -23,6 +23,20 @@ from mclaw.skills_hub.paths import get_skill_drafting_dir
 
 logger = logging.getLogger(__name__)
 
+_PRUNED_WRITE_CONTENT_PREFIX = "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
+_LEGACY_PRUNED_WRITE_CONTENT_PREFIX = (
+    "[Earlier content argument cleared after successful write; "
+)
+
+
+def _is_pruned_write_content(content: str) -> bool:
+    """Reject internal history markers if a model copies them into a new write."""
+    marker = str(content or "").strip()
+    return marker.startswith(_PRUNED_WRITE_CONTENT_PREFIX) or (
+        marker.startswith(_LEGACY_PRUNED_WRITE_CONTENT_PREFIX)
+        and marker.endswith(" chars]")
+    )
+
 
 def _is_path_within(path: Path, root: Path) -> bool:
     """Return whether path is equal to or nested under root without prefix leaks."""
@@ -242,6 +256,16 @@ def write_file_tool(path: str, content: str) -> str:
     Returns:
         JSON string with written path and UTF-8 byte count.
     """
+    if _is_pruned_write_content(content):
+        return json.dumps({
+            "success": False,
+            "error": (
+                "Refusing to write an internal context-pruning marker. "
+                "The earlier content was already written successfully; use read_file "
+                "to inspect it, or regenerate the intended content for a new write."
+            ),
+        }, ensure_ascii=False)
+
     blocked = _skill_store_mutation_error(path, "write_file")
     if blocked:
         return json.dumps({"success": False, "error": blocked}, ensure_ascii=False)

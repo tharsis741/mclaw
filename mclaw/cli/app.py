@@ -78,7 +78,10 @@ from mclaw.cli.tui.composer import (
     move_cursor_or_history_up,
     normalize_paste_text,
 )
-from mclaw.cli.tui.frontends.classic import build_classic_root_container
+from mclaw.cli.tui.frontends.classic import (
+    build_classic_root_container,
+    formatted_text_height,
+)
 from mclaw.cli.tui.renderers.banner import BannerRenderer
 from mclaw.cli.tui.renderers.commands import CommandsRenderer
 from mclaw.cli.tui.renderers.confirm import ConfirmRenderer
@@ -1088,15 +1091,24 @@ class InteractiveChat:
                         event.data.get("tool", "unknown"),
                         event.data.get("args_bytes", 0),
                     ))
+                elif event.event_type == "finalizing":
+                    task["status"] = "finalizing"
+                    task["finalizing_reason"] = event.data.get("reason", "")
                 elif event.event_type == "completed":
-                    task["status"] = "completed"
+                    result_status = event.data.get("status", "completed")
+                    task["status"] = result_status
                     task["summary"] = event.data.get("summary", "")
                     task["duration"] = event.data.get("duration", 0.0)
                     task["api_calls"] = event.data.get("api_calls", 0)
                 elif event.event_type == "error":
                     task["status"] = "error"
                     task["error"] = event.data.get("error", "")
-                if all(t["status"] in ("completed", "error") for t in self.tasks):
+                if all(
+                    t["status"] in (
+                        "completed", "timed_out", "interrupted", "failed", "error"
+                    )
+                    for t in self.tasks
+                ):
                     self.completion_event.set()
 
         def render_overview(self) -> str:
@@ -2900,13 +2912,8 @@ class InteractiveChat:
             return [("class:prompt", " 输入 ▸ ")]
 
         def _status_bar_height():
-            sm = getattr(cli_ref, "subtask_manager", None)
-            if sm:
-                compact_rows = min(5, len([t for t in sm.tasks if t["status"] != "completed"]))
-                if compact_rows == 0 and sm.tasks:
-                    compact_rows = 1
-                return 1 + compact_rows + 1
-            return 1
+            columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+            return formatted_text_height(cli_ref._get_status_fragments(), columns)
 
         paste_store = FoldedPasteStore()
         history_state = HistoryNavigationState()
@@ -3156,6 +3163,7 @@ class InteractiveChat:
             "status-bar-subagent-done": "bold #50c878",
             "status-bar-subagent-error": "bold #d95a5a",
             "status-bar-subagent-pending": "#5a6b7d",
+            "status-bar-subagent-goal": "#e0e0e0",
             "status-bar-subagent-badge": "bold #c084fc",
             "completion-menu": "bg:#1e293b #e2e8f0",
             "completion-menu.completion": "",

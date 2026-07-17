@@ -380,6 +380,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "provider": "",
         "base_url": "",
         "max_iterations": 10,
+        "timeout_seconds": 600,
     },
     "skills": {
         "evolution_review_round": 10,

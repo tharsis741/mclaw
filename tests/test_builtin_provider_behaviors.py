@@ -878,11 +878,12 @@ def test_gemini_current_effort_disable_signature_replay_and_local_usage() -> Non
     assert usage is not None
     assert usage.to_counter_delta() == {
         "input_tokens": 10,
-        "output_tokens": 4,
+        "output_tokens": 7,
         "cache_read_tokens": 3,
         "reasoning_tokens": 3,
     }
     assert usage.total_tokens == 17
+    assert usage.input_tokens + usage.output_tokens == usage.total_tokens
 
 
 def test_qwen_37_preserves_explicit_budget_reasoning_and_required_stream() -> None:

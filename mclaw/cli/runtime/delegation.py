@@ -52,7 +52,7 @@ class RuntimeDelegationCoordinator:
         hooks: RuntimeDelegationHooks,
         *,
         startup_delay_seconds: float = 0.3,
-        poll_timeout_seconds: float = 600.0,
+        poll_timeout_seconds: float | None = None,
         queue_grace_seconds: float = 5.0,
         final_attempts: int = 10,
         final_attempt_timeout_seconds: float = 0.2,
@@ -107,8 +107,12 @@ class RuntimeDelegationCoordinator:
 
     def _poll_result(self, task_id: str, manager: Any) -> dict[str, Any] | None:
         """Poll the subagent result queue with completion-event grace windows."""
-        deadline = time.time() + max(0.0, self.poll_timeout_seconds)
-        while time.time() < deadline:
+        deadline = (
+            None
+            if self.poll_timeout_seconds is None
+            else time.time() + max(0.0, self.poll_timeout_seconds)
+        )
+        while deadline is None or time.time() < deadline:
             pending_result = self.hooks.get_pending_result(task_id, 0.2)
             if pending_result:
                 self.hooks.log_info("[DELEGATE TUI] result received task_id=%s", (task_id,))

@@ -186,13 +186,24 @@ class StatusRenderer:
         if owner.subtask_manager:
             sm = owner.subtask_manager
             running = sum(1 for t in sm.tasks if t["status"] == "running")
+            finalizing = sum(1 for t in sm.tasks if t["status"] == "finalizing")
             done = sum(1 for t in sm.tasks if t["status"] == "completed")
-            errs = sum(1 for t in sm.tasks if t["status"] == "error")
+            errs = sum(1 for t in sm.tasks if t["status"] in {"error", "failed"})
+            timed_out = sum(1 for t in sm.tasks if t["status"] == "timed_out")
+            interrupted = sum(1 for t in sm.tasks if t["status"] == "interrupted")
             total = len(sm.tasks)
             if running:
                 badge_text = f"🔀 {running}/{total} running"
-            elif errs:
+                if finalizing:
+                    badge_text += f" · {finalizing} finalizing"
+            elif finalizing:
+                badge_text = f"🔀 {finalizing}/{total} finalizing"
+            elif errs or timed_out or interrupted:
                 badge_text = f"🔀 {done}/{total} done · {errs} failed"
+                if timed_out:
+                    badge_text += f" · {timed_out} timed out"
+                if interrupted:
+                    badge_text += f" · {interrupted} interrupted"
             else:
                 badge_text = f"🔀 {done}/{total} done"
             fragments.append(("class:status-bar-subagent-badge", f" {badge_text}"))
@@ -204,26 +215,25 @@ class StatusRenderer:
         return fragments
 
     def build_subagent_compact_progress(self, owner) -> list:
-        """Show active subagent work while folding completed or hidden tasks."""
+        """Show every delegated task in the compact progress area."""
         sm = getattr(owner, "subtask_manager", None)
         if not sm:
             return []
 
         frags: list = []
-        visible_tasks = [task for task in sm.tasks if task["status"] != "completed"]
-        completed_count = sum(1 for task in sm.tasks if task["status"] == "completed")
-        if not visible_tasks and sm.tasks:
-            visible_tasks = sm.tasks[-1:]
-            completed_count = max(0, completed_count - 1)
-
-        max_visible = 5
-        for task in visible_tasks[:max_visible]:
+        for task in sm.tasks:
             idx = task["index"] + 1
             status = task["status"]
-            goal = self.format_subagent_goal(task["goal"], max_len=72)
-            if status == "error":
+            goal = self.format_subagent_goal(task["goal"], max_len=100)
+            if status in {"error", "failed"}:
                 marker = "✗"
                 style = "class:status-bar-subagent-error"
+            elif status in {"timed_out", "interrupted"}:
+                marker = "⚠"
+                style = "class:status-bar-subagent-error"
+            elif status == "finalizing":
+                marker = "◐"
+                style = "class:status-bar-subagent-running"
             elif status == "running":
                 marker = "◼"
                 style = "class:status-bar-subagent-running"
@@ -233,25 +243,21 @@ class StatusRenderer:
             else:
                 marker = "◻"
                 style = "class:status-bar-subagent-pending"
-            frags.append((style, f"     {marker} Task {idx}: {goal}"))
+            phase = "（收尾中）" if status == "finalizing" else ""
+            frags.append((style, f"{marker} Task {idx}{phase}: "))
+            goal_style = (
+                style
+                if status in {"completed", "error", "failed", "timed_out", "interrupted"}
+                else "class:status-bar-subagent-goal"
+            )
+            frags.append((goal_style, goal))
             frags.append(("", "\n"))
-
-        hidden_pending = max(0, len(visible_tasks) - max_visible)
-        hidden_done = completed_count
-        extras = []
-        if hidden_pending:
-            extras.append(f"+{hidden_pending} pending")
-        if hidden_done:
-            extras.append(f"+{hidden_done} done")
-        if extras:
-            suffix = "  ".join(extras)
-            frags.append(("class:status-bar-subagent-pending", f"       ... {suffix}"))
         return frags
 
     @staticmethod
-    def format_subagent_goal(goal: str, max_len: int = 72) -> str:
+    def format_subagent_goal(goal: str, max_len: int = 100) -> str:
         """Normalize and trim subagent goals for one-line status rows."""
         text = " ".join(str(goal or "").split())
         if len(text) <= max_len:
             return text
-        return text[: max_len - 3] + "…"
+        return text[: max_len - 1] + "…"

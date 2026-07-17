@@ -61,7 +61,8 @@ ALLOWED_DELEGATE_TOOLSETS = frozenset([
 MAX_CONCURRENT_CHILDREN = 5
 MAX_DELEGATE_DEPTH = 2
 DEFAULT_MAX_ITERATIONS = 10  # hard cap after workspace preloading limits exploration
-MAX_SUMMARY_CHARS = 800  # keep child summaries concise but useful
+DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 600
+MAX_INLINE_SUMMARY_CHARS = 800
 MAX_WORKSPACE_COPY_FILES = 300
 MAX_WORKSPACE_COPY_BYTES = 30 * 1024 * 1024
 DELEGATION_COPY_EXCLUDES = frozenset({
@@ -101,6 +102,7 @@ class SubtaskEvent:
 
 SUBAGENT_STARTED = "started"
 SUBAGENT_TOOL_CALL = "tool_call"
+SUBAGENT_FINALIZING = "finalizing"
 SUBAGENT_COMPLETED = "completed"
 SUBAGENT_ERROR = "error"
 
@@ -192,6 +194,20 @@ def _workspace_preparation_summary(child: Any) -> Dict[str, Any]:
         "skipped_count": len(preparation.get("skipped_paths", [])),
         "workspace_path": preparation.get("workspace_path"),
     }
+
+
+def _persist_oversized_summary(child: Any, summary: str) -> str | None:
+    """Persist a full child handoff while keeping the parent prompt compact."""
+    delegation_dir = getattr(child, "_delegation_dir", None)
+    if not delegation_dir or len(summary) <= MAX_INLINE_SUMMARY_CHARS:
+        return None
+    handoff_path = Path(delegation_dir) / f"mclaw_handoff_{uuid.uuid4().hex[:8]}.md"
+    try:
+        handoff_path.write_text(summary, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Could not persist full subagent handoff: %s", exc)
+        return None
+    return str(handoff_path)
 
 
 def _generate_dir_tree(path: str, max_depth: int = 4, max_files_per_dir: int = 30) -> str:
@@ -662,6 +678,7 @@ def _run_single_child(
     child: "MClaw",
     parent_agent,
     progress_callback: ProgressCallback = None,
+    timeout_seconds: float | None = None,
 ) -> Dict[str, Any]:
     """Run one child agent and collect its result."""
     child_start = time.monotonic()
@@ -689,14 +706,64 @@ def _run_single_child(
             {"goal": goal[:100], "depth": child._delegate_depth}
         ))
 
+    api_calls_before = int(getattr(child, "session_api_calls", 0) or 0)
     try:
         # Run the child without parent conversation history.
         logger.info("[subagent-%d] entering run_conversation", task_index)
         effective_goal = getattr(child, "_prepared_goal", None) or goal
-        result = child.run_conversation(
-            user_message=effective_goal,
-            call_source="delegation",
+        summary_instruction = (
+            "请基于以上任务和已经获得的全部工具结果，直接给出最终总结；不要再调用工具。"
         )
+        original_max_iterations = child.max_iterations
+        original_tools = child.tools
+        call_limit = max(1, int(original_max_iterations))
+        exploration_stop_reason: str | None = None
+        try:
+            if call_limit == 1:
+                result = child.run_conversation(
+                    user_message=f"{effective_goal}\n\n{summary_instruction}",
+                    disable_tools=True,
+                    call_source="delegation",
+                )
+            else:
+                child.max_iterations = call_limit - 1
+                deadline = (
+                    time.monotonic() + timeout_seconds
+                    if timeout_seconds is not None and timeout_seconds > 0
+                    else None
+                )
+                result = child.run_conversation(
+                    user_message=effective_goal,
+                    call_source="delegation",
+                    deadline_monotonic=deadline,
+                )
+                exploration_api_calls = int(result.get("api_calls", 0) or 0)
+                exploration_stop_reason = result.get("stop_reason")
+                if (
+                    (not result.get("final_response") or result.get("error"))
+                    and not result.get("interrupted", False)
+                ):
+                    if progress_callback:
+                        progress_callback(SubtaskEvent(
+                            task_index,
+                            SUBAGENT_FINALIZING,
+                            {"reason": exploration_stop_reason or "max_iterations"},
+                        ))
+                    child.max_iterations = 1
+                    result = child.run_conversation(
+                        user_message=summary_instruction,
+                        conversation_history=result.get("messages") or [],
+                        disable_tools=True,
+                        advance_background_review=False,
+                        call_source="delegation",
+                    )
+                    result["api_calls"] = exploration_api_calls + int(
+                        result.get("api_calls", 0) or 0
+                    )
+                    result["stop_reason"] = exploration_stop_reason
+        finally:
+            child.max_iterations = original_max_iterations
+            child.tools = original_tools
         logger.info("[subagent-%d] run_conversation returned", task_index)
 
         duration = round(time.monotonic() - child_start, 2)
@@ -709,12 +776,16 @@ def _run_single_child(
         if interrupted:
             status = "interrupted"
             exit_reason = "interrupted"
-        elif summary:
-            status = "completed"
-            exit_reason = "completed" if completed else "max_iterations"
+        elif summary and not result.get("error"):
+            if exploration_stop_reason == "timeout":
+                status = "timed_out"
+                exit_reason = "timeout"
+            else:
+                status = "completed"
+                exit_reason = "completed" if completed else "max_iterations"
         else:
             status = "failed"
-            exit_reason = "max_iterations"
+            exit_reason = "error" if result.get("error") else "max_iterations"
 
         logger.info(
             "[subagent-%d] 完成, duration=%.2fs, status=%s, exit=%s",
@@ -725,19 +796,24 @@ def _run_single_child(
         input_tokens = getattr(child, "session_input_tokens", 0) or 0
         output_tokens = getattr(child, "session_output_tokens", 0) or 0
 
-        # Truncate oversized summaries before returning them to the parent.
-        if len(summary) > MAX_SUMMARY_CHARS:
-            summary = summary[:MAX_SUMMARY_CHARS] + "……[内容已截断]"
+        summary_path = _persist_oversized_summary(child, summary)
+        inline_summary = summary
+        if summary_path:
+            inline_summary = (
+                summary[:MAX_INLINE_SUMMARY_CHARS]
+                + "……[完整结果已保存到交接文件，父代理必须读取]"
+            )
 
         entry: Dict[str, Any] = {
             "task_index": task_index,
             "goal": goal,
             "status": status,
-            "summary": summary,
+            "summary": inline_summary,
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": child.model if isinstance(child.model, str) else None,
             "exit_reason": exit_reason,
+            "timed_out": exploration_stop_reason == "timeout",
             "tokens": {
                 "input": input_tokens if isinstance(input_tokens, (int, float)) else 0,
                 "output": output_tokens if isinstance(output_tokens, (int, float)) else 0,
@@ -747,6 +823,8 @@ def _run_single_child(
         workspace_preparation = _workspace_preparation_for_child(child)
         if workspace_preparation:
             entry["workspace_preparation"] = workspace_preparation
+        if summary_path:
+            entry["summary_path"] = summary_path
 
         if status == "failed":
             entry["error"] = result.get("error", "子代理未产生响应")
@@ -755,7 +833,12 @@ def _run_single_child(
         if progress_callback:
             progress_callback(SubtaskEvent(
                 task_index, SUBAGENT_COMPLETED,
-                {"status": status, "duration": duration, "summary": summary, "api_calls": api_calls}
+                {
+                    "status": status,
+                    "duration": duration,
+                    "summary": inline_summary,
+                    "api_calls": api_calls,
+                }
             ))
 
         return entry
@@ -777,15 +860,12 @@ def _run_single_child(
             "status": "error",
             "summary": None,
             "error": str(exc),
-            "api_calls": 0,
+            "api_calls": max(
+                0,
+                int(getattr(child, "session_api_calls", 0) or 0) - api_calls_before,
+            ),
             "duration_seconds": duration,
         }
-
-# Hard wall-clock timeout for each delegated task. HTTP timeouts are not enough:
-# one child may make several API calls, and browser-heavy work can accumulate
-# navigation, snapshot, scrolling, and provider latency.
-_SUBAGENT_MAX_WALL_TIME = 300  # 5 minutes
-
 
 def _run_all_children_background(
     task_list: list,
@@ -794,6 +874,7 @@ def _run_all_children_background(
     progress_callback: ProgressCallback,
     task_id: str,
     start_time: float,
+    timeout_seconds: float,
 ) -> None:
     """Run all children in a daemon thread and queue their final results.
 
@@ -804,10 +885,9 @@ def _run_all_children_background(
     results: List[Dict[str, Any]] = []
     goal_map = {i: task["goal"] for i, task, _child in children}
 
-    # The executor lifecycle is controlled explicitly so result delivery stays
-    # independent from slow child workers.
-    executor = ThreadPoolExecutor(max_workers=min(len(children), MAX_CONCURRENT_CHILDREN))
-    try:
+    # This coordinator may run off the TUI thread, but it does not hand results
+    # to the parent until every child has finished or produced a timeout summary.
+    with ThreadPoolExecutor(max_workers=min(len(children), MAX_CONCURRENT_CHILDREN)) as executor:
         futures = {}
         for i, task, child in children:
             fut = executor.submit(
@@ -817,72 +897,30 @@ def _run_all_children_background(
                 child=child,
                 parent_agent=parent_agent,
                 progress_callback=progress_callback,
+                timeout_seconds=timeout_seconds,
             )
             futures[fut] = i
 
-        # Wait for all children under one global wall-clock deadline. The
-        # FIRST_COMPLETED loop avoids serial future timeouts multiplying by
-        # child count.
-        from concurrent.futures import wait, FIRST_COMPLETED
-
-        pending = set(futures.keys())
-        deadline = time.time() + _SUBAGENT_MAX_WALL_TIME
-
-        while pending:
-            remaining = max(0.0, deadline - time.time())
-            if remaining <= 0:
-                break
-            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-            for future in done:
-                idx = futures[future]
-                try:
-                    entry = future.result()
-                except Exception as exc:
-                    logger.error("[subagent-%d] 执行异常或超时: %s", idx, exc)
-                    entry = {
-                        "task_index": idx,
-                        "goal": goal_map.get(idx, ""),
-                        "status": "error",
-                        "summary": None,
-                        "error": str(exc),
-                        "api_calls": 0,
-                        "duration_seconds": _SUBAGENT_MAX_WALL_TIME,
-                    }
-                    if progress_callback:
-                        progress_callback(SubtaskEvent(
-                            idx, SUBAGENT_ERROR,
-                            {"error": str(exc)}
-                        ))
-                results.append(entry)
-
-        # Mark remaining children as timed out.
-        for future in pending:
-            idx = futures[future]
-            future.cancel()
-            logger.error("[subagent-%d] 执行异常或超时: %s", idx, "wall-clock timeout")
-            entry = {
-                "task_index": idx,
-                "goal": goal_map.get(idx, ""),
-                "status": "error",
-                "summary": None,
-                "error": "子代理执行超时（5分钟）",
-                "api_calls": 0,
-                "duration_seconds": _SUBAGENT_MAX_WALL_TIME,
-            }
-            child = next((c for i, _task, c in children if i == idx), None)
-            workspace_preparation = _workspace_preparation_for_child(child)
-            if workspace_preparation:
-                entry["workspace_preparation"] = workspace_preparation
-            if progress_callback:
-                progress_callback(SubtaskEvent(
-                    idx, SUBAGENT_ERROR,
-                    {"error": "子代理执行超时（5分钟）"}
-                ))
+        for future, idx in futures.items():
+            try:
+                entry = future.result()
+            except Exception as exc:
+                logger.error("[subagent-%d] 执行异常: %s", idx, exc)
+                entry = {
+                    "task_index": idx,
+                    "goal": goal_map.get(idx, ""),
+                    "status": "error",
+                    "summary": None,
+                    "error": str(exc),
+                    "api_calls": 0,
+                    "duration_seconds": round(time.time() - start_time, 2),
+                }
+                if progress_callback:
+                    progress_callback(SubtaskEvent(
+                        idx, SUBAGENT_ERROR,
+                        {"error": str(exc)}
+                    ))
             results.append(entry)
-    finally:
-        # Return immediately. Stuck workers may continue until their API call
-        # times out, but they no longer block the parent flow.
-        executor.shutdown(wait=False)
 
     results.sort(key=lambda r: r["task_index"])
     _subagent_results.put({
@@ -992,6 +1030,15 @@ def delegate_task(
     except (TypeError, ValueError):
         configured_max_iter = DEFAULT_MAX_ITERATIONS
     effective_max_iter = configured_max_iter
+    configured_timeout = delegation_cfg.get(
+        "timeout_seconds", DEFAULT_SUBAGENT_TIMEOUT_SECONDS
+    )
+    try:
+        effective_timeout = float(configured_timeout)
+        if effective_timeout <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        effective_timeout = float(DEFAULT_SUBAGENT_TIMEOUT_SECONDS)
 
     # Parse task list.
     if not isinstance(tasks, list):
@@ -1048,10 +1095,19 @@ def delegate_task(
     task_id = str(uuid.uuid4())[:8]
 
     if progress_callback is not None:
-        # Non-blocking mode: start a daemon thread and return immediately.
+        # Keep collection off the TUI thread. The coordinator waits for every
+        # child to finalize before publishing one complete result set.
         thread = threading.Thread(
             target=_run_all_children_background,
-            args=(task_list, children, parent_agent, progress_callback, task_id, start_time),
+            args=(
+                task_list,
+                children,
+                parent_agent,
+                progress_callback,
+                task_id,
+                start_time,
+                effective_timeout,
+            ),
             daemon=True,
         )
         thread.start()
@@ -1059,7 +1115,7 @@ def delegate_task(
         task_info = {
             "task_id": task_id,
             "num_tasks": len(task_list),
-            "goals": [t["goal"][:80] for t in task_list],
+            "goals": [t["goal"] for t in task_list],
             "workspace_preparation": [
                 _workspace_preparation_summary(child)
                 for _i, _task, child in children
@@ -1082,7 +1138,13 @@ def delegate_task(
     if len(children) == 1:
         # Single task: run directly to avoid thread-pool overhead.
         _, _, child = children[0]
-        result = _run_single_child(0, children[0][1]["goal"], child, parent_agent)
+        result = _run_single_child(
+            0,
+            children[0][1]["goal"],
+            child,
+            parent_agent,
+            timeout_seconds=effective_timeout,
+        )
         results.append(result)
     else:
         # Batch mode: run concurrently with wall-clock timeouts.
@@ -1095,15 +1157,15 @@ def delegate_task(
                     goal=task["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    timeout_seconds=effective_timeout,
                 )
                 futures[future] = i
 
-            # Per-future timeouts keep each child task bounded independently.
             for future, idx in futures.items():
                 try:
-                    entry = future.result(timeout=_SUBAGENT_MAX_WALL_TIME)
+                    entry = future.result()
                 except Exception as exc:
-                    logger.error("[subagent-%d] 执行异常或超时: %s", idx, exc)
+                    logger.error("[subagent-%d] 执行异常: %s", idx, exc)
                     entry = {
                         "task_index": idx,
                         "goal": goal_map.get(idx, ""),
@@ -1111,7 +1173,7 @@ def delegate_task(
                         "summary": None,
                         "error": str(exc),
                         "api_calls": 0,
-                        "duration_seconds": _SUBAGENT_MAX_WALL_TIME,
+                        "duration_seconds": round(time.monotonic() - overall_start, 2),
                     }
                 results.append(entry)
 

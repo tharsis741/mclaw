@@ -8,6 +8,7 @@ import json
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -34,6 +35,7 @@ from mclaw.agent.usage import (
 from mclaw.providers.base import ModelTraits, RuntimeProviderProfile
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
+from mclaw.tools.file_tools import write_file_tool
 
 
 def _context(
@@ -415,6 +417,576 @@ def _runtime_agent(
     )
 
 
+@pytest.mark.parametrize("retry_first", [False, True])
+def test_delegated_child_reserves_final_call_for_tool_free_summary(
+    monkeypatch,
+    retry_first: bool,
+) -> None:
+    from mclaw.tools.delegate_tool import _run_single_child
+
+    context = _context()
+
+    def model_result(*, content: str = "", call_id: str | None = None) -> ModelCallResult:
+        tool_calls = None
+        if call_id:
+            tool_calls = [{
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "lookup", "arguments": json.dumps({"step": call_id})},
+            }]
+        return ModelCallResult(
+            content=content,
+            tool_calls=tool_calls,
+            finish_reason="tool_calls" if tool_calls else "stop",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        )
+
+    transport_results: list[object] = []
+    if retry_first:
+        transport_results.append(ModelCallError(
+            message="retry",
+            provider=context.provider,
+            model=context.model,
+            retryable=True,
+            retry_after=0,
+        ))
+    transport_results.append(model_result(call_id="call-1"))
+    if not retry_first:
+        transport_results.append(model_result(call_id="call-2"))
+    final_summary = "final summary " + "s" * 1_200
+    transport_results.append(model_result(content=final_summary))
+    transport = _SequenceTransport(*transport_results)
+    child = _runtime_agent(monkeypatch, context, transport)
+    child.max_iterations = 3
+    child._delegate_depth = 1
+    child.tools = [{
+        "type": "function",
+        "function": {"name": "lookup", "parameters": {"type": "object"}},
+    }]
+    child.valid_tool_names = {"lookup"}
+
+    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+        messages.append(child._build_assistant_msg(assistant_content, tool_calls, reasoning))
+        for call in tool_calls:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": f"result for {call['id']}",
+            })
+
+    child._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    entry = _run_single_child(0, "research", child, parent_agent=None)
+
+    assert entry["status"] == "completed"
+    assert entry["exit_reason"] == "completed"
+    assert entry["summary"] == final_summary
+    assert entry["api_calls"] == 3
+    assert len(transport.calls) == 3
+    assert transport.calls[0]["tools"]
+    assert transport.calls[1]["tools"]
+    assert transport.calls[2]["tools"] == []
+    last_call_id = "call-1" if retry_first else "call-2"
+    assert any(
+        message.get("tool_call_id") == last_call_id
+        and message.get("content") == f"result for {last_call_id}"
+        for message in transport.calls[2]["messages"]
+    )
+    assert child.max_iterations == 3
+    assert child.tools
+
+
+def test_delegated_timeout_summarizes_completed_tool_results(monkeypatch) -> None:
+    from mclaw.tools.delegate_tool import _run_single_child
+
+    context = _context()
+    large_arguments = json.dumps({
+        "path": "report.md",
+        "content": "x" * 2_000,
+    })
+    tool_call = {
+        "id": "write-before-timeout",
+        "type": "function",
+        "function": {"name": "write_file", "arguments": large_arguments},
+    }
+    transport = _SequenceTransport(
+        ModelCallResult(
+            content="",
+            tool_calls=[tool_call],
+            finish_reason="tool_calls",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        ),
+        ModelCallResult(
+            content="timeout summary",
+            tool_calls=None,
+            finish_reason="stop",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        ),
+    )
+    child = _runtime_agent(monkeypatch, context, transport)
+    child.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=128_000,
+        quiet_mode=True,
+    )
+    child.max_iterations = 5
+    child._delegate_depth = 1
+    child.tools = [{
+        "type": "function",
+        "function": {"name": "write_file", "parameters": {"type": "object"}},
+    }]
+    child.valid_tool_names = {"write_file"}
+
+    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+        messages.append(child._build_assistant_msg(assistant_content, tool_calls, reasoning))
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_calls[0]["id"],
+            "content": json.dumps({
+                "path": "report.md",
+                "bytes_written": 2_000,
+            }),
+        })
+        threading.Event().wait(0.12)
+
+    child._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    events = []
+    entry = _run_single_child(
+        0,
+        "research",
+        child,
+        parent_agent=None,
+        progress_callback=events.append,
+        timeout_seconds=0.1,
+    )
+
+    assert entry["status"] == "timed_out"
+    assert entry["exit_reason"] == "timeout"
+    assert entry["summary"] == "timeout summary"
+    assert entry["api_calls"] == 2
+    assert len(transport.calls) == 2
+    assert transport.calls[0]["tools"]
+    assert transport.calls[1]["tools"] == []
+    assert any(event.event_type == "finalizing" for event in events)
+    summary_calls = {
+        call["id"]: call
+        for message in transport.calls[1]["messages"]
+        for call in message.get("tool_calls") or []
+    }
+    assert summary_calls["write-before-timeout"]["function"]["arguments"] == large_arguments
+    assert any(
+        message.get("tool_call_id") == "write-before-timeout"
+        and json.loads(message.get("content") or "{}").get("bytes_written") == 2_000
+        for message in transport.calls[1]["messages"]
+    )
+
+
+def test_oversized_child_summary_is_persisted_for_parent_handoff(tmp_path) -> None:
+    from mclaw.tools.delegate_tool import _run_single_child
+
+    full_summary = "result-" + "x" * 2_000
+
+    class Child:
+        max_iterations = 1
+        tools = ["tool"]
+        model = "test-model"
+        _delegate_depth = 1
+        _delegation_dir = tmp_path
+
+        def run_conversation(self, **_kwargs):
+            return {
+                "final_response": full_summary,
+                "completed": True,
+                "interrupted": False,
+                "api_calls": 1,
+            }
+
+    entry = _run_single_child(0, "research", Child(), parent_agent=None)
+
+    assert len(entry["summary"]) < len(full_summary)
+    assert "完整结果已保存" in entry["summary"]
+    assert Path(entry["summary_path"]).read_text(encoding="utf-8") == full_summary
+
+
+def test_delegation_publishes_only_after_every_child_finishes(monkeypatch) -> None:
+    from mclaw.tools import delegate_tool
+
+    release = threading.Event()
+    second_started = threading.Event()
+    task_id = "test-complete-handoff"
+
+    def fake_run_single_child(task_index, goal, child, parent_agent, **kwargs):
+        if task_index == 1:
+            second_started.set()
+            assert release.wait(timeout=1)
+        return {
+            "task_index": task_index,
+            "goal": goal,
+            "status": "completed",
+            "summary": f"summary-{task_index}",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run_single_child)
+    tasks = [{"goal": "first"}, {"goal": "second"}]
+    children = [(0, tasks[0], object()), (1, tasks[1], object())]
+    coordinator = threading.Thread(
+        target=delegate_tool._run_all_children_background,
+        args=(tasks, children, None, None, task_id, 0.0, 600.0),
+        daemon=True,
+    )
+    coordinator.start()
+    try:
+        assert second_started.wait(timeout=1)
+        assert delegate_tool.get_pending_result_for_task(task_id, timeout=0.01) is None
+    finally:
+        release.set()
+        coordinator.join(timeout=1)
+    assert not coordinator.is_alive()
+    result = delegate_tool.get_pending_result_for_task(task_id, timeout=0.1)
+    assert result is not None
+    assert [entry["summary"] for entry in result["results"]] == [
+        "summary-0",
+        "summary-1",
+    ]
+
+
+def test_delegate_task_passes_configured_timeout_to_child(monkeypatch) -> None:
+    from mclaw.tools import delegate_tool
+
+    child = SimpleNamespace()
+    captured: dict[str, float] = {}
+    monkeypatch.setattr(delegate_tool, "_build_child_agent", lambda **kwargs: child)
+
+    def fake_run_single_child(task_index, goal, built_child, parent_agent, **kwargs):
+        captured["timeout_seconds"] = kwargs["timeout_seconds"]
+        return {
+            "task_index": task_index,
+            "goal": goal,
+            "status": "completed",
+            "summary": "done",
+            "api_calls": 1,
+            "duration_seconds": 0.01,
+        }
+
+    monkeypatch.setattr(delegate_tool, "_run_single_child", fake_run_single_child)
+    parent = SimpleNamespace(
+        _delegate_depth=0,
+        config={"delegation": {"max_iterations": 50, "timeout_seconds": 900}},
+    )
+
+    result = json.loads(delegate_tool.delegate_task(
+        tasks=[{"goal": "research"}],
+        parent_agent=parent,
+    ))
+
+    assert result["success"] is True
+    assert captured["timeout_seconds"] == 900.0
+
+
+def test_delegated_summary_exception_restores_tools_and_reports_calls() -> None:
+    from mclaw.tools.delegate_tool import _run_single_child
+
+    class Child:
+        max_iterations = 2
+        tools = ["tool"]
+        session_api_calls = 0
+        _delegate_depth = 1
+
+        def run_conversation(self, **kwargs):
+            self.session_api_calls += 1
+            if kwargs.get("disable_tools"):
+                self.tools = []
+                raise RuntimeError("summary failed")
+            return {
+                "final_response": "",
+                "interrupted": False,
+                "messages": [],
+                "api_calls": 1,
+            }
+
+    child = Child()
+    entry = _run_single_child(0, "research", child, parent_agent=None)
+
+    assert entry["status"] == "error"
+    assert entry["api_calls"] == 2
+    assert child.max_iterations == 2
+    assert child.tools == ["tool"]
+
+
+@pytest.mark.parametrize("retryable", [False, True])
+def test_delegated_api_error_is_not_completed(monkeypatch, retryable: bool) -> None:
+    from mclaw.tools.delegate_tool import _run_single_child
+
+    context = _context()
+    child = _runtime_agent(
+        monkeypatch,
+        context,
+        _SequenceTransport(ModelCallError(
+            message="bad request",
+            provider=context.provider,
+            model=context.model,
+            retryable=retryable,
+            retry_after=0,
+        )),
+    )
+    child.max_iterations = 1
+    child._delegate_depth = 1
+
+    entry = _run_single_child(0, "research", child, parent_agent=None)
+
+    assert entry["status"] == "failed"
+    assert entry["exit_reason"] == "error"
+    assert entry["api_calls"] == 1
+
+
+def test_successful_large_write_is_visible_once_before_pruning(monkeypatch) -> None:
+    context = _context()
+    large_arguments = json.dumps({
+        "path": "report.md",
+        "content": "x" * 2_000,
+    })
+    write_call = {
+        "id": "write-once",
+        "type": "function",
+        "function": {"name": "write_file", "arguments": large_arguments},
+    }
+    lookup_call = {
+        "id": "lookup-after-write",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+    class Transport:
+        def __init__(self) -> None:
+            self.call_index = 0
+
+        def call(self, **kwargs):
+            calls = {
+                call["id"]: call
+                for message in kwargs["messages"]
+                for call in message.get("tool_calls") or []
+            }
+            if self.call_index == 0:
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=[write_call],
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            elif self.call_index == 1:
+                assert calls["write-once"]["function"]["arguments"] == large_arguments
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=[lookup_call],
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            else:
+                pruned = json.loads(calls["write-once"]["function"]["arguments"])
+                assert pruned["path"] == "report.md"
+                assert pruned["content"].startswith(
+                    "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
+                )
+                result = ModelCallResult(
+                    content="done",
+                    tool_calls=None,
+                    finish_reason="stop",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            self.call_index += 1
+            return result
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+
+    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+        messages.append(agent._build_assistant_msg(
+            assistant_content,
+            tool_calls,
+            reasoning,
+        ))
+        for call in tool_calls:
+            content = (
+                {"path": "report.md", "bytes_written": 2_000}
+                if call["id"] == "write-once"
+                else {"success": True, "value": "ok"}
+            )
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": json.dumps(content),
+            })
+
+    agent._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    result = agent.run_conversation("create report", advance_background_review=False)
+
+    assert result["final_response"] == "done"
+    assert transport.call_index == 3
+
+
+def test_restored_history_prunes_completed_large_tool_arguments_before_first_call(
+    monkeypatch,
+) -> None:
+    context = _context()
+    transport = _SequenceTransport(ModelCallResult(
+        content="done",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=None,
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    ))
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=128_000,
+        quiet_mode=True,
+    )
+    large_arguments = json.dumps({
+        "path": "report.py",
+        "content": "x" * 2_000,
+        "encoding": "utf-8",
+    })
+    small_arguments = json.dumps({"path": "notes.txt", "content": "small"})
+    failed_arguments = json.dumps({"path": "blocked.py", "content": "y" * 2_000})
+    terminal_arguments = json.dumps({"command": "z" * 2_000})
+
+    def tool_pair(call_id, name, arguments, result, **extra):
+        call = {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": arguments},
+            **extra,
+        }
+        return [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": json.dumps(result),
+            },
+        ]
+
+    history = [
+        {"role": "system", "content": "system"},
+        *tool_pair(
+            "large-call",
+            "write_file",
+            large_arguments,
+            {"path": "report.py", "bytes_written": 2_000},
+            extra_content={"provider": "signature"},
+        ),
+        *tool_pair(
+            "small-call",
+            "write_file",
+            small_arguments,
+            {"path": "notes.txt", "bytes_written": 5},
+        ),
+        *tool_pair(
+            "failed-call",
+            "write_file",
+            failed_arguments,
+            {"error": "blocked"},
+        ),
+        *tool_pair(
+            "terminal-call",
+            "terminal",
+            terminal_arguments,
+            {"output": "ok", "returncode": 0, "error": ""},
+        ),
+    ]
+    original_history = deepcopy(history)
+
+    agent.run_conversation(
+        "continue",
+        conversation_history=history,
+        advance_background_review=False,
+    )
+
+    sent = transport.calls[0]["messages"]
+    calls = {
+        call["id"]: call
+        for message in sent
+        for call in message.get("tool_calls") or []
+    }
+    pruned_arguments = json.loads(calls["large-call"]["function"]["arguments"])
+    assert pruned_arguments["path"] == "report.py"
+    assert pruned_arguments["encoding"] == "utf-8"
+    assert pruned_arguments["content"] == (
+        "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED: original 2000 chars were already "
+        "written successfully and removed from history; never use this marker as "
+        "new write_file content; use read_file(path) to inspect the file]"
+    )
+    assert calls["large-call"]["id"] == "large-call"
+    assert calls["large-call"]["function"]["name"] == "write_file"
+    assert calls["large-call"]["extra_content"] == {"provider": "signature"}
+    assert calls["small-call"]["function"]["arguments"] == small_arguments
+    assert calls["failed-call"]["function"]["arguments"] == failed_arguments
+    assert calls["terminal-call"]["function"]["arguments"] == terminal_arguments
+    assert {
+        call["id"] for call in calls.values()
+    } == {
+        message["tool_call_id"] for message in sent if message.get("role") == "tool"
+    }
+    assert history == original_history
+
+
+@pytest.mark.parametrize("marker", [
+    "[Earlier content argument cleared after successful write; 19436 chars]",
+    (
+        "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED: original 19436 chars were already "
+        "written successfully and removed from history; never use this marker as "
+        "new write_file content; use read_file(path) to inspect the file]"
+    ),
+])
+def test_write_file_rejects_internal_pruning_marker(tmp_path, marker: str) -> None:
+    target = tmp_path / "report.md"
+    target.write_text("existing content", encoding="utf-8")
+
+    result = json.loads(write_file_tool(str(target), marker))
+
+    assert result["success"] is False
+    assert "context-pruning marker" in result["error"]
+    assert target.read_text(encoding="utf-8") == "existing content"
+
+
 @pytest.mark.parametrize("trigger", ["preventive", "context_overflow"])
 def test_compression_flush_receives_current_working_history(
     monkeypatch,
@@ -449,8 +1021,12 @@ def test_compression_flush_receives_current_working_history(
         _compressed_this_turn = False
 
         @staticmethod
-        def compress(messages):
+        def compress(messages, **_kwargs):
             return [messages[0], *messages[2:]]
+
+        @staticmethod
+        def prune(messages, **_kwargs):
+            return messages, 0
 
     agent.context_compressor = Compressor()
     flushed: list[list[dict] | None] = []

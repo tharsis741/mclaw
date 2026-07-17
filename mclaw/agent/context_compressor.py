@@ -14,6 +14,7 @@ usage when available. That keeps decisions tied to provider behavior rather
 than only to local token estimates.
 """
 
+import json
 import logging
 import time
 from dataclasses import replace
@@ -38,6 +39,7 @@ SUMMARY_PREFIX = (
 
 # Placeholder used when earlier tool results are pruned.
 _PRUNED_TOOL_PLACEHOLDER = "[Earlier tool output cleared to save context space]"
+_PRUNED_WRITE_CONTENT_PREFIX = "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
 
 # Summary token budget controls.
 _MIN_SUMMARY_TOKENS = 2000
@@ -238,19 +240,88 @@ class ContextCompressor:
         )
         self.last_total_tokens = int(usage.get("total_tokens", 0) or 0)
 
-    def prune(self, messages: list[dict]) -> tuple[list[dict], int]:
-        """Lightweight pre-pass: replace earlier tool results with placeholders.
+    def prune(
+        self,
+        messages: list[dict],
+        *,
+        protected_write_call_ids: set[str] | None = None,
+    ) -> tuple[list[dict], int]:
+        """Lightweight pre-pass: shrink completed tool payloads.
 
-        Safe to call every turn: it only touches messages outside the
-        protected tail window and never drops data silently.
+        Earlier tool results respect the protected tail window. Large content
+        from successful writes is cleared after the model has seen the full
+        call and its paired result once.
 
         Returns (pruned_messages, pruned_count).
         """
-        return self._prune_earlier_tool_results(
+        successful_call_ids = set()
+        protected_write_call_ids = protected_write_call_ids or set()
+        for msg in messages:
+            if msg.get("role") != "tool" or not msg.get("tool_call_id"):
+                continue
+            try:
+                payload = json.loads(_content_to_text(msg.get("content")))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and payload.get("success") is not False
+                and not payload.get("error")
+            ):
+                successful_call_ids.add(msg["tool_call_id"])
+
+        result, pruned = self._prune_earlier_tool_results(
             messages,
             protect_tail_count=self.protect_last_n,
             protect_tail_tokens=self.tail_token_budget,
         )
+
+        for i, msg in enumerate(result):
+            if msg.get("role") != "assistant" or not msg.get("tool_calls"):
+                continue
+            tool_calls = list(msg["tool_calls"])
+            changed = False
+            for j, call in enumerate(tool_calls):
+                if not isinstance(call, dict) or call.get("id") not in successful_call_ids:
+                    continue
+                if call.get("id") in protected_write_call_ids:
+                    continue
+                function = call.get("function")
+                if not isinstance(function, dict) or function.get("name") != "write_file":
+                    continue
+                raw_arguments = function.get("arguments")
+                if not isinstance(raw_arguments, str) or len(raw_arguments) <= _TOOL_ARGS_MAX:
+                    continue
+                try:
+                    arguments = json.loads(raw_arguments)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(arguments, dict):
+                    continue
+                content = arguments.get("content")
+                if not isinstance(content, str) or len(content) <= _TOOL_ARGS_MAX:
+                    continue
+                arguments["content"] = (
+                    f"{_PRUNED_WRITE_CONTENT_PREFIX} original {len(content)} chars "
+                    "were already written successfully and removed from history; "
+                    "never use this marker as new write_file content; use read_file(path) "
+                    "to inspect the file]"
+                )
+                tool_calls[j] = {
+                    **call,
+                    "function": {
+                        **function,
+                        "arguments": json.dumps(
+                            arguments, ensure_ascii=False, separators=(",", ":")
+                        ),
+                    },
+                }
+                changed = True
+                pruned += 1
+            if changed:
+                result[i] = {**msg, "tool_calls": tool_calls}
+
+        return result, pruned
 
     def _prune_earlier_tool_results(
         self, messages: list[dict], protect_tail_count: int,
@@ -603,7 +674,12 @@ class ContextCompressor:
 
         return messages
 
-    def compress(self, messages: list[dict]) -> list[dict]:
+    def compress(
+        self,
+        messages: list[dict],
+        *,
+        protected_write_call_ids: set[str] | None = None,
+    ) -> list[dict]:
         """Compress conversation history.
 
         Returns a new list with middle turns replaced by a structured summary.
@@ -615,15 +691,14 @@ class ContextCompressor:
 
         logger.info("[COMPRESSION START] messages=%d threshold=%d", n, self.threshold_tokens)
 
-        # Phase 1: prune earlier tool results as a cheap pre-pass.
-        logger.info("[COMPRESSION] Phase 1: pruning earlier tool results")
-        messages, pruned_count = self._prune_earlier_tool_results(
+        # Phase 1: prune completed tool payloads as a cheap pre-pass.
+        logger.info("[COMPRESSION] Phase 1: pruning tool payloads")
+        messages, pruned_count = self.prune(
             messages,
-            protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
+            protected_write_call_ids=protected_write_call_ids,
         )
         if pruned_count:
-            logger.info("Pre-compression: pruned %d earlier tool result(s)", pruned_count)
+            logger.info("Pre-compression: pruned %d tool payload(s)", pruned_count)
 
         # Phase 2: Determine boundaries
         logger.info("[COMPRESSION] Phase 2: determining boundaries")

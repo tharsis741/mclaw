@@ -192,6 +192,18 @@ class GoogleGeminiProfile(RuntimeProviderProfile):
                 raw_usage, "thoughts_token_count", "thoughtsTokenCount"
             ),
         }
+        input_tokens = local["input_tokens"]
+        total_tokens = local["total_tokens"]
+        if (
+            input_tokens is not None
+            and total_tokens is not None
+            and total_tokens >= input_tokens
+        ):
+            local["output_tokens"] = total_tokens - input_tokens
+        elif local["reasoning_tokens"] is not None:
+            local["output_tokens"] = (
+                (local["output_tokens"] or 0) + local["reasoning_tokens"]
+            )
         if record is None:
             if all(value is None for value in local.values()):
                 return None

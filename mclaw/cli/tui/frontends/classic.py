@@ -17,6 +17,16 @@ from prompt_toolkit.utils import get_cwidth
 from mclaw.cli.slash_completer import slash_token_before_cursor
 
 
+def formatted_text_height(fragments, width: int) -> int:
+    """Count terminal rows after prompt_toolkit wraps formatted text."""
+    width = max(1, int(width))
+    text = "".join(fragment[1] for fragment in fragments)
+    return sum(
+        max(1, (get_cwidth(line) + width - 1) // width)
+        for line in text.split("\n")
+    )
+
+
 def _trim_to_width(text: str, width: int) -> str:
     """Trim display text by terminal cell width rather than Python character count."""
     if width <= 0:
@@ -128,7 +138,7 @@ def build_classic_root_container(
     status_bar = Window(
         content=FormattedTextControl(status_fragments),
         height=status_height,
-        wrap_lines=False,
+        wrap_lines=True,
     )
     completion_menu = Window(
         content=SlashCompletionMenuControl(completion_selected_index, max_height=4),

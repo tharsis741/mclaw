@@ -143,6 +143,7 @@ class MClaw:
         self.messages: List[Dict[str, Any]] = []
         self._interrupted = False
         self._prompt_epoch_dirty = False
+        self._write_call_ids_pending_visibility: Set[str] = set()
 
         # Memory subsystem.
         self._memory_manager: Optional[MemoryManager] = None
@@ -759,6 +760,7 @@ class MClaw:
         advance_background_review: bool = True,
         *,
         call_source: str = "turn",
+        deadline_monotonic: float | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -845,20 +847,48 @@ class MClaw:
         else:
             self.session_user_messages += 1
 
+        # Restored sessions reload full payloads from the database. Prune once
+        # before the first request as well as after each new tool batch below.
+        if self.context_compressor:
+            messages, initial_pruned = self.context_compressor.prune(
+                messages,
+                protected_write_call_ids=self._write_call_ids_pending_visibility,
+            )
+            if initial_pruned:
+                logger.info(
+                    "[CONTEXT] pruned %d tool payload(s) before first API call",
+                    initial_pruned,
+                )
+
         api_call_count = 0
         assistant_iteration_count = 0
+        api_call_limit = self.max_iterations if getattr(self, "_delegate_depth", 0) > 0 else None
         final_response = ""
         final_response_recorded = False
         interrupted = False
+        stop_reason: str | None = None
         assistant_rounds = []
         final_result: ModelCallResult | None = None
+
+        def _deadline_reached() -> bool:
+            return bool(
+                deadline_monotonic is not None
+                and time.monotonic() >= deadline_monotonic
+            )
 
         # Temporarily disable tools when disable_tools=True (e.g. synthesis turn)
         original_tools = self.tools
         if disable_tools:
             self.tools = []
 
-        while assistant_iteration_count < self.max_iterations:
+        while (
+            assistant_iteration_count < self.max_iterations
+            and (api_call_limit is None or api_call_count < api_call_limit)
+        ):
+            if _deadline_reached():
+                stop_reason = "timeout"
+                logger.info("[LOOP] delegation deadline reached before next iteration")
+                break
             assistant_iteration_count += 1
             logger.info("[LOOP] starting iteration %d", assistant_iteration_count)
             if self._interrupted:
@@ -906,7 +936,10 @@ class MClaw:
                         logger.info("[LOOP] preventive compression triggered (check=%d >= threshold=%d)", check_tokens, compression_limit)
                         self._emit_status("Compressing context...")
                         self.flush_memories(messages)
-                        messages = cc.compress(messages)
+                        messages = cc.compress(
+                            messages,
+                            protected_write_call_ids=self._write_call_ids_pending_visibility,
+                        )
                         logger.info("[LOOP] compression done")
                         self._refresh_memory_snapshot()
                         logger.info("[LOOP] memory snapshot refreshed")
@@ -921,6 +954,11 @@ class MClaw:
             context_retry_used = False
 
             while retry_count < MAX_RETRIES:
+                if _deadline_reached():
+                    stop_reason = "timeout"
+                    break
+                if api_call_limit is not None and api_call_count >= api_call_limit:
+                    break
                 if self._interrupted:
                     interrupted = True
                     break
@@ -994,7 +1032,10 @@ class MClaw:
                         self.flush_memories(messages)
                         from mclaw.agent.context_compressor import estimate_messages_tokens
                         before_tokens = estimate_messages_tokens(messages)
-                        compressed_messages = self.context_compressor.compress(messages)
+                        compressed_messages = self.context_compressor.compress(
+                            messages,
+                            protected_write_call_ids=self._write_call_ids_pending_visibility,
+                        )
                         after_tokens = estimate_messages_tokens(compressed_messages)
                         if len(compressed_messages) >= len(messages) and after_tokens >= before_tokens:
                             logger.warning(
@@ -1009,7 +1050,11 @@ class MClaw:
                             self._refresh_prompt_epoch(messages)
                             self.context_compressor._compressed_this_turn = True
                             continue  # retry with compressed messages
-                    if error.retryable and retry_count < MAX_RETRIES - 1:
+                    if (
+                        error.retryable
+                        and retry_count < MAX_RETRIES - 1
+                        and (api_call_limit is None or api_call_count < api_call_limit)
+                    ):
                         retry_count += 1
                         wait = (
                             error.retry_after
@@ -1027,7 +1072,7 @@ class MClaw:
                                 break
                             time.sleep(0.2)
                         continue
-                    logger.error("API error (non-retryable): %s", error)
+                    logger.error("API error (not retried): %s", error)
                     final_response = f"API Error: {error}"
                     self.messages = messages
                     if disable_tools:
@@ -1038,6 +1083,10 @@ class MClaw:
                         "model": self.model,
                         "session_id": self.session_id,
                         "api_calls": api_call_count,
+                        "error": str(error),
+                        "interrupted": interrupted,
+                        "stop_reason": stop_reason,
+                        "completed": False,
                         "assistant_rounds": assistant_rounds,
                         "token_usage": self._finish_turn_usage(),
                     }
@@ -1052,6 +1101,10 @@ class MClaw:
 
             if interrupted or result is None:
                 break
+
+            # A successful model response proves the pending write call and
+            # paired result were visible once; later pruning may now shrink it.
+            self._write_call_ids_pending_visibility.clear()
 
             assistant_content = result.content
             tool_calls = result.tool_calls
@@ -1097,6 +1150,24 @@ class MClaw:
                     reasoning=result.reasoning,
                 )
                 logger.info("[POST-TOOL] _execute_tool_calls returned, pending=%s", pending_result is not None)
+
+                # Keep successful large writes intact for exactly the next
+                # model response. Older writes remain eligible for pruning.
+                self._write_call_ids_pending_visibility = {
+                    tc.get("id")
+                    for tc in tool_calls
+                    if isinstance(tc, dict)
+                    and tc.get("id")
+                    and (tc.get("function") or {}).get("name") == "write_file"
+                }
+                if self.context_compressor:
+                    logger.info("[POST-TOOL] pruning context before next iteration")
+                    messages, _pruned = self.context_compressor.prune(
+                        messages,
+                        protected_write_call_ids=self._write_call_ids_pending_visibility,
+                    )
+                    logger.info("[POST-TOOL] pruning done, pruned=%s", _pruned)
+
                 if pending_result is not None:
                     # delegate_task started in non-blocking mode; return for TUI polling.
                     # Restore tools before returning so they are not left disabled.
@@ -1115,13 +1186,6 @@ class MClaw:
                     final_response = assistant_content or ""
                     final_response_recorded = True
                     break
-
-                # Prune earlier tool results after each tool batch so large
-                # read_file or terminal output stays bounded in history.
-                if self.context_compressor:
-                    logger.info("[POST-TOOL] pruning context before next iteration")
-                    messages, _pruned = self.context_compressor.prune(messages)
-                    logger.info("[POST-TOOL] pruning done, pruned=%s", _pruned)
 
                 logger.info("[POST-TOOL] continuing to next API iteration")
                 continue
@@ -1217,6 +1281,7 @@ class MClaw:
             "session_id": self.session_id,
             "api_calls": api_call_count,
             "interrupted": interrupted,
+            "stop_reason": stop_reason,
             "completed": bool(not interrupted and final_response),
             "assistant_rounds": assistant_rounds,
             "token_usage": turn_usage,

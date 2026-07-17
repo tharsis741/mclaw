@@ -10,6 +10,7 @@ from typing import Callable
 
 from mclaw.cli.runtime.panels import PanelColumn, PanelModel, panel_cell, table_block
 from mclaw.cli.tui.panel_renderer import render_panel_model
+from mclaw.cli.tui.renderers.status import StatusRenderer
 from mclaw.cli.tui.theme import ACCENT_COLOR
 
 
@@ -31,18 +32,24 @@ class DelegationRenderer:
         """Render the task summary panel and return text the parent turn can consume."""
         task_results = results.get("results", [])
         total_duration = results.get("total_duration_seconds", 0)
-        icons = {"completed": "✅", "error": "❌", "interrupted": "⚠️", "failed": "❌"}
+        icons = {
+            "completed": "✅",
+            "timed_out": "⚠️",
+            "error": "❌",
+            "interrupted": "⚠️",
+            "failed": "❌",
+        }
 
         rows = []
         for r in task_results:
             status = r.get("status", "unknown")
             icon = icons.get(status, "❓")
             goal = r.get("goal", "") or ""
-            goal_short = goal[:30] + "…" if len(goal) > 30 else goal
+            goal_short = StatusRenderer.format_subagent_goal(goal, max_len=100)
             duration = r.get("duration_seconds", 0)
             api_calls = r.get("api_calls", 0)
             rows.append((
-                f"任务 {r.get('task_index', '?')}",
+                f"任务 {_display_task_index(r.get('task_index', '?'))}",
                 goal_short,
                 panel_cell(f"{icon} {status}", _status_role(status)),
                 f"{duration:.1f}s",
@@ -78,12 +85,13 @@ class DelegationRenderer:
         else:
             self._run_external_output(_print_panel)
 
-        lines = [f"子代理任务全部完成（共 {len(task_results)} 个任务，总耗时 {total_duration:.1f} 秒）："]
+        lines = [f"子代理任务全部结束并已完成结果交接（共 {len(task_results)} 个任务，总耗时 {total_duration:.1f} 秒）："]
         for r in task_results:
-            idx = r.get("task_index", "?")
+            idx = _display_task_index(r.get("task_index", "?"))
             status = r.get("status", "unknown")
             goal = r.get("goal", "")
             summary = r.get("summary") or ""
+            summary_path = r.get("summary_path") or ""
             error = r.get("error", "")
             duration = r.get("duration_seconds", 0)
             lines.append(f"\n【任务 {idx}】{goal}")
@@ -92,8 +100,11 @@ class DelegationRenderer:
                 lines.append(f"错误：{error}")
             if summary:
                 lines.append(f"结果：{summary}")
+            if summary_path:
+                lines.append(f"完整结果文件：{summary_path}（继续任务前必须读取）")
         lines.append(
             "\n请把以上子代理结果作为中间材料，回到原始用户任务继续执行。"
+            "如存在完整结果文件，必须先读取文件再继续。"
             "如果原始任务还需要创建或修改文件、生成 PPT、运行验证、调用工具或继续处理，必须继续完成。"
             "只有确认原始用户任务已经完整完成后，才给出最终回复；不要仅总结子代理结果后结束。"
         )
@@ -105,6 +116,11 @@ def _status_role(status: str) -> str:
         return "success"
     if status in {"error", "failed"}:
         return "danger"
-    if status == "interrupted":
+    if status in {"interrupted", "timed_out"}:
         return "warning"
     return "default"
+
+
+def _display_task_index(task_index):
+    """Keep internal indexes zero-based while presenting tasks from one."""
+    return task_index + 1 if isinstance(task_index, int) else task_index
