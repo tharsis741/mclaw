@@ -12,6 +12,7 @@ import importlib.util
 import multiprocessing as mp
 import os
 import queue
+import signal
 import threading
 import time
 from typing import Any
@@ -207,6 +208,7 @@ class PetController:
 
 def _run_sidecar(event_queue: mp.Queue, command_queue: mp.Queue, runtime_config: dict) -> None:
     """Late-import the Qt runtime inside the spawned sidecar process."""
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     from mclaw.pet.runtime_qt import run_pet
 
     run_pet(event_queue, command_queue, runtime_config)
