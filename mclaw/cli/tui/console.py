@@ -40,7 +40,7 @@ def configure_text_output() -> None:
 
 
 class MClawConsole:
-    """Rich Console that routes output through prompt_toolkit's renderer."""
+    """Rich Console that emits one rendered block through the selected printer."""
 
     def __init__(self, printer=None, *, color_system: str = "truecolor", width: int | None = None):
         configure_text_output()
@@ -56,11 +56,10 @@ class MClawConsole:
     def print(self, *args, **kwargs):
         with self._inner.capture() as capture:
             self._inner.print(*args, **kwargs)
-        text = capture.get()
+        text = capture.get().rstrip("\n")
         if not text:
             return
-        for line in text.rstrip("\n").splitlines():
-            self._printer(line)
+        self._printer(text)
 
 
 def cprint(text: str):
@@ -75,6 +74,59 @@ def cprint(text: str):
     except Exception as exc:
         logger.debug("prompt_toolkit ANSI print failed: %s", exc)
         print(text)
+
+
+def write_ansi_block(text: str) -> None:
+    """Write one rendered ANSI block directly when the terminal supports it."""
+
+    configure_text_output()
+    stream = sys.__stdout__
+    if stream is None or not getattr(stream, "isatty", lambda: False)():
+        cprint(text)
+        return
+
+    payload = (text.rstrip("\n") + "\n").encode("utf-8", errors="replace")
+    try:
+        stream.flush()
+        if not _write_raw_ansi(stream, payload):
+            cprint(text)
+    except (AttributeError, OSError, ValueError) as exc:
+        logger.debug("Direct ANSI block write failed: %s", exc)
+        cprint(text)
+
+
+def _write_raw_ansi(stream, payload: bytes) -> bool:
+    if os.name != "nt":
+        _write_all(stream.fileno(), payload)
+        return True
+
+    try:
+        import ctypes
+        import msvcrt
+
+        handle = ctypes.c_void_p(msvcrt.get_osfhandle(stream.fileno()))
+        original_mode = ctypes.c_ulong()
+        kernel32 = ctypes.windll.kernel32
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(original_mode)):
+            return False
+        if not kernel32.SetConsoleMode(handle, original_mode.value | 0x0001 | 0x0004):
+            return False
+        try:
+            _write_all(stream.fileno(), payload)
+        finally:
+            kernel32.SetConsoleMode(handle, original_mode.value)
+        return True
+    except Exception:
+        return False
+
+
+def _write_all(fd: int, payload: bytes) -> None:
+    remaining = memoryview(payload)
+    while remaining:
+        written = os.write(fd, remaining)
+        if written <= 0:
+            raise OSError("terminal write returned no bytes")
+        remaining = remaining[written:]
 
 
 def print_rich(*args, **kwargs) -> None:

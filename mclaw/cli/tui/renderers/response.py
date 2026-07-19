@@ -65,8 +65,8 @@ def _print_assistant_response(
     from rich.text import Text
 
     from mclaw.cli.tui.components import vertical_stack
-    from mclaw.cli.tui.console import MClawConsole
+    from mclaw.cli.tui.console import MClawConsole, write_ansi_block
 
     content = str(text or "").strip()
-    console = MClawConsole()
+    console = MClawConsole(printer=write_ansi_block)
     console.print(vertical_stack(Text(title, style=title_style), Markdown(content or " ")))
