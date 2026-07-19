@@ -26,8 +26,6 @@
 
 ## Roadmap
 
-**M-CLAW 将从单机 Agent Runtime 逐步演进为分布式机器人执行网络与统一任务控制平面，构建面向具身智能的可编排运行时基础设施。**
-
 ### 2026.06 | **1.0.0 单机智能体运行时**
 
 完成最小智能体运行时闭环，在 M-Robots OS 上验证“模型驱动执行 + 工具调用 + 记忆 + Skill 扩展 + 机器人控制”的端到端执行链路。
@@ -58,7 +56,7 @@
 - 空间记忆：构建环境与位置的持续性记忆，使 Agent 能够在时间维度上累积空间状态与变化。
 - 空间建模：将物理环境抽象为可计算的空间图结构，用于支持定位、关系建模与任务规划。
 - 跨机器人调度：在统一空间状态下进行任务分配与执行协调，实现多设备协同操作。
-- 分布式空间执行：支持多 Agent 在同一空间语义下进行协同执行与状态同步，形成空间级任务网络。
+- 分布式空间执行：支持多 Agent 在统一空间语义下进行协同执行与状态同步，形成空间级任务网络。
 
 ## 当前能力
 
@@ -84,10 +82,10 @@ M-Claw 当前已经包含：
 
 ## 模型支持
 
-**M-Claw 支持在当前会话中动态切换模型和 Provider，并在不改动 Agent Loop 的情况下进入同一套运行流程。**
+**M-Claw 支持在当前会话中动态切换模型和 Provider。**
 
 - **模型目录**：基于 [models.dev](https://models.dev/) 获取模型 ID、Provider 归属和上下文长度等元数据；当前公开目录包含 145 个 provider、5,246 条模型记录。
-- **Provider 配置**：内置 31 个可配置 provider key，覆盖主流国内外模型服务、托管平台和路由器，并支持用户自定义 OpenAI-compatible/Anthropic message endpoint。
+- **Provider 配置**：适配31个国内外主流供应商，并支持用户自定义 OpenAI-compatible/Anthropic message endpoint接口。
 - **协议调用**：根据 Provider 使用 OpenAI-compatible 或 Anthropic Messages 接口，支撑模型切换、上下文预算、流式输出和工具调用流程。
 
 不同模型的实际可用能力取决于 Provider endpoint 与模型自身对工具调用、流式输出、视觉输入等能力的支持。
@@ -176,7 +174,7 @@ M-Claw 当前已经包含：
 
 - `skill_manage(action="evolution_update")` 用于更新 Skill 的运行时经验状态。
 - 后台审查机制周期性触发 Skill 使用情况分析与演化建议生成。
-- 后后台线程仅允许访问受限工具白名单，以降低自动修改 Skill 的风险。
+- 后台线程仅允许访问受限工具白名单，以降低自动修改 Skill 的风险。
 
 
 ## 安全策略与可恢复执行
@@ -184,9 +182,7 @@ M-Claw 当前已经包含：
 
 ### PathPolicy
 
-文件与终端工具默认使用主机完整文件系统权限，不创建 `MCLAW_HOME/workspace`，也不把当前工作目录伪装成沙箱边界；最终权限由操作系统和启动 M-Claw 的用户决定。首次进入工作区时仍沿用风险确认 UI，明确提示 full access 并只把用户确认写入用户级 `security.trusted_workspaces`，项目配置不能自行授权；文件操作过程中不会再临时弹出 runtime confirm。
-
-PathPolicy 只保留几类明确的防护栏：直接访问 `.env*`、SSH 私钥、常用云/容器凭据文件、`/proc/*/{environ,mem}` 和 `/proc/kcore` 会被拒绝；`MCLAW_HOME` 允许诊断读取但禁止通用工具改写；`/proc`、`/sys`、`/dev` 禁止递归搜索和删除/移动节点，但允许按名称显式读写设备节点。Windows 保护卷/UNC 根、用户目录和系统安装目录的锚点；Linux 保护 `/`、用户目录、关键系统目录及挂载点的锚点；Kaihong 保护 `/`、`/system`、`/vendor`、`/data`、`/data/local/release` 等锚点。锚点保护只针对目录本身，其后代仍是正常 host 路径，例如 `/data/local/release/bin/*` 可以正常更新。递归/通配符删除、无法解析目标的破坏性命令和 Skill 存储的非专用修改仍由安全层阻止。
+文件与终端工具使用当前操作系统用户的主机权限，并由 PathPolicy 保护凭据文件、MCLAW_HOME、系统关键目录和危险递归操作。首次使用工作目录时需要完成风险确认。
 
 ### Scoped Secret
 
@@ -198,7 +194,7 @@ CheckpointManager 使用单个共享 shadow git store，在文件写入、patch�
 
 ### Rollback
 
-RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可同步回滚会话上下文。CLI 提供 `/rollback` 和 `/checkpoints` 命令查看、预览、撤销和恢复变更。
+RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可同步回滚会话上下文。 内置命令提供 `/rollback` 和 `/checkpoints` 命令查看、预览、撤销和恢复变更。
 
 ### 当前缺陷
 
@@ -220,7 +216,6 @@ M-Claw 支持以下交互入口：
 
 - **CLI/TUI**：基于 Rich 与 prompt_toolkit 终端交互入口。
 - **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word、push-to-talk 和一次性录音模式。
-- **Scheduler**：本地定时任务引擎，支持 due detection、queued run、并发策略、失败计数、输出文件和投递结果。
 - **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
 
 
