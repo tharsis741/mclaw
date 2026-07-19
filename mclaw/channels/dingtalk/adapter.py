@@ -245,7 +245,7 @@ class DingTalkAdapter:
             message_id=message_id,
             account_id=self.config.client_id,
         )
-        routed = self.session_router.route(source, model=self.runner.model)
+        routed = self.session_router.route(source, model=self.runner.startup_provider_runtime.model)
 
         command = self.command_router.handle(
             text,
@@ -263,7 +263,10 @@ class DingTalkAdapter:
                 reset = getattr(self.runner, "reset_session", None)
                 if reset:
                     reset(routed.session_id)
-                routed = self.session_router.new_session(source, model=self.runner.model)
+                routed = self.session_router.new_session(
+                    source,
+                    model=self.runner.startup_provider_runtime.model,
+                )
                 await self.send(chat_id, command.text, reply_to=message_id, route=reply_route, done_message=message)
             elif command.action == "stop":
                 interrupted = self.runner.interrupt(routed.session_id)
