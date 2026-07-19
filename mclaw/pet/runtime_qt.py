@@ -30,27 +30,6 @@ QUIET_EVENTS = {"app_started"}
 logger = logging.getLogger(__name__)
 
 
-STATE_BY_EVENT = {
-    "app_started": REST_STATE,
-    "turn_started": PetState.JUMPING.value,
-    "model_streaming": PetState.TYPING.value,
-    "tool_started": PetState.READING.value,
-    "tool_finished": PetState.RUNNING_RIGHT.value,
-    "status_changed": None,
-    "waiting_for_user": PetState.WAITING.value,
-    "turn_completed": PetState.WAVING.value,
-    "turn_failed": PetState.FAILED.value,
-    "turn_interrupted": PetState.FAILED.value,
-    "background_process_updated": PetState.TYPING.value,
-    "background_process_completed": PetState.WAVING.value,
-    "delegation_started": PetState.CARRYING.value,
-    "delegation_task_started": PetState.CARRYING.value,
-    "delegation_task_tool": PetState.READING.value,
-    "delegation_task_completed": PetState.CARRYING.value,
-    "delegation_task_failed": PetState.FAILED.value,
-    "delegation_completed": PetState.WAVING.value,
-}
-
 EVENT_MESSAGES = {
     "app_started": "休息中，我眯一会儿，叫我就行！",
     "turn_started": "收到，开始处理！",
@@ -355,9 +334,8 @@ class _PetWindow:
     def handle_event(self, event: PetEvent) -> None:
         """Apply one runtime event to animation state and optional bubble text."""
         self._mark_activity()
-        next_state = event.state or STATE_BY_EVENT.get(event.type)
-        if next_state:
-            self.set_state(next_state)
+        if event.state:
+            self.set_state(event.state)
         if event.type in QUIET_EVENTS:
             return
         self._set_bubble(event)
@@ -432,7 +410,7 @@ class _PetWindow:
         """Show transient event text without changing animation ownership."""
         if not self.config.get("show_bubble", True):
             return
-        state = event.state or STATE_BY_EVENT.get(event.type) or self.state
+        state = event.state or self.state
         label = self._display_event(event, state)
         self.bubble_label.setText(label)
         self.last_event_text = label

@@ -74,7 +74,6 @@ class RuntimeDelegationCoordinator:
             return False
 
         pending_data = result.get("pending_data", {}) or {}
-        self.hooks.emit_delegation_started(pending_data)
         task_id = str(pending_data.get("task_id") or "")
         num_tasks = int(pending_data.get("num_tasks") or 1)
         task_info = pending_data.get("task_info", {}) or {}
@@ -85,6 +84,7 @@ class RuntimeDelegationCoordinator:
         self.hooks.replay_pending_subagent_events(manager)
         self.hooks.update_subagent_status()
         self.hooks.set_delegating_status(num_tasks)
+        self.hooks.emit_delegation_started(pending_data)
         self.hooks.invalidate()
         self.hooks.log_info("[DELEGATE TUI] polling started task_id=%s num_tasks=%s", (task_id, num_tasks))
 

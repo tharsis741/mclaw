@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from mclaw.cli.runtime.events import RuntimeStatus
+
 _CTX_BAR_WIDTH = 8
 _CTX_FILLED = "■"
 _CTX_EMPTY = "□"
@@ -19,15 +21,18 @@ _CTX_COLOR_WARN = "#fcd34d"
 _CTX_COLOR_HIGH = "#fb923c"
 _CTX_COLOR_CRIT = "#f87171"
 
-_LIFECYCLE_STATES = [
-    ("Initializing", "#8ab4d6"),
-    ("Requesting", "#6CB4EE"),
-    ("Streaming", "#f0c040"),
-    ("Tools", "#4A90D9"),
-    ("Done", "#50c878"),
-    ("Delegating", "#c084fc"),
-    ("Aggregating", "#4ecdc4"),
-]
+_STATUS_STYLES = {
+    RuntimeStatus.IDLE: ("Idle", "#8ab4d6"),
+    RuntimeStatus.REQUESTING: ("Requesting", "#6CB4EE"),
+    RuntimeStatus.STREAMING: ("Streaming", "#f0c040"),
+    RuntimeStatus.TOOLS: ("Tools", "#4A90D9"),
+    RuntimeStatus.DELEGATING: ("Delegating", "#c084fc"),
+    RuntimeStatus.AGGREGATING: ("Aggregating", "#4ecdc4"),
+    RuntimeStatus.WAITING_FOR_USER: ("Waiting", "#fcd34d"),
+    RuntimeStatus.DONE: ("Done", "#50c878"),
+    RuntimeStatus.INTERRUPTED: ("Interrupted", "#fcd34d"),
+    RuntimeStatus.ERROR: ("Error", "#f87171"),
+}
 
 _STATUS_ANIM_FRAMES = [
     "🌕", "🌖", "🌗", "🌘", "🌑", "🌑", "🌒", "🌓", "🌔", "🌕",
@@ -123,6 +128,8 @@ class StatusRenderer:
             return []
 
         agent = owner.agent
+        state = owner.runtime_state
+        status = state.status
         model_short = owner.model.split("/")[-1] if "/" in owner.model else owner.model
         if len(model_short) > 24:
             model_short = model_short[:21] + "..."
@@ -147,8 +154,6 @@ class StatusRenderer:
 
         if owner._agent_running:
             moon = _STATUS_ANIM_FRAMES[owner._spinner_idx % len(_STATUS_ANIM_FRAMES)]
-        elif owner._lifecycle_idx == 4:
-            moon = "🌕"
         else:
             moon = "🌕"
 
@@ -170,22 +175,28 @@ class StatusRenderer:
             asr_label = owner._compact_asr_status(owner._asr_status_text or owner._input_mode)
             fragments.append(("class:status-bar-active", f" ASR:{asr_label} "))
 
-        if owner._agent_running:
-            lc_label, lc_color = _LIFECYCLE_STATES[min(owner._lifecycle_idx, len(_LIFECYCLE_STATES) - 1)]
-            fragments.append((f"fg:{lc_color} bold", f" {lc_label} "))
-            if owner._active_tools:
-                tools_str = " | ".join(sorted(owner._active_tools))
+        if owner._agent_running or status == RuntimeStatus.WAITING_FOR_USER:
+            status_label, status_color = _STATUS_STYLES[status]
+            fragments.append((f"fg:{status_color} bold", f" {status_label} "))
+            if state.active_tools:
+                tools_str = " | ".join(sorted(state.active_tools))
                 if len(tools_str) > 30:
                     tools_str = tools_str[:27] + "..."
                 fragments.append(("class:status-bar", f" · {tools_str}"))
-            if owner._spinner_text:
-                fragments.append(("class:status-bar", f" · {owner._spinner_text}"))
-        elif owner._lifecycle_idx == 4:
-            result = getattr(owner, "_last_chat_result", {}) or {}
+            if state.detail:
+                fragments.append(("class:status-bar", f" · {state.detail}"))
+        elif status == RuntimeStatus.INTERRUPTED:
+            fragments.append(("class:status-bar-warning", " ⚡ Interrupted "))
+        elif status == RuntimeStatus.ERROR:
+            result = state.last_result or {}
             if result.get("stop_reason") == "max_iterations":
                 fragments.append(("class:status-bar-warning", " ⚠️ Iteration limit reached "))
+            elif result.get("stop_reason") == "timeout":
+                fragments.append(("class:status-bar-warning", " ⚠ Timed out "))
             else:
-                fragments.append(("class:status-bar-done", " ✓ Done "))
+                fragments.append(("class:status-bar-error", " ✗ Error "))
+        elif status == RuntimeStatus.DONE:
+            fragments.append(("class:status-bar-done", " ✓ Done "))
 
         if owner.subtask_manager:
             sm = owner.subtask_manager

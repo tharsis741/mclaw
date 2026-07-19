@@ -6,6 +6,7 @@ import signal
 
 from mclaw.pet import controller
 from mclaw.pet import runtime_qt
+from mclaw.pet.events import PetEvent, PetState
 
 
 def test_sidecar_ignores_sigint_before_starting_qt(monkeypatch) -> None:
@@ -19,3 +20,16 @@ def test_sidecar_ignores_sigint_before_starting_qt(monkeypatch) -> None:
         ("signal", (signal.SIGINT, signal.SIG_IGN)),
         ("run_pet", ("events", "commands", {"asset": "robot-dark"})),
     ]
+
+
+def test_sidecar_uses_explicit_state_instead_of_inferring_from_event_type() -> None:
+    window = runtime_qt._PetWindow.__new__(runtime_qt._PetWindow)
+    states = []
+    window._mark_activity = lambda: None
+    window.set_state = states.append
+    window._set_bubble = lambda _event: None
+
+    window.handle_event(PetEvent(type="tool_started"))
+    window.handle_event(PetEvent(type="status_changed", state=PetState.READING.value))
+
+    assert states == [PetState.READING.value]

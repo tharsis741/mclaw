@@ -54,6 +54,26 @@ class PetEventType(str, Enum):
     DELEGATION_COMPLETED = "delegation_completed"
 
 
+PET_STATE_BY_RUNTIME_STATUS: dict[str, PetState] = {
+    "idle": PetState.IDLE,
+    "requesting": PetState.RUNNING,
+    "streaming": PetState.TYPING,
+    "tools": PetState.READING,
+    "delegating": PetState.CARRYING,
+    "aggregating": PetState.REVIEW,
+    "waiting_for_user": PetState.WAITING,
+    "done": PetState.WAVING,
+    "interrupted": PetState.FAILED,
+    "error": PetState.FAILED,
+}
+
+
+def pet_state_for_runtime_status(status: Any) -> PetState:
+    """Map the canonical runtime lifecycle onto one pet animation state."""
+    value = getattr(status, "value", status)
+    return PET_STATE_BY_RUNTIME_STATUS.get(str(value), PetState.RUNNING)
+
+
 LOW_PRIORITY_EVENTS = {
     PetEventType.MODEL_STREAMING.value,
     PetEventType.STATUS_CHANGED.value,

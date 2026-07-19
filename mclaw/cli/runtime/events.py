@@ -22,8 +22,10 @@ class RuntimeStatus(StrEnum):
     STREAMING = "streaming"
     TOOLS = "tools"
     DELEGATING = "delegating"
+    AGGREGATING = "aggregating"
     WAITING_FOR_USER = "waiting_for_user"
     DONE = "done"
+    INTERRUPTED = "interrupted"
     ERROR = "error"
 
 

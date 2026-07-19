@@ -5,6 +5,8 @@
 from datetime import datetime
 from types import SimpleNamespace
 
+from mclaw.cli.runtime.events import RuntimeStatus
+from mclaw.cli.runtime.session import RuntimeSessionState
 from mclaw.cli.tui.frontends.classic import formatted_text_height
 from mclaw.cli.tui.renderers.delegation import DelegationRenderer
 from mclaw.cli.tui.renderers.status import StatusRenderer
@@ -27,8 +29,10 @@ def test_status_bar_reports_iteration_limit_instead_of_done() -> None:
         _project_name="",
         _input_mode="",
         _asr_status_text="",
-        _lifecycle_idx=4,
-        _last_chat_result={"completed": False, "stop_reason": "max_iterations"},
+        runtime_state=RuntimeSessionState(
+            status=RuntimeStatus.ERROR,
+            last_result={"completed": False, "stop_reason": "max_iterations"},
+        ),
         subtask_manager=None,
     )
 

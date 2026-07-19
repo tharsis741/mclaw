@@ -55,7 +55,7 @@ from mclaw.cli.runtime.workspace_trust import ensure_workspace_trusted, normaliz
 from mclaw.cli.slash_completer import SlashCompleter, slash_token_before_cursor
 from mclaw.pet.config import ensure_pet_config
 from mclaw.pet.controller import PetController
-from mclaw.pet.events import PetEventType, PetState
+from mclaw.pet.events import PetEventType, PetState, pet_state_for_runtime_status
 from mclaw.prompts.skills import build_skill_import_confirmation_context
 from mclaw.prompts.slash_intents import (
     build_pet_file_drop_intent,
@@ -407,10 +407,6 @@ class InteractiveChat:
         self.event_bus = self.runtime.event_bus
         self.runtime_state = self.runtime.session_state
         self._status_bar_visible = True
-        self._spinner_text = ""
-        self._stream_text = ""
-        self._stream_started = False
-        self._active_tools: set[str] = set()   # Currently concurrent tool names.
         self._pending_key_setup: Optional[dict] = None
         self._pending_skill_import_confirmation: Optional[dict] = None
         self._pending_secret_request: Optional[dict] = None
@@ -458,12 +454,10 @@ class InteractiveChat:
 
         # Animation state
         self._spinner_idx: int = 0           # 0..3 spinner chars
-        self._lifecycle_idx: int = 0         # 0..4 lifecycle states
         self._anim_tick: int = 0             # global tick counter
 
         # Subagent state
         self.subtask_manager = None
-        self._subagent_status_fragments: list = []
         # Event buffer for progress events that arrive before subtask_manager exists.
         self._pending_subagent_events: list = []
 
@@ -603,6 +597,11 @@ class InteractiveChat:
         except Exception:
             return False
 
+    def _pet_emit_for_runtime_status(self, event_type, **kwargs) -> bool:
+        """Emit a pet event whose animation is derived from canonical runtime state."""
+        kwargs["state"] = pet_state_for_runtime_status(self._runtime_state().status)
+        return self._pet_emit(event_type, **kwargs)
+
     def _drain_pet_commands(self) -> None:
         """Translate pet-side commands into normal pending user input."""
         pet = getattr(self, "pet", None)
@@ -660,19 +659,20 @@ class InteractiveChat:
             self._pet_emit(PetEventType.DELEGATION_TASK_FAILED, state=PetState.FAILED, payload={"task_index": event.task_index, "data": event.data})
 
         self.subtask_manager.on_progress(event)
-        self._update_subagent_status_fragments()
+        self._update_subagent_status_detail()
 
-    def _update_subagent_status_fragments(self):
-        """Refresh subagent status-bar fragments from current subtask_manager state."""
+    def _update_subagent_status_detail(self):
+        """Refresh canonical delegation detail from current subtask state."""
         sm = self.subtask_manager
         if not sm:
             return
 
         done = sum(1 for t in sm.tasks if t["status"] in ("completed", "error"))
         running = sum(1 for t in sm.tasks if t["status"] == "running")
-        self._spinner_text = f"{done}/{sm.num_tasks} done"
+        state = self._runtime_state()
+        state.detail = f"{done}/{sm.num_tasks} done"
         if running:
-            self._spinner_text += f" · {running} running"
+            state.detail += f" · {running} running"
 
         if self._app:
             self._app.invalidate()
@@ -747,18 +747,22 @@ class InteractiveChat:
         if getattr(self, "_app", None) is None:
             return {"values": {}, "authorized": [], "skipped": [str(item.get("env_var") or "").strip().upper() for item in needs]}
 
+        state = self._runtime_state()
         event = threading.Event()
         pending = {
             "required_for": required_for,
             "needs": [dict(item) for item in needs],
             "event": event,
             "response": None,
+            "resume_status": state.status,
+            "resume_detail": state.detail,
         }
         self._pending_secret_request = pending
+        state.set_status(RuntimeStatus.WAITING_FOR_USER, f"Credentials for {required_for}")
+        self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
         self._render_secret_request(pending)
-        self._pet_emit(
+        self._pet_emit_for_runtime_status(
             PetEventType.WAITING_FOR_USER,
-            state=PetState.WAITING,
             text="凭据请求",
         )
         if self._app:
@@ -767,6 +771,9 @@ class InteractiveChat:
             if getattr(self, "_pending_secret_request", None) is pending:
                 self._pending_secret_request = None
                 self._last_rendered_secret_request_signature = None
+                state.set_status(pending["resume_status"], pending["resume_detail"])
+                self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+                self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
                 if self._app:
                     self._app.invalidate()
             skipped = [
@@ -780,43 +787,35 @@ class InteractiveChat:
 
     def _on_stream_delta(self, text: str):
         """Receive streamed assistant text and update UI/runtime state."""
-        if self._active_tools:
-            self._active_tools.clear()
-        if not self._stream_started:
-            self._stream_started = True
-            self._lifecycle_idx = 2  # Streaming
-
         # Strip MiniMax internal thinking tags before displaying
         clean = _strip_thinking(text)
-        self._stream_text += clean
-        char_count = self._runtime_state().append_stream_delta(clean)
-        self._pet_emit(PetEventType.MODEL_STREAMING, state=PetState.TYPING)
-        self._spinner_text = f"{char_count} chars"
+        state = self._runtime_state()
+        char_count = state.append_stream_delta(clean)
+        self._pet_emit_for_runtime_status(PetEventType.MODEL_STREAMING)
         self._emit_runtime_event(
             EventType.ASSISTANT_DELTA,
             text=clean,
             char_count=char_count,
-            status=RuntimeStatus.STREAMING,
+            status=state.status,
         )
         if self._app:
             self._app.invalidate()
 
     def _on_tool_start(self, name: str, args: dict):
         """Reflect agent tool execution in status state, events, and pet signals."""
-        self._active_tools.add(name)
-        self._lifecycle_idx = 3  # Tools
-        self._runtime_state().begin_tools(name)
-        self._emit_runtime_event(EventType.TOOL_STARTED, name=name, args=args, status=RuntimeStatus.TOOLS)
-        self._pet_emit(PetEventType.TOOL_STARTED, state=PetState.READING, text=name, payload={"tool": name})
+        state = self._runtime_state()
+        state.begin_tools(name)
+        self._emit_runtime_event(EventType.TOOL_STARTED, name=name, args=args, status=state.status)
+        self._pet_emit_for_runtime_status(PetEventType.TOOL_STARTED, text=name, payload={"tool": name})
         if self._app:
             self._app.invalidate()
 
     def _on_tool_end(self):
         logger.info("[TUI] _on_tool_end")
-        self._active_tools.clear()
-        self._runtime_state().finish_tools()
-        self._emit_runtime_event(EventType.TOOL_FINISHED, status=RuntimeStatus.STREAMING)
-        self._pet_emit(PetEventType.TOOL_FINISHED, state=PetState.RUNNING_RIGHT)
+        state = self._runtime_state()
+        state.finish_tools()
+        self._emit_runtime_event(EventType.TOOL_FINISHED, status=state.status, message=state.detail)
+        self._pet_emit_for_runtime_status(PetEventType.TOOL_FINISHED)
         if self._app:
             logger.info("[TUI] _on_tool_end calling invalidate")
             self._app.invalidate()
@@ -826,22 +825,19 @@ class InteractiveChat:
     def _on_status(self, msg: str):
         lower = msg.lower()
         is_tool_status = "running" in lower and "tool" in lower
-        self._spinner_text = _compact_status_detail(msg, has_active_tools=bool(self._active_tools))
+        state = self._runtime_state()
+        detail = _compact_status_detail(msg, has_active_tools=bool(state.active_tools))
         if is_tool_status:
-            self._runtime_state().status = RuntimeStatus.TOOLS
-        self._emit_runtime_event(EventType.STATUS_CHANGED, message=msg)
-        self._pet_emit(PetEventType.STATUS_CHANGED, text=msg)
-        if is_tool_status:
-            self._lifecycle_idx = 3  # Tools
+            state.set_status(RuntimeStatus.TOOLS, detail)
+        else:
+            state.detail = detail
+        self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=msg, detail=state.detail)
+        self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=msg)
         if self._app:
             self._app.invalidate()
 
     def _reset_stream_accumulator(self) -> None:
-        self._stream_text = ""
-        self._stream_started = False
-        state = self._runtime_state()
-        state.stream_text = ""
-        state.stream_started = False
+        self._runtime_state().reset_stream()
 
     def _on_agent_event(self, event: dict):
         """Render non-final assistant rounds that would otherwise be hidden by tools."""
@@ -946,10 +942,9 @@ class InteractiveChat:
             provider=self.provider,
             status=str(state.status),
             running=self._agent_running,
-            lifecycle_index=self._lifecycle_idx,
             spinner_index=self._spinner_idx,
-            spinner_text=self._spinner_text,
-            active_tools=sorted(self._active_tools),
+            detail=state.detail,
+            active_tools=sorted(state.active_tools),
             tokens=total_tokens,
             tokens_label=fmt_tokens(total_tokens),
             api_calls=api_calls,
@@ -1030,7 +1025,6 @@ class InteractiveChat:
 
     def _prepare_for_external_output(self):
         """Shorten live status before printing a final block to scrollback."""
-        self._spinner_text = ""
         if getattr(self, "_asr_status_text", "") and self._asr_status_text != "off":
             self._asr_status_text = self._compact_asr_status(self._asr_status_text)
         if getattr(self, "_app", None):
@@ -1150,11 +1144,11 @@ class InteractiveChat:
 
     def chat(self, user_input: str):
         """Send user message to agent and display response."""
-        self._stream_text = ""
-        self._stream_started = False
+        state = self._runtime_state()
+        state.reset_stream()
         self._last_chat_result = None
-        if self._runtime_state().turn_started_at is None:
-            self._runtime_state().begin_turn()
+        if state.turn_started_at is None:
+            state.begin_turn()
 
         try:
             result = self.agent.run_conversation(
@@ -1162,11 +1156,11 @@ class InteractiveChat:
                 conversation_history=self.agent.messages,
             )
             self._last_chat_result = result
-            self._runtime_state().last_result = result
+            state.last_result = result
         except Exception as exc:
             logger.exception("run_conversation failed: %s", exc)
             self._last_chat_result = {"error": str(exc), "completed": False}
-            self._runtime_state().fail_turn(str(exc))
+            state.fail_turn(str(exc))
             self._get_runtime_renderer().error(f"处理请求时出错: {exc}", leading_newline=True)
             return
 
@@ -1177,19 +1171,24 @@ class InteractiveChat:
         self._get_runtime_renderer().user_message("❯", user_input)
 
     def _get_turn_result_coordinator(self) -> RuntimeTurnResultCoordinator:
+        def _emit_waiting_for_skill_confirmation() -> None:
+            state = self._runtime_state()
+            state.set_status(RuntimeStatus.WAITING_FOR_USER, "Skill confirmation")
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+            self._pet_emit_for_runtime_status(
+                PetEventType.WAITING_FOR_USER,
+                text="Skill import confirmation",
+            )
+
         return RuntimeTurnResultCoordinator(
             RuntimeTurnResultHooks(
-                stream_text=lambda: self._stream_text,
-                stream_started=lambda: self._stream_started,
+                stream_text=lambda: self._runtime_state().stream_text,
+                stream_started=lambda: self._runtime_state().stream_started,
                 render_response=self._render_response,
                 render_interrupted=lambda: self._get_runtime_renderer().interrupted(
                     self._sym("⚡")
                 ),
-                emit_waiting_for_skill_confirmation=lambda: self._pet_emit(
-                    PetEventType.WAITING_FOR_USER,
-                    state=PetState.WAITING,
-                    text="Skill import confirmation",
-                ),
+                emit_waiting_for_skill_confirmation=_emit_waiting_for_skill_confirmation,
                 remember_pending_skill_confirmation=lambda confirmation: setattr(
                     self,
                     "_pending_skill_import_confirmation",
@@ -1221,24 +1220,27 @@ class InteractiveChat:
             self.subtask_manager = manager
 
         def _set_delegating_status(num_tasks: int) -> None:
-            self._lifecycle_idx = 5
-            self._spinner_text = f"0/{num_tasks} done · {num_tasks} running"
+            state = self._runtime_state()
+            state.set_status(RuntimeStatus.DELEGATING, f"0/{num_tasks} done · {num_tasks} running")
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
 
         def _set_aggregating_status() -> None:
-            self._lifecycle_idx = 6
-            self._spinner_text = "collecting results"
+            state = self._runtime_state()
+            state.set_status(RuntimeStatus.AGGREGATING, "collecting results")
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
 
         def _set_synthesis_status() -> None:
-            self._lifecycle_idx = 6
-            self._spinner_text = "summarizing results"
+            state = self._runtime_state()
+            state.set_status(RuntimeStatus.AGGREGATING, "summarizing results")
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
 
         def _clear_stream_state() -> None:
-            self._stream_text = ""
-            self._stream_started = False
+            self._reset_stream_accumulator()
 
         def _clear_subagent_state() -> None:
             self.subtask_manager = None
-            self._subagent_status_fragments = []
             self._pending_subagent_events.clear()
 
         def _run_synthesis(synthesis_prompt: str, extra_system: str) -> dict:
@@ -1255,23 +1257,21 @@ class InteractiveChat:
 
         return RuntimeDelegationCoordinator(
             RuntimeDelegationHooks(
-                emit_delegation_started=lambda payload: self._pet_emit(
+                emit_delegation_started=lambda payload: self._pet_emit_for_runtime_status(
                     PetEventType.DELEGATION_STARTED,
-                    state=PetState.CARRYING,
                     payload=payload,
                 ),
                 make_subtask_manager=self._make_subtask_manager,
                 set_subtask_manager=_set_subtask_manager,
                 replay_pending_subagent_events=_replay_pending_events,
-                update_subagent_status=self._update_subagent_status_fragments,
+                update_subagent_status=self._update_subagent_status_detail,
                 set_delegating_status=_set_delegating_status,
                 set_aggregating_status=_set_aggregating_status,
                 set_synthesis_status=_set_synthesis_status,
                 clear_stream_state=_clear_stream_state,
                 clear_subagent_state=_clear_subagent_state,
-                emit_delegation_completed=lambda payload: self._pet_emit(
+                emit_delegation_completed=lambda payload: self._pet_emit_for_runtime_status(
                     PetEventType.DELEGATION_COMPLETED,
-                    state=PetState.WAVING,
                     payload=payload,
                 ),
                 invalidate=_invalidate,
@@ -1357,6 +1357,10 @@ class InteractiveChat:
             return
         self._pending_secret_request = None
         self._last_rendered_secret_request_signature = None
+        state = self._runtime_state()
+        state.set_status(pending["resume_status"], pending["resume_detail"])
+        self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+        self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
         pending["response"] = response
         event = pending.get("event")
         if hasattr(event, "set"):
@@ -1532,13 +1536,20 @@ class InteractiveChat:
 
         def _set_busy(approve: bool) -> None:
             self._agent_running = True
-            self._lifecycle_idx = 3
-            self._spinner_text = "confirming Skill install" if approve else "cancelling Skill import"
+            state = self._runtime_state()
+            state.set_status(
+                RuntimeStatus.TOOLS,
+                "confirming Skill install" if approve else "cancelling Skill import",
+            )
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
 
         def _clear_busy() -> None:
             self._agent_running = False
-            self._spinner_text = ""
-            self._lifecycle_idx = 4
+            state = self._runtime_state()
+            state.set_status(RuntimeStatus.DONE)
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="done")
+            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED)
 
         def _invalidate_skill_registry() -> None:
             try:
@@ -2745,33 +2756,38 @@ class InteractiveChat:
 
         def _begin_background_turn(_notice: str) -> None:
             self._agent_running = True
-            self._lifecycle_idx = 1  # Connecting
-            self._runtime_state().begin_turn()
+            state = self._runtime_state()
+            state.begin_turn()
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="requesting")
+            self._pet_emit_for_runtime_status(PetEventType.TURN_STARTED, text="background process event")
             _safe_invalidate()
 
         def _run_background_turn(notice: str) -> None:
             set_current_session(self.session_id)
-            self._pet_emit(PetEventType.TURN_STARTED, state=PetState.JUMPING, text="background process event")
             self.chat(notice)
 
         def _finish_agent_turn(*, emit_done_status: bool) -> None:
-            duration = self._runtime_state().finish_turn(getattr(self, "_last_chat_result", {}) or {})
-            self._agent_running = False
-            self._active_tools.clear()
-            self._lifecycle_idx = 4  # Done
-            self._spinner_text = ""
-            if emit_done_status:
-                self._emit_runtime_event(EventType.STATUS_CHANGED, status=RuntimeStatus.DONE, message="done")
             result = getattr(self, "_last_chat_result", {}) or {}
-            if result.get("interrupted"):
-                self._pet_emit(PetEventType.TURN_INTERRUPTED, state=PetState.FAILED)
-            elif result.get("error"):
-                self._pet_emit(PetEventType.TURN_FAILED, state=PetState.FAILED, text=str(result.get("error")))
-            elif result.get("completed"):
-                self._pet_emit(PetEventType.TURN_COMPLETED, state=PetState.WAVING, payload={
+            state = self._runtime_state()
+            duration = state.finish_turn(result)
+            self._agent_running = False
+            if emit_done_status:
+                self._emit_runtime_event(
+                    EventType.STATUS_CHANGED,
+                    status=state.status,
+                    message=state.detail or str(state.status),
+                )
+            if state.status == RuntimeStatus.INTERRUPTED:
+                self._pet_emit_for_runtime_status(PetEventType.TURN_INTERRUPTED)
+            elif state.status == RuntimeStatus.ERROR:
+                self._pet_emit_for_runtime_status(PetEventType.TURN_FAILED, text=state.detail)
+            elif state.status == RuntimeStatus.DONE and result.get("completed"):
+                self._pet_emit_for_runtime_status(PetEventType.TURN_COMPLETED, payload={
                     "duration": duration,
                     "api_calls": result.get("api_calls", 0),
                 })
+            elif state.status == RuntimeStatus.DONE:
+                self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED)
             _safe_invalidate()
 
         background_coordinator = RuntimeBackgroundCoordinator(
@@ -2808,14 +2824,14 @@ class InteractiveChat:
 
         def _begin_user_turn(user_input: str) -> None:
             self._agent_running = True
-            self._lifecycle_idx = 1  # Connecting
-            self._runtime_state().begin_turn()
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=RuntimeStatus.REQUESTING, message="requesting")
+            state = self._runtime_state()
+            state.begin_turn()
+            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="requesting")
+            self._pet_emit_for_runtime_status(PetEventType.TURN_STARTED, text=user_input[:80])
             _safe_invalidate()
 
         def _run_user_turn(user_input: str) -> None:
             set_current_session(self.session_id)
-            self._pet_emit(PetEventType.TURN_STARTED, state=PetState.JUMPING, text=user_input[:80])
             self.chat(user_input)
 
         def _finish_user_turn() -> None:
@@ -3165,6 +3181,7 @@ class InteractiveChat:
             "status-bar-active": "bold #90caf9",
             "status-bar-done": "bold #50c878",
             "status-bar-warning": "bold #fcd34d",
+            "status-bar-error": "bold #f87171",
             "status-bar-ctx": "#ffcc00",
             "status-bar-subagent-running": "bold #90caf9",
             "status-bar-subagent-done": "bold #50c878",
