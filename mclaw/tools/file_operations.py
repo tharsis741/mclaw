@@ -4,9 +4,9 @@
 
 """Low-level file operations routed through the active Runtime PathPolicy.
 
-This module owns filesystem primitives only. Tool-facing schemas, delegation
-checks, and response shaping live in file_tools, while every direct path touch
-here is normalized or approved by Runtime PathPolicy before execution.
+This module owns filesystem primitives only. Tool-facing schemas, agent-relative
+path resolution, and response shaping live in file_tools, while every direct
+path touch here is normalized or approved by Runtime PathPolicy before execution.
 """
 
 from __future__ import annotations
@@ -122,7 +122,7 @@ def edit_file(path: str, old_block: str, new_block: str) -> str:
 
 def delete_file(path: str) -> str:
     """Delete a single file; directory removal is intentionally out of scope."""
-    abs_path = _checked_path(path, "write")
+    abs_path = _checked_path(path, "delete")
     if not abs_path.exists():
         raise FileNotFoundError(f"File not found: {path}")
     if abs_path.is_dir():

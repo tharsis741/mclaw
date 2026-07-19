@@ -184,11 +184,13 @@ M-Claw 当前已经包含：
 
 ### PathPolicy
 
-运行时会根据平台对路径进行分类，包括 workspace、exchange、runtime、system、device、home、tmp 等范围。系统路径和设备路径默认限制写入或执行，KaihongRuntime 还对 `/proc`、`/sys`、`/dev`、系统目录和交换目录做了专门策略。
+文件与终端工具默认使用主机完整文件系统权限，不创建 `MCLAW_HOME/workspace`，也不把当前工作目录伪装成沙箱边界；最终权限由操作系统和启动 M-Claw 的用户决定。首次进入工作区时仍沿用风险确认 UI，明确提示 full access 并只把用户确认写入用户级 `security.trusted_workspaces`，项目配置不能自行授权；文件操作过程中不会再临时弹出 runtime confirm。
+
+PathPolicy 只保留几类明确的防护栏：直接访问 `.env*`、SSH 私钥、常用云/容器凭据文件、`/proc/*/{environ,mem}` 和 `/proc/kcore` 会被拒绝；`MCLAW_HOME` 允许诊断读取但禁止通用工具改写；`/proc`、`/sys`、`/dev` 禁止递归搜索和删除/移动节点，但允许按名称显式读写设备节点。Windows 保护卷/UNC 根、用户目录和系统安装目录的锚点；Linux 保护 `/`、用户目录、关键系统目录及挂载点的锚点；Kaihong 保护 `/`、`/system`、`/vendor`、`/data`、`/data/local/release` 等锚点。锚点保护只针对目录本身，其后代仍是正常 host 路径，例如 `/data/local/release/bin/*` 可以正常更新。递归/通配符删除、无法解析目标的破坏性命令和 Skill 存储的非专用修改仍由安全层阻止。
 
 ### Scoped Secret
 
-凭据不会通过运行时直接暴露给模型。`secret_request_many` 只请求环境变量名和用途，保存后通过 `required_for` 作用域注入给对应 Skill、工具、runtime 或 channel。
+凭据不会通过运行时直接暴露给模型。`secret_request_many` 只请求环境变量名和用途，保存后通过 `required_for` 作用域注入给对应 Skill、工具、runtime 或 channel；未授权的敏感环境变量会从子进程删除，命令输出中的已授权值会被脱敏。
 
 ### Checkpoint
 
@@ -200,7 +202,7 @@ RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可
 
 ### 当前缺陷
 
-**M-Claw 1.0.0 的安全机制仍以路径策略、凭据作用域和可恢复执行为主，尚未形成统一的高风险操作确认、沙箱隔离和权限分级体系。**
+**M-Claw 1.0.0 不提供安全沙箱或权限分级。Full access 模式下的凭据与破坏性操作保护是降低误操作风险的防护栏，不能替代操作系统级隔离。**
 
 ## 系统运行时适配
 

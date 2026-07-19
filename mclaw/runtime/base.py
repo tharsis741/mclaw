@@ -59,7 +59,7 @@ class Runtime:
         env = sanitize_subprocess_env(os.environ, allowed_sensitive=allowed_sensitive)
         env["MCLAW_HOME"] = str(self.paths.mclaw_home)
         if extra:
-            env.update({str(key): str(value) for key, value in extra.items()})
+            env.update(sanitize_subprocess_env(extra, allowed_sensitive=allowed_sensitive))
         return env
 
     def exec(
@@ -207,7 +207,8 @@ class Runtime:
             "shell_executable": self.shell.executable,
             "search_provider": self.search.provider,
             "mclaw_home": str(self.paths.mclaw_home),
-            "workspace": str(self.paths.default_workspace()),
+            "filesystem_access": "full",
+            "credential_files": "protected",
             "features": self.features.to_dict(),
         }
         launch_domain = getattr(self, "launch_domain", None)

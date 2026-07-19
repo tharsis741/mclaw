@@ -2,11 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Delegated subagent execution with isolated runtime state.
+"""Delegated subagent execution with isolated conversation state.
 
 The delegate tool spawns child ``MClaw`` instances for independent subtasks.
-Each child receives a self-contained prompt, a restricted toolset, its own
-runtime workspace, and no inherited conversation history from the parent.
+Each child receives a self-contained prompt, a restricted toolset, the same
+host filesystem access as its parent, and no inherited conversation history.
 
 The parent context only receives the delegation call and final summaries.
 Intermediate child tool calls stay out of the parent message history so large
@@ -18,7 +18,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import shutil
 import time
 import threading
 import uuid
@@ -27,7 +26,6 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from mclaw.tools.path_extract import extract_absolute_paths
 from mclaw.tools.registry import registry, tool_error
 
 if TYPE_CHECKING:
@@ -60,27 +58,9 @@ ALLOWED_DELEGATE_TOOLSETS = frozenset([
 
 MAX_CONCURRENT_CHILDREN = 5
 MAX_DELEGATE_DEPTH = 2
-DEFAULT_MAX_ITERATIONS = 10  # hard cap after workspace preloading limits exploration
+DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 600
 MAX_INLINE_SUMMARY_CHARS = 800
-MAX_WORKSPACE_COPY_FILES = 300
-MAX_WORKSPACE_COPY_BYTES = 30 * 1024 * 1024
-DELEGATION_COPY_EXCLUDES = frozenset({
-    ".git",
-    ".hg",
-    ".svn",
-    ".venv",
-    "venv",
-    "env",
-    "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".mypy_cache",
-    "dist",
-    "build",
-    ".next",
-    ".turbo",
-})
 
 class SubtaskEvent:
     """Thread-safe progress event emitted by a child agent."""
@@ -116,7 +96,7 @@ def _build_child_system_prompt(
     goal: str,
     context: Optional[str] = None,
     *,
-    workspace_path: Optional[str] = None,
+    working_directory: Optional[str] = None,
     max_iterations: int = 10,
 ) -> str:
     """Build the lightweight child prompt without inheriting the parent prompt."""
@@ -127,16 +107,15 @@ def _build_child_system_prompt(
     ]
     if context and context.strip():
         parts.append(f"\n上下文信息：\n{context.strip()}")
-    if workspace_path and str(workspace_path).strip():
+    if working_directory and str(working_directory).strip():
         parts.append(
-            f"\n工作区路径：\n{workspace_path.strip()}"
+            f"\n当前工作目录：\n{working_directory.strip()}"
         )
     parts.append(
         "\n执行方式：\n"
         "- 以任务目标为准，结合上下文完成可独立处理的部分。\n"
-        "- 本地文件读写以工作区为默认范围；优先使用工作区内已有文件和上下文提供的路径。\n"
-        "- 只能通过 terminal 访问 delegation workspace 内的文件，不要声称拥有更高权限。\n"
-        "- 不要用 terminal 直接访问 delegation workspace 之外的路径。\n"
+        "- 文件工具和 terminal 拥有主机文件系统访问权限；优先在当前工作目录内完成任务。\n"
+        "- 不要读取 .env 等凭据文件；凭据由运行时按作用域提供。\n"
         "- 路径或文件不明确时，先做最小范围探索，再读取关键文件。\n"
         "- 信息收集类任务直接返回结论；需要交付文件时再创建或修改文件。\n"
         "- 遇到缺失文件、权限限制、工具不可用或上下文不足时，说明影响和已完成部分。\n"
@@ -154,9 +133,20 @@ def _build_child_system_prompt(
     return "\n".join(parts)
 
 
-def _resolve_workspace_hint(parent_agent) -> Optional[str]:
-    """Return the best local workspace hint available from the parent agent."""
+def _resolve_working_directory(parent_agent) -> Optional[str]:
+    """Return the parent's current local working directory when available."""
+    terminal_cwd = None
+    parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
+    if parent_session_id:
+        try:
+            from mclaw.tools.terminal_tool import _env_registry
+
+            terminal_cwd = getattr(_env_registry.get(parent_session_id), "cwd", None)
+        except ImportError:
+            pass
     candidates = [
+        terminal_cwd,
+        getattr(parent_agent, "workspace_path", None),
         os.getenv("TERMINAL_CWD"),
         getattr(parent_agent, "terminal_cwd", None),
         getattr(parent_agent, "cwd", None),
@@ -173,29 +163,6 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
     return None
 
 
-def _extract_paths_from_text(text: str) -> List[str]:
-    """Extract absolute Windows or Unix paths from free-form text."""
-    return [p for p in extract_absolute_paths(text) if os.path.isabs(os.path.normpath(p))]
-
-
-def _workspace_preparation_for_child(child: Any) -> Dict[str, Any]:
-    """Return the full workspace-copy report attached during child setup."""
-    preparation = getattr(child, "_workspace_preparation", None)
-    return preparation if isinstance(preparation, dict) else {}
-
-
-def _workspace_preparation_summary(child: Any) -> Dict[str, Any]:
-    """Collapse workspace-copy details for parent-facing pending metadata."""
-    preparation = _workspace_preparation_for_child(child)
-    return {
-        "detected_count": len(preparation.get("detected_paths", [])),
-        "copied_count": len(preparation.get("copied_paths", [])),
-        "failed_count": len(preparation.get("failed_paths", [])),
-        "skipped_count": len(preparation.get("skipped_paths", [])),
-        "workspace_path": preparation.get("workspace_path"),
-    }
-
-
 def _persist_oversized_summary(child: Any, summary: str) -> str | None:
     """Persist a full child handoff while keeping the parent prompt compact."""
     delegation_dir = getattr(child, "_delegation_dir", None)
@@ -203,261 +170,13 @@ def _persist_oversized_summary(child: Any, summary: str) -> str | None:
         return None
     handoff_path = Path(delegation_dir) / f"mclaw_handoff_{uuid.uuid4().hex[:8]}.md"
     try:
+        handoff_path.parent.mkdir(parents=True, exist_ok=True)
         handoff_path.write_text(summary, encoding="utf-8")
     except OSError as exc:
         logger.warning("Could not persist full subagent handoff: %s", exc)
         return None
     return str(handoff_path)
 
-
-def _generate_dir_tree(path: str, max_depth: int = 4, max_files_per_dir: int = 30) -> str:
-    """Generate a compact directory tree to reduce blind child exploration."""
-    root = Path(path)
-    if not root.exists() or not root.is_dir():
-        return ""
-
-    lines: list[str] = []
-
-    def _walk(p: Path, prefix: str, depth: int):
-        if depth > max_depth:
-            return
-        try:
-            entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-        except OSError:
-            return
-        # Cap each directory so large trees do not flood the prompt.
-        shown = entries[:max_files_per_dir]
-        for i, entry in enumerate(shown):
-            is_last = (i == len(shown) - 1)
-            connector = "└── " if is_last else "├── "
-            suffix = "/" if entry.is_dir() else ""
-            lines.append(f"{prefix}{connector}{entry.name}{suffix}")
-            if entry.is_dir() and depth < max_depth:
-                ext = "    " if is_last else "│   "
-                _walk(entry, prefix + ext, depth + 1)
-        if len(entries) > max_files_per_dir:
-            lines.append(f"{prefix}... ({len(entries) - max_files_per_dir} more items)")
-
-    lines.append(f"{root.name}/")
-    _walk(root, "", 1)
-    return "\n".join(lines)
-
-
-def _copy_path_limited(src: Path, dest: Path) -> tuple[int, int, list[str]]:
-    """Copy one file or directory into a bounded delegation workspace."""
-    copied_files = 0
-    copied_bytes = 0
-    skipped: list[str] = []
-
-    def _copy_file(file_src: Path, file_dest: Path) -> None:
-        nonlocal copied_files, copied_bytes
-        try:
-            size = file_src.stat().st_size
-        except OSError:
-            skipped.append(str(file_src))
-            return
-        if copied_files + 1 > MAX_WORKSPACE_COPY_FILES:
-            skipped.append(str(file_src))
-            return
-        if copied_bytes + size > MAX_WORKSPACE_COPY_BYTES:
-            skipped.append(str(file_src))
-            return
-        file_dest.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(file_src, file_dest)
-        copied_files += 1
-        copied_bytes += size
-
-    if src.is_file():
-        _copy_file(src, dest)
-        return copied_files, copied_bytes, skipped
-
-    for item in src.rglob("*"):
-        rel = item.relative_to(src)
-        if any(part in DELEGATION_COPY_EXCLUDES for part in rel.parts):
-            if item.is_dir():
-                skipped.append(str(item))
-            continue
-        if item.is_dir():
-            continue
-        _copy_file(item, dest / rel)
-
-    return copied_files, copied_bytes, skipped
-
-
-def _prepare_delegation_workspace(
-    goal: str,
-    context: Optional[str],
-    child_delegation_dir: Path,
-) -> tuple[str, Optional[str], str, Dict[str, Any]]:
-    """Copy referenced external paths into the child workspace and rewrite paths.
-
-    Child agents may only work inside their delegation workspace. Absolute
-    paths mentioned in the task are copied into that workspace under hard file
-    and byte limits, then the goal/context are rewritten so child terminal
-    access stays within the isolated tree.
-
-    Returns:
-        (new_goal, new_context, workspace_path, preparation_report)
-    """
-    workspace = child_delegation_dir / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
-
-    text = f"{goal or ''} {context or ''}"
-    paths = _extract_paths_from_text(text)
-    # Replace longer paths first to avoid partial substitutions.
-    paths = sorted(paths, key=len, reverse=True)
-
-    preparation: Dict[str, Any] = {
-        "workspace_path": str(workspace),
-        "detected_paths": paths,
-        "copied_paths": [],
-        "failed_paths": [],
-        "skipped_paths": [],
-    }
-
-    copied: Dict[str, str] = {}
-    covered_norms: set = set()
-
-    for original in paths:
-        norm = os.path.normpath(original)
-        if not os.path.exists(norm):
-            preparation["failed_paths"].append({
-                "path": original,
-                "reason": "not_found",
-            })
-            logger.warning("[delegate] external path not found for subagent copy: %s", original)
-            continue
-
-        # Skip paths already covered by a copied parent directory.
-        is_covered = False
-        for covered in covered_norms:
-            if norm == covered or norm.startswith(covered + os.sep):
-                is_covered = True
-                break
-        if is_covered:
-            preparation["skipped_paths"].append({
-                "path": original,
-                "reason": "covered_by_parent_copy",
-            })
-            continue
-
-        # Skip M-Claw internal runtime paths.
-        lower = norm.lower()
-        if ".mclaw" in lower:
-            skip = False
-            for marker in ("\\workspace\\", "/workspace/", "\\delegations\\", "/delegations/"):
-                if marker in lower:
-                    skip = True
-                    break
-            if skip:
-                preparation["skipped_paths"].append({
-                    "path": original,
-                    "reason": "mclaw_internal_path",
-                })
-                continue
-
-        basename = os.path.basename(norm) or "item"
-        dest = workspace / basename
-        counter = 1
-        while dest.exists() and os.path.normpath(dest) != norm:
-            dest = workspace / f"{basename}_{counter}"
-            counter += 1
-
-        try:
-            if os.path.isdir(norm):
-                copied_files, copied_bytes, skipped = _copy_path_limited(Path(norm), dest)
-                logger.info(
-                    "[delegate] copied directory for subagent: %s -> %s files=%d bytes=%d skipped=%d",
-                    norm,
-                    dest,
-                    copied_files,
-                    copied_bytes,
-                    len(skipped),
-                )
-                if copied_files <= 0:
-                    preparation["skipped_paths"].append({
-                        "path": original,
-                        "reason": "copy_limit_or_empty_directory",
-                        "skipped": skipped[:20],
-                    })
-                    continue
-            else:
-                copied_files, copied_bytes, skipped = _copy_path_limited(Path(norm), dest)
-                if copied_files <= 0:
-                    preparation["skipped_paths"].append({
-                        "path": original,
-                        "reason": "copy_limit_or_empty_file",
-                        "skipped": skipped[:20],
-                    })
-                    continue
-            copied[original] = str(dest)
-            covered_norms.add(norm)
-            preparation["copied_paths"].append({
-                "source": original,
-                "destination": str(dest),
-                "files": copied_files,
-                "bytes": copied_bytes,
-            })
-            if skipped:
-                preparation["skipped_paths"].append({
-                    "path": original,
-                    "reason": "partial_copy_skipped_items",
-                    "skipped": skipped[:20],
-                    "skipped_count": len(skipped),
-                })
-            logger.info("[delegate] copied for subagent: %s -> %s", norm, dest)
-        except Exception as exc:
-            preparation["failed_paths"].append({
-                "path": original,
-                "reason": "copy_error",
-                "error": str(exc),
-            })
-            logger.warning("[delegate] failed to copy %s: %s", norm, exc)
-
-    new_goal = goal or ""
-    new_context = context or ""
-    for original in sorted(copied.keys(), key=len, reverse=True):
-        replacement = copied[original]
-        new_goal = new_goal.replace(original, replacement)
-        if new_context:
-            new_context = new_context.replace(original, replacement)
-        # Also replace forward-slash variants, which commonly appear in JSON.
-        if "\\" in original:
-            forward = original.replace("\\", "/")
-            new_goal = new_goal.replace(forward, replacement)
-            if new_context:
-                new_context = new_context.replace(forward, replacement)
-
-    if paths:
-        prep_lines = [
-            "\n\n【Delegation workspace 准备情况】",
-            f"- workspace: {workspace}",
-            f"- 检测到外部路径: {len(preparation['detected_paths'])}",
-            f"- 已复制: {len(preparation['copied_paths'])}",
-            f"- 失败: {len(preparation['failed_paths'])}",
-            f"- 跳过: {len(preparation['skipped_paths'])}",
-        ]
-        for item in preparation["copied_paths"][:10]:
-            prep_lines.append(f"- 可用副本: {item['destination']}")
-        for item in preparation["failed_paths"][:10]:
-            prep_lines.append(f"- 未复制: {item['path']} ({item.get('reason', 'unknown')})")
-        if preparation["failed_paths"]:
-            prep_lines.append(
-                "处理文件时优先使用 workspace 内可用副本；缺少必要文件时，在总结中说明缺失路径和影响。"
-            )
-        new_context = (new_context or "") + "\n".join(prep_lines)
-
-    # Preload a directory tree so children can jump straight to relevant files.
-    dir_tree = _generate_dir_tree(str(workspace))
-    if dir_tree:
-        tree_block = (
-            f"\n\n【项目目录结构】\n"
-            f"```\n{dir_tree}\n```\n"
-            f"以上已包含 workspace 内目录树；请直接读取关键文件进行分析。"
-        )
-        new_context = (new_context or "") + tree_block
-
-    return new_goal, new_context or None, str(workspace), preparation
 
 def _strip_blocked_toolsets(toolsets: List[str]) -> List[str]:
     """Remove blocked toolset names from a requested child toolset list."""
@@ -514,8 +233,8 @@ def _build_child_agent(
 
     The parent decides the maximum capability envelope. This builder narrows it
     again for delegation, resolves optional delegation-specific provider
-    credentials, preloads referenced files into an isolated workspace, and
-    installs filtered tool definitions without re-running discovery.
+    credentials, and installs filtered tool definitions without re-running
+    discovery.
     """
     from mclaw.agent.core import MClaw
     from mclaw.tools.dispatch import get_tool_definitions, get_toolset_for_tool
@@ -558,25 +277,18 @@ def _build_child_agent(
     safe_tool_names = _filter_blocked_tools(list(all_tool_names))
     safe_tool_defs = [t for t in all_tool_defs if t["function"]["name"] in safe_tool_names]
 
-    # Pre-create the session id and runtime workspace before prompt assembly.
+    # Keep child conversation artifacts separate without restricting filesystem access.
     child_session_id = f"delegate_{getattr(parent_agent, 'session_id', 'unknown')}_{task_index}_{uuid.uuid4().hex[:6]}"
     from mclaw.runtime.manager import RuntimeManager
 
     runtime = RuntimeManager.current(parent_config if isinstance(parent_config, dict) else None)
-    child_runtime_workspace = runtime.paths.session_root(child_session_id)
-    child_runtime_workspace.mkdir(parents=True, exist_ok=True)
     delegation_root = runtime.paths.delegation_root()
     child_delegation_dir = delegation_root / child_session_id
-    child_delegation_dir.mkdir(parents=True, exist_ok=True)
-
-    # Copy external files into the child workspace and rewrite goal/context.
-    prepared_goal, prepared_context, workspace_path, workspace_preparation = _prepare_delegation_workspace(
-        goal, context, child_delegation_dir
-    )
+    working_directory = _resolve_working_directory(parent_agent) or os.getcwd()
 
     # Build the child prompt.
     child_prompt = _build_child_system_prompt(
-        prepared_goal, prepared_context, workspace_path=workspace_path, max_iterations=max_iterations
+        goal, context, working_directory=working_directory, max_iterations=max_iterations
     )
 
     delegation_cfg = parent_config.get("delegation", {}) if isinstance(parent_config, dict) else {}
@@ -640,7 +352,7 @@ def _build_child_agent(
         session_db=getattr(parent_agent, "_session_db", None),
         session_id=child_session_id,
         parent_session_id=getattr(parent_agent, "session_id", None),
-        workspace=getattr(parent_agent, "workspace_path", None),
+        workspace=working_directory,
         config=parent_config,
     )
 
@@ -652,11 +364,8 @@ def _build_child_agent(
     parent_depth = getattr(parent_agent, "_delegate_depth", 0)
     child._delegate_depth = parent_depth + 1
 
-    # Attach runtime and delegation workspace paths.
-    child._runtime_workspace_dir = child_runtime_workspace
+    # Keep a private handoff location for oversized summaries only.
     child._delegation_dir = child_delegation_dir
-    child._prepared_goal = prepared_goal
-    child._workspace_preparation = workspace_preparation
 
     # Inherit parent callbacks for streaming/status plumbing.
     child._print_fn = getattr(parent_agent, "_print_fn", print)
@@ -665,8 +374,8 @@ def _build_child_agent(
     child._status_callback = getattr(parent_agent, "_status_callback", None)
 
     logger.info(
-        "[subagent-%d] 已构建, runtime_workspace=%s, delegation=%s, tools=%s, depth=%d",
-        task_index, str(child_runtime_workspace), str(child_delegation_dir),
+        "[subagent-%d] 已构建, cwd=%s, delegation=%s, tools=%s, depth=%d",
+        task_index, working_directory, str(child_delegation_dir),
         list(safe_tool_names), child._delegate_depth
     )
 
@@ -710,7 +419,7 @@ def _run_single_child(
     try:
         # Run the child without parent conversation history.
         logger.info("[subagent-%d] entering run_conversation", task_index)
-        effective_goal = getattr(child, "_prepared_goal", None) or goal
+        effective_goal = goal
         summary_instruction = (
             "请基于以上任务和已经获得的全部工具结果，直接给出最终总结；不要再调用工具。"
         )
@@ -820,9 +529,6 @@ def _run_single_child(
             },
             "tool_trace": [],
         }
-        workspace_preparation = _workspace_preparation_for_child(child)
-        if workspace_preparation:
-            entry["workspace_preparation"] = workspace_preparation
         if summary_path:
             entry["summary_path"] = summary_path
 
@@ -866,6 +572,12 @@ def _run_single_child(
             ),
             "duration_seconds": duration,
         }
+    finally:
+        from mclaw.tools.terminal_tool import cleanup_session
+
+        child_session_id = getattr(child, "session_id", None)
+        if child_session_id:
+            cleanup_session(child_session_id)
 
 def _run_all_children_background(
     task_list: list,
@@ -1116,10 +828,6 @@ def delegate_task(
             "task_id": task_id,
             "num_tasks": len(task_list),
             "goals": [t["goal"] for t in task_list],
-            "workspace_preparation": [
-                _workspace_preparation_summary(child)
-                for _i, _task, child in children
-            ],
         }
 
         return json.dumps({
@@ -1191,10 +899,6 @@ def delegate_task(
         "results": results,
         "total_duration_seconds": total_duration,
         "success": True,
-        "workspace_preparation": [
-            _workspace_preparation_for_child(child)
-            for _i, _task, child in children
-        ],
     }, ensure_ascii=False)
 
 DELEGATE_TASK_SCHEMA = {

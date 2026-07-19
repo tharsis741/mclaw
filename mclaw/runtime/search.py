@@ -19,6 +19,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from mclaw.runtime.paths import CREDENTIAL_GLOBS
+
 
 class SearchProfile:
     """Search provider cascade bound to the active runtime path policy."""
@@ -70,9 +72,12 @@ class SearchProfile:
         return self._python_regex(root, pattern, file_pattern, effective_limit)
 
     def _rg(self, root: str, pattern: str, file_pattern: str | None, limit: int) -> str | None:
-        cmd = ["rg", "--color=never", "--no-heading", "-n", pattern, root]
+        cmd = ["rg"]
+        for credential_glob in CREDENTIAL_GLOBS:
+            cmd.extend(("--glob", credential_glob))
+        cmd.extend(("--glob", "!**/.git/**", "--color=never", "--no-heading", "-n", pattern, root))
         if file_pattern:
-            cmd[1:1] = ["--glob", file_pattern, "--glob", "!**/.git/**"]
+            cmd[1:1] = ["--glob", file_pattern]
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
@@ -90,7 +95,18 @@ class SearchProfile:
         escaped_root = root.replace("'", "''")
         escaped_pattern = pattern.replace("'", "''")
         escaped_filter = file_pattern.replace("'", "''") if file_pattern else ""
-        filter_line = f"| Where-Object {{ $_.Name -like '{escaped_filter}' }}" if escaped_filter else ""
+        name_filter = f"$_.Name -like '{escaped_filter}' -and " if escaped_filter else ""
+        credential_names = "@('.git-credentials','.netrc','.npmrc','.pypirc')"
+        private_keys = "@('id_rsa','id_dsa','id_ecdsa','id_ed25519')"
+        filter_line = (
+            f"| Where-Object {{ {name_filter}"
+            "$_.Name -notlike '.env*' "
+            f"-and $_.Name -notin {credential_names} "
+            f"-and -not ($_.Name -in {private_keys} -and $_.Directory.Name -eq '.ssh') "
+            "-and $_.FullName -notmatch '[\\/]\\.aws[\\/]credentials$' "
+            "-and $_.FullName -notmatch '[\\/]\\.kube[\\/]config$' "
+            "-and $_.FullName -notmatch '[\\/]\\.docker[\\/]config\\.json$' }"
+        )
         script = (
             "$ErrorActionPreference='Stop';"
             f"$files = Get-ChildItem -LiteralPath '{escaped_root}' -Recurse -File {filter_line};"
@@ -130,6 +146,8 @@ class SearchProfile:
         for file_name in find_result.stdout.splitlines():
             if file_pattern and not fnmatch.fnmatch(Path(file_name).name, file_pattern):
                 continue
+            if not self.runtime.paths.check("read", file_name).allowed:
+                continue
             try:
                 grep = subprocess.run(["grep", "-n", "-E", pattern, file_name], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=10)
             except (FileNotFoundError, OSError, subprocess.TimeoutExpired):
@@ -156,6 +174,8 @@ class SearchProfile:
                 if file_pattern and not fnmatch.fnmatch(file_name, file_pattern):
                     continue
                 path = os.path.join(current_root, file_name)
+                if not self.runtime.paths.check("read", path).allowed:
+                    continue
                 searched += 1
                 if searched > 5000:
                     return "[search limit reached: scanned 5000 files, narrow the directory]"

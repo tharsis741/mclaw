@@ -2,12 +2,12 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Register the terminal tool and constrain shell execution by runtime policy.
+"""Register the terminal tool with scoped secrets and small safety guards.
 
-The terminal tool preserves per-session cwd/env state, supports background
+The terminal tool preserves per-session cwd state, supports background
 processes through the process registry, scopes authorized secrets into command
-environments, and blocks shell mutations against managed Skill storage. Child
-agents are forced into their delegation workspace before commands execute.
+environments, and blocks credential-file access and shell mutations against
+managed Skill storage.
 """
 
 import json
@@ -22,8 +22,8 @@ from mclaw.constants import get_skills_dir
 from mclaw.runtime.manager import RuntimeManager
 from mclaw.runtime.secrets import SecretRequestError, build_scoped_env, redact_secret_values
 from mclaw.safety.mutation_detector import is_destructive_terminal_command
+from mclaw.safety.path_resolver import extract_mutation_targets_from_command
 from mclaw.skills_hub.paths import get_skill_drafting_dir
-from mclaw.tools.path_extract import extract_absolute_paths
 from mclaw.tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -46,9 +46,17 @@ class RuntimeTerminalSession:
 
 _env_registry: dict[str, RuntimeTerminalSession] = {}
 _current_session_id: str | None = None
-_SHELL_TOKEN_RE = re.compile(r'(&&|\|\||[;|])|"([^"]+)"|\'([^\']+)\'|([^\s;&|<>`]+)')
-_REDIRECT_TARGET_RE = re.compile(
-    r'(?:^|[\s;&|])(?:\d*)>{1,2}(?![>&])\s*(?:"([^"]+)"|\'([^\']+)\'|([^\s;&|]+))'
+_CREDENTIAL_FILE_REFERENCE_RE = re.compile(
+    r"""(?:
+        (?<![\w])\.env[^\s/\\\"';&|]*
+        |(?:^|[/\\])\.ssh[/\\](?:id_rsa|id_dsa|id_ecdsa|id_ed25519)(?=$|[\s\"';&|])
+        |(?:^|[/\\])\.aws[/\\]credentials(?=$|[\s\"';&|])
+        |(?:^|[/\\])\.kube[/\\]config(?=$|[\s\"';&|])
+        |(?:^|[/\\])\.docker[/\\]config\.json(?=$|[\s\"';&|])
+        |(?<![\w.-])(?:\.git-credentials|\.netrc|\.npmrc|\.pypirc)(?![\w.-])
+        |[/\\]proc[/\\](?:[^/\\\s\"']+[/\\](?:environ|mem)|kcore)\b
+    )""",
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -106,130 +114,9 @@ def _skill_store_terminal_error_message(root: Path) -> str:
     )
 
 
-def _shell_tokens(command: str) -> list[str]:
-    """Tokenize enough shell syntax to identify mutation operands conservatively."""
-    tokens: list[str] = []
-    for match in _SHELL_TOKEN_RE.finditer(command):
-        token = next((group for group in match.groups() if group), "")
-        token = str(token or "").strip()
-        if token:
-            tokens.append(token)
-    return tokens
-
-
-def _command_name(token: str) -> str:
-    """Normalize an executable token for cross-shell verb matching."""
-    cleaned = str(token or "").strip().strip("\"'").replace("\\", "/")
-    name = cleaned.rsplit("/", 1)[-1].lower()
-    if name.endswith(".exe"):
-        name = name[:-4]
-    return name
-
-
-def _operands_after(tokens: list[str], index: int) -> list[str]:
-    """Collect non-option operands until the next simple shell separator."""
-    operands: list[str] = []
-    for token in tokens[index + 1:]:
-        cleaned = str(token or "").strip().strip("\"'")
-        if not cleaned:
-            continue
-        lowered = cleaned.lower()
-        if lowered in {"|", "&&", "||", ";"}:
-            break
-        if re.match(r"^\d*>", cleaned) or cleaned.startswith(">"):
-            continue
-        if cleaned.startswith("-"):
-            continue
-        operands.append(cleaned)
-    return operands
-
-
-def _first_verb_operands(tokens: list[str], verbs: set[str]) -> tuple[int, list[str]] | None:
-    for index, token in enumerate(tokens):
-        if _command_name(token) in verbs:
-            return index, _operands_after(tokens, index)
-    return None
-
-
-def _redirection_targets(command: str) -> list[str]:
-    """Extract output redirection targets that imply filesystem mutation."""
-    targets: list[str] = []
-    for match in _REDIRECT_TARGET_RE.finditer(command or ""):
-        target = next((group for group in match.groups() if group), "")
-        target = str(target or "").strip().strip("\"'")
-        if not target or target.startswith("&"):
-            continue
-        targets.append(target)
-    return targets
-
-
 def _skill_store_mutation_targets(command: str, workdir: str = "") -> list[str]:
     """Return shell mutation targets, not read-only Skill asset inputs."""
-    targets: list[str] = []
-    tokens = _shell_tokens(command)
-
-    targets.extend(_redirection_targets(command))
-
-    copy_verbs = {"cp", "copy", "copy-item", "ci", "install"}
-    move_verbs = {"mv", "move", "move-item", "mi", "ren", "rename", "rename-item", "rni"}
-    delete_verbs = {"rm", "rmdir", "del", "erase", "rd", "remove-item", "ri", "shred"}
-    content_verbs = {
-        "set-content",
-        "sc",
-        "add-content",
-        "ac",
-        "clear-content",
-        "clc",
-        "out-file",
-        "new-item",
-        "ni",
-        "truncate",
-    }
-
-    match = _first_verb_operands(tokens, copy_verbs)
-    if match is not None:
-        _, operands = match
-        if operands:
-            targets.append(operands[-1])
-
-    match = _first_verb_operands(tokens, move_verbs | delete_verbs)
-    if match is not None:
-        _, operands = match
-        targets.extend(operands)
-
-    match = _first_verb_operands(tokens, content_verbs)
-    if match is not None:
-        _, operands = match
-        if operands:
-            targets.append(operands[0])
-
-    match = _first_verb_operands(tokens, {"sed"})
-    if match is not None and re.search(r"(?:^|\s)sed\s+.*(?:^|\s)-i\b", command, re.IGNORECASE):
-        _, operands = match
-        if operands:
-            targets.append(operands[-1])
-
-    for token in tokens:
-        lowered = token.lower()
-        if lowered.startswith("of="):
-            targets.append(token[3:])
-
-    match = _first_verb_operands(tokens, {"git"})
-    if match is not None and re.search(r"\bgit\s+(?:reset|clean|checkout)\b", command, re.IGNORECASE):
-        _, operands = match
-        if operands:
-            targets.extend(operands)
-        elif workdir:
-            targets.append(".")
-
-    seen: set[str] = set()
-    unique: list[str] = []
-    for target in targets:
-        cleaned = str(target or "").strip().strip("\"'").rstrip(".,;)]}")
-        if cleaned and cleaned not in seen:
-            seen.add(cleaned)
-            unique.append(cleaned)
-    return unique
+    return extract_mutation_targets_from_command(command, workdir)
 
 
 def _skill_store_terminal_mutation_error(command: str, workdir: str = "") -> str | None:
@@ -251,6 +138,13 @@ def _skill_store_terminal_mutation_error(command: str, workdir: str = "") -> str
             if _is_path_within(candidate_path, root):
                 return _skill_store_terminal_error_message(root)
     return None
+
+
+def _credential_file_terminal_error(command: str) -> str | None:
+    """Block direct credential-file access; scoped secret injection is supported."""
+    if not _CREDENTIAL_FILE_REFERENCE_RE.search(command or ""):
+        return None
+    return "Credential file access is blocked; use secret_request_many and terminal(required_for=...)."
 
 
 def set_current_session(session_id: str | None) -> None:
@@ -278,23 +172,23 @@ def _get_or_create_env(
     timeout: int,
     env_vars: dict | None = None,
     scoped_secret_keys: set[str] | None = None,
+    session_key: str | None = None,
 ) -> RuntimeTerminalSession:
     """Create or update the active session environment snapshot."""
-    global _env_registry, _current_session_id
+    active_session = session_key if session_key is not None else _current_session_id
 
-    if _current_session_id is None:
+    if not active_session:
         return RuntimeTerminalSession(cwd=cwd or os.getcwd(), timeout=timeout, env=dict(env_vars or {}), scoped_secret_keys=set(scoped_secret_keys or set()))
 
-    if _current_session_id not in _env_registry:
+    if active_session not in _env_registry:
         env = RuntimeTerminalSession(cwd=cwd or os.getcwd(), timeout=timeout, env=dict(env_vars or {}), scoped_secret_keys=set(scoped_secret_keys or set()))
-        _env_registry[_current_session_id] = env
+        _env_registry[active_session] = env
     else:
-        env = _env_registry[_current_session_id]
+        env = _env_registry[active_session]
         if cwd:
             env.cwd = cwd
         env.timeout = timeout
-        if env_vars:
-            env.env.update(env_vars)
+        env.env = dict(env_vars or {})
         env.scoped_secret_keys = set(scoped_secret_keys or set())
 
     return env
@@ -372,10 +266,13 @@ def terminal_tool(
     pty: bool = False,
     notify_on_complete: bool = False,
     required_for: str | None = None,
+    session_key: str | None = None,
 ) -> str:
     """Execute a shell command; optional background via process registry."""
     effective_timeout = _coerce_timeout(timeout) or DEFAULT_TIMEOUT
     effective_cwd = workdir or ""
+    active_session = session_key if session_key is not None else _current_session_id
+    session_env = _env_registry.get(active_session) if active_session else None
     try:
         scoped_env, scoped_secret_keys = build_scoped_env(required_for)
     except SecretRequestError as exc:
@@ -387,7 +284,8 @@ def terminal_tool(
             },
             ensure_ascii=False,
         )
-    blocked = _skill_store_terminal_mutation_error(command, effective_cwd)
+    guard_cwd = effective_cwd or (session_env.cwd if session_env else "")
+    blocked = _credential_file_terminal_error(command) or _skill_store_terminal_mutation_error(command, guard_cwd)
     if blocked:
         return json.dumps(
             {
@@ -401,17 +299,15 @@ def terminal_tool(
     if background:
         from mclaw.tools.process_registry import process_registry
 
-        effective_task_id = task_id or _current_session_id or ""
+        effective_task_id = task_id or active_session or ""
 
         # Without an explicit workdir, inherit the current session cwd/env so
         # background and foreground commands share the same environment snapshot.
-        session_env = _env_registry.get(_current_session_id) if _current_session_id else None
         # Explicit workdir takes priority; fall back to session_env.cwd only when not specified.
         bg_cwd = session_env.cwd if session_env else None
         if effective_cwd:
             bg_cwd = effective_cwd
-        bg_env_vars = dict(session_env.env) if session_env and session_env.env else {}
-        bg_env_vars.update(scoped_env)
+        bg_env_vars = dict(scoped_env)
 
         # PTY support is optional; pipe mode remains the portable execution path.
         use_pty = False
@@ -434,7 +330,7 @@ def terminal_tool(
                 command=command,
                 cwd=bg_cwd,
                 task_id=effective_task_id,
-                session_key=_current_session_id or "",
+                session_key=active_session or "",
                 env_vars=bg_env_vars,
                 use_pty=use_pty,
                 scoped_secret_keys=scoped_secret_keys,
@@ -500,7 +396,7 @@ def terminal_tool(
                         watcher = process_registry.register_watcher(
                             session_id=proc_session.id,
                             check_interval=effective_interval,
-                            session_key=_current_session_id or "",
+                            session_key=active_session or "",
                             notify_on_complete=bool(notify_on_complete),
                         )
                     except Exception as exc:
@@ -533,6 +429,7 @@ def terminal_tool(
         timeout=effective_timeout,
         env_vars=scoped_env,
         scoped_secret_keys=scoped_secret_keys,
+        session_key=active_session,
     )
 
     try:
@@ -580,57 +477,18 @@ def terminal_tool(
 
 
 def _handle_terminal(args: dict, **kwargs) -> str:
-    """Registry handler that applies parent-agent delegation before execution."""
+    """Registry handler that applies parent configuration before execution."""
     parent_agent = kwargs.get("parent_agent")
     effective_workdir = args.get("workdir")
     command = args.get("command") or ""
     cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
     cfg = cfg or {}
     effective_timeout = _resolve_timeout(args.get("timeout"), cfg if isinstance(cfg, dict) else {})
+    from mclaw.tools.dispatch import get_current_session_id
 
-    # Child agents must execute from the runtime-approved delegation workspace.
-    delegation_dir = None
-    if parent_agent is not None and getattr(parent_agent, "_delegate_depth", 0) > 0:
-        delegation_dir = getattr(parent_agent, "_delegation_dir", None)
-        if delegation_dir:
-            delegation_dir = str(delegation_dir)
-            effective_workdir = delegation_dir
-
-            # Absolute paths must pass Runtime PathPolicy and remain inside
-            # the delegation directory.
-            abs_paths = extract_absolute_paths(command)
-            runtime = RuntimeManager.current(cfg if isinstance(cfg, dict) else None)
-            for abs_path in abs_paths:
-                try:
-                    decision = runtime.paths.check("execute", abs_path, base=delegation_dir)
-                    if not decision.allowed:
-                        return json.dumps({
-                            "error": decision.error_message(),
-                        }, ensure_ascii=False)
-                    normalized = decision.resolved
-                    root = Path(delegation_dir).resolve()
-                    try:
-                        allowed = normalized.is_relative_to(root)
-                    except AttributeError:
-                        allowed = os.path.commonpath([
-                            os.path.normcase(str(normalized)),
-                            os.path.normcase(str(root)),
-                        ]) == os.path.normcase(str(root))
-                    if not allowed:
-                        return json.dumps({
-                            "error": (
-                                f"子代理只能操作 delegation 目录内的资源。"
-                                f"\n禁止的绝对路径: {abs_path}"
-                                f"\n允许的目录: {delegation_dir}"
-                            ),
-                        }, ensure_ascii=False)
-                except Exception as exc:
-                    return json.dumps({
-                        "error": (
-                            "Delegation path validation failed for absolute path "
-                            f"{abs_path}: {exc}"
-                        ),
-                    }, ensure_ascii=False)
+    session_key = get_current_session_id() or str(getattr(parent_agent, "session_id", "") or "")
+    if not effective_workdir and session_key not in _env_registry:
+        effective_workdir = str(getattr(parent_agent, "workspace_path", "") or "").strip() or None
 
     return terminal_tool(
         command=command,
@@ -642,6 +500,7 @@ def _handle_terminal(args: dict, **kwargs) -> str:
         pty=bool(args.get("pty", False)),
         notify_on_complete=bool(args.get("notify_on_complete", False)),
         required_for=args.get("required_for"),
+        session_key=session_key or None,
     )
 
 

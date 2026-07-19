@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-from mclaw.safety.path_resolver import extract_absolute_paths_from_command, repair_common_mojibake
+from mclaw.safety.path_resolver import extract_mutation_target_actions_from_command, repair_common_mojibake
 
 _DESTRUCTIVE_TERMINAL_PATTERNS = re.compile(
     r"""(?:^|\s|&&|\|\||;|`)(?:
@@ -45,33 +45,43 @@ class MutationIntent:
     action: str
     raw_command: str = ""
     target_paths: list[str] | None = None
+    target_actions: list[str] | None = None
     confidence: str = "detected"
 
     def __post_init__(self) -> None:
         if self.target_paths is None:
             self.target_paths = []
+        if self.target_actions is None:
+            self.target_actions = [self.action] * len(self.target_paths)
 
 
 def detect_mutation(tool_name: str, arguments: dict[str, Any]) -> MutationIntent:
     """Classify tool-call arguments before safety policy and checkpointing."""
     if tool_name in {"write_file", "patch", "edit_file", "delete_file"}:
         path = arguments.get("path")
-        return MutationIntent(True, tool_name, target_paths=[path] if path else [])
+        action = "delete" if tool_name == "delete_file" else "write"
+        return MutationIntent(True, action, target_paths=[path] if path else [])
     if tool_name == "skill_manage":
         action = str(arguments.get("action") or "skill_manage")
-        return MutationIntent(action not in {"list", "view", "search"}, action)
+        mutates = action not in {"list", "view", "search"}
+        return MutationIntent(mutates, "managed_mutation" if mutates else "read")
     if tool_name != "terminal":
         return MutationIntent(False, tool_name)
 
     raw = repair_common_mojibake(str(arguments.get("command") or ""))
     if not is_destructive_terminal_command(raw):
         return MutationIntent(False, "read", raw_command=raw)
-    target_paths = extract_absolute_paths_from_command(raw)
+    target_actions = extract_mutation_target_actions_from_command(
+        raw,
+        str(arguments.get("workdir") or ""),
+    )
+    target_paths = [path for _action, path in target_actions]
     return MutationIntent(
         True,
         terminal_action(raw),
         raw_command=raw,
         target_paths=target_paths,
+        target_actions=[action for action, _path in target_actions],
         confidence="targeted" if target_paths else "workspace",
     )
 
@@ -86,8 +96,10 @@ def is_destructive_terminal_command(command: str) -> bool:
 def terminal_action(command: str) -> str:
     """Map a destructive terminal command into the policy action vocabulary."""
     command = repair_common_mojibake(command or "").lower()
-    if re.search(r'\b(rm|del|erase|remove-item|ri|rmdir|rd)\b', command):
-        if re.search(r'(-r|-recurse|/s)\b', command):
+    if re.search(r'\b(rmdir|rd)\b', command):
+        return "directory_delete"
+    if re.search(r'\b(rm|del|erase|remove-item|ri)\b', command):
+        if has_recursive_delete_flag(command):
             return "directory_delete"
         return "delete"
     if re.search(r'\b(mv|move|ren|rename|move-item|rename-item)\b', command):
@@ -99,3 +111,13 @@ def terminal_action(command: str) -> str:
     if re.search(r'\b(add-content|new-item)\b', command):
         return "write"
     return "unknown_destructive"
+
+
+def has_recursive_delete_flag(command: str) -> bool:
+    if re.search(r"\brm\b", command, re.IGNORECASE) and re.search(
+        r"(?:^|\s)-(?!-)[A-Za-z]*r[A-Za-z]*(?=\s|$)",
+        command,
+        re.IGNORECASE,
+    ):
+        return True
+    return bool(re.search(r"(?:^|\s)(?:--recursive|-recurse|/s)(?:\s|$)", command, re.IGNORECASE))

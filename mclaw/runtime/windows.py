@@ -36,17 +36,18 @@ class WindowsRuntime(Runtime):
     def __init__(self) -> None:
         home = get_mclaw_home()
         shell = self._shell_profile()
-        paths = PathPolicy(
-            kind=self.kind,
-            mclaw_home=home,
-            workspace_root=home / "workspace",
-            runtime_roots=(home,),
-            system_roots=tuple(Path(p) for p in (
+        anchors = [Path.home()]
+        anchors.extend(
+            Path(value)
+            for value in (
                 os.environ.get("SystemRoot", r"C:\Windows"),
                 os.environ.get("ProgramFiles", r"C:\Program Files"),
                 os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
-            ) if p),
+                os.environ.get("ProgramData", r"C:\ProgramData"),
+            )
+            if value
         )
+        paths = PathPolicy(mclaw_home=home, protected_anchors=anchors)
         features = runtime_features(
             checkpoint=FeatureState.ENABLED if shutil.which("git") else FeatureState.DISABLED,
             pet=_feature_from_module("PySide6"),

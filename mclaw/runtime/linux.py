@@ -36,12 +36,22 @@ class LinuxRuntime(Runtime):
         home = get_mclaw_home()
         shell = self._shell_profile()
         paths = PathPolicy(
-            kind=self.kind,
             mclaw_home=home,
-            workspace_root=home / "workspace",
-            runtime_roots=(home,),
-            system_roots=(Path("/etc"), Path("/usr"), Path("/bin"), Path("/sbin"), Path("/boot")),
-            device_roots=(Path("/proc"), Path("/sys"), Path("/dev")),
+            protected_anchors=(
+                Path.home(),
+                Path("/"),
+                Path("/boot"),
+                Path("/etc"),
+                Path("/usr"),
+                Path("/bin"),
+                Path("/sbin"),
+                Path("/lib"),
+                Path("/lib64"),
+                Path("/var"),
+                Path("/root"),
+            ),
+            pseudo_roots=(Path("/proc"), Path("/sys"), Path("/dev")),
+            protect_mount_points=True,
         )
         features = runtime_features(
             checkpoint=FeatureState.ENABLED if shutil.which("git") else FeatureState.DISABLED,

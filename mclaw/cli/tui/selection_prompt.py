@@ -18,7 +18,7 @@ from mclaw.cli.tui.console import MClawConsole
 
 
 def prompt_workspace_risk_confirmation(workspace: str) -> bool:
-    """Ask whether M-Claw may access the current workspace before startup continues."""
+    """Ask whether a trusted project may drive M-Claw's full-host access."""
     selected = {"index": 0}
 
     console = MClawConsole()
@@ -31,7 +31,9 @@ def prompt_workspace_risk_confirmation(workspace: str) -> bool:
         ]
         result: StyleAndTextTuples = [
             ("class:title", "M-Claw 风险确认\n"),
-            ("", "M-Claw 可能读取、修改或执行当前工作区内容。请选择：\n\n"),
+            ("", f"当前工作区：{workspace}\n\n"),
+            ("", "M-Claw 不提供文件系统沙箱，将以当前系统用户权限读取、修改或执行工作区内外的内容。\n"),
+            ("", "请仅信任来源可靠的项目；继续即表示你理解风险并对执行的命令和文件修改负责。\n\n"),
         ]
         for index, label in enumerate(items):
             if index == selected["index"]:

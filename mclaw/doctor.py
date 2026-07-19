@@ -537,7 +537,8 @@ def run_doctor() -> list[CheckResult]:
                 True,
                 (
                     f"kind={info['kind']}; shell={info['shell']}; "
-                    f"search={info['search_provider']}; workspace={info['workspace']}"
+                    f"search={info['search_provider']}; filesystem={info['filesystem_access']}; "
+                    f"credential_files={info['credential_files']}"
                 ),
             )
         )

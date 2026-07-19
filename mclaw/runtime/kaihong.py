@@ -51,21 +51,21 @@ class KaihongRuntime(Runtime):
     def __init__(self) -> None:
         home = get_mclaw_home()
         paths = PathPolicy(
-            kind=self.kind,
             mclaw_home=home,
-            workspace_root=home / "workspace",
-            exchange_roots=(
-                Path("/data/acs/acs/file_sharing/download"),
-                Path("/data/acs/acs/file_sharing/documents"),
-                Path("/data/acs/acs/file_sharing/desktop"),
-                Path("/mnt/data/external/data-1"),
+            protected_anchors=(
+                Path("/"),
+                Path("/system"),
+                Path("/vendor"),
+                Path("/sys_prod"),
+                Path("/chip_prod"),
+                Path("/data"),
+                self.release_root,
+                Path("/data/app"),
+                Path("/data/service"),
+                Path("/data/docker"),
             ),
-            workspace_roots=(Path("/data/local/tmp/mclaw_src"),),
-            workspace_prefixes=("/data/local/tmp/M-Claw",),
-            runtime_roots=(self.release_root, Path("/bin"), Path("/usr"), Path("/proc/self")),
-            system_roots=(Path("/"), Path("/system"), Path("/vendor"), Path("/sys_prod"), Path("/chip_prod")),
-            device_roots=(Path("/proc"), Path("/sys"), Path("/dev"), Path("/data/docker"), Path("/data/app"), Path("/data/service")),
-            tmp_root=Path("/data/local/tmp"),
+            pseudo_roots=(Path("/proc"), Path("/sys"), Path("/dev")),
+            protect_mount_points=True,
         )
         features = runtime_features(
             checkpoint=FeatureState.DISABLED,
@@ -123,7 +123,7 @@ class KaihongRuntime(Runtime):
             }
         )
         if extra:
-            env.update({str(key): str(value) for key, value in extra.items()})
+            env.update(sanitize_subprocess_env(extra, allowed_sensitive=allowed_sensitive))
         return env
 
     def prompt_os_label(self, os_name: str, os_release: str) -> str:

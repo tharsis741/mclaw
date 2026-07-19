@@ -69,11 +69,6 @@ class BootstrapPathResolver:
         return Path.home() / ".mclaw"
 
     @staticmethod
-    def default_workspace() -> Path:
-        """Return the bootstrap workspace derived from the resolved home."""
-        return BootstrapPathResolver.resolve_mclaw_home() / "workspace"
-
-    @staticmethod
     def ensure_env() -> Path:
         """Set MCLAW_HOME in-process so later imports share one path root."""
         home = BootstrapPathResolver.resolve_mclaw_home()

@@ -6,8 +6,8 @@
 
 This module exposes the public tool schemas and handlers for read, write,
 patch, edit, delete, search, and directory listing operations. Low-level file
-IO remains in file_operations; this layer owns tool-facing limits, delegation
-path policy, Skill-store protection, and registry registration.
+IO remains in file_operations; this layer owns tool-facing limits,
+Skill-store protection, and registry registration.
 """
 
 import json
@@ -16,7 +16,6 @@ import os
 from pathlib import Path
 
 from mclaw.tools import file_operations as ops
-from mclaw.runtime.manager import RuntimeManager
 from mclaw.tools.registry import registry
 from mclaw.constants import get_skills_dir
 from mclaw.skills_hub.paths import get_skill_drafting_dir
@@ -77,39 +76,6 @@ def _skill_store_mutation_error(file_path: str, tool_name: str) -> str | None:
                 "and skill_manage(action=\"validate\") before reporting creation success."
             )
     return None
-
-
-def _check_delegation_path(file_path: str, parent_agent, mode: str = "write") -> tuple[bool, str, str]:
-    """Validate delegated file access and return (allowed, error_message, resolved_path)."""
-    if parent_agent is None:
-        return True, "", file_path
-    if getattr(parent_agent, "_delegate_depth", 0) <= 0:
-        return True, "", file_path
-    delegation_dir = getattr(parent_agent, "_delegation_dir", None)
-    if delegation_dir is None:
-        return True, "", file_path
-    preparation = getattr(parent_agent, "_workspace_preparation", None)
-    workspace_dir = preparation.get("workspace_path") if isinstance(preparation, dict) else None
-    base_dir = workspace_dir or delegation_dir
-
-    runtime = RuntimeManager.current(getattr(parent_agent, "config", None))
-    action = "read" if mode == "read" else "write"
-    decision = runtime.paths.check(action, file_path, base=str(base_dir))
-    if not decision.allowed:
-        return False, decision.error_message(), file_path
-
-    try:
-        abs_path = decision.resolved
-        root = Path(delegation_dir).resolve()
-        if not _is_path_within(abs_path, root):
-            return False, (
-                f"子代理只能访问 {delegation_dir} 下的文件，"
-                f"禁止访问: {file_path}"
-            ), file_path
-    except Exception:
-        logger.debug("Delegation path validation failed for %s", file_path, exc_info=True)
-        return False, f"无效路径: {file_path}", file_path
-    return True, "", str(decision.resolved)
 
 
 # read_file tool.
@@ -568,15 +534,21 @@ LIST_DIRECTORY_SCHEMA = {
 
 # Dispatch wrappers: registry calls handler(args_dict, **meta_kwargs).
 
+def _resolve_agent_path(path: str, parent_agent=None) -> str:
+    """Resolve relative tool paths against the agent's inherited workspace."""
+    workspace = str(getattr(parent_agent, "workspace_path", "") or "").strip()
+    if not workspace:
+        return path
+    value = os.path.expandvars(str(path or "")).strip().strip('"').strip("'") or "."
+    candidate = Path(value).expanduser()
+    return str(candidate if candidate.is_absolute() else Path(workspace).expanduser() / candidate)
+
 def _handle_read_file(args: dict, **kw) -> str:
-    path = args.get("path", "")
-    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"), mode="read")
-    if not safe:
-        return json.dumps({"error": err}, ensure_ascii=False)
     parent_agent = kw.get("parent_agent")
+    path = _resolve_agent_path(args.get("path", ""), parent_agent)
     task_id = getattr(parent_agent, "session_id", "default") if parent_agent else "default"
     return read_file_tool(
-        path=resolved_path,
+        path=path,
         offset=args.get("offset", 0),
         limit=args.get("limit"),
         task_id=task_id,
@@ -584,59 +556,41 @@ def _handle_read_file(args: dict, **kw) -> str:
     )
 
 def _handle_write_file(args: dict, **kw) -> str:
-    path = args.get("path", "")
-    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
-    if not safe:
-        return json.dumps({"error": err, "success": False}, ensure_ascii=False)
-    return write_file_tool(path=resolved_path, content=args.get("content", ""))
+    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
+    return write_file_tool(path=path, content=args.get("content", ""))
 
 def _handle_patch(args: dict, **kw) -> str:
-    path = args.get("path", "")
-    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
-    if not safe:
-        return json.dumps({"error": err, "success": False}, ensure_ascii=False)
+    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
     return patch_tool(
-        path=resolved_path,
+        path=path,
         old_str=args.get("old_str", ""),
         new_str=args.get("new_str", ""),
     )
 
 def _handle_edit_file(args: dict, **kw) -> str:
-    path = args.get("path", "")
-    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
-    if not safe:
-        return json.dumps({"error": err, "success": False}, ensure_ascii=False)
+    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
     return edit_file_tool(
-        path=resolved_path,
+        path=path,
         old_block=args.get("old_block", ""),
         new_block=args.get("new_block", ""),
     )
 
 def _handle_delete_file(args: dict, **kw) -> str:
-    path = args.get("path", "")
-    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"))
-    if not safe:
-        return json.dumps({"error": err, "success": False}, ensure_ascii=False)
-    return delete_file_tool(path=resolved_path)
+    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
+    return delete_file_tool(path=path)
 
 def _handle_search_files(args: dict, **kw) -> str:
-    directory = args.get("directory", "")
-    safe, err, resolved_directory = _check_delegation_path(directory, kw.get("parent_agent"), mode="read")
-    if not safe:
-        return json.dumps({"error": err}, ensure_ascii=False)
+    directory = _resolve_agent_path(args.get("directory", ""), kw.get("parent_agent"))
     return search_files_tool(
-        directory=resolved_directory,
+        directory=directory,
         pattern=args.get("pattern", ""),
         file_pattern=args.get("file_pattern"),
         limit=args.get("limit"),
     )
 
 def _handle_list_directory(args: dict, **kw) -> str:
-    path = args.get("path", "")
-    safe, err, resolved_path = _check_delegation_path(path, kw.get("parent_agent"), mode="read")
-    if not safe:
-        return json.dumps({"error": err}, ensure_ascii=False)
-    return list_directory_tool(path=resolved_path)
+    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
+    return list_directory_tool(path=path)
 
 # Register all file tools in the tool registry.
 registry.register(

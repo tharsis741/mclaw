@@ -214,7 +214,6 @@ def test_delegation_resolves_target_provider_credentials(
     )
     monkeypatch.setattr("mclaw.tools.dispatch.get_toolset_for_tool", lambda _name: "terminal")
     paths = SimpleNamespace(
-        session_root=lambda session_id: tmp_path / session_id,
         delegation_root=lambda: tmp_path / "delegations",
     )
     monkeypatch.setattr(
@@ -222,12 +221,6 @@ def test_delegation_resolves_target_provider_credentials(
         "current",
         classmethod(lambda _cls, _config=None: SimpleNamespace(paths=paths)),
     )
-    monkeypatch.setattr(
-        delegate_tool,
-        "_prepare_delegation_workspace",
-        lambda goal, context, _directory: (goal, context, str(tmp_path), {}),
-    )
-
     class FakeChild:
         def __init__(self, **kwargs) -> None:
             self.__dict__.update(kwargs)
@@ -312,6 +305,106 @@ def test_delegation_resolves_target_provider_credentials(
     assert custom_endpoint.provider_runtime.api_mode == parent.provider_runtime.api_mode
     assert custom_endpoint.provider_runtime.model == "local-model"
     assert custom_endpoint.provider_runtime.api_key == "parent-secret"
+
+
+def test_subagent_relative_file_paths_use_inherited_workspace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mclaw.tools import file_tools
+
+    child = SimpleNamespace(
+        workspace_path=str(tmp_path),
+        session_id="child-files",
+    )
+    captured: dict[str, str] = {}
+    monkeypatch.setattr(
+        file_tools,
+        "read_file_tool",
+        lambda **kwargs: captured.setdefault("path", kwargs["path"]),
+    )
+
+    file_tools._handle_read_file(
+        {"path": "src/main.py"},
+        parent_agent=child,
+    )
+
+    assert Path(captured["path"]) == tmp_path / "src" / "main.py"
+
+
+def test_subagent_inherits_parent_terminal_cwd(tmp_path: Path) -> None:
+    from mclaw.tools import delegate_tool, terminal_tool
+
+    workspace = tmp_path / "project"
+    terminal_cwd = workspace / "backend"
+    terminal_cwd.mkdir(parents=True)
+    parent = SimpleNamespace(
+        session_id="parent-terminal-cwd",
+        workspace_path=str(workspace),
+    )
+    terminal_tool._env_registry[parent.session_id] = terminal_tool.RuntimeTerminalSession(
+        cwd=str(terminal_cwd)
+    )
+    try:
+        assert delegate_tool._resolve_working_directory(parent) == str(terminal_cwd)
+        terminal_tool._env_registry[parent.session_id].cwd = str(workspace / "missing")
+        assert delegate_tool._resolve_working_directory(parent) == str(workspace)
+    finally:
+        terminal_tool._env_registry.pop(parent.session_id, None)
+
+
+def test_subagent_terminal_cwd_is_inherited_and_session_local(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mclaw.tools import terminal_tool
+    from mclaw.tools.dispatch import set_tool_context
+
+    first_workspace = tmp_path / "first"
+    second_workspace = tmp_path / "second"
+    (first_workspace / "sub").mkdir(parents=True)
+    second_workspace.mkdir()
+    calls: list[tuple[str, str]] = []
+
+    class FakeRuntime:
+        def exec(self, command: str, *, cwd: str, **_kwargs):
+            calls.append((command, str(cwd)))
+            next_cwd = Path(cwd) / "sub" if command == "cd sub" else Path(cwd)
+            return SimpleNamespace(output="", returncode=0, cwd=str(next_cwd))
+
+    monkeypatch.setattr(
+        terminal_tool.RuntimeManager,
+        "current",
+        classmethod(lambda _cls: FakeRuntime()),
+    )
+    terminal_tool._env_registry.clear()
+    try:
+        first = SimpleNamespace(
+            workspace_path=str(first_workspace),
+            session_id="child-terminal-1",
+            config={},
+        )
+        second = SimpleNamespace(
+            workspace_path=str(second_workspace),
+            session_id="child-terminal-2",
+            config={},
+        )
+
+        set_tool_context(session_id=first.session_id)
+        terminal_tool._handle_terminal({"command": "cd sub"}, parent_agent=first)
+        terminal_tool._handle_terminal({"command": "pwd"}, parent_agent=first)
+
+        set_tool_context(session_id=second.session_id)
+        terminal_tool._handle_terminal({"command": "pwd"}, parent_agent=second)
+    finally:
+        terminal_tool._env_registry.clear()
+        set_tool_context(session_id="")
+
+    assert calls == [
+        ("cd sub", str(first_workspace)),
+        ("pwd", str(first_workspace / "sub")),
+        ("pwd", str(second_workspace)),
+    ]
 
 
 def test_background_review_inherits_context_and_forwards_each_usage(
