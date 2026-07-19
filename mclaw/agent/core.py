@@ -100,7 +100,7 @@ class MClaw:
         session_db: SessionDB = None,
         session_id: str = None,
         parent_session_id: str = None,
-        max_iterations: int = 50,
+        max_iterations: int | None = None,
         platform: str = "cli",
         enabled_toolsets: List[str] = None,
         stream_callback: Callable = None,
@@ -121,11 +121,22 @@ class MClaw:
         self.transport = create_transport(provider_runtime)
         self._usage_sink = usage_sink
         self.system_prompt = system_prompt
+        self.config = config or {}
+        if max_iterations is None:
+            agent_config = self.config.get("agent", {})
+            if isinstance(agent_config, dict):
+                max_iterations = agent_config.get("max_turns")
+        if max_iterations is not None:
+            try:
+                max_iterations = int(max_iterations)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("agent.max_turns must be a positive integer") from exc
+            if max_iterations <= 0:
+                raise ValueError("agent.max_turns must be a positive integer")
         self.max_iterations = max_iterations
         self.platform = platform
         self.enabled_toolsets = enabled_toolsets
 
-        self.config = config or {}
         self.session_id = session_id or f"session_{uuid.uuid4().hex[:12]}"
         self.workspace_path = str(workspace or "").strip()
         self._session_db = session_db
@@ -882,7 +893,7 @@ class MClaw:
             self.tools = []
 
         while (
-            assistant_iteration_count < self.max_iterations
+            (self.max_iterations is None or assistant_iteration_count < self.max_iterations)
             and (api_call_limit is None or api_call_count < api_call_limit)
         ):
             if _deadline_reached():
@@ -898,7 +909,7 @@ class MClaw:
             # Subagent diagnostics: log each API iteration to locate stalls.
             if getattr(self, "_delegate_depth", 0) > 0:
                 logger.info(
-                    "[subagent-%s] API iteration %d/%d",
+                    "[subagent-%s] API iteration %d/%s",
                     getattr(self, "session_id", "?")[-6:], assistant_iteration_count, self.max_iterations
                 )
 
@@ -1203,6 +1214,9 @@ class MClaw:
             if getattr(self, "_delegate_depth", 0) > 0:
                 logger.info("[subagent-%s] no tool_calls, breaking loop", self.session_id[-6:])
             break
+        else:
+            stop_reason = "max_iterations"
+            logger.info("[LOOP] iteration limit reached (%s)", self.max_iterations)
 
         if getattr(self, "_delegate_depth", 0) > 0:
             logger.info("[subagent-%s] exited loop, api_calls=%d", self.session_id[-6:], api_call_count)

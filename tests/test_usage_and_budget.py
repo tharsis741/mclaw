@@ -417,6 +417,63 @@ def _runtime_agent(
     )
 
 
+def test_configured_iteration_limit_returns_incomplete_stop_reason(monkeypatch) -> None:
+    context = _context()
+
+    def tool_result(call_id: str) -> ModelCallResult:
+        return ModelCallResult(
+            content="",
+            tool_calls=[{
+                "id": call_id,
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+            finish_reason="tool_calls",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        )
+
+    transport = _SequenceTransport(tool_result("call-1"), tool_result("call-2"))
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+
+    unlimited = MClaw(
+        provider_runtime=context,
+        skip_memory=True,
+        config={"compression": {"enabled": False}},
+    )
+    assert unlimited.max_iterations is None
+
+    agent = MClaw(
+        provider_runtime=context,
+        skip_memory=True,
+        config={
+            "agent": {"max_turns": 2},
+            "compression": {"enabled": False},
+        },
+    )
+
+    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+        messages.append(agent._build_assistant_msg(assistant_content, tool_calls, reasoning))
+        for call in tool_calls:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": "ok",
+            })
+
+    agent._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    result = agent.run_conversation("keep working", advance_background_review=False)
+
+    assert result["stop_reason"] == "max_iterations"
+    assert result["completed"] is False
+    assert result["api_calls"] == 2
+
+
 @pytest.mark.parametrize("retry_first", [False, True])
 def test_delegated_child_reserves_final_call_for_tool_free_summary(
     monkeypatch,

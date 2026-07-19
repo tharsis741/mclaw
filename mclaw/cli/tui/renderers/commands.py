@@ -139,7 +139,7 @@ class CommandsRenderer:
                 section_block("快捷键"),
                 key_value_block([
                     ("发送", "Enter"),
-                    ("换行", "Esc+Enter"),
+                    ("换行", "Shift+Enter"),
                     ("中断", "Ctrl+C"),
                     ("退出", "Ctrl+D"),
                     ("清空输入", "Ctrl+U"),

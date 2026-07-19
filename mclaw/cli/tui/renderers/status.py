@@ -181,7 +181,11 @@ class StatusRenderer:
             if owner._spinner_text:
                 fragments.append(("class:status-bar", f" · {owner._spinner_text}"))
         elif owner._lifecycle_idx == 4:
-            fragments.append(("class:status-bar-done", " ✓ Done "))
+            result = getattr(owner, "_last_chat_result", {}) or {}
+            if result.get("stop_reason") == "max_iterations":
+                fragments.append(("class:status-bar-warning", " ⚠️ Iteration limit reached "))
+            else:
+                fragments.append(("class:status-bar-done", " ✓ Done "))
 
         if owner.subtask_manager:
             sm = owner.subtask_manager

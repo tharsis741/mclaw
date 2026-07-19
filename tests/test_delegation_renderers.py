@@ -2,11 +2,40 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+from datetime import datetime
 from types import SimpleNamespace
 
 from mclaw.cli.tui.frontends.classic import formatted_text_height
 from mclaw.cli.tui.renderers.delegation import DelegationRenderer
 from mclaw.cli.tui.renderers.status import StatusRenderer
+
+
+def test_status_bar_reports_iteration_limit_instead_of_done() -> None:
+    owner = SimpleNamespace(
+        _status_bar_visible=True,
+        agent=SimpleNamespace(
+            session_input_tokens=0,
+            session_output_tokens=0,
+            session_user_messages=1,
+            context_compressor=None,
+        ),
+        model="test-model",
+        _agent_running=False,
+        _turn_start_at=None,
+        session_start=datetime.now(),
+        _last_turn_duration=1,
+        _project_name="",
+        _input_mode="",
+        _asr_status_text="",
+        _lifecycle_idx=4,
+        _last_chat_result={"completed": False, "stop_reason": "max_iterations"},
+        subtask_manager=None,
+    )
+
+    rendered = "".join(text for _style, text in StatusRenderer().build_status_fragments(owner))
+
+    assert "⚠️ Iteration limit reached" in rendered
+    assert "✓ Done" not in rendered
 
 
 def test_live_subagent_progress_shows_all_five_tasks_and_truncates_at_100() -> None:

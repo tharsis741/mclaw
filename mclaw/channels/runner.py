@@ -203,7 +203,6 @@ class AgentRunner:
             session_db=self.session_db,
             session_id=session_id,
             enabled_toolsets=self.enabled_toolsets,
-            max_iterations=int(self.config.get("agent", {}).get("max_turns", 90)),
             platform=self.platform,
             config=self.config,
             event_callback=lambda event, _session_id=session_id: self._emit_agent_event(_session_id, event),

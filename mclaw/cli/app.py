@@ -107,6 +107,7 @@ from mclaw.utils import is_truthy_value
 logger = logging.getLogger(__name__)
 
 _SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
+_SHIFT_ENTER_SEQUENCE = "\x1b[27;2;13~"
 
 
 def _sanitize_text_for_utf8(text: str) -> str:
@@ -155,6 +156,19 @@ def _handle_right_key(buffer) -> None:
         buffer.insert_text(buffer.suggestion.text)
     else:
         buffer.cursor_right()
+
+
+def _windows_shift_pressed() -> bool:
+    if os.name != "nt":
+        return False
+    # ponytail: remove OS polling when prompt_toolkit preserves modified Enter.
+    import ctypes
+
+    return bool(ctypes.windll.user32.GetAsyncKeyState(0x10) & 0x8000)
+
+
+def _is_shift_enter(event) -> bool:
+    return bool(event.key_sequence and event.key_sequence[-1].data == _SHIFT_ENTER_SEQUENCE) or _windows_shift_pressed()
 
 
 def _strip_thinking(text: str) -> str:
@@ -673,12 +687,6 @@ class InteractiveChat:
         """Construct one agent without mutating the active interactive state."""
         from mclaw.agent.core import MClaw
 
-        agent_cfg = self.config.get("agent", {}) if isinstance(self.config, dict) else {}
-        try:
-            max_iterations = int(agent_cfg.get("max_turns", 90))
-        except (TypeError, ValueError):
-            max_iterations = 90
-
         agent = MClaw(
             provider_runtime=provider_runtime,
             session_db=self._session_db,
@@ -690,7 +698,6 @@ class InteractiveChat:
             status_callback=self._on_status,
             event_callback=self._on_agent_event,
             print_fn=_cprint,
-            max_iterations=max_iterations,
             workspace=self.workspace_path,
             config=self.config,
         )
@@ -2991,6 +2998,9 @@ class InteractiveChat:
         @kb.add("enter")
         def _(event):
             buf = event.app.current_buffer
+            if _is_shift_enter(event):
+                buf.insert_text("\n")
+                return
             if not self._pending_key_setup and not self._pending_secret_request:
                 _accept_slash_completion()
             display_text = buf.text.strip()
@@ -3022,10 +3032,6 @@ class InteractiveChat:
                 self._handle_secret_request_input("__mclaw_confirm_esc__")
                 return
             self._pending_input.put("__mclaw_confirm_esc__")
-
-        @kb.add("escape", "enter")
-        def _(event):
-            event.app.current_buffer.insert_text("\n")
 
         @kb.add("c-c")
         def _(event):
@@ -3158,6 +3164,7 @@ class InteractiveChat:
             "status-bar-model": "bold #6CB4EE",
             "status-bar-active": "bold #90caf9",
             "status-bar-done": "bold #50c878",
+            "status-bar-warning": "bold #fcd34d",
             "status-bar-ctx": "#ffcc00",
             "status-bar-subagent-running": "bold #90caf9",
             "status-bar-subagent-done": "bold #50c878",

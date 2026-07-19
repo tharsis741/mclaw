@@ -198,9 +198,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tools": {
         "disabled": [],
     },
-    "agent": {
-        "max_turns": 90,
-    },
     "terminal": {
         "cwd": ".",
         "timeout": 180,
