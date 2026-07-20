@@ -172,6 +172,7 @@ def test_registry_profiles_are_frozen_and_fallbacks_cover_required_families() ->
         "mimo-v2.5-pro",
         "mimo-v2.5",
     )
+    assert PROVIDER_REGISTRY["moonshot"].fallback_models[0] == "kimi-k3"
     assert "kimi-k2.6" in PROVIDER_REGISTRY["moonshot"].fallback_models
     assert "kimi-k2.7-code" in PROVIDER_REGISTRY["moonshot"].fallback_models
     assert PROVIDER_REGISTRY["deepseek"].fallback_models[:2] == (

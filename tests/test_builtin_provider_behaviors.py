@@ -790,6 +790,85 @@ def test_kimi_current_families_apply_stream_thinking_and_preserved_replay() -> N
     assert usage is not None and usage.cache_read_tokens == 4
 
 
+def test_kimi_k3_uses_effort_fixed_sampling_and_preserved_replay() -> None:
+    profile = MoonshotKimiProfile(name="moonshot", display_name="Moonshot")
+    trace = ReasoningTrace(
+        text="preserved",
+        provider="moonshot",
+        model="kimi-k3",
+        api_mode="chat_completions",
+        format="reasoning_content",
+        payload="preserved",
+    )
+    tools = [{
+        "type": "function",
+        "function": {"name": "write", "parameters": {"type": "object"}},
+    }]
+    prepared = profile.prepare_request(
+        {
+            "messages": [{"role": "assistant", "content": "", **trace.to_message_fields()}],
+            "tools": tools,
+            "max_tokens": 8,
+            "temperature": 0.2,
+            "top_p": 0.8,
+            "n": 2,
+            "presence_penalty": 0.1,
+            "frequency_penalty": 0.1,
+            "extra_body": {"thinking": {"type": "enabled"}},
+        },
+        _context(profile, "kimi-k3", reasoning_config={"enabled": True, "effort": "high"}),
+        ModelCallOptions(),
+    )
+    foreign = ReasoningTrace(
+        text="foreign",
+        provider="moonshot",
+        model="kimi-k2.7-code",
+        api_mode="chat_completions",
+        format="reasoning_content",
+        payload="foreign",
+    )
+    foreign_prepared = profile.prepare_request(
+        {"messages": [{"role": "assistant", "content": "", **foreign.to_message_fields()}]},
+        _context(profile, "kimi-k3"),
+        ModelCallOptions(),
+    )
+
+    traits = profile.model_traits("moonshot/kimi-k3")
+    assert traits.output_token_param == "max_completion_tokens"
+    assert traits.max_output_tokens == 131_072
+    assert traits.include_stream_usage_option is True
+    assert traits.requires_stream is False
+    assert traits.reasoning_modes == ("low", "high", "max")
+    assert traits.prompt_cache_layout == "automatic_prefix"
+    assert traits.stream_safety_timeout == 7200.0
+    assert profile.model_traits("kimi-k3-preview").reasoning_modes == ()
+    assert prepared["max_completion_tokens"] == 131_072
+    assert prepared["reasoning_effort"] == "high"
+    assert prepared["tool_choice"] == "auto"
+    assert prepared["tools"] == tools
+    assert prepared["messages"][0]["reasoning_content"] == "preserved"
+    assert "reasoning" not in prepared["messages"][0]
+    assert "reasoning_details" not in prepared["messages"][0]
+    assert "reasoning_content" not in foreign_prepared["messages"][0]
+    assert "reasoning_effort" not in foreign_prepared
+    assert "extra_body" not in prepared
+    for name in (
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "n",
+        "presence_penalty",
+        "frequency_penalty",
+    ):
+        assert name not in prepared
+    with pytest.raises(ValueError, match="cannot be disabled"):
+        profile.prepare_request(
+            {"messages": [{"role": "user", "content": "hello"}]},
+            _context(profile, "kimi-k3", reasoning_config={"enabled": False}),
+            ModelCallOptions(),
+        )
+
+
 def test_glm_52_maps_effort_and_preserved_thinking_without_guessing_context() -> None:
     profile = ZhipuGLMProfile(name="zhipu", display_name="Zhipu")
     trace = ReasoningTrace(

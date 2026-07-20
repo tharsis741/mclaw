@@ -35,6 +35,10 @@ class RuntimeTurnResultCoordinator:
 
     def handle_result(self, result: dict[str, Any]) -> None:
         """Render terminal output and dispatch post-turn continuation intents."""
+        if result.get("interrupted"):
+            self.hooks.render_interrupted()
+            return
+
         display_text = self.select_display_text(
             result,
             stream_text=self.hooks.stream_text(),
@@ -42,10 +46,6 @@ class RuntimeTurnResultCoordinator:
         )
         if display_text:
             self.hooks.render_response(display_text)
-
-        if result.get("interrupted"):
-            self.hooks.render_interrupted()
-            return
 
         if result.get("skills_changed"):
             self.hooks.invalidate_skill_registry()

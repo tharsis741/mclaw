@@ -366,6 +366,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     options,
                     content_mode=traits.content_stream_mode,
                     reasoning_mode=traits.reasoning_stream_mode,
+                    profile_safety_timeout=traits.stream_safety_timeout,
                     stream_callback=stream_callback,
                     interrupted=interrupted,
                 )
@@ -428,6 +429,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
         *,
         content_mode: str,
         reasoning_mode: str,
+        profile_safety_timeout: float | None,
         stream_callback: Callable[[str], None] | None,
         interrupted: Callable[[], bool] | None,
     ) -> ModelCallResult:
@@ -474,9 +476,21 @@ class OpenAIChatCompletionsTransport(ModelTransport):
         interrupted_result = False
         stalled = False
         safety_timeout = False
-        stream_safety_timeout = max(STREAM_SAFETY_TIMEOUT, options.timeout)
+        stream_safety_timeout = max(
+            STREAM_SAFETY_TIMEOUT,
+            options.timeout,
+            profile_safety_timeout or 0.0,
+        )
         stream_stall_timeout = max(STREAM_STALL_TIMEOUT, options.timeout)
         started = last_meaningful = time.monotonic()
+        activity_status = ""
+
+        def report_activity(status: str) -> None:
+            nonlocal activity_status
+            callback = options.stream_activity_callback
+            if callback is not None and status != activity_status:
+                callback(status)
+                activity_status = status
 
         def add_structured(field: str, raw: Any, index: int | None = None) -> None:
             event = {"field": field, "value": json_safe_value(raw)}
@@ -542,6 +556,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 content, visible_delta = _merge_text(content, incoming_content, content_mode)
                 if visible_delta:
                     meaningful = True
+                    activity_status = ""
                     if stream_callback is not None:
                         stream_callback(visible_delta)
 
@@ -565,7 +580,10 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     reasoning_mode,
                 )
                 meaningful = meaningful or bool(reasoning_delta) or _has_payload(details)
+                if not visible_delta and (reasoning_delta or _has_payload(details)):
+                    report_activity("Thinking...")
 
+                tool_activity = False
                 for position, raw_tool in enumerate(_sequence(_field(delta, "tool_calls"))):
                     raw_index = _field(raw_tool, "index", position)
                     index = raw_index if type(raw_index) is int else position
@@ -577,6 +595,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     if tool_id := _field(raw_tool, "id"):
                         entry["id"] = str(tool_id)
                         meaningful = True
+                        tool_activity = True
                     if tool_type := _field(raw_tool, "type"):
                         entry["type"] = str(tool_type)
                     function = _field(raw_tool, "function")
@@ -585,13 +604,18 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     if name:
                         entry["function"]["name"] += name
                         meaningful = True
+                        tool_activity = True
                     if arguments:
                         entry["function"]["arguments"] += arguments
                         meaningful = True
+                        tool_activity = True
                     extra = _field(raw_tool, "extra_content")
                     if _has_payload(extra):
                         add_structured("tool_calls.extra_content", extra, index)
                         meaningful = True
+                        tool_activity = True
+                if not visible_delta and tool_activity:
+                    report_activity("Preparing tool call...")
                 if meaningful:
                     last_meaningful = time.monotonic()
         finally:

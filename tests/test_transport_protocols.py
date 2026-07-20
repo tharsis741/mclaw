@@ -654,6 +654,50 @@ def test_openai_delta_stream_assembles_content_reasoning_tools_and_usage() -> No
     assert result.was_streamed is True
 
 
+def test_openai_stream_reports_hidden_reasoning_and_tool_activity() -> None:
+    profile = GenericOpenAICompatibleProfile(name="generic", display_name="Generic")
+    context = _context(profile=profile)
+    stream = _FakeStream([
+        {
+            "choices": [{
+                "delta": {"reasoning_content": "think"},
+                "finish_reason": None,
+            }],
+        },
+        {
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "write", "arguments": "{}"},
+                }]},
+                "finish_reason": "tool_calls",
+            }],
+        },
+    ])
+    activities: list[str] = []
+    visible: list[str] = []
+
+    result = OpenAIChatCompletionsTransport(
+        context,
+        _FakeOpenAIClient(stream),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(
+            stream=True,
+            stream_activity_callback=activities.append,
+        ),
+        stream_callback=visible.append,
+    )
+
+    assert visible == []
+    assert activities == ["Thinking...", "Preparing tool call..."]
+    assert result.reasoning is not None and result.reasoning.text == "think"
+    assert result.tool_calls is not None and result.tool_calls[0]["id"] == "call-1"
+
+
 def test_openai_cumulative_stream_emits_only_new_visible_text() -> None:
     profile = MiniMaxProfile(name="minimax", display_name="MiniMax")
     context = _context(profile=profile, model="MiniMax-M2.7")
@@ -1052,6 +1096,50 @@ def test_openai_stream_watchdogs_respect_longer_call_timeout(monkeypatch) -> Non
 
     assert result.content == "answer"
     assert stream.closed is True
+
+
+def test_openai_stream_uses_profile_safety_timeout(monkeypatch) -> None:
+    from mclaw.agent.transports import openai_chat_completions as module
+
+    class LongStreamProfile(GenericOpenAICompatibleProfile):
+        def model_traits(self, model: str) -> ModelTraits:
+            return ModelTraits(stream_safety_timeout=0.05)
+
+    monkeypatch.setattr(module, "STREAM_SAFETY_TIMEOUT", 0.01)
+    monkeypatch.setattr(module, "STREAM_STALL_TIMEOUT", 0.05)
+    monkeypatch.setattr(module, "POLL_INTERVAL", 0.001)
+    profile = LongStreamProfile(name="generic", display_name="Generic")
+    context = _context(profile=profile)
+    stream = _DelayedFirstStream(0.02, [{
+        "choices": [{"delta": {"content": "answer"}, "finish_reason": "stop"}],
+    }])
+
+    result = OpenAIChatCompletionsTransport(
+        context,
+        _FakeOpenAIClient(stream),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(stream=True, timeout=0.001),
+    )
+
+    assert result.content == "answer"
+    assert stream.closed is True
+
+    monkeypatch.setattr(module, "STREAM_STALL_TIMEOUT", 0.005)
+    stalled_stream = _DelayedFirstStream(0.02, [{
+        "choices": [{"delta": {"content": "late"}, "finish_reason": "stop"}],
+    }])
+    with pytest.raises(ModelCallError, match="stalled before returning a payload"):
+        OpenAIChatCompletionsTransport(
+            context,
+            _FakeOpenAIClient(stalled_stream),
+        ).call(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            options=ModelCallOptions(stream=True, timeout=0.001),
+        )
+    assert stalled_stream.closed is True
 
 
 def test_openai_zero_payload_stream_is_normalized() -> None:

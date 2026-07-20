@@ -509,6 +509,7 @@ def test_reasoning_config_is_strict_and_model_trait_scoped(
         ("openrouter", "anthropic/claude-sonnet-5", "OPENROUTER_API_KEY", "max"),
         ("deepseek", "deepseek-v4-pro", "DEEPSEEK_API_KEY", "low"),
         ("moonshot", "kimi-k2.6", "KIMI_API_KEY", "high"),
+        ("moonshot", "kimi-k3", "KIMI_API_KEY", "low"),
         ("zhipu", "glm-5.2", "GLM_API_KEY", "max"),
         ("google", "gemini-3.5-flash", "GEMINI_API_KEY", "minimal"),
         ("google", "gemini-3.1-pro", "GEMINI_API_KEY", "minimal"),

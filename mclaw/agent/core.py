@@ -1246,6 +1246,12 @@ class MClaw:
                             timeout=30.0,
                             source=call_source,
                             dynamic_system_context=dynamic_system_context,
+                            stream_activity_callback=(
+                                self._emit_status
+                                if self._stream_callback
+                                and getattr(self, "_delegate_depth", 0) == 0
+                                else None
+                            ),
                             cache_plan=build_prompt_cache_plan(
                                 messages=messages,
                                 tools=self.tools,

@@ -34,6 +34,8 @@ if TYPE_CHECKING:
 
 def _family(model: str) -> str:
     lowered = model.strip().casefold()
+    if lowered == "kimi-k3":
+        return "kimi-k3"
     if lowered.startswith("kimi-k2.7-code"):
         return "kimi-k2.7-code"
     for name in ("kimi-k2.6", "kimi-k2.5"):
@@ -46,6 +48,8 @@ def _family(model: str) -> str:
 
 def _thinking_policy(model: str) -> str:
     family = _family(model)
+    if family == "kimi-k3":
+        return "always_preserved"
     if family == "kimi-k2.7-code":
         return "always_preserved"
     if family == "kimi-k2.6":
@@ -68,16 +72,24 @@ class MoonshotKimiProfile(RuntimeProviderProfile):
         return model
 
     def model_traits(self, model: str) -> ModelTraits:
-        policy = _thinking_policy(self.normalize_model(model))
+        family = _family(self.normalize_model(model))
+        policy = _thinking_policy(family)
         current = policy != "none"
         return ModelTraits(
             output_token_param="max_completion_tokens" if current else "max_tokens",
-            # K2.5/K2.6 default to 32K. Using the full 256K context as an
-            # output budget makes any non-empty request exceed the window.
-            max_output_tokens=32_768 if current else None,
+            # Use provider defaults as request budgets; the advertised hard
+            # limits can consume the entire context window.
+            max_output_tokens=(
+                131_072 if family == "kimi-k3" else 32_768 if current else None
+            ),
             include_stream_usage_option=True,
-            reasoning_modes=("high",) if current else (),
+            reasoning_modes=(
+                ("low", "high", "max")
+                if family == "kimi-k3"
+                else ("high",) if current else ()
+            ),
             prompt_cache_layout=PROMPT_CACHE_LAYOUT_AUTOMATIC_PREFIX,
+            stream_safety_timeout=7200.0 if family == "kimi-k3" else None,
         )
 
     def prepare_request(
@@ -95,12 +107,22 @@ class MoonshotKimiProfile(RuntimeProviderProfile):
         plan = options.cache_plan
         if plan is not None and plan.enabled and plan.conversation_key:
             kwargs["prompt_cache_key"] = plan.conversation_key
-        policy = _thinking_policy(context.model)
+        family = _family(context.model)
+        policy = _thinking_policy(family)
         config = context.reasoning_config
         thinking = policy.startswith("always") or (
             policy.startswith("toggle")
             and (config is None or config.get("enabled") is True)
         )
+
+        kwargs.pop("reasoning_effort", None)
+        if family == "kimi-k3" and config is not None:
+            if config.get("enabled") is not True:
+                raise ValueError("Kimi K3 reasoning cannot be disabled")
+            effort = str(config.get("effort") or "")
+            if effort not in {"low", "high", "max"}:
+                raise ValueError(f"Unsupported Kimi K3 reasoning effort: {effort}")
+            kwargs["reasoning_effort"] = effort
 
         if policy != "none":
             for name in ("temperature", "top_p", "presence_penalty", "frequency_penalty", "n"):

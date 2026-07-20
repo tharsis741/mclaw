@@ -62,6 +62,7 @@ class ModelTraits:
     reasoning_stream_mode: str = "delta"
     reasoning_modes: tuple[str, ...] = ()
     prompt_cache_layout: str = ""
+    stream_safety_timeout: float | None = None
 
 
 @dataclass(frozen=True)

@@ -118,6 +118,27 @@ def test_status_detail_does_not_replace_the_canonical_lifecycle() -> None:
     assert pet.events[-1][1]["state"] == PetState.REVIEW
 
 
+def test_reasoning_marker_prints_once_per_main_model_round() -> None:
+    chat, _pet = make_chat_with_pet()
+    rendered: list[tuple[str, str]] = []
+    chat._response_renderer = SimpleNamespace(
+        render_title=lambda title, *, title_style: rendered.append((title, title_style))
+    )
+
+    chat._on_status("Waiting for model...")
+    chat._on_status("Thinking...")
+    chat._on_status("Thinking...")
+    chat._on_status("Preparing tool call...")
+    chat._on_status("Thinking...")
+
+    assert [title for title, _style in rendered] == ["- 推理中..."]
+
+    chat._on_status("Waiting for model...")
+    chat._on_status("Thinking...")
+
+    assert [title for title, _style in rendered] == ["- 推理中...", "- 推理中..."]
+
+
 def test_all_agent_status_messages_are_self_contained() -> None:
     cases = {
         "Refreshing context...": "Refreshing context",

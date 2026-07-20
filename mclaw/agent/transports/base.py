@@ -105,6 +105,11 @@ class ModelCallOptions:
     source: str = "turn"
     dynamic_system_context: str = ""
     cache_plan: PromptCachePlan | None = None
+    stream_activity_callback: Callable[[str], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
