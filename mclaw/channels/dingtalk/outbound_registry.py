@@ -25,10 +25,6 @@ class DingTalkOutboundTarget:
     chat_id: str
     loop: asyncio.AbstractEventLoop
 
-    def send_text(self, *, text: str) -> "SendResult":
-        """Schedule a text send on the adapter's owning event loop."""
-        return self._run(self.adapter.send(self.chat_id, text), timeout=120, label="text")
-
     def send_file(self, *, file_path: str, caption: str = "") -> "SendResult":
         """Schedule a file send with a longer timeout for upload work."""
         return self._run(

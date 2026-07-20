@@ -74,7 +74,7 @@ M-CLAW 运行时架构由四个逻辑层构成：
 M-Claw 当前已经包含：
 
 - **21 个基础工具**：默认工具集，覆盖凭据授权、文件读写、终端、记忆、Skill、历史会话检索和子代理委派。
-- **13 个可选工具**：覆盖联网搜索、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
+- **12 个可选工具**：覆盖联网搜索、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
 - **22 个内置命令**：包括模型切换、搜索后端、语音输入、历史会话、rollback、checkpoint、定时任务、Skill 管理和运行环境诊断。
 - **模型库与多 Provider 管理**：支持 OpenAI-compatible 与 Anthropic Messages 两类调用协议，并通过 models.dev 获取模型目录与上下文元数据。
 - **三层记忆体系**：会话级记忆、长期记忆和 Skill 级运行/优化记忆。
@@ -138,7 +138,7 @@ M-Claw 当前已经包含：
 | vision | `vision_analyze` | 使用 Qwen 视觉模型分析 URL 或本地图片。 |
 | browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download` | 基于 Playwright 的浏览器自动化，支持导航、快照、点击、输入、滚动、截图和下载。 |
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
-| dingtalk | `dingtalk_send_text`, `dingtalk_send_file` | 在当前钉钉会话中发送文本或文件。 |
+| dingtalk | `dingtalk_send_file` | 在当前钉钉会话中发送文件。 |
 
 联网搜索默认使用 `auto` 后端：配置 Tavily 密钥时优先使用 Tavily，否则使用 DashScope/Qwen；当 Tavily 调用失败且 DashScope 凭据可用时，运行时会自动降级到 DashScope。可在交互式界面中使用 `/search-backend dashscope|tavily|auto` 查看或切换后端。
 

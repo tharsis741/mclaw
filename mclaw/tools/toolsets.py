@@ -29,7 +29,7 @@ BROWSER_TOOLS = [
     "browser_download",
 ]
 WEIXIN_TOOLS = ["weixin_send_file"]
-DINGTALK_TOOLS = ["dingtalk_send_text", "dingtalk_send_file"]
+DINGTALK_TOOLS = ["dingtalk_send_file"]
 
 REQUIRED_TOOLSETS = ["credentials", "terminal", "file", "memory", "skills", "session_search", "delegation"]
 OPTIONAL_TOOLSETS = ["web", "vision", "browser", "weixin", "dingtalk"]

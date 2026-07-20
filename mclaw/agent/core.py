@@ -326,6 +326,10 @@ class MClaw:
         from mclaw.tools.dispatch import get_tool_definitions
         definitions, valid_names = get_tool_definitions(
             enabled_toolsets=self.enabled_toolsets,
+            disabled_toolsets=[
+                name for name in ("weixin", "dingtalk")
+                if name != self.platform
+            ],
             config=self.config,
         )
         self.tools = definitions

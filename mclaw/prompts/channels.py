@@ -58,5 +58,5 @@ def build_dingtalk_channel_context(
         f"- channel_key: dingtalk {display_chat_type}\n"
         f"- 用户：{user_name or user_id}\n"
         "- 回复前结合钉钉附件信息处理图片、视频、语音或文件。\n"
-        "- 用户要求发送钉钉消息或文件时，使用 dingtalk_send_text 或 dingtalk_send_file。\n"
+        "- 用户要求发送本地文件时，使用 dingtalk_send_file。\n"
     )

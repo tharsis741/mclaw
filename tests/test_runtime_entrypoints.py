@@ -146,6 +146,28 @@ def test_channel_bootstraps_row_model_and_replaces_changed_fingerprint(
         db.close()
 
 
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [
+        ("cli", set()),
+        ("scheduler", set()),
+        ("weixin", {"weixin_send_file"}),
+        ("dingtalk", {"dingtalk_send_file"}),
+    ],
+)
+def test_channel_tools_are_scoped_to_agent_platform(platform: str, expected: set[str]) -> None:
+    from mclaw.agent.core import MClaw
+
+    agent = MClaw.__new__(MClaw)
+    agent.platform = platform
+    agent.enabled_toolsets = ["mclaw-required", "weixin", "dingtalk"]
+    agent.config = {}
+    agent._discover_tools()
+
+    channel_tools = {"weixin_send_file", "dingtalk_send_file", "dingtalk_send_text"}
+    assert agent.valid_tool_names & channel_tools == expected
+
+
 def test_channel_rejects_corrupt_persisted_snapshot_before_cache_lookup(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

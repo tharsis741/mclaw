@@ -2,10 +2,10 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Function-call tools for DingTalk outbound channel sessions.
+"""Function-call tool for DingTalk outbound channel sessions.
 
-These tools send text and files through the DingTalk target bound to the active
-agent session. They intentionally fail closed when no channel target is bound.
+The tool sends files through the DingTalk target bound to the active agent
+session. It intentionally fails closed when no channel target is bound.
 """
 
 from __future__ import annotations
@@ -15,23 +15,6 @@ from pathlib import Path
 
 from mclaw.channels.dingtalk.outbound_registry import get_dingtalk_outbound_target
 from mclaw.tools.registry import registry, tool_error
-
-
-def dingtalk_send_text(text: str, parent_agent=None) -> str:
-    """Send text through the DingTalk target bound to the current agent session."""
-    if parent_agent is None:
-        return tool_error("dingtalk_send_text requires an active DingTalk agent session", success=False)
-    session_id = str(getattr(parent_agent, "session_id", "") or "")
-    target = get_dingtalk_outbound_target(session_id)
-    if target is None:
-        return tool_error("No active DingTalk outbound target is bound to this session", success=False)
-    try:
-        result = target.send_text(text=str(text or ""))
-    except Exception as exc:
-        return tool_error(f"DingTalk text send failed: {exc}", success=False)
-    if not result.success:
-        return tool_error(result.error or "DingTalk text send failed", success=False)
-    return json.dumps({"success": True, "message_id": result.message_id}, ensure_ascii=False)
 
 
 def dingtalk_send_file(file_path: str, caption: str = "", parent_agent=None) -> str:
@@ -62,22 +45,6 @@ def dingtalk_send_file(file_path: str, caption: str = "", parent_agent=None) -> 
     )
 
 
-DINGTALK_SEND_TEXT_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "dingtalk_send_text",
-        "description": "Send a proactive text/markdown message to the current DingTalk conversation.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "text": {"type": "string", "description": "Text or Markdown content to send."},
-            },
-            "required": ["text"],
-        },
-    },
-}
-
-
 DINGTALK_SEND_FILE_SCHEMA = {
     "type": "function",
     "function": {
@@ -99,11 +66,6 @@ DINGTALK_SEND_FILE_SCHEMA = {
 }
 
 
-def _handle_dingtalk_send_text(args: dict, **kw) -> str:
-    """Registry adapter for DingTalk text sends."""
-    return dingtalk_send_text(text=args.get("text", ""), parent_agent=kw.get("parent_agent"))
-
-
 def _handle_dingtalk_send_file(args: dict, **kw) -> str:
     """Registry adapter for DingTalk file sends."""
     return dingtalk_send_file(
@@ -112,16 +74,6 @@ def _handle_dingtalk_send_file(args: dict, **kw) -> str:
         parent_agent=kw.get("parent_agent"),
     )
 
-
-registry.register(
-    name="dingtalk_send_text",
-    toolset="dingtalk",
-    schema=DINGTALK_SEND_TEXT_SCHEMA,
-    handler=_handle_dingtalk_send_text,
-    description="Send text or Markdown to the current DingTalk conversation",
-    emoji="📨",
-    max_result_size_chars=2000,
-)
 
 registry.register(
     name="dingtalk_send_file",
