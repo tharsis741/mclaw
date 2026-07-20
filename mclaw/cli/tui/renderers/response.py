@@ -15,8 +15,6 @@ INTERMEDIATE_ASSISTANT_TITLE = "- 任务进展："
 INTERMEDIATE_ASSISTANT_TITLE_STYLE = "#6B8E23"
 THINKING_ASSISTANT_TITLE = "- 思考中..."
 THINKING_ASSISTANT_TITLE_STYLE = "bold #D99A2B"
-REASONING_ASSISTANT_TITLE = "- 推理中..."
-REASONING_ASSISTANT_TITLE_STYLE = THINKING_ASSISTANT_TITLE_STYLE
 
 
 class ResponseRenderer:
@@ -54,28 +52,6 @@ class ResponseRenderer:
                 title_style=title_style,
             )
         )
-
-    def render_title(self, title: str, *, title_style: str) -> None:
-        """Emit a title-only assistant marker without exposing response content."""
-        content = str(title or "").strip()
-        if not content:
-            return
-        if self._message_sink is not None:
-            self._message_sink(content)
-            return
-        self._run_external_output(
-            lambda: _print_assistant_title(content, title_style=title_style)
-        )
-
-
-def _print_assistant_title(title: str, *, title_style: str) -> None:
-    """Render one title-only assistant marker in the classic terminal frontend."""
-    from rich.text import Text
-
-    from mclaw.cli.tui.console import MClawConsole, write_ansi_block
-
-    MClawConsole(printer=write_ansi_block).print(Text(title, style=title_style))
-
 
 def _print_assistant_response(
     text: str,

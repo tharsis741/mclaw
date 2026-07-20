@@ -441,13 +441,14 @@ class OpenAIChatCompletionsTransport(ModelTransport):
         if stream is _INTERRUPTED:
             return self._interrupted_result(was_streamed=True)
 
-        chunks: queue.Queue[Any] = queue.Queue()
+        chunks: queue.Queue[tuple[float, Any]] = queue.Queue()
         producer_error: list[Exception | None] = [None]
+        stream_started_at = time.monotonic()
 
         def produce() -> None:
             try:
                 for chunk in stream:
-                    chunks.put(chunk)
+                    chunks.put((time.monotonic(), chunk))
                     if self._is_interrupted(interrupted):
                         break
             except Exception as exc:
@@ -462,7 +463,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     )
                     producer_error[0] = _response_error(envelope) or exc
             finally:
-                chunks.put(_DONE)
+                chunks.put((time.monotonic(), _DONE))
 
         threading.Thread(target=produce, daemon=True).start()
         content = ""
@@ -482,7 +483,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
             profile_safety_timeout or 0.0,
         )
         stream_stall_timeout = max(STREAM_STALL_TIMEOUT, options.timeout)
-        started = last_meaningful = time.monotonic()
+        started = last_meaningful = stream_started_at
         activity_status = ""
 
         def report_activity(status: str) -> None:
@@ -509,7 +510,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     interrupted_result = True
                     while True:
                         try:
-                            pending = chunks.get_nowait()
+                            _arrived_at, pending = chunks.get_nowait()
                         except queue.Empty:
                             break
                         if pending is _DONE:
@@ -520,13 +521,27 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 if now - started >= stream_safety_timeout:
                     safety_timeout = True
                     break
-                if now - last_meaningful >= stream_stall_timeout:
+                try:
+                    arrived_at, chunk = chunks.get_nowait()
+                except queue.Empty:
+                    if now - last_meaningful >= stream_stall_timeout:
+                        stalled = True
+                        break
+                    wait_timeout = min(
+                        POLL_INTERVAL,
+                        stream_safety_timeout - (now - started),
+                        stream_stall_timeout - (now - last_meaningful),
+                    )
+                    try:
+                        arrived_at, chunk = chunks.get(timeout=wait_timeout)
+                    except queue.Empty:
+                        continue
+                if time.monotonic() - started >= stream_safety_timeout:
+                    safety_timeout = True
+                    break
+                if arrived_at - last_meaningful >= stream_stall_timeout:
                     stalled = True
                     break
-                try:
-                    chunk = chunks.get(timeout=POLL_INTERVAL)
-                except queue.Empty:
-                    continue
                 if chunk is _DONE:
                     break
 
@@ -546,7 +561,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 meaningful = bool(provider_finish)
                 if delta is None:
                     if meaningful:
-                        last_meaningful = time.monotonic()
+                        last_meaningful = arrived_at
                     continue
 
                 incoming_content = (
@@ -617,7 +632,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 if not visible_delta and tool_activity:
                     report_activity("Preparing tool call...")
                 if meaningful:
-                    last_meaningful = time.monotonic()
+                    last_meaningful = arrived_at
         finally:
             close = getattr(stream, "close", None)
             if callable(close):

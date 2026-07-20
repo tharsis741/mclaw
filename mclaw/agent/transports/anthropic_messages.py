@@ -229,12 +229,14 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
         stream_callback: Callable[[str], None] | None,
         interrupted: Callable[[], bool] | None,
     ) -> ModelCallResult:
-        events: queue.Queue[Any] = queue.Queue()
+        events: queue.Queue[tuple[float, Any]] = queue.Queue()
         done = threading.Event()
         started = threading.Event()
         stop_requested = threading.Event()
         stream_holder: list[Any] = [None]
+        stream_started_holder: list[float | None] = [None]
         producer_error: list[Exception | None] = [None]
+        created_at = time.monotonic()
 
         def produce() -> None:
             try:
@@ -242,6 +244,7 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                 context = manager if hasattr(manager, "__enter__") else nullcontext(manager)
                 with context as stream:
                     stream_holder[0] = stream
+                    stream_started_holder[0] = time.monotonic()
                     started.set()
                     if stop_requested.is_set():
                         close = getattr(stream, "close", None)
@@ -251,15 +254,14 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                     for event in stream:
                         if stop_requested.is_set():
                             break
-                        events.put(event)
+                        events.put((time.monotonic(), event))
             except Exception as exc:
                 producer_error[0] = exc
             finally:
                 done.set()
 
         threading.Thread(target=produce, daemon=True).start()
-        created_at = time.monotonic()
-        stream_started_at = created_at
+        stream_started_at: float | None = None
         last_event_at = created_at
         timed_out = False
         timeout_finish_reason = "stream_stalled"
@@ -307,36 +309,67 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                 stop_requested.set()
                 while True:
                     try:
-                        pending = events.get_nowait()
+                        _arrived_at, pending = events.get_nowait()
                     except queue.Empty:
                         break
                     merge_usage(pending)
                 break
             now = time.monotonic()
-            if not started.is_set():
-                if now - created_at > stream_create_timeout:
+            stream_is_started = started.is_set()
+            if not stream_is_started:
+                if now - created_at >= stream_create_timeout:
                     timed_out = True
                     timeout_finish_reason = "stream_create_timeout"
                     stop_requested.set()
                     break
             else:
-                if stream_started_at == created_at:
-                    stream_started_at = last_event_at = now
-                if now - stream_started_at > stream_safety_timeout:
+                if stream_started_at is None:
+                    stream_started_at = stream_started_holder[0] or now
+                    last_event_at = stream_started_at
+                if now - stream_started_at >= stream_safety_timeout:
                     timed_out = True
                     timeout_finish_reason = "stream_timeout"
                     stop_requested.set()
                     break
-                if now - last_event_at > stream_stall_timeout:
+            try:
+                arrived_at, event = events.get_nowait()
+            except queue.Empty:
+                if stream_is_started and now - last_event_at >= stream_stall_timeout:
                     timed_out = True
                     timeout_finish_reason = "stream_stalled"
                     stop_requested.set()
                     break
-            try:
-                event = events.get(timeout=POLL_INTERVAL)
-            except queue.Empty:
-                continue
-            last_event_at = time.monotonic()
+                wait_timeout = POLL_INTERVAL
+                if not stream_is_started:
+                    wait_timeout = min(
+                        wait_timeout,
+                        stream_create_timeout - (now - created_at),
+                    )
+                else:
+                    wait_timeout = min(
+                        wait_timeout,
+                        stream_safety_timeout - (now - stream_started_at),
+                        stream_stall_timeout - (now - last_event_at),
+                    )
+                try:
+                    arrived_at, event = events.get(timeout=wait_timeout)
+                except queue.Empty:
+                    continue
+            if stream_started_at is None:
+                stream_started_at = stream_started_holder[0] or arrived_at
+                last_event_at = stream_started_at
+            now = time.monotonic()
+            if now - stream_started_at >= stream_safety_timeout:
+                timed_out = True
+                timeout_finish_reason = "stream_timeout"
+                stop_requested.set()
+                break
+            if arrived_at - last_event_at >= stream_stall_timeout:
+                timed_out = True
+                timeout_finish_reason = "stream_stalled"
+                stop_requested.set()
+                break
+            last_event_at = arrived_at
             event_type = _field(event, "type", "")
             if event_type == "message_start":
                 message = _field(event, "message")

@@ -118,25 +118,36 @@ def test_status_detail_does_not_replace_the_canonical_lifecycle() -> None:
     assert pet.events[-1][1]["state"] == PetState.REVIEW
 
 
-def test_reasoning_marker_prints_once_per_main_model_round() -> None:
+def test_reasoning_activity_is_status_only_until_visible_text_arrives() -> None:
     chat, _pet = make_chat_with_pet()
-    rendered: list[tuple[str, str]] = []
+    rendered: list[tuple[str, dict]] = []
     chat._response_renderer = SimpleNamespace(
-        render_title=lambda title, *, title_style: rendered.append((title, title_style))
+        render_response=lambda text, **kwargs: rendered.append((text, kwargs))
     )
 
-    chat._on_status("Waiting for model...")
-    chat._on_status("Thinking...")
-    chat._on_status("Thinking...")
-    chat._on_status("Preparing tool call...")
     chat._on_status("Thinking...")
 
-    assert [title for title, _style in rendered] == ["- 推理中..."]
+    assert rendered == []
 
-    chat._on_status("Waiting for model...")
-    chat._on_status("Thinking...")
+    chat._on_agent_event(
+        {
+            "type": "assistant.message",
+            "content": "actual reasoning",
+            "content_source": "reasoning_content",
+            "is_final": False,
+            "tool_names": [],
+        }
+    )
 
-    assert [title for title, _style in rendered] == ["- 推理中...", "- 推理中..."]
+    assert rendered == [
+        (
+            "actual reasoning",
+            {
+                "title": "- 思考中...",
+                "title_style": "bold #D99A2B",
+            },
+        )
+    ]
 
 
 def test_all_agent_status_messages_are_self_contained() -> None:

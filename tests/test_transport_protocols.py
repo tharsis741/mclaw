@@ -1142,6 +1142,60 @@ def test_openai_stream_uses_profile_safety_timeout(monkeypatch) -> None:
     assert stalled_stream.closed is True
 
 
+def test_openai_stall_watchdog_uses_chunk_arrival_time(monkeypatch) -> None:
+    from mclaw.agent.transports import openai_chat_completions as module
+
+    monkeypatch.setattr(module, "STREAM_SAFETY_TIMEOUT", 0.5)
+    monkeypatch.setattr(module, "STREAM_STALL_TIMEOUT", 0.05)
+    monkeypatch.setattr(module, "POLL_INTERVAL", 0.001)
+    profile = GenericOpenAICompatibleProfile(name="generic", display_name="Generic")
+    context = _context(profile=profile)
+
+    timely_stream = _FakeStream([
+        {"choices": [{"delta": {"content": "first"}, "finish_reason": None}]},
+        {"choices": [{"delta": {"content": "second"}, "finish_reason": "stop"}]},
+    ])
+
+    def slow_callback(text: str) -> None:
+        if text == "first":
+            time.sleep(0.1)
+
+    result = OpenAIChatCompletionsTransport(
+        context,
+        _FakeOpenAIClient(timely_stream),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(
+            stream=True,
+            timeout=0.001,
+            stream_activity_callback=None,
+        ),
+        stream_callback=slow_callback,
+    )
+
+    assert result.content == "firstsecond"
+    assert result.finish_reason == "stop"
+
+    def delayed_stream():
+        yield {"choices": [{"delta": {"content": "first"}, "finish_reason": None}]}
+        time.sleep(0.1)
+        yield {"choices": [{"delta": {"content": "late"}, "finish_reason": "stop"}]}
+
+    late_result = OpenAIChatCompletionsTransport(
+        context,
+        _FakeOpenAIClient(delayed_stream()),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(stream=True, timeout=0.001),
+        stream_callback=slow_callback,
+    )
+
+    assert late_result.content == "first"
+    assert late_result.finish_reason == "stream_stalled"
+
+
 def test_openai_zero_payload_stream_is_normalized() -> None:
     profile = GenericOpenAICompatibleProfile(name="generic", display_name="Generic")
     context = _context(profile=profile)
@@ -1418,6 +1472,80 @@ def test_anthropic_stream_watchdogs_respect_longer_call_timeout(monkeypatch) -> 
 
     assert result.content == "answer"
     assert api.closed is True
+
+
+def test_anthropic_stall_watchdog_uses_event_arrival_time(monkeypatch) -> None:
+    from mclaw.agent.transports import anthropic_messages as module
+
+    monkeypatch.setattr(module, "STREAM_SAFETY_TIMEOUT", 0.5)
+    monkeypatch.setattr(module, "STREAM_STALL_TIMEOUT", 0.05)
+    monkeypatch.setattr(module, "POLL_INTERVAL", 0.001)
+    profile = AnthropicProfile(
+        name="anthropic",
+        display_name="Anthropic",
+        api_mode="anthropic_messages",
+        auth_scheme="anthropic_x_api_key",
+    )
+    context = _context(profile=profile, model="claude-sonnet-5")
+
+    timely_api = _FakeMessageAPI(events=[
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "first"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "second"},
+        },
+        {"type": "message_stop", "message": {"stop_reason": "end_turn"}},
+    ])
+
+    def slow_callback(text: str) -> None:
+        if text == "first":
+            time.sleep(0.15)
+
+    result = AnthropicMessagesTransport(
+        context,
+        _FakeAnthropicClient(timely_api),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(timeout=0.001),
+        stream_callback=slow_callback,
+    )
+
+    assert result.content == "firstsecond"
+    assert result.finish_reason == "end_turn"
+
+    def delayed_events():
+        yield {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "first"},
+        }
+        time.sleep(0.1)
+        yield {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "late"},
+        }
+        yield {"type": "message_stop", "message": {"stop_reason": "end_turn"}}
+
+    late_api = _FakeMessageAPI(events=delayed_events())
+    late_result = AnthropicMessagesTransport(
+        context,
+        _FakeAnthropicClient(late_api),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(timeout=0.001),
+        stream_callback=slow_callback,
+    )
+
+    assert late_result.content == "first"
+    assert late_result.finish_reason == "stream_stalled"
 
 
 def test_anthropic_interrupted_stream_keeps_reported_input_usage() -> None:

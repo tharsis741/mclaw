@@ -89,8 +89,6 @@ from mclaw.cli.tui.renderers.delegation import DelegationRenderer
 from mclaw.cli.tui.renderers.response import (
     INTERMEDIATE_ASSISTANT_TITLE,
     INTERMEDIATE_ASSISTANT_TITLE_STYLE,
-    REASONING_ASSISTANT_TITLE,
-    REASONING_ASSISTANT_TITLE_STYLE,
     ResponseRenderer,
     THINKING_ASSISTANT_TITLE,
     THINKING_ASSISTANT_TITLE_STYLE,
@@ -444,7 +442,6 @@ class InteractiveChat:
         # Animation state
         self._spinner_idx: int = 0           # 0..3 spinner chars
         self._anim_tick: int = 0             # global tick counter
-        self._reasoning_marker_shown = False
 
         # Subagent state
         self.subtask_manager = None
@@ -811,18 +808,6 @@ class InteractiveChat:
         logger.info("[TUI] _on_tool_end done")
 
     def _on_status(self, msg: str):
-        if msg == "Waiting for model...":
-            self._reasoning_marker_shown = False
-        elif msg == "Thinking..." and not getattr(self, "_reasoning_marker_shown", False):
-            self._reasoning_marker_shown = True
-            try:
-                self._get_response_renderer().render_title(
-                    REASONING_ASSISTANT_TITLE,
-                    title_style=REASONING_ASSISTANT_TITLE_STYLE,
-                )
-            except Exception:
-                logger.warning("reasoning marker render failed", exc_info=True)
-
         lower = msg.lower()
         is_tool_status = "running" in lower and "tool" in lower
         state = self._runtime_state()
