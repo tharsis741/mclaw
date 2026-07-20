@@ -2465,7 +2465,7 @@ def test_summary_failure_prunes_confirmed_tools_to_eighty_percent_then_calls_mod
         "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
     )
     assert sent_results["pending-current"] == "P" * 400
-    assert any("History compression failed" in status for status in statuses)
+    assert any("Pruning tool results" in status for status in statuses)
     assert any("[CONTEXT FALLBACK START]" in message for message in logs)
     assert any("target=800" in message for message in logs)
     assert "[LOOP] compression done" not in logs

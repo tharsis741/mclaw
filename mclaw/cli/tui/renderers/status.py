@@ -185,14 +185,13 @@ class StatusRenderer:
 
         if owner._agent_running or status == RuntimeStatus.WAITING_FOR_USER:
             status_label, status_color = _STATUS_STYLES[status]
-            fragments.append((f"fg:{status_color} bold", f" {status_label} "))
             if state.active_tools:
-                tools_str = " | ".join(sorted(state.active_tools))
-                if len(tools_str) > 30:
-                    tools_str = tools_str[:27] + "..."
-                fragments.append(("class:status-bar", f" · {tools_str}"))
-            if state.detail:
-                fragments.append(("class:status-bar", f" · {state.detail}"))
+                display_status = " | ".join(sorted(state.active_tools))
+                if len(display_status) > 30:
+                    display_status = display_status[:27] + "..."
+            else:
+                display_status = state.detail or status_label
+            fragments.append((f"fg:{status_color} bold", f" {display_status} "))
         elif status == RuntimeStatus.INTERRUPTED:
             fragments.append(("class:status-bar-warning", " ⚡ Interrupted "))
         elif status == RuntimeStatus.ERROR:
@@ -205,31 +204,6 @@ class StatusRenderer:
                 fragments.append(("class:status-bar-error", " ✗ Error "))
         elif status == RuntimeStatus.DONE:
             fragments.append(("class:status-bar-done", " ✓ Done "))
-
-        if owner.subtask_manager:
-            sm = owner.subtask_manager
-            running = sum(1 for t in sm.tasks if t["status"] == "running")
-            finalizing = sum(1 for t in sm.tasks if t["status"] == "finalizing")
-            done = sum(1 for t in sm.tasks if t["status"] == "completed")
-            errs = sum(1 for t in sm.tasks if t["status"] in {"error", "failed"})
-            timed_out = sum(1 for t in sm.tasks if t["status"] == "timed_out")
-            interrupted = sum(1 for t in sm.tasks if t["status"] == "interrupted")
-            total = len(sm.tasks)
-            if running:
-                badge_text = f"🔀 {running}/{total} running"
-                if finalizing:
-                    badge_text += f" · {finalizing} finalizing"
-            elif finalizing:
-                badge_text = f"🔀 {finalizing}/{total} finalizing"
-            elif errs or timed_out or interrupted:
-                badge_text = f"🔀 {done}/{total} done · {errs} failed"
-                if timed_out:
-                    badge_text += f" · {timed_out} timed out"
-                if interrupted:
-                    badge_text += f" · {interrupted} interrupted"
-            else:
-                badge_text = f"🔀 {done}/{total} done"
-            fragments.append(("class:status-bar-subagent-badge", f" {badge_text}"))
 
         if owner.subtask_manager:
             fragments.append(("", "\n"))

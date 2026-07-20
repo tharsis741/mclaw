@@ -33,7 +33,7 @@ class RuntimeSessionState:
 
     def begin_turn(self) -> None:
         """Reset per-turn rendering state and mark the runtime as requesting."""
-        self.set_status(RuntimeStatus.REQUESTING)
+        self.set_status(RuntimeStatus.REQUESTING, "Preparing request")
         self.active_tools.clear()
         self.stream_text = ""
         self.stream_started = False
@@ -46,7 +46,7 @@ class RuntimeSessionState:
         self.stream_started = True
         self.stream_text += text
         char_count = len(self.stream_text)
-        self.set_status(RuntimeStatus.STREAMING, f"{char_count} chars")
+        self.set_status(RuntimeStatus.STREAMING, f"Streaming {char_count} chars")
         return char_count
 
     def begin_tools(self, tool_name: str) -> None:
@@ -75,7 +75,7 @@ class RuntimeSessionState:
             self.turn_started_at = None
         self.active_tools.clear()
         if final_result.get("pending_skill_import_confirmation"):
-            self.set_status(RuntimeStatus.WAITING_FOR_USER, "Skill confirmation")
+            self.set_status(RuntimeStatus.WAITING_FOR_USER, "Waiting for skill confirmation")
         elif final_result.get("interrupted"):
             self.set_status(RuntimeStatus.INTERRUPTED, "Interrupted")
         elif final_result.get("error"):

@@ -195,34 +195,21 @@ def _compact_status_detail(message: str, *, has_active_tools: bool = False) -> s
         return ""
 
     lower = text.lower().rstrip(".")
-    if lower == "waiting for response":
-        return "Waiting for response"
-    if lower == "compressing context":
-        return "Compressing context"
-    if "context overflow" in lower and "compress" in lower:
-        return "Compressing context"
     if "running" in lower and "tool" in lower:
         if has_active_tools:
             return ""
         match = re.search(r"running\s+(\d+)\s+tool", lower)
         if match:
             count = int(match.group(1))
-            return f"{count} tool" if count == 1 else f"{count} tools"
-        return "Tools"
+            return f"Running {count} tool" if count == 1 else f"Running {count} tools"
+        return "Running tools"
 
-    retry_match = re.search(r"等待\s+(\d+(?:\.\d+)?)s", text)
-    if retry_match:
-        return f"Retrying in {retry_match.group(1)}s"
-    if "触发后台记忆与技能审查" in text:
-        return "Reviewing memory and skills"
-    if "触发后台记忆审查" in text:
-        return "Reviewing memory"
-    if "触发后台技能审查" in text:
-        return "Reviewing skills"
-
-    if any(ord(ch) > 127 for ch in text):
-        return "Working"
     return text.rstrip(".")
+
+
+def _format_subagent_status(total: int, done: int, running: int) -> str:
+    noun = "subagent" if running == 1 else "subagents"
+    return f"{running} {noun} running · {done}/{total} done"
 
 
 def _strip_markdown(text: str) -> str:
@@ -667,13 +654,11 @@ class InteractiveChat:
         if not sm:
             return
 
-        done = sum(1 for t in sm.tasks if t["status"] in ("completed", "error"))
+        terminal_statuses = {"completed", "timed_out", "interrupted", "failed", "error"}
+        done = sum(1 for t in sm.tasks if t["status"] in terminal_statuses)
         running = sum(1 for t in sm.tasks if t["status"] == "running")
         state = self._runtime_state()
-        state.detail = f"{done}/{sm.num_tasks} done"
-        if running:
-            state.detail += f" · {running} running"
-
+        state.detail = _format_subagent_status(sm.num_tasks, done, running)
         if self._app:
             self._app.invalidate()
 
@@ -758,7 +743,7 @@ class InteractiveChat:
             "resume_detail": state.detail,
         }
         self._pending_secret_request = pending
-        state.set_status(RuntimeStatus.WAITING_FOR_USER, f"Credentials for {required_for}")
+        state.set_status(RuntimeStatus.WAITING_FOR_USER, f"Waiting for {required_for} credentials")
         self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
         self._render_secret_request(pending)
         self._pet_emit_for_runtime_status(
@@ -1173,7 +1158,7 @@ class InteractiveChat:
     def _get_turn_result_coordinator(self) -> RuntimeTurnResultCoordinator:
         def _emit_waiting_for_skill_confirmation() -> None:
             state = self._runtime_state()
-            state.set_status(RuntimeStatus.WAITING_FOR_USER, "Skill confirmation")
+            state.set_status(RuntimeStatus.WAITING_FOR_USER, "Waiting for skill confirmation")
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
             self._pet_emit_for_runtime_status(
                 PetEventType.WAITING_FOR_USER,
@@ -1221,18 +1206,21 @@ class InteractiveChat:
 
         def _set_delegating_status(num_tasks: int) -> None:
             state = self._runtime_state()
-            state.set_status(RuntimeStatus.DELEGATING, f"0/{num_tasks} done · {num_tasks} running")
+            state.set_status(
+                RuntimeStatus.DELEGATING,
+                _format_subagent_status(num_tasks, 0, num_tasks),
+            )
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
 
         def _set_aggregating_status() -> None:
             state = self._runtime_state()
-            state.set_status(RuntimeStatus.AGGREGATING, "collecting results")
+            state.set_status(RuntimeStatus.AGGREGATING, "Collecting results")
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
             self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
 
         def _set_synthesis_status() -> None:
             state = self._runtime_state()
-            state.set_status(RuntimeStatus.AGGREGATING, "summarizing results")
+            state.set_status(RuntimeStatus.AGGREGATING, "Summarizing results")
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
             self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
 
@@ -1539,7 +1527,7 @@ class InteractiveChat:
             state = self._runtime_state()
             state.set_status(
                 RuntimeStatus.TOOLS,
-                "confirming Skill install" if approve else "cancelling Skill import",
+                "Confirming Skill install" if approve else "Cancelling Skill import",
             )
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
             self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)

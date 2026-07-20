@@ -840,9 +840,7 @@ class MClaw:
             target,
             len(self._tool_call_ids_pending_visibility),
         )
-        self._emit_status(
-            "History compression failed — pruning confirmed tool results..."
-        )
+        self._emit_status("Pruning tool results...")
         pruned_messages, pruned, _saved = compressor.prune_confirmed_tool_results(
             messages,
             tokens_to_save=tokens_to_save,
@@ -1099,10 +1097,7 @@ class MClaw:
                     )
                     if check_tokens >= compression_limit:
                         logger.info("[LOOP] preventive compression triggered (check=%d >= threshold=%d)", check_tokens, compression_limit)
-                        self._emit_status(
-                            "Compressing history before the model request — "
-                            "the current task will continue..."
-                        )
+                        self._emit_status("Refreshing context...")
                         self.flush_memories(messages)
                         messages = cc.compress(
                             messages,
@@ -1210,7 +1205,7 @@ class MClaw:
                             "[TUI CONTEXT] source=estimate tokens=%d",
                             display_budget.input_tokens,
                         )
-                    self._emit_status("Requesting model...")
+                    self._emit_status("Waiting for model...")
                     # Log the full message list before API calls to diagnose context growth.
                     try:
                         _msgs_log = []
@@ -1273,9 +1268,7 @@ class MClaw:
                     ):
                         if context_recovery_attempts == 0:
                             context_recovery_attempts = 1
-                            self._emit_status(
-                                "Context overflow — compressing and retrying..."
-                            )
+                            self._emit_status("Compressing context...")
                             self.flush_memories(messages)
                             self._refresh_memory_snapshot()
                             self._refresh_prompt_epoch(messages)
@@ -1383,7 +1376,7 @@ class MClaw:
                             "API error (attempt %d/%d), retrying in %.1fs: %s",
                             retry_count, MAX_RETRIES, wait, error,
                         )
-                        self._emit_status(f"重试中，等待 {wait:.0f}s...")
+                        self._emit_status(f"Retrying in {wait:.0f}s...")
                         deadline = time.time() + wait
                         while time.time() < deadline:
                             if self._interrupted:
@@ -1606,11 +1599,11 @@ class MClaw:
         if (_should_review_memory or _should_review_skills) and getattr(self, "_delegate_depth", 0) == 0:
             try:
                 if _should_review_memory and _should_review_skills:
-                    self._emit_status("触发后台记忆与技能审查...")
+                    self._emit_status("Reviewing memory and skills...")
                 elif _should_review_memory:
-                    self._emit_status("触发后台记忆审查...")
+                    self._emit_status("Reviewing memory...")
                 elif _should_review_skills:
-                    self._emit_status("触发后台技能审查...")
+                    self._emit_status("Reviewing skills...")
                 self._spawn_background_review(
                     messages_snapshot=list(messages),
                     review_memory=_should_review_memory,
