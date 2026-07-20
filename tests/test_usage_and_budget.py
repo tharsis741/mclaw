@@ -34,6 +34,7 @@ from mclaw.agent.usage import (
 )
 from mclaw.providers.base import ModelTraits, RuntimeProviderProfile
 from mclaw.providers.runtime import ProviderRuntimeContext
+from mclaw.safety.context_rollback import ContextRollbackManager
 from mclaw.state import SessionDB
 from mclaw.tools.file_tools import write_file_tool
 
@@ -862,7 +863,9 @@ def test_successful_large_write_is_visible_once_before_pruning(monkeypatch) -> N
                     model=context.model,
                 )
             else:
-                pruned = json.loads(calls["write-once"]["function"]["arguments"])
+                pruned = json.loads(
+                    calls["write-once"]["function"]["arguments"]
+                )
                 assert pruned["path"] == "report.md"
                 assert pruned["content"].startswith(
                     "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
@@ -916,7 +919,828 @@ def test_successful_large_write_is_visible_once_before_pruning(monkeypatch) -> N
     assert transport.call_index == 3
 
 
-def test_restored_history_prunes_completed_large_tool_arguments_before_first_call(
+def test_non_write_tool_results_remain_raw_after_seen_once(
+    monkeypatch,
+) -> None:
+    context = _context()
+    tool_calls = [
+        {
+            "id": f"batch-{i}",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        for i in range(21)
+    ]
+    tool_results = {
+        call["id"]: json.dumps({
+            "success": True,
+            "value": f"result-{i}-" + "x" * 500,
+        })
+        for i, call in enumerate(tool_calls)
+    }
+    lookup_call = {
+        "id": "lookup-after-batch",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+    class Transport:
+        def __init__(self) -> None:
+            self.call_index = 0
+
+        def call(self, **kwargs):
+            if self.call_index == 0:
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=tool_calls,
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            elif self.call_index == 1:
+                visible_results = {
+                    message.get("tool_call_id"): message.get("content")
+                    for message in kwargs["messages"]
+                    if message.get("tool_call_id") in tool_results
+                }
+                assert visible_results == tool_results
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=[lookup_call],
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            else:
+                visible_results = {
+                    message.get("tool_call_id"): message.get("content")
+                    for message in kwargs["messages"]
+                    if message.get("tool_call_id") in tool_results
+                }
+                assert visible_results == tool_results
+                result = ModelCallResult(
+                    content="done",
+                    tool_calls=None,
+                    finish_reason="stop",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            self.call_index += 1
+            return result
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+
+    def execute(calls, messages, assistant_content="", reasoning=None):
+        messages.append(agent._build_assistant_msg(
+            assistant_content,
+            calls,
+            reasoning,
+        ))
+        for call in calls:
+            messages.append({
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": tool_results.get(
+                    call["id"],
+                    json.dumps({"success": True, "value": "ok"}),
+                ),
+            })
+
+    agent._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    result = agent.run_conversation("run the batch", advance_background_review=False)
+
+    assert result["final_response"] == "done"
+    assert transport.call_index == 3
+
+
+def test_failed_follow_up_keeps_pending_write_raw(monkeypatch) -> None:
+    context = _context()
+    large_arguments = json.dumps({
+        "path": "report.md",
+        "content": "x" * 2_000,
+    })
+    write_call = {
+        "id": "write-fail",
+        "type": "function",
+        "function": {"name": "write_file", "arguments": large_arguments},
+    }
+
+    class Transport:
+        call_index = 0
+
+        def call(self, **kwargs):
+            if self.call_index == 0:
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=[write_call],
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            else:
+                sent_call = next(
+                    call
+                    for message in kwargs["messages"]
+                    for call in message.get("tool_calls") or []
+                    if call.get("id") == "write-fail"
+                )
+                assert sent_call["function"]["arguments"] == large_arguments
+                raise ModelCallError(
+                    message="provider failed",
+                    provider=context.provider,
+                    model=context.model,
+                )
+            self.call_index += 1
+            return result
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+
+    def execute(calls, messages, assistant_content="", reasoning=None):
+        messages.append(agent._build_assistant_msg(
+            assistant_content,
+            calls,
+            reasoning,
+        ))
+        messages.append({
+            "role": "tool",
+            "tool_call_id": calls[0]["id"],
+            "content": json.dumps({"path": "report.md", "bytes_written": 2_000}),
+        })
+
+    agent._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    result = agent.run_conversation("create report", advance_background_review=False)
+
+    assert result["completed"] is False
+    assert agent._tool_call_ids_pending_visibility == {"write-fail"}
+
+
+def test_tui_context_uses_first_estimate_then_provider_input_usage(
+    monkeypatch,
+) -> None:
+    context = _context()
+    tool_call = {
+        "id": "lookup-usage",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+    class Transport:
+        call_index = 0
+        agent = None
+
+        def call(self, **kwargs):
+            compressor = self.agent.context_compressor
+            if self.call_index == 0:
+                expected = estimate_request_budget(
+                    messages=kwargs["messages"],
+                    tools=kwargs["tools"],
+                    dynamic_system_context=kwargs["options"].dynamic_system_context,
+                    context=context,
+                    context_window=compressor.context_length,
+                ).input_tokens
+                assert compressor.display_context_estimated is True
+                assert compressor.display_context_tokens == expected
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=[tool_call],
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=UsageRecord(
+                        input_tokens=100,
+                        output_tokens=10,
+                        total_tokens=110,
+                    ),
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            else:
+                # Tool execution must not replace the last API report with an
+                # estimate of the enlarged message list.
+                assert compressor.display_context_estimated is False
+                assert compressor.display_context_tokens == 100
+                result = ModelCallResult(
+                    content="done",
+                    tool_calls=None,
+                    finish_reason="stop",
+                    reasoning=None,
+                    usage=UsageRecord(input_tokens=150, output_tokens=20),
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            self.call_index += 1
+            return result
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+    transport.agent = agent
+
+    def execute(calls, messages, assistant_content="", reasoning=None):
+        messages.append(agent._build_assistant_msg(
+            assistant_content,
+            calls,
+            reasoning,
+        ))
+        messages.append({
+            "role": "tool",
+            "tool_call_id": calls[0]["id"],
+            "content": json.dumps({"success": True, "value": "ok"}),
+        })
+
+    agent._execute_tool_calls = execute  # type: ignore[method-assign]
+
+    result = agent.run_conversation("look it up", advance_background_review=False)
+
+    assert result["final_response"] == "done"
+    assert agent.context_compressor.display_context_tokens == 150
+    assert agent.context_compressor.display_context_estimated is False
+
+
+def test_input_only_usage_replaces_first_request_estimate(monkeypatch) -> None:
+    context = _context()
+    tool_call = {
+        "id": "lookup-partial",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+    class Transport:
+        call_index = 0
+        agent = None
+        first_estimate = 0
+
+        def call(self, **_kwargs):
+            compressor = self.agent.context_compressor
+            if self.call_index == 0:
+                self.first_estimate = compressor.display_context_tokens
+                result = ModelCallResult(
+                    content="",
+                    tool_calls=[tool_call],
+                    finish_reason="tool_calls",
+                    reasoning=None,
+                    usage=UsageRecord(input_tokens=100),
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            else:
+                assert compressor.display_context_estimated is False
+                assert compressor.display_context_tokens == 100
+                result = ModelCallResult(
+                    content="done",
+                    tool_calls=None,
+                    finish_reason="stop",
+                    reasoning=None,
+                    usage=None,
+                    was_streamed=False,
+                    provider=context.provider,
+                    model=context.model,
+                )
+            self.call_index += 1
+            return result
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+    transport.agent = agent
+    agent._execute_tool_calls = lambda calls, messages, **_kwargs: messages.extend([  # type: ignore[method-assign]
+        agent._build_assistant_msg("", calls),
+        {
+            "role": "tool",
+            "tool_call_id": calls[0]["id"],
+            "content": json.dumps({"success": True, "value": "ok"}),
+        },
+    ])
+
+    agent.run_conversation("look it up", advance_background_review=False)
+
+    assert agent.context_compressor.display_context_estimated is False
+    assert agent.context_compressor.display_context_tokens == 100
+
+
+def test_later_user_turn_keeps_last_actual_while_backend_still_estimates(
+    monkeypatch,
+    caplog,
+) -> None:
+    context = _context()
+
+    class Transport:
+        call_index = 0
+        agent = None
+
+        def call(self, **_kwargs):
+            compressor = self.agent.context_compressor
+            if self.call_index == 0:
+                assert compressor.display_context_estimated is True
+                assert compressor.display_context_tokens is not None
+                usage = UsageRecord(input_tokens=100, output_tokens=10, total_tokens=110)
+                content = "first"
+            else:
+                assert compressor.display_context_estimated is False
+                assert compressor.display_context_tokens == 100
+                usage = UsageRecord(input_tokens=150, output_tokens=20, total_tokens=170)
+                content = "second"
+            self.call_index += 1
+            return ModelCallResult(
+                content=content,
+                tool_calls=None,
+                finish_reason="stop",
+                reasoning=None,
+                usage=usage,
+                was_streamed=False,
+                provider=context.provider,
+                model=context.model,
+            )
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+    transport.agent = agent
+    caplog.set_level(20, logger="mclaw.agent.core")
+
+    first = agent.run_conversation("first user", advance_background_review=False)
+    second = agent.run_conversation(
+        "second user",
+        conversation_history=first["messages"],
+        advance_background_review=False,
+    )
+
+    logs = [record.getMessage() for record in caplog.records]
+    assert second["final_response"] == "second"
+    assert agent.context_compressor.display_context_tokens == 150
+    assert agent.context_compressor.display_context_estimated is False
+    assert sum("[TUI CONTEXT] source=estimate" in message for message in logs) == 1
+    assert sum(
+        "[LOOP] estimating tokens for preventive compression" in message
+        for message in logs
+    ) == 2
+
+
+def test_missing_input_usage_clears_first_estimate_without_reestimating(
+    monkeypatch,
+    caplog,
+) -> None:
+    context = _context()
+
+    class Transport:
+        call_index = 0
+        agent = None
+
+        def call(self, **_kwargs):
+            compressor = self.agent.context_compressor
+            if self.call_index == 0:
+                assert compressor.display_context_estimated is True
+                assert compressor.display_context_tokens is not None
+                usage = UsageRecord(output_tokens=10, total_tokens=10)
+            else:
+                assert compressor._display_estimate_emitted is True
+                assert compressor.display_context_estimated is False
+                assert compressor.display_context_tokens is None
+                usage = None
+            self.call_index += 1
+            return ModelCallResult(
+                content=f"answer-{self.call_index}",
+                tool_calls=None,
+                finish_reason="stop",
+                reasoning=None,
+                usage=usage,
+                was_streamed=False,
+                provider=context.provider,
+                model=context.model,
+            )
+
+    transport = Transport()
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+    transport.agent = agent
+    caplog.set_level(20, logger="mclaw.agent.core")
+
+    first = agent.run_conversation("first user", advance_background_review=False)
+    agent.run_conversation(
+        "second user",
+        conversation_history=first["messages"],
+        advance_background_review=False,
+    )
+
+    logs = [record.getMessage() for record in caplog.records]
+    assert agent.context_compressor.display_context_tokens is None
+    assert agent.context_compressor.display_context_estimated is False
+    assert sum("[TUI CONTEXT] source=estimate" in message for message in logs) == 1
+
+
+def test_unexpected_transport_error_clears_first_context_estimate(
+    monkeypatch,
+) -> None:
+    context = _context()
+
+    class Transport:
+        def call(self, **_kwargs):
+            raise RuntimeError("transport crashed")
+
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: Transport())
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+
+    with pytest.raises(RuntimeError, match="transport crashed"):
+        agent.run_conversation("first user", advance_background_review=False)
+
+    compressor = agent.context_compressor
+    assert compressor.display_context_tokens is None
+    assert compressor.display_context_estimated is False
+    assert compressor._display_estimate_emitted is True
+
+
+@pytest.mark.parametrize("record_actual", [False, True])
+def test_post_transport_error_keeps_only_confirmed_context_usage(
+    monkeypatch,
+    record_actual,
+) -> None:
+    context = _context()
+    transport = _SequenceTransport(ModelCallResult(
+        content="done",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=UsageRecord(
+            provider=context.provider,
+            model=context.model,
+            input_tokens=321,
+            source="turn",
+        ),
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    ))
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=128_000,
+        quiet_mode=True,
+    )
+
+    original_record_usage = agent._record_usage
+
+    def fail_usage(usage):
+        if record_actual:
+            original_record_usage(usage)
+        raise RuntimeError("usage processing crashed")
+
+    monkeypatch.setattr(agent, "_record_usage", fail_usage)
+
+    with pytest.raises(RuntimeError, match="usage processing crashed"):
+        agent.run_conversation("first user", advance_background_review=False)
+
+    compressor = agent.context_compressor
+    assert compressor.display_context_tokens == (321 if record_actual else None)
+    assert compressor.display_context_estimated is False
+    assert compressor._display_estimate_emitted is True
+
+
+def test_summary_api_receives_ten_thousand_content_chars() -> None:
+    compressor = ContextCompressor(
+        provider_runtime=_context(),
+        context_window=128_000,
+        quiet_mode=True,
+    )
+    content = "H" * 7_000 + "M" * 2_000 + "T" * 3_000
+
+    message = {
+        "role": "tool",
+        "tool_call_id": "large-result",
+        "content": content,
+    }
+    serialized = compressor._serialize_for_summary([message])
+
+    assert serialized == (
+        "[TOOL RESULT large-result]: "
+        + "H" * 7_000
+        + "\n...[truncated]...\n"
+        + "T" * 3_000
+    )
+    calls: list[dict] = []
+
+    class Transport:
+        def call(self, **kwargs):
+            calls.append(kwargs)
+            return ModelCallResult(
+                content="summary",
+                tool_calls=None,
+                finish_reason="stop",
+                reasoning=None,
+                usage=None,
+                was_streamed=False,
+                provider=compressor.provider_runtime.provider,
+                model=compressor.provider_runtime.model,
+            )
+
+    compressor._summary_runtime = compressor.provider_runtime
+    compressor._summary_transport = Transport()
+
+    summary = compressor._generate_summary([message])
+
+    assert summary is not None and summary.endswith("summary")
+    assert len(calls) == 1
+    assert serialized in calls[0]["messages"][0]["content"]
+    assert calls[0]["options"].source == "summary"
+
+
+def test_confirmed_tool_fallback_prunes_oldest_but_protects_pending() -> None:
+    compressor = ContextCompressor(
+        provider_runtime=_context(),
+        context_window=128_000,
+        quiet_mode=True,
+    )
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "pending-oldest",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "pending-oldest",
+            "content": "P" * 6_000,
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-old",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "confirmed-old",
+            "content": "O" * 4_000,
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-new-large",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "confirmed-new-large",
+            "content": "N" * 8_000,
+        },
+    ]
+    original = deepcopy(messages)
+
+    pruned_messages, pruned, saved = compressor.prune_confirmed_tool_results(
+        messages,
+        tokens_to_save=500,
+        protected_tool_call_ids={"pending-oldest"},
+    )
+
+    contents = {
+        message.get("tool_call_id"): message.get("content")
+        for message in pruned_messages
+        if message.get("role") == "tool"
+    }
+    assert pruned == 1
+    assert saved >= 500
+    assert contents["pending-oldest"] == "P" * 6_000
+    assert contents["confirmed-old"].startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+    assert contents["confirmed-new-large"] == "N" * 8_000
+    assert [message.get("tool_call_id") for message in pruned_messages] == [
+        message.get("tool_call_id") for message in messages
+    ]
+    assert messages == original
+
+
+def test_confirmed_tool_fallback_keeps_raw_session_result(tmp_path) -> None:
+    db = SessionDB(tmp_path / "fallback-raw.db")
+    session_id = "fallback-raw"
+    raw_content = "R" * 4_000
+    call = {
+        "id": "confirmed-db",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+    try:
+        db.create_session(session_id, "cli", model="model-a")
+        db.append_message(
+            session_id,
+            "assistant",
+            content="",
+            tool_calls=[call],
+            turn_id="tool-turn",
+        )
+        db.append_message(
+            session_id,
+            "tool",
+            content=raw_content,
+            tool_call_id="confirmed-db",
+            turn_id="tool-turn",
+        )
+        history = db.get_messages_as_conversation(session_id)
+        compressor = ContextCompressor(
+            provider_runtime=_context(),
+            context_window=128_000,
+            quiet_mode=True,
+        )
+
+        projection, pruned, _saved = compressor.prune_confirmed_tool_results(
+            history,
+            tokens_to_save=1,
+        )
+
+        projected_result = next(
+            message["content"]
+            for message in projection
+            if message.get("tool_call_id") == "confirmed-db"
+        )
+        persisted_result = next(
+            message["content"]
+            for message in db.get_messages_as_conversation(session_id)
+            if message.get("tool_call_id") == "confirmed-db"
+        )
+        assert pruned == 1
+        assert projected_result.startswith(
+            "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+        )
+        assert persisted_result == raw_content
+    finally:
+        db.close()
+
+
+def test_full_compression_keeps_entire_latest_user_turn_raw(monkeypatch) -> None:
+    context = _context()
+    compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=1_000,
+        protect_first_n=1,
+        quiet_mode=True,
+    )
+    latest_user = {
+        "role": "user",
+        "content": "LATEST USER REQUEST: preserve this exact text",
+    }
+    tool_calls = [
+        {
+            "id": f"current-{i}",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        for i in range(6)
+    ]
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old response"},
+        latest_user,
+        {"role": "assistant", "content": "", "tool_calls": tool_calls},
+        *[
+            {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": json.dumps({
+                    "success": True,
+                    "value": "x" * 2_000,
+                }),
+            }
+            for call in tool_calls
+        ],
+    ]
+    summarized: list[dict] = []
+
+    def generate_summary(turns):
+        summarized.extend(deepcopy(turns))
+        return "old turns summary"
+
+    monkeypatch.setattr(compressor, "_generate_summary", generate_summary)
+
+    compressed = compressor.compress(messages)
+
+    assert summarized == messages[1:3]
+    assert latest_user not in summarized
+    latest_user_idx = compressed.index(latest_user)
+    assert compressed[latest_user_idx:] == messages[3:]
+
+
+def test_full_compression_keeps_resumed_pending_batch_raw(monkeypatch) -> None:
+    context = _context()
+    compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=1_000,
+        protect_first_n=1,
+        quiet_mode=True,
+    )
+    pending_calls = [
+        {
+            "id": f"pending-{i}",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+        for i in range(2)
+    ]
+    messages = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {"role": "assistant", "content": "old response"},
+        {"role": "assistant", "content": "", "tool_calls": pending_calls},
+        *[
+            {
+                "role": "tool",
+                "tool_call_id": call["id"],
+                "content": json.dumps({"success": True, "value": "x" * 2_000}),
+            }
+            for call in pending_calls
+        ],
+        {"role": "user", "content": "resume and continue"},
+    ]
+    summarized: list[dict] = []
+
+    def generate_summary(turns):
+        summarized.extend(deepcopy(turns))
+        return "old turns summary"
+
+    monkeypatch.setattr(compressor, "_generate_summary", generate_summary)
+
+    compressed = compressor.compress(
+        messages,
+        protected_tool_call_ids={"pending-0", "pending-1"},
+    )
+
+    assert summarized == messages[1:3]
+    pending_start = compressed.index(messages[3])
+    assert compressed[pending_start:] == messages[3:]
+
+
+def test_completed_restored_write_is_pruned_at_pre_api_boundary(
     monkeypatch,
 ) -> None:
     context = _context()
@@ -1003,13 +1827,11 @@ def test_restored_history_prunes_completed_large_tool_arguments_before_first_cal
         for message in sent
         for call in message.get("tool_calls") or []
     }
-    pruned_arguments = json.loads(calls["large-call"]["function"]["arguments"])
-    assert pruned_arguments["path"] == "report.py"
-    assert pruned_arguments["encoding"] == "utf-8"
-    assert pruned_arguments["content"] == (
-        "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED: original 2000 chars were already "
-        "written successfully and removed from history; never use this marker as "
-        "new write_file content; use read_file(path) to inspect the file]"
+    pruned_large = json.loads(calls["large-call"]["function"]["arguments"])
+    assert pruned_large["path"] == "report.py"
+    assert pruned_large["encoding"] == "utf-8"
+    assert pruned_large["content"].startswith(
+        "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
     )
     assert calls["large-call"]["id"] == "large-call"
     assert calls["large-call"]["function"]["name"] == "write_file"
@@ -1023,6 +1845,375 @@ def test_restored_history_prunes_completed_large_tool_arguments_before_first_cal
         message["tool_call_id"] for message in sent if message.get("role") == "tool"
     }
     assert history == original_history
+
+
+def test_resume_rebuilds_pending_batch_before_pre_api_prune(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    context = _context()
+    db = SessionDB(tmp_path / "resume.db")
+    session_id = "resume-pending"
+    pending_calls = [
+        {
+            "id": f"pending-{i}",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps({
+                    "path": f"pending-{i}.txt",
+                    "content": "x" * 2_000,
+                }),
+            },
+        }
+        for i in range(2)
+    ]
+    raw_results = {
+        call["id"]: json.dumps({"success": True, "value": "x" * 500})
+        for call in pending_calls
+    }
+    final = ModelCallResult(
+        content="done",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=None,
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    )
+    transport = _SequenceTransport(final)
+
+    try:
+        db.create_session(session_id, "cli", model=context.model)
+        db.append_message(
+            session_id,
+            "assistant",
+            content="",
+            tool_calls=pending_calls,
+            turn_id="turn-tools",
+        )
+        for call in pending_calls:
+            db.append_message(
+                session_id,
+                "tool",
+                content=raw_results[call["id"]],
+                tool_call_id=call["id"],
+                turn_id="turn-tools",
+            )
+        # Runtime notices and later user input do not prove model visibility.
+        db.append_message(session_id, "assistant", content="runtime notice")
+        for i in range(21):
+            db.append_message(
+                session_id,
+                "user",
+                content=f"queued user message {i}",
+                turn_id=f"queued-{i}",
+            )
+
+        history = db.get_messages_as_conversation(session_id)
+        agent = _runtime_agent(
+            monkeypatch,
+            context,
+            transport,
+            session_db=db,
+            session_id=session_id,
+        )
+        agent.context_compressor = ContextCompressor(
+            provider_runtime=context,
+            context_window=128_000,
+            quiet_mode=True,
+        )
+
+        assert agent._tool_call_ids_pending_visibility == {
+            "pending-0",
+            "pending-1",
+        }
+
+        agent.run_conversation(
+            "continue",
+            conversation_history=history,
+            advance_background_review=False,
+        )
+
+        sent_results = {
+            message.get("tool_call_id"): message.get("content")
+            for message in transport.calls[0]["messages"]
+            if message.get("tool_call_id") in raw_results
+        }
+        assert sent_results == raw_results
+        sent_calls = {
+            call["id"]: call
+            for message in transport.calls[0]["messages"]
+            for call in message.get("tool_calls") or []
+            if call.get("id") in raw_results
+        }
+        assert all(
+            json.loads(sent_calls[call["id"]]["function"]["arguments"])["content"]
+            == "x" * 2_000
+            for call in pending_calls
+        )
+        assert agent._tool_call_ids_pending_visibility == set()
+
+        # The persisted final model assistant now proves the batch was seen.
+        resumed_again = _runtime_agent(
+            monkeypatch,
+            context,
+            _SequenceTransport(final),
+            session_db=db,
+            session_id=session_id,
+        )
+        assert resumed_again._tool_call_ids_pending_visibility == set()
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "finish_reason",
+    [
+        "stream_stalled",
+        "stream_timeout",
+        "stream_error",
+        "stream_create_timeout",
+        "stream_incomplete",
+    ],
+)
+def test_incomplete_stream_keeps_pending_in_memory_and_after_resume(
+    monkeypatch,
+    tmp_path,
+    finish_reason,
+) -> None:
+    context = _context()
+    db = SessionDB(tmp_path / f"{finish_reason}.db")
+    session_id = f"pending-{finish_reason}"
+    pending_call = {
+        "id": "pending-stream",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+    partial = ModelCallResult(
+        content="partial response",
+        tool_calls=None,
+        finish_reason=finish_reason,
+        reasoning=None,
+        usage=UsageRecord(input_tokens=123),
+        was_streamed=True,
+        provider=context.provider,
+        model=context.model,
+        interrupted=False,
+    )
+
+    try:
+        db.create_session(session_id, "cli", model=context.model)
+        db.append_message(
+            session_id,
+            "assistant",
+            content="",
+            tool_calls=[pending_call],
+            finish_reason="tool_calls",
+            turn_id="tool-turn",
+        )
+        db.append_message(
+            session_id,
+            "tool",
+            content="raw tool result",
+            tool_call_id="pending-stream",
+            turn_id="tool-turn",
+        )
+        history = db.get_messages_as_conversation(session_id)
+        agent = _runtime_agent(
+            monkeypatch,
+            context,
+            _SequenceTransport(partial),
+            session_db=db,
+            session_id=session_id,
+        )
+
+        result = agent.run_conversation(
+            "continue",
+            conversation_history=history,
+            advance_background_review=False,
+        )
+
+        assert result["final_response"] == "partial response"
+        assert result["completed"] is False
+        assert result["stop_reason"] == finish_reason
+        assert result["assistant_rounds"][-1]["is_final"] is False
+        assert agent._tool_call_ids_pending_visibility == {"pending-stream"}
+        assert db.get_pending_tool_call_ids(session_id) == {"pending-stream"}
+
+        resumed = _runtime_agent(
+            monkeypatch,
+            context,
+            _SequenceTransport(partial),
+            session_db=db,
+            session_id=session_id,
+        )
+        assert resumed._tool_call_ids_pending_visibility == {"pending-stream"}
+    finally:
+        db.close()
+
+
+def test_pending_recovery_is_conservative_for_legacy_tool_rows(tmp_path) -> None:
+    db = SessionDB(tmp_path / "legacy-resume.db")
+    session_id = "legacy-pending"
+    legacy_call = {
+        "id": "legacy-tool",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+
+    try:
+        db.create_session(session_id, "cli", model="legacy-model")
+        db.append_message(
+            session_id,
+            "assistant",
+            content="",
+            tool_calls=[legacy_call],
+        )
+        db.append_message(
+            session_id,
+            "tool",
+            content=json.dumps({"success": True, "value": "raw"}),
+            tool_call_id="legacy-tool",
+        )
+        db.append_message(session_id, "assistant", content="runtime notice")
+
+        assert db.get_pending_tool_call_ids(session_id) == {"legacy-tool"}
+
+        db.append_message(
+            session_id,
+            "assistant",
+            content="current model reply",
+            turn_id="current-turn",
+        )
+        assert db.get_pending_tool_call_ids(session_id) == set()
+    finally:
+        db.close()
+
+
+def test_context_reload_rebuilds_live_pending_visibility(tmp_path) -> None:
+    db = SessionDB(tmp_path / "rollback-pending.db")
+    session_id = "rollback-pending"
+    call = {
+        "id": "rollback-tool",
+        "type": "function",
+        "function": {"name": "lookup", "arguments": "{}"},
+    }
+    agent = SimpleNamespace(
+        session_id=session_id,
+        messages=[],
+        session_user_messages=0,
+        _tool_call_ids_pending_visibility=set(),
+    )
+
+    try:
+        db.create_session(session_id, "cli", model="model-a")
+        db.append_message(
+            session_id,
+            "assistant",
+            content="",
+            tool_calls=[call],
+            turn_id="tool-turn",
+        )
+        db.append_message(
+            session_id,
+            "tool",
+            content=json.dumps({"success": True, "value": "raw"}),
+            tool_call_id="rollback-tool",
+            turn_id="tool-turn",
+        )
+        manager = ContextRollbackManager(session_db=db, agent=agent)
+
+        manager.reload_agent_messages(session_id)
+        assert agent._tool_call_ids_pending_visibility == {"rollback-tool"}
+
+        db.append_message(
+            session_id,
+            "assistant",
+            content="seen",
+            turn_id="response-turn",
+        )
+        manager.reload_agent_messages(session_id)
+        assert agent._tool_call_ids_pending_visibility == set()
+    finally:
+        db.close()
+
+
+def test_write_pruning_invalidates_stale_provider_prompt_for_compression_check(
+    monkeypatch,
+) -> None:
+    context = _context()
+    old_call = {
+        "id": "old-write",
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "arguments": json.dumps({
+                "path": "old.txt",
+                "content": "x" * 2_000,
+            }),
+        },
+    }
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "assistant", "content": "", "tool_calls": [old_call]},
+        {
+            "role": "tool",
+            "tool_call_id": "old-write",
+            "content": json.dumps({"success": True, "bytes_written": 2_000}),
+        },
+        *[
+            {"role": "user", "content": f"filler {i}"}
+            for i in range(21)
+        ],
+    ]
+    transport = _SequenceTransport(ModelCallResult(
+        content="done",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=None,
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    ))
+    monkeypatch.setattr("mclaw.agent.core.create_transport", lambda _context: transport)
+    monkeypatch.setattr(MClaw, "_discover_tools", lambda self: None)
+    agent = MClaw(
+        provider_runtime=context,
+        system_prompt="system",
+        skip_memory=True,
+        config={"compression": {"enabled": True}},
+    )
+    agent.context_compressor.last_prompt_tokens = 100_000
+    agent.context_compressor.threshold_tokens = 50_000
+    compress_calls = []
+
+    def unexpected_compress(messages, **_kwargs):
+        compress_calls.append(messages)
+        return messages
+
+    monkeypatch.setattr(agent.context_compressor, "compress", unexpected_compress)
+
+    agent.run_conversation(
+        "continue",
+        conversation_history=history,
+        advance_background_review=False,
+    )
+
+    assert compress_calls == []
+    old_write = next(
+        call
+        for message in transport.calls[0]["messages"]
+        for call in message.get("tool_calls") or []
+        if call.get("id") == "old-write"
+    )
+    old_arguments = json.loads(old_write["function"]["arguments"])
+    assert old_arguments["path"] == "old.txt"
+    assert old_arguments["content"].startswith(
+        "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
+    )
 
 
 @pytest.mark.parametrize("marker", [
@@ -1075,15 +2266,18 @@ def test_compression_flush_receives_current_working_history(
         threshold_tokens = 1 if trigger == "preventive" else 127_000
         last_prompt_tokens = 128_000 if trigger == "preventive" else 0
         last_completion_tokens = 0
+        display_context_tokens = 0
+        display_context_estimated = False
         _compressed_this_turn = False
-
-        @staticmethod
-        def compress(messages, **_kwargs):
-            return [messages[0], *messages[2:]]
 
         @staticmethod
         def prune(messages, **_kwargs):
             return messages, 0
+
+        @classmethod
+        def compress(cls, messages, **_kwargs):
+            cls._compressed_this_turn = True
+            return [messages[0], *messages[2:]]
 
     agent.context_compressor = Compressor()
     flushed: list[list[dict] | None] = []
@@ -1106,6 +2300,479 @@ def test_compression_flush_receives_current_working_history(
     assert len(flushed) == 1
     assert flushed[0] is not None
     assert flushed[0][-1] == {"role": "user", "content": "current user"}
+
+
+def test_preventive_compression_does_not_report_noop_as_done(
+    monkeypatch,
+    caplog,
+) -> None:
+    context = _context()
+    transport = _SequenceTransport(ModelCallResult(
+        content="answer",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=None,
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    ))
+    agent = _runtime_agent(monkeypatch, context, transport)
+
+    class Compressor:
+        context_length = 128_000
+        threshold_tokens = 1
+        last_prompt_tokens = 128_000
+        last_completion_tokens = 0
+        display_context_tokens = 0
+        display_context_estimated = False
+        _compressed_this_turn = False
+
+        @staticmethod
+        def prune(messages, **_kwargs):
+            return messages, 0
+
+        @staticmethod
+        def compress(messages, **_kwargs):
+            return messages
+
+    compressor = Compressor()
+    agent.context_compressor = compressor
+    caplog.set_level(20, logger="mclaw.agent.core")
+
+    result = agent.run_conversation(
+        "current user",
+        conversation_history=[
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "old user"},
+            {"role": "assistant", "content": "old answer"},
+        ],
+        advance_background_review=False,
+    )
+
+    log_messages = [record.getMessage() for record in caplog.records]
+    assert result["final_response"] == "answer"
+    assert compressor._compressed_this_turn is False
+    assert "[LOOP] compression done" not in log_messages
+    assert (
+        "[LOOP] compression unavailable; continuing without compaction"
+        in log_messages
+    )
+
+
+def test_summary_failure_prunes_confirmed_tools_to_eighty_percent_then_calls_model(
+    monkeypatch,
+    caplog,
+) -> None:
+    context = _context(_CappedProfile(name="capped", display_name="Capped"))
+    transport = _SequenceTransport(ModelCallResult(
+        content="done",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=None,
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    ))
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=2_000,
+        threshold_percent=0.50,
+        protect_first_n=1,
+        quiet_mode=True,
+    )
+    monkeypatch.setattr(
+        agent.context_compressor,
+        "_generate_summary",
+        lambda _turns: None,
+    )
+    agent._tool_visibility_state_reliable = True
+    agent._tool_call_ids_pending_visibility = {"pending-current"}
+    statuses: list[str] = []
+    agent._status_callback = statuses.append
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "confirmed-1", "content": "A" * 4_000},
+        {"role": "assistant", "content": "first result seen"},
+        {"role": "user", "content": "continue"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-2",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "confirmed-2", "content": "B" * 4_000},
+        {"role": "assistant", "content": "second result seen"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "pending-current",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "pending-current",
+            "content": "P" * 400,
+        },
+    ]
+    original = deepcopy(history)
+    caplog.set_level(20, logger="mclaw.agent.core")
+
+    result = agent.run_conversation(
+        "current request",
+        conversation_history=history,
+        advance_background_review=False,
+    )
+
+    sent = transport.calls[0]["messages"]
+    sent_budget = estimate_request_budget(
+        messages=sent,
+        tools=[],
+        dynamic_system_context="",
+        context=context,
+        context_window=2_000,
+    )
+    sent_results = {
+        message.get("tool_call_id"): message.get("content")
+        for message in sent
+        if message.get("role") == "tool"
+    }
+    logs = [record.getMessage() for record in caplog.records]
+    assert result["final_response"] == "done"
+    assert sent_budget.input_tokens <= 800
+    assert sent_results["confirmed-1"].startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+    assert sent_results["confirmed-2"].startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+    assert sent_results["pending-current"] == "P" * 400
+    assert any("History compression failed" in status for status in statuses)
+    assert any("[CONTEXT FALLBACK START]" in message for message in logs)
+    assert any("target=800" in message for message in logs)
+    assert "[LOOP] compression done" not in logs
+    assert history == original
+
+
+def test_successful_preventive_summary_above_target_adds_tool_fallback(
+    monkeypatch,
+) -> None:
+    context = _context(_CappedProfile(name="capped", display_name="Capped"))
+    transport = _SequenceTransport(ModelCallResult(
+        content="done",
+        tool_calls=None,
+        finish_reason="stop",
+        reasoning=None,
+        usage=None,
+        was_streamed=False,
+        provider=context.provider,
+        model=context.model,
+    ))
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=2_000,
+        threshold_percent=0.50,
+        protect_first_n=4,
+        quiet_mode=True,
+    )
+    summary_calls = 0
+
+    def generate_summary(_turns):
+        nonlocal summary_calls
+        summary_calls += 1
+        return "successful summary"
+
+    monkeypatch.setattr(agent.context_compressor, "_generate_summary", generate_summary)
+    real_compress = agent.context_compressor.compress
+    post_summary_inputs: list[int] = []
+
+    def capture_compress(messages, **kwargs):
+        projection = real_compress(messages, **kwargs)
+        post_summary_inputs.append(estimate_request_budget(
+            messages=projection,
+            tools=[],
+            dynamic_system_context="",
+            context=context,
+            context_window=2_000,
+        ).input_tokens)
+        return projection
+
+    monkeypatch.setattr(agent.context_compressor, "compress", capture_compress)
+    agent._tool_visibility_state_reliable = True
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-head",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "confirmed-head", "content": "T" * 2_400},
+        *[
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"filler-{i}-" + "F" * 400,
+            }
+            for i in range(12)
+        ],
+    ]
+    original = deepcopy(history)
+
+    result = agent.run_conversation(
+        "current request",
+        conversation_history=history,
+        advance_background_review=False,
+    )
+
+    sent = transport.calls[0]["messages"]
+    sent_result = next(
+        message["content"]
+        for message in sent
+        if message.get("tool_call_id") == "confirmed-head"
+    )
+    sent_budget = estimate_request_budget(
+        messages=sent,
+        tools=[],
+        dynamic_system_context="",
+        context=context,
+        context_window=2_000,
+    )
+    assert result["final_response"] == "done"
+    assert summary_calls == 1
+    assert len(post_summary_inputs) == 1
+    assert 800 < post_summary_inputs[0] < 1_000
+    assert len(transport.calls) == 1
+    assert any(message.get("content") == "successful summary" for message in sent)
+    assert sent_result.startswith("[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:")
+    assert sent_budget.input_tokens <= 800
+    assert history == original
+
+
+def test_context_overflow_uses_summary_then_fallback_in_finite_stages(
+    monkeypatch,
+) -> None:
+    context = _context(_CappedProfile(name="capped", display_name="Capped"))
+    transport = _SequenceTransport(
+        ModelCallError(
+            message="first context limit",
+            provider=context.provider,
+            model=context.model,
+            context_limit=True,
+        ),
+        ModelCallError(
+            message="second context limit",
+            provider=context.provider,
+            model=context.model,
+            context_limit=True,
+            retryable=True,
+            retry_after=0,
+        ),
+        ModelCallError(
+            message="third context limit",
+            provider=context.provider,
+            model=context.model,
+            context_limit=True,
+            retryable=True,
+            retry_after=0,
+        ),
+    )
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=2_000,
+        threshold_percent=0.50,
+        protect_first_n=1,
+        quiet_mode=True,
+    )
+    compressor = agent.context_compressor
+    summary_calls = 0
+
+    def compress(messages, **_kwargs):
+        nonlocal summary_calls
+        summary_calls += 1
+        projection = deepcopy(messages)
+        old_user = next(
+            message
+            for message in projection
+            if message.get("role") == "user" and len(message.get("content", "")) == 200
+        )
+        old_user["content"] = old_user["content"][:100]
+        compressor._compressed_this_turn = True
+        compressor.last_compression_outcome = "compressed"
+        return projection
+
+    monkeypatch.setattr(compressor, "compress", compress)
+    agent._tool_visibility_state_reliable = True
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "U" * 200},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-1",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "confirmed-1", "content": "A" * 1_600},
+        {"role": "assistant", "content": "first result seen"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-2",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "confirmed-2", "content": "B" * 1_600},
+        {"role": "assistant", "content": "second result seen"},
+    ]
+
+    result = agent.run_conversation(
+        "current request",
+        conversation_history=history,
+        advance_background_review=False,
+    )
+
+    def sent_results(call_index):
+        return {
+            message.get("tool_call_id"): message.get("content")
+            for message in transport.calls[call_index]["messages"]
+            if message.get("role") == "tool"
+        }
+
+    first = sent_results(0)
+    second = sent_results(1)
+    third = sent_results(2)
+    assert result["completed"] is False
+    assert result["error"] == "third context limit"
+    assert len(transport.calls) == 3
+    assert summary_calls == 1
+    assert first["confirmed-1"] == "A" * 1_600
+    assert first["confirmed-2"] == "B" * 1_600
+    assert second["confirmed-1"].startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+    assert second["confirmed-2"] == "B" * 1_600
+    assert third["confirmed-1"].startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+    assert third["confirmed-2"].startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+
+
+def test_context_overflow_uses_confirmed_tool_fallback_before_single_retry(
+    monkeypatch,
+    caplog,
+) -> None:
+    context = _context(_CappedProfile(name="capped", display_name="Capped"))
+    transport = _SequenceTransport(
+        ModelCallError(
+            message="context limit",
+            provider=context.provider,
+            model=context.model,
+            context_limit=True,
+        ),
+        ModelCallResult(
+            content="done",
+            tool_calls=None,
+            finish_reason="stop",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        ),
+    )
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.context_compressor = ContextCompressor(
+        provider_runtime=context,
+        context_window=10_000,
+        protect_first_n=1,
+        quiet_mode=True,
+    )
+    agent.context_compressor.threshold_tokens = 100_000
+    monkeypatch.setattr(
+        agent.context_compressor,
+        "_generate_summary",
+        lambda _turns: None,
+    )
+    agent._tool_visibility_state_reliable = True
+    caplog.set_level(20, logger="mclaw.agent.core")
+    history = [
+        {"role": "system", "content": "system"},
+        {"role": "user", "content": "old request"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "confirmed-overflow",
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "confirmed-overflow",
+            "content": "X" * 4_000,
+        },
+        {"role": "assistant", "content": "result seen"},
+        {"role": "user", "content": "more work"},
+        {"role": "assistant", "content": "ready"},
+    ]
+
+    result = agent.run_conversation(
+        "current request",
+        conversation_history=history,
+        advance_background_review=False,
+    )
+
+    first_result = next(
+        message["content"]
+        for message in transport.calls[0]["messages"]
+        if message.get("tool_call_id") == "confirmed-overflow"
+    )
+    retried_result = next(
+        message["content"]
+        for message in transport.calls[1]["messages"]
+        if message.get("tool_call_id") == "confirmed-overflow"
+    )
+    assert result["final_response"] == "done"
+    assert len(transport.calls) == 2
+    assert first_result == "X" * 4_000
+    assert retried_result.startswith(
+        "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
+    )
+    assert sum(
+        "[TUI CONTEXT] source=estimate" in record.getMessage()
+        for record in caplog.records
+    ) == 1
 
 
 def test_core_transport_attempt_usage_hydration_and_reasoning_persistence(
@@ -1343,8 +3010,22 @@ def test_compressor_reconfigure_is_in_memory_and_clears_summary_cache() -> None:
     )
     compressor._summary_runtime = current
     compressor._summary_transport = object()
+    compressor.display_context_tokens = 999
+    compressor.display_context_estimated = True
+    compressor._display_estimate_emitted = True
+    compressor.update_from_response(
+        {"prompt_tokens": 800, "completion_tokens": 100, "total_tokens": 900}
+    )
 
     compressor.reconfigure_model(next_context, context_window=2_000)
+
+    assert compressor.last_prompt_tokens == 0
+    assert compressor.last_completion_tokens == 0
+    assert compressor.last_total_tokens == 0
+    assert compressor.display_context_tokens is None
+    assert compressor.display_context_estimated is False
+    assert compressor._display_estimate_emitted is False
+
     compressor.update_from_response(
         {"prompt_tokens": 0, "completion_tokens": 7, "total_tokens": 7}
     )

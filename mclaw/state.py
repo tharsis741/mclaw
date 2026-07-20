@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from mclaw.agent.transports.base import model_response_confirms_visibility
 from mclaw.constants import get_mclaw_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -1124,6 +1125,59 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def get_pending_tool_call_ids(self, session_id: str) -> set[str]:
+        """Recover the newest tool batch not followed by a persisted model reply.
+
+        Model-authored assistant messages carry ``turn_id``. Runtime-generated
+        assistant notices do not, so they cannot prove that tool results were
+        visible to the model. Legacy tool-call rows without ``turn_id`` are
+        treated conservatively as pending until a current model row proves
+        visibility.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT turn_id, tool_calls, finish_reason FROM messages
+                   WHERE session_id = ?
+                     AND invalidated_at IS NULL
+                     AND role = 'assistant'
+                   ORDER BY timestamp, id""",
+                (session_id,),
+            ).fetchall()
+        pending: set[str] = set()
+        for row in rows:
+            # Any persisted current-model response proves the previous batch
+            # was sent once, even when this response creates another batch.
+            response_confirmed = (
+                row["turn_id"] is not None
+                and model_response_confirms_visibility(row["finish_reason"])
+            )
+            if response_confirmed:
+                pending.clear()
+            if not row["tool_calls"]:
+                continue
+            if row["turn_id"] is not None and not response_confirmed:
+                continue
+            try:
+                tool_calls = json.loads(row["tool_calls"])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Could not decode model tool calls for session %s",
+                    session_id,
+                )
+                pending.clear()
+                continue
+            if not isinstance(tool_calls, list):
+                pending.clear()
+                continue
+            pending = {
+                call_id
+                for call in tool_calls
+                if isinstance(call, dict)
+                and isinstance((call_id := call.get("id")), str)
+                and call_id
+            }
+        return pending
 
     def get_messages_as_conversation(self, session_id: str, include_invalidated: bool = False) -> List[Dict[str, Any]]:
         """Return messages in provider-facing conversation shape."""

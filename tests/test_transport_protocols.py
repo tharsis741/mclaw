@@ -706,6 +706,28 @@ def test_openai_waits_for_delayed_final_usage_chunk(monkeypatch) -> None:
     assert result.usage.output_tokens == 2
 
 
+def test_openai_stream_eof_without_finish_reason_is_incomplete() -> None:
+    profile = GenericOpenAICompatibleProfile(name="generic", display_name="Generic")
+    context = _context(profile=profile)
+    stream = _FakeStream([
+        {"choices": [{"delta": {"content": "partial"}, "finish_reason": None}]},
+    ])
+
+    result = OpenAIChatCompletionsTransport(
+        context,
+        _FakeOpenAIClient(stream),
+    ).call(
+        messages=[{"role": "user", "content": "hello"}],
+        tools=[],
+        options=ModelCallOptions(stream=True),
+    )
+
+    assert result.content == "partial"
+    assert result.finish_reason == "stream_incomplete"
+    assert result.was_streamed is True
+    assert result.interrupted is False
+
+
 def test_generic_openai_keeps_unsolicited_delayed_usage(monkeypatch) -> None:
     from mclaw.agent.transports import openai_chat_completions as module
 

@@ -219,7 +219,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "enabled": True,
         "threshold": 0.50,
         "target_ratio": 0.20,
-        "protect_last_n": 20,
         "summary_model": "",
         "summary_provider": "auto",
         "summary_base_url": None,

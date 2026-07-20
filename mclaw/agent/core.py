@@ -32,6 +32,7 @@ from mclaw.agent.transports.base import (
     ModelCallOptions,
     ModelCallResult,
     ReasoningTrace,
+    model_response_confirms_visibility,
 )
 from mclaw.agent.transports.factory import create_transport
 from mclaw.agent.usage import UsageRecord
@@ -43,6 +44,7 @@ from mclaw.tools.interrupt import set_interrupt
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
+_COMPRESSION_FALLBACK_TARGET_RATIO = 0.80
 
 SKILL_WRITE_ACTIONS = frozenset({
     "create_scaffold",
@@ -154,7 +156,8 @@ class MClaw:
         self.messages: List[Dict[str, Any]] = []
         self._interrupted = False
         self._prompt_epoch_dirty = False
-        self._write_call_ids_pending_visibility: Set[str] = set()
+        self._tool_call_ids_pending_visibility: Set[str] = set()
+        self._tool_visibility_state_reliable = False
 
         # Memory subsystem.
         self._memory_manager: Optional[MemoryManager] = None
@@ -205,10 +208,6 @@ class MClaw:
             except (TypeError, ValueError):
                 compression_target_ratio = 0.20
             try:
-                compression_protect_last_n = int(compression_cfg.get("protect_last_n", 20))
-            except (TypeError, ValueError):
-                compression_protect_last_n = 20
-            try:
                 compression_summary_timeout = int(compression_cfg.get("summary_timeout", 180))
             except (TypeError, ValueError):
                 compression_summary_timeout = 180
@@ -233,7 +232,6 @@ class MClaw:
                 provider_runtime=self.provider_runtime,
                 context_window=context_window,
                 threshold_percent=compression_threshold,
-                protect_last_n=compression_protect_last_n,
                 summary_target_ratio=compression_target_ratio,
                 session_id=self.session_id,
                 summary_model_override=summary_model,
@@ -284,6 +282,24 @@ class MClaw:
                     self.session_user_messages = self._session_db.count_user_messages(self.session_id)
                 except Exception:
                     self.session_user_messages = 0
+            if hasattr(self._session_db, "get_pending_tool_call_ids"):
+                try:
+                    self._tool_call_ids_pending_visibility = (
+                        self._session_db.get_pending_tool_call_ids(self.session_id)
+                    )
+                    self._tool_visibility_state_reliable = True
+                    if self._tool_call_ids_pending_visibility:
+                        logger.info(
+                            "[CONTEXT RESTORE] pending tool visibility restored: count=%d ids=%s",
+                            len(self._tool_call_ids_pending_visibility),
+                            sorted(self._tool_call_ids_pending_visibility),
+                        )
+                except Exception:
+                    logger.warning(
+                        "Could not restore pending tool visibility for session %s",
+                        self.session_id,
+                        exc_info=True,
+                    )
 
     @property
     def model(self) -> str:
@@ -760,9 +776,137 @@ class MClaw:
             config=self.config,
         )
 
+    def _clear_unconfirmed_context_display(self) -> None:
+        """Replace a one-off estimate with unknown when no input usage arrived."""
+        compressor = self.context_compressor
+        if compressor and compressor.display_context_estimated:
+            compressor.display_context_tokens = None
+            compressor.display_context_estimated = False
+            logger.info("[TUI CONTEXT] source=provider tokens=unknown")
+
+    def _fallback_prune_confirmed_tool_results(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        dynamic_system_context: str,
+        reason: str,
+        force_one: bool = False,
+    ) -> tuple[List[Dict[str, Any]], int]:
+        """Prune confirmed tool results when summary compaction cannot help."""
+        compressor = self.context_compressor
+        if not compressor:
+            return messages, 0
+        if not self._tool_visibility_state_reliable:
+            logger.warning(
+                "[CONTEXT FALLBACK SKIP] reason=%s outcome=visibility_unknown pending=%d",
+                reason,
+                len(self._tool_call_ids_pending_visibility),
+            )
+            return messages, 0
+
+        before = estimate_request_budget(
+            messages=messages,
+            tools=self.tools,
+            dynamic_system_context=dynamic_system_context,
+            context=self.provider_runtime,
+            context_window=compressor.context_length,
+        )
+        compression_limit = min(
+            compressor.threshold_tokens,
+            max(1, before.context_window - before.output_budget),
+        )
+        target = max(1, int(compression_limit * _COMPRESSION_FALLBACK_TARGET_RATIO))
+        if not force_one and before.input_tokens <= target:
+            logger.warning(
+                "[CONTEXT FALLBACK SKIP] reason=%s outcome=target_met "
+                "estimated=%d target=%d",
+                reason,
+                before.input_tokens,
+                target,
+            )
+            return messages, 0
+
+        tokens_to_save = max(0, before.input_tokens - target)
+        if force_one:
+            tokens_to_save = max(1, tokens_to_save)
+        if tokens_to_save <= 0:
+            return messages, 0
+
+        logger.warning(
+            "[CONTEXT FALLBACK START] reason=%s estimated_before=%d target=%d "
+            "pending=%d",
+            reason,
+            before.input_tokens,
+            target,
+            len(self._tool_call_ids_pending_visibility),
+        )
+        self._emit_status(
+            "History compression failed — pruning confirmed tool results..."
+        )
+        pruned_messages, pruned, _saved = compressor.prune_confirmed_tool_results(
+            messages,
+            tokens_to_save=tokens_to_save,
+            protected_tool_call_ids=self._tool_call_ids_pending_visibility,
+        )
+        after = estimate_request_budget(
+            messages=pruned_messages,
+            tools=self.tools,
+            dynamic_system_context=dynamic_system_context,
+            context=self.provider_runtime,
+            context_window=compressor.context_length,
+        )
+        outcome = (
+            "target_met"
+            if after.input_tokens <= target
+            else "partial"
+            if pruned
+            else "no_candidates"
+        )
+        logger.warning(
+            "[CONTEXT FALLBACK END] reason=%s pruned=%d saved_tokens=%d "
+            "estimated_after=%d target=%d pending=%d outcome=%s",
+            reason,
+            pruned,
+            max(0, before.input_tokens - after.input_tokens),
+            after.input_tokens,
+            target,
+            len(self._tool_call_ids_pending_visibility),
+            outcome,
+        )
+        if pruned:
+            # The previous provider prompt count described a different payload.
+            compressor.last_prompt_tokens = 0
+        return pruned_messages, pruned
+
     # ── Main conversation loop ──
 
     def run_conversation(
+        self,
+        user_message: str,
+        conversation_history: List[Dict] = None,
+        disable_tools: bool = False,
+        extra_system: str = "",
+        advance_background_review: bool = True,
+        *,
+        call_source: str = "turn",
+        deadline_monotonic: float | None = None,
+    ) -> Dict[str, Any]:
+        """Run one conversation turn and discard stale estimates on failure."""
+        try:
+            return self._run_conversation_impl(
+                user_message,
+                conversation_history=conversation_history,
+                disable_tools=disable_tools,
+                extra_system=extra_system,
+                advance_background_review=advance_background_review,
+                call_source=call_source,
+                deadline_monotonic=deadline_monotonic,
+            )
+        except Exception:
+            self._clear_unconfirmed_context_display()
+            raise
+
+    def _run_conversation_impl(
         self,
         user_message: str,
         conversation_history: List[Dict] = None,
@@ -858,25 +1002,13 @@ class MClaw:
         else:
             self.session_user_messages += 1
 
-        # Restored sessions reload full payloads from the database. Prune once
-        # before the first request as well as after each new tool batch below.
-        if self.context_compressor:
-            messages, initial_pruned = self.context_compressor.prune(
-                messages,
-                protected_write_call_ids=self._write_call_ids_pending_visibility,
-            )
-            if initial_pruned:
-                logger.info(
-                    "[CONTEXT] pruned %d tool payload(s) before first API call",
-                    initial_pruned,
-                )
-
         api_call_count = 0
         assistant_iteration_count = 0
         api_call_limit = self.max_iterations if getattr(self, "_delegate_depth", 0) > 0 else None
         final_response = ""
         final_response_recorded = False
         interrupted = False
+        incomplete_response = False
         stop_reason: str | None = None
         assistant_rounds = []
         final_result: ModelCallResult | None = None
@@ -905,6 +1037,22 @@ class MClaw:
             if self._interrupted:
                 interrupted = True
                 break
+
+            # Successful write payloads shrink at one boundary for fresh,
+            # resumed, and post-tool requests. Pending writes remain raw until
+            # a successful main-model response proves visibility once.
+            pre_api_pruned = 0
+            if self.context_compressor:
+                messages, pre_api_pruned = self.context_compressor.prune(
+                    messages,
+                    protected_tool_call_ids=self._tool_call_ids_pending_visibility,
+                )
+                logger.info(
+                    "[PRE-API WRITE PRUNE] messages=%d pruned=%d pending=%d",
+                    len(messages),
+                    pre_api_pruned,
+                    len(self._tool_call_ids_pending_visibility),
+                )
 
             # Subagent diagnostics: log each API iteration to locate stalls.
             if getattr(self, "_delegate_depth", 0) > 0:
@@ -938,31 +1086,90 @@ class MClaw:
                         cc.last_prompt_tokens,
                         cc.last_completion_tokens,
                     )
-                    check_tokens = max(budget.input_tokens, cc.last_prompt_tokens)
+                    # A provider prompt count from before pruning describes a
+                    # different payload and must not force a stale compression.
+                    check_tokens = (
+                        budget.input_tokens
+                        if pre_api_pruned
+                        else max(budget.input_tokens, cc.last_prompt_tokens)
+                    )
                     compression_limit = min(
                         cc.threshold_tokens,
                         max(1, budget.context_window - budget.output_budget),
                     )
                     if check_tokens >= compression_limit:
                         logger.info("[LOOP] preventive compression triggered (check=%d >= threshold=%d)", check_tokens, compression_limit)
-                        self._emit_status("Compressing context...")
+                        self._emit_status(
+                            "Compressing history before the model request — "
+                            "the current task will continue..."
+                        )
                         self.flush_memories(messages)
                         messages = cc.compress(
                             messages,
-                            protected_write_call_ids=self._write_call_ids_pending_visibility,
+                            protected_tool_call_ids=self._tool_call_ids_pending_visibility,
                         )
-                        logger.info("[LOOP] compression done")
                         self._refresh_memory_snapshot()
                         logger.info("[LOOP] memory snapshot refreshed")
                         self._refresh_prompt_epoch(messages)
-                        cc._compressed_this_turn = True
+                        if cc._compressed_this_turn:
+                            logger.info("[LOOP] compression done")
+                            post_summary_budget = estimate_request_budget(
+                                messages=messages,
+                                tools=self.tools,
+                                dynamic_system_context=dynamic_system_context,
+                                context=self.provider_runtime,
+                                context_window=cc.context_length,
+                            )
+                            fallback_target = max(
+                                1,
+                                int(
+                                    compression_limit
+                                    * _COMPRESSION_FALLBACK_TARGET_RATIO
+                                ),
+                            )
+                            if post_summary_budget.input_tokens > fallback_target:
+                                messages, fallback_pruned = (
+                                    self._fallback_prune_confirmed_tool_results(
+                                        messages,
+                                        dynamic_system_context=dynamic_system_context,
+                                        reason="preventive_summary_insufficient",
+                                    )
+                                )
+                                if fallback_pruned:
+                                    logger.warning(
+                                        "[LOOP] summary remained above target; "
+                                        "confirmed-tool fallback applied"
+                                    )
+                        else:
+                            outcome = getattr(
+                                cc,
+                                "last_compression_outcome",
+                                "compression_unavailable",
+                            )
+                            messages, fallback_pruned = (
+                                self._fallback_prune_confirmed_tool_results(
+                                    messages,
+                                    dynamic_system_context=dynamic_system_context,
+                                    reason=f"preventive_{outcome}",
+                                )
+                            )
+                            if fallback_pruned:
+                                logger.warning(
+                                    "[LOOP] summary compression unavailable; "
+                                    "confirmed-tool fallback applied"
+                                )
+                            else:
+                                logger.warning(
+                                    "[LOOP] compression unavailable; continuing "
+                                    "without compaction"
+                                )
                     else:
                         logger.info("[LOOP] no preventive compression needed (check=%d < threshold=%d)", check_tokens, compression_limit)
 
             # ── API call with retry ──
             result: ModelCallResult | None = None
             retry_count = 0
-            context_retry_used = False
+            context_recovery_attempts = 0
 
             while retry_count < MAX_RETRIES:
                 if _deadline_reached():
@@ -976,6 +1183,34 @@ class MClaw:
                 try:
                     if self._prompt_epoch_dirty:
                         self._refresh_prompt_epoch(messages)
+                    # Emit one display estimate per runtime/model epoch. Backend
+                    # request estimates above still run on every iteration for
+                    # compression decisions.
+                    if (
+                        self.context_compressor
+                        and not getattr(
+                            self.context_compressor,
+                            "_display_estimate_emitted",
+                            False,
+                        )
+                    ):
+                        display_budget = estimate_request_budget(
+                            messages=messages,
+                            tools=self.tools,
+                            dynamic_system_context=dynamic_system_context,
+                            context=self.provider_runtime,
+                            context_window=self.context_compressor.context_length,
+                        )
+                        self.context_compressor.display_context_tokens = (
+                            display_budget.input_tokens
+                        )
+                        self.context_compressor.display_context_estimated = True
+                        self.context_compressor._display_estimate_emitted = True
+                        logger.info(
+                            "[TUI CONTEXT] source=estimate tokens=%d",
+                            display_budget.input_tokens,
+                        )
+                    self._emit_status("Requesting model...")
                     # Log the full message list before API calls to diagnose context growth.
                     try:
                         _msgs_log = []
@@ -1031,38 +1266,110 @@ class MClaw:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
                     break
                 except ModelCallError as error:
-                    # Context overflow: compress once, then retry.
                     if (
                         error.context_limit
                         and self.context_compressor
-                        and not context_retry_used
+                        and context_recovery_attempts < 2
                     ):
-                        context_retry_used = True
-                        # Retry once after compression without consuming normal retry budget.
-                        self._emit_status("Context overflow — compressing and retrying...")
-                        self.flush_memories(messages)
-                        from mclaw.agent.context_compressor import estimate_messages_tokens
-                        before_tokens = estimate_messages_tokens(messages)
-                        compressed_messages = self.context_compressor.compress(
-                            messages,
-                            protected_write_call_ids=self._write_call_ids_pending_visibility,
-                        )
-                        after_tokens = estimate_messages_tokens(compressed_messages)
-                        if len(compressed_messages) >= len(messages) and after_tokens >= before_tokens:
-                            logger.warning(
-                                "Context overflow compression did not reduce history "
-                                "(messages=%d tokens=%d)",
-                                len(messages),
-                                before_tokens,
+                        if context_recovery_attempts == 0:
+                            context_recovery_attempts = 1
+                            self._emit_status(
+                                "Context overflow — compressing and retrying..."
                             )
-                        else:
-                            messages = compressed_messages
+                            self.flush_memories(messages)
                             self._refresh_memory_snapshot()
                             self._refresh_prompt_epoch(messages)
-                            self.context_compressor._compressed_this_turn = True
-                            continue  # retry with compressed messages
+                            before_budget = estimate_request_budget(
+                                messages=messages,
+                                tools=self.tools,
+                                dynamic_system_context=dynamic_system_context,
+                                context=self.provider_runtime,
+                                context_window=self.context_compressor.context_length,
+                            )
+                            compressed_messages = self.context_compressor.compress(
+                                messages,
+                                protected_tool_call_ids=(
+                                    self._tool_call_ids_pending_visibility
+                                ),
+                            )
+                            after_budget = estimate_request_budget(
+                                messages=compressed_messages,
+                                tools=self.tools,
+                                dynamic_system_context=dynamic_system_context,
+                                context=self.provider_runtime,
+                                context_window=self.context_compressor.context_length,
+                            )
+                            summary_reduced = (
+                                after_budget.input_tokens < before_budget.input_tokens
+                            )
+                            candidate_messages = (
+                                compressed_messages if summary_reduced else messages
+                            )
+                            candidate_budget = (
+                                after_budget if summary_reduced else before_budget
+                            )
+                            recovery_limit = min(
+                                self.context_compressor.threshold_tokens,
+                                max(
+                                    1,
+                                    candidate_budget.context_window
+                                    - candidate_budget.output_budget,
+                                ),
+                            )
+                            recovery_target = max(
+                                1,
+                                int(
+                                    recovery_limit
+                                    * _COMPRESSION_FALLBACK_TARGET_RATIO
+                                ),
+                            )
+                            fallback_pruned = 0
+                            if (
+                                not summary_reduced
+                                or candidate_budget.input_tokens > recovery_target
+                            ):
+                                outcome = getattr(
+                                    self.context_compressor,
+                                    "last_compression_outcome",
+                                    "compression_unavailable",
+                                )
+                                candidate_messages, fallback_pruned = (
+                                    self._fallback_prune_confirmed_tool_results(
+                                        candidate_messages,
+                                        dynamic_system_context=dynamic_system_context,
+                                        reason=f"context_overflow_{outcome}",
+                                        force_one=True,
+                                    )
+                                )
+                            if summary_reduced or fallback_pruned:
+                                messages = candidate_messages
+                                continue
+                            logger.warning(
+                                "Context overflow recovery did not reduce history "
+                                "(messages=%d tokens=%d)",
+                                len(messages),
+                                before_budget.input_tokens,
+                            )
+                        else:
+                            context_recovery_attempts = 2
+                            fallback_messages, fallback_pruned = (
+                                self._fallback_prune_confirmed_tool_results(
+                                    messages,
+                                    dynamic_system_context=dynamic_system_context,
+                                    reason="context_overflow_after_compacted_retry",
+                                    force_one=True,
+                                )
+                            )
+                            if fallback_pruned:
+                                messages = fallback_messages
+                                continue
+                            logger.warning(
+                                "Context overflow fallback has no remaining "
+                                "confirmed tool results"
+                            )
                     if (
                         error.retryable
+                        and not error.context_limit
                         and retry_count < MAX_RETRIES - 1
                         and (api_call_limit is None or api_call_count < api_call_limit)
                     ):
@@ -1084,6 +1391,7 @@ class MClaw:
                             time.sleep(0.2)
                         continue
                     logger.error("API error (not retried): %s", error)
+                    self._clear_unconfirmed_context_display()
                     final_response = f"API Error: {error}"
                     self.messages = messages
                     if disable_tools:
@@ -1101,24 +1409,50 @@ class MClaw:
                         "assistant_rounds": assistant_rounds,
                         "token_usage": self._finish_turn_usage(),
                     }
+                except Exception:
+                    self._clear_unconfirmed_context_display()
+                    raise
 
             if self._interrupted:
                 interrupted = True
 
             if result is not None and result.usage is not None:
                 self._record_usage(result.usage)
+            elif result is not None:
+                self._clear_unconfirmed_context_display()
             if result is not None and result.interrupted:
                 interrupted = True
 
+            response_confirms_visibility = bool(
+                result
+                and model_response_confirms_visibility(
+                    result.finish_reason,
+                    interrupted=result.interrupted,
+                )
+            )
+            if result is not None and not result.interrupted and not response_confirms_visibility:
+                incomplete_response = True
+                stop_reason = result.finish_reason or "incomplete_response"
+                logger.warning(
+                    "Incomplete model stream retained without releasing pending "
+                    "tool visibility: finish_reason=%s pending=%d",
+                    result.finish_reason,
+                    len(self._tool_call_ids_pending_visibility),
+                )
+
             if interrupted or result is None:
+                if result is None:
+                    self._clear_unconfirmed_context_display()
                 break
 
-            # A successful model response proves the pending write call and
-            # paired result were visible once; later pruning may now shrink it.
-            self._write_call_ids_pending_visibility.clear()
+            if response_confirms_visibility:
+                # A successful model response proves the pending tool calls and
+                # paired results were visible once.
+                self._tool_visibility_state_reliable = True
+                self._tool_call_ids_pending_visibility.clear()
 
             assistant_content = result.content
-            tool_calls = result.tool_calls
+            tool_calls = result.tool_calls if response_confirms_visibility else None
             finish = result.finish_reason
             reasoning_text = result.reasoning.text if result.reasoning else None
 
@@ -1133,13 +1467,27 @@ class MClaw:
                 tool_calls=tool_calls,
                 finish_reason=finish,
                 was_streamed=result.was_streamed,
-                is_final_override=True if finish_after_cleanup else None,
+                is_final_override=(
+                    False
+                    if incomplete_response
+                    else True
+                    if finish_after_cleanup
+                    else None
+                ),
             )
             assistant_rounds.append(round_event)
             self._emit_event(round_event)
 
             # ── Tool calls present → dispatch and continue ──
             if tool_calls:
+                # Establish protection as soon as the model creates the batch,
+                # before any tool starts or a pause/exception can intervene.
+                self._tool_call_ids_pending_visibility = {
+                    tc.get("id")
+                    for tc in tool_calls
+                    if isinstance(tc, dict) and tc.get("id")
+                }
+
                 # Persist to session DB independently from the API messages list.
                 if self._session_db:
                     self._session_db.append_message(
@@ -1161,24 +1509,6 @@ class MClaw:
                     reasoning=result.reasoning,
                 )
                 logger.info("[POST-TOOL] _execute_tool_calls returned, pending=%s", pending_result is not None)
-
-                # Keep successful large writes intact for exactly the next
-                # model response. Older writes remain eligible for pruning.
-                self._write_call_ids_pending_visibility = {
-                    tc.get("id")
-                    for tc in tool_calls
-                    if isinstance(tc, dict)
-                    and tc.get("id")
-                    and (tc.get("function") or {}).get("name") == "write_file"
-                }
-                if self.context_compressor:
-                    logger.info("[POST-TOOL] pruning context before next iteration")
-                    messages, _pruned = self.context_compressor.prune(
-                        messages,
-                        protected_write_call_ids=self._write_call_ids_pending_visibility,
-                    )
-                    logger.info("[POST-TOOL] pruning done, pruned=%s", _pruned)
-
                 if pending_result is not None:
                     # delegate_task started in non-blocking mode; return for TUI polling.
                     # Restore tools before returning so they are not left disabled.
@@ -1239,7 +1569,12 @@ class MClaw:
         turn_usage = self._finish_turn_usage()
 
         _should_review_skills = False
-        completed_user_turn = bool(advance_background_review and not interrupted and final_response)
+        completed_user_turn = bool(
+            advance_background_review
+            and not interrupted
+            and not incomplete_response
+            and final_response
+        )
         if completed_user_turn:
             if (
                 self._memory_manager
@@ -1296,7 +1631,9 @@ class MClaw:
             "api_calls": api_call_count,
             "interrupted": interrupted,
             "stop_reason": stop_reason,
-            "completed": bool(not interrupted and final_response),
+            "completed": bool(
+                not interrupted and not incomplete_response and final_response
+            ),
             "assistant_rounds": assistant_rounds,
             "token_usage": turn_usage,
             "skills_changed": bool(getattr(self, "_skills_changed_in_turn", False)),
@@ -1523,14 +1860,6 @@ class MClaw:
         if memory_prompt_changed or skill_prompt_changed:
             self._refresh_prompt_epoch(messages)
 
-        # Update prompt-token estimates after tool execution so the compressor
-        # and status bar reflect the current message size.
-        if self.context_compressor:
-            from mclaw.agent.context_compressor import estimate_messages_tokens
-            estimated = estimate_messages_tokens(messages)
-            self.context_compressor.last_prompt_tokens = estimated
-            logger.info("[TOKEN ESTIMATE POST-TOOLS] estimated=%d", estimated)
-
         # Check whether a subagent is running in pending mode. The parent turn's
         # assistant tool call and tool results are already stored before the TUI
         # starts polling; subagent internals are not injected here.
@@ -1597,6 +1926,15 @@ class MClaw:
                 logger.warning("Failed to persist provider usage", exc_info=True)
         if self.context_compressor and record.source == "turn":
             self.context_compressor.update_from_response(record.to_compressor_update())
+            if record.input_tokens is not None:
+                self.context_compressor.display_context_tokens = record.input_tokens
+                self.context_compressor.display_context_estimated = False
+                logger.info(
+                    "[TUI CONTEXT] source=provider tokens=%d",
+                    record.input_tokens,
+                )
+            else:
+                self._clear_unconfirmed_context_display()
         if self._usage_sink is not None:
             try:
                 self._usage_sink(record)

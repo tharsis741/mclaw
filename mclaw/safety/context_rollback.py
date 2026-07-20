@@ -24,6 +24,11 @@ def reset_agent_runtime_context(agent: Any) -> None:
             ("compression_count", 0),
             ("last_prompt_tokens", 0),
             ("last_completion_tokens", 0),
+            ("last_total_tokens", 0),
+            ("display_context_tokens", None),
+            ("display_context_estimated", False),
+            ("_display_estimate_emitted", False),
+            ("last_compression_outcome", "not_attempted"),
         ]:
             if hasattr(compressor, name):
                 try:
@@ -119,6 +124,15 @@ class ContextRollbackManager:
             self.agent.session_user_messages = sum(
                 1 for msg in messages if isinstance(msg, dict) and msg.get("role") == "user"
             )
+        if (
+            hasattr(self.agent, "_tool_call_ids_pending_visibility")
+            and hasattr(self.session_db, "get_pending_tool_call_ids")
+        ):
+            self.agent._tool_call_ids_pending_visibility = (
+                self.session_db.get_pending_tool_call_ids(session_id)
+            )
+            if hasattr(self.agent, "_tool_visibility_state_reliable"):
+                self.agent._tool_visibility_state_reliable = True
 
     def reset_runtime_context(self) -> None:
         """Reset live-only state that depends on the previous message list."""

@@ -5,9 +5,9 @@
 """Conversation compaction for long-running M-Claw sessions.
 
 This module owns context-window pressure management for the agent loop. It
-prunes stale tool output, protects recent turns by token budget, summarizes
-middle turns through the active model provider, and repairs tool-call/result
-pairs so compressed histories remain valid API messages.
+shrinks successful write payloads, protects recent turns by token budget,
+summarizes middle turns through the active model provider, and repairs
+tool-call/result pairs so compressed histories remain valid API messages.
 
 The compressor keeps a running summary across compactions and uses real API
 usage when available. That keeps decisions tied to provider behavior rather
@@ -37,9 +37,8 @@ SUMMARY_PREFIX = (
     "from where things left off, and avoid repeating work:"
 )
 
-# Placeholder used when earlier tool results are pruned.
-_PRUNED_TOOL_PLACEHOLDER = "[Earlier tool output cleared to save context space]"
 _PRUNED_WRITE_CONTENT_PREFIX = "[MCLAW_INTERNAL_WRITE_CONTENT_PRUNED:"
+_PRUNED_TOOL_RESULT_PREFIX = "[MCLAW_CONTEXT_FALLBACK_TOOL_RESULT_PRUNED:"
 
 # Summary token budget controls.
 _MIN_SUMMARY_TOKENS = 2000
@@ -48,9 +47,9 @@ _SUMMARY_TOKENS_CEILING = 12_000
 _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 
 # Content truncation limits.
-_CONTENT_MAX = 6000       # total chars per message body
-_CONTENT_HEAD = 4000      # chars kept from the start
-_CONTENT_TAIL = 1500      # chars kept from the end
+_CONTENT_MAX = 10_000     # total chars per message body
+_CONTENT_HEAD = 7_000     # chars kept from the start
+_CONTENT_TAIL = 3_000     # chars kept from the end
 _TOOL_ARGS_MAX = 1500     # max chars kept from tool-call arguments
 _TOOL_ARGS_HEAD = 1200    # chars kept from the start of tool-call arguments
 
@@ -106,7 +105,7 @@ class ContextCompressor:
     """Manages context window pressure by summarizing earlier turns.
 
     Algorithm:
-      1. Prune earlier tool results (cheap, no LLM call)
+      1. Shrink completed write payloads at the agent's pre-API boundary
       2. Protect head messages (system + first exchange)
       3. Find tail boundary by token budget (~20% of context)
       4. Summarize middle turns with structured LLM prompt
@@ -119,7 +118,6 @@ class ContextCompressor:
         context_window: int,
         threshold_percent: float = 0.50,
         protect_first_n: int = 3,
-        protect_last_n: int = 20,
         summary_target_ratio: float = 0.20,
         quiet_mode: bool = False,
         summary_model_override: str | None = None,
@@ -137,7 +135,6 @@ class ContextCompressor:
             raise ValueError("context_window must be a positive integer")
         self.provider_runtime = provider_runtime
         self.protect_first_n = protect_first_n
-        self.protect_last_n = protect_last_n
         self.threshold_percent = threshold_percent
         self.summary_target_ratio = max(0.10, min(summary_target_ratio, 0.80))
         self.quiet_mode = quiet_mode
@@ -161,6 +158,12 @@ class ContextCompressor:
         self.last_prompt_tokens = 0
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
+        # TUI state is intentionally separate from the compression signal.
+        # It is either the first request estimate for this runtime/model or a
+        # provider-reported input count from a main-model response.
+        self.display_context_tokens: int | None = None
+        self.display_context_estimated = False
+        self._display_estimate_emitted = False
 
         self._summary_failure_cooldown_until: float = 0.0
         self._previous_summary: str | None = None
@@ -168,6 +171,7 @@ class ContextCompressor:
         # Circuit breaker for a single API iteration. The agent loop clears it
         # before each new provider call.
         self._compressed_this_turn: bool = False
+        self.last_compression_outcome = "not_attempted"
 
         if not quiet_mode:
             logger.info(
@@ -210,6 +214,12 @@ class ContextCompressor:
         self._refresh_context_budgets(context_window)
         self._summary_runtime = None
         self._summary_transport = None
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.display_context_tokens = None
+        self.display_context_estimated = False
+        self._display_estimate_emitted = False
 
         logger.info(
             "Context compressor reconfigured: model=%s context_length=%d "
@@ -244,18 +254,21 @@ class ContextCompressor:
         self,
         messages: list[dict],
         *,
+        protected_tool_call_ids: set[str] | None = None,
         protected_write_call_ids: set[str] | None = None,
     ) -> tuple[list[dict], int]:
-        """Lightweight pre-pass: shrink completed tool payloads.
+        """Lightweight pre-pass: shrink successful write-file arguments.
 
-        Earlier tool results respect the protected tail window. Large content
-        from successful writes is cleared after the model has seen the full
-        call and its paired result once.
+        Large write content is cleared only after the model has seen the full
+        call and its paired successful result once. Other tool results remain
+        unchanged.
 
         Returns (pruned_messages, pruned_count).
         """
         successful_call_ids = set()
-        protected_write_call_ids = protected_write_call_ids or set()
+        protected_tool_call_ids = set(protected_tool_call_ids or ())
+        # Backward-compatible alias for callers using the former write-only API.
+        protected_tool_call_ids.update(protected_write_call_ids or ())
         for msg in messages:
             if msg.get("role") != "tool" or not msg.get("tool_call_id"):
                 continue
@@ -270,11 +283,8 @@ class ContextCompressor:
             ):
                 successful_call_ids.add(msg["tool_call_id"])
 
-        result, pruned = self._prune_earlier_tool_results(
-            messages,
-            protect_tail_count=self.protect_last_n,
-            protect_tail_tokens=self.tail_token_budget,
-        )
+        result = [message.copy() for message in messages]
+        pruned = 0
 
         for i, msg in enumerate(result):
             if msg.get("role") != "assistant" or not msg.get("tool_calls"):
@@ -284,7 +294,7 @@ class ContextCompressor:
             for j, call in enumerate(tool_calls):
                 if not isinstance(call, dict) or call.get("id") not in successful_call_ids:
                     continue
-                if call.get("id") in protected_write_call_ids:
+                if call.get("id") in protected_tool_call_ids:
                     continue
                 function = call.get("function")
                 if not isinstance(function, dict) or function.get("name") != "write_file":
@@ -323,53 +333,52 @@ class ContextCompressor:
 
         return result, pruned
 
-    def _prune_earlier_tool_results(
-        self, messages: list[dict], protect_tail_count: int,
-        protect_tail_tokens: int,
-    ) -> tuple[list[dict], int]:
-        """Replace earlier tool result contents with a short placeholder.
+    def prune_confirmed_tool_results(
+        self,
+        messages: list[dict],
+        *,
+        tokens_to_save: int,
+        protected_tool_call_ids: set[str] | None = None,
+    ) -> tuple[list[dict], int, int]:
+        """Clear oldest confirmed tool results after summary compaction fails.
 
-        Walks backward protecting recent messages by token budget.
-        Returns (pruned_messages, pruned_count).
+        Callers must pass every tool call whose visibility is still pending.
+        The input history is not mutated. Returns the request projection,
+        number of results pruned, and estimated tokens saved.
         """
-        if not messages:
-            return messages, 0
+        if tokens_to_save <= 0:
+            return messages, 0, 0
 
-        result = [m.copy() for m in messages]
+        protected = set(protected_tool_call_ids or ())
+        result = [message.copy() for message in messages]
         pruned = 0
+        saved_tokens = 0
 
-        # Find the oldest message that should still be protected.
-        accumulated = 0
-        boundary = len(result)
-        min_protect = min(protect_tail_count, len(result) - 1)
-        for i in range(len(result) - 1, -1, -1):
-            msg = result[i]
+        for i, msg in enumerate(result):
+            tool_call_id = msg.get("tool_call_id")
+            if (
+                msg.get("role") != "tool"
+                or not tool_call_id
+                or tool_call_id in protected
+            ):
+                continue
             content = _content_to_text(msg.get("content"))
-            msg_tokens = estimate_tokens_rough(content) + 10
-            for tc in msg.get("tool_calls") or []:
-                if isinstance(tc, dict):
-                    args = tc.get("function", {}).get("arguments", "")
-                    msg_tokens += estimate_tokens_rough(_content_to_text(args))
-            if accumulated + msg_tokens > protect_tail_tokens and (len(result) - i) >= min_protect:
-                boundary = i
+            if not content or content.startswith(_PRUNED_TOOL_RESULT_PREFIX):
+                continue
+            marker = (
+                f"{_PRUNED_TOOL_RESULT_PREFIX} model previously saw this result; "
+                f"original {len(content)} chars omitted from this request projection]"
+            )
+            saved = estimate_tokens_rough(content) - estimate_tokens_rough(marker)
+            if saved <= 0:
+                continue
+            result[i] = {**msg, "content": marker}
+            pruned += 1
+            saved_tokens += saved
+            if saved_tokens >= tokens_to_save:
                 break
-            accumulated += msg_tokens
-            boundary = i
-        prune_boundary = max(boundary, len(result) - min_protect)
 
-        for i in range(prune_boundary):
-            msg = result[i]
-            if msg.get("role") != "tool":
-                continue
-            content = msg.get("content", "")
-            if not content or content == _PRUNED_TOOL_PLACEHOLDER:
-                continue
-            # Only prune substantial content (>200 chars)
-            if len(content) > 200:
-                result[i] = {**msg, "content": _PRUNED_TOOL_PLACEHOLDER}
-                pruned += 1
-
-        return result, pruned
+        return result, pruned, saved_tokens
 
     # ------------------------------------------------------------------
     # Content serialization for summarizer (with head+tail truncation)
@@ -678,12 +687,14 @@ class ContextCompressor:
         self,
         messages: list[dict],
         *,
+        protected_tool_call_ids: set[str] | None = None,
         protected_write_call_ids: set[str] | None = None,
     ) -> list[dict]:
         """Compress conversation history.
 
         Returns a new list with middle turns replaced by a structured summary.
         """
+        self.last_compression_outcome = "not_applicable"
         n = len(messages)
         _min_for_compress = self.protect_first_n + 3 + 1
         if n <= _min_for_compress:
@@ -691,21 +702,47 @@ class ContextCompressor:
 
         logger.info("[COMPRESSION START] messages=%d threshold=%d", n, self.threshold_tokens)
 
-        # Phase 1: prune completed tool payloads as a cheap pre-pass.
-        logger.info("[COMPRESSION] Phase 1: pruning tool payloads")
-        messages, pruned_count = self.prune(
-            messages,
-            protected_write_call_ids=protected_write_call_ids,
-        )
-        if pruned_count:
-            logger.info("Pre-compression: pruned %d tool payload(s)", pruned_count)
+        protected_tool_call_ids = set(protected_tool_call_ids or ())
+        # Backward-compatible alias for callers using the former write-only API.
+        protected_tool_call_ids.update(protected_write_call_ids or ())
 
-        # Phase 2: Determine boundaries
-        logger.info("[COMPRESSION] Phase 2: determining boundaries")
+        # Phase 1: Determine boundaries
+        logger.info("[COMPRESSION] Phase 1: determining boundaries")
         compress_start = self._align_boundary_forward(messages, self.protect_first_n)
 
         # Protect recent tail messages with a token budget.
         compress_end = self._find_tail_cut_by_tokens(messages, compress_start)
+
+        # The active turn is authoritative input, not summary material.
+        latest_user_idx = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if messages[i].get("role") == "user"
+            ),
+            None,
+        )
+        if latest_user_idx is not None:
+            compress_end = min(compress_end, latest_user_idx)
+
+        # A pending result must remain raw until a successful model response
+        # proves that it was visible. Preserve its parent tool-call group too.
+        if protected_tool_call_ids:
+            earliest_protected_idx = len(messages)
+            for i, msg in enumerate(messages):
+                if (
+                    msg.get("role") == "tool"
+                    and msg.get("tool_call_id") in protected_tool_call_ids
+                ):
+                    earliest_protected_idx = min(earliest_protected_idx, i)
+                if msg.get("role") == "assistant" and any(
+                    isinstance(call, dict)
+                    and call.get("id") in protected_tool_call_ids
+                    for call in msg.get("tool_calls") or []
+                ):
+                    earliest_protected_idx = min(earliest_protected_idx, i)
+            compress_end = min(compress_end, earliest_protected_idx)
+
         # If the boundary lands on a tool result, move it backward so the
         # tool_call/result pair is summarized together.
         compress_end = self._align_boundary_backward(messages, compress_end)
@@ -721,20 +758,21 @@ class ContextCompressor:
             compress_start, n - compress_end,
         )
 
-        # Phase 3: Generate structured summary
-        logger.info("[COMPRESSION] Phase 3: generating summary")
+        # Phase 2: Generate structured summary
+        logger.info("[COMPRESSION] Phase 2: generating summary")
         summary = self._generate_summary(turns_to_summarize)
         logger.info("[COMPRESSION] summary generated: len=%d", len(summary) if summary else 0)
 
         if not summary:
+            self.last_compression_outcome = "summary_unavailable"
             logger.warning(
                 "Summary generation unavailable; keeping conversation turns and "
                 "skipping summary-based compaction"
             )
             return messages
 
-        # Phase 4: Assemble compressed messages
-        logger.info("[COMPRESSION] Phase 4: assembling compressed messages")
+        # Phase 3: Assemble compressed messages
+        logger.info("[COMPRESSION] Phase 3: assembling compressed messages")
         compressed = []
 
         for i in range(compress_start):
@@ -770,9 +808,10 @@ class ContextCompressor:
 
         self.compression_count += 1
         self._compressed_this_turn = True
+        self.last_compression_outcome = "compressed"
 
-        # Phase 5: repair tool-call/result pairs.
-        logger.info("[COMPRESSION] Phase 5: sanitizing tool pairs")
+        # Phase 4: repair tool-call/result pairs.
+        logger.info("[COMPRESSION] Phase 4: sanitizing tool pairs")
         compressed = self._sanitize_tool_pairs(compressed)
 
         before = estimate_messages_tokens(messages)

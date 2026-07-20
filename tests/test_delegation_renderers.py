@@ -9,7 +9,7 @@ from mclaw.cli.runtime.events import RuntimeStatus
 from mclaw.cli.runtime.session import RuntimeSessionState
 from mclaw.cli.tui.frontends.classic import formatted_text_height
 from mclaw.cli.tui.renderers.delegation import DelegationRenderer
-from mclaw.cli.tui.renderers.status import StatusRenderer
+from mclaw.cli.tui.renderers.status import StatusRenderer, format_context_bar
 
 
 def test_status_bar_reports_iteration_limit_instead_of_done() -> None:
@@ -40,6 +40,28 @@ def test_status_bar_reports_iteration_limit_instead_of_done() -> None:
 
     assert "⚠️ Iteration limit reached" in rendered
     assert "✓ Done" not in rendered
+
+
+def test_context_bar_marks_estimates_and_provider_actuals_differently() -> None:
+    compressor = SimpleNamespace(
+        context_length=262_144,
+        threshold_tokens=131_072,
+        last_prompt_tokens=1,
+        last_completion_tokens=2,
+        display_context_tokens=70_400,
+        display_context_estimated=True,
+    )
+
+    estimated, _style = format_context_bar(compressor)
+    compressor.display_context_estimated = False
+    actual, _style = format_context_bar(compressor)
+    compressor.display_context_tokens = None
+    unknown, _style = format_context_bar(compressor)
+
+    assert estimated is not None and "~70.4k/262.1k" in estimated
+    assert actual is not None and " 70.4k/262.1k" in actual
+    assert "~" not in actual
+    assert unknown is not None and "—/262.1k" in unknown
 
 
 def test_live_subagent_progress_shows_all_five_tasks_and_truncates_at_100() -> None:

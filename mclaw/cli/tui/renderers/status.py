@@ -80,11 +80,15 @@ def format_context_bar(compressor) -> tuple[str, str] | tuple[None, None]:
     if not compressor or compressor.context_length <= 0:
         return None, None
 
-    real_tokens = compressor.last_prompt_tokens + compressor.last_completion_tokens
+    if hasattr(compressor, "display_context_tokens"):
+        context_tokens = compressor.display_context_tokens
+    else:
+        context_tokens = compressor.last_prompt_tokens + compressor.last_completion_tokens
+    estimated = bool(getattr(compressor, "display_context_estimated", False))
     context_length = compressor.context_length
     threshold_tokens = compressor.threshold_tokens
 
-    usage = real_tokens / context_length
+    usage = (context_tokens or 0) / context_length
     filled = min(int(usage * _CTX_BAR_WIDTH), _CTX_BAR_WIDTH)
 
     threshold_pos = -1
@@ -103,7 +107,11 @@ def format_context_bar(compressor) -> tuple[str, str] | tuple[None, None]:
         else:
             chars.append(_CTX_EMPTY)
     bar = "".join(chars)
-    label = f"{fmt_tokens(real_tokens)}/{fmt_tokens(context_length)}"
+    if context_tokens is None:
+        label = f"—/{fmt_tokens(context_length)}"
+    else:
+        estimate_prefix = "~" if estimated else ""
+        label = f"{estimate_prefix}{fmt_tokens(context_tokens)}/{fmt_tokens(context_length)}"
 
     if usage >= 0.90:
         color = _CTX_COLOR_CRIT

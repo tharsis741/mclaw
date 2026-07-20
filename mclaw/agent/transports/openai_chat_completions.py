@@ -637,6 +637,8 @@ class OpenAIChatCompletionsTransport(ModelTransport):
             finish_reason = "stream_timeout"
         elif producer_error[0] is not None:
             finish_reason = "stream_error"
+        elif not provider_finish_reason:
+            finish_reason = "stream_incomplete"
 
         reasoning = None
         if reasoning_text or structured:

@@ -43,6 +43,16 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 )
 
 
+def model_response_confirms_visibility(
+    finish_reason: str | None,
+    *,
+    interrupted: bool = False,
+) -> bool:
+    """Return whether a model response can release pending tool results."""
+    reason = str(finish_reason or "")
+    return not interrupted and reason != "interrupted" and not reason.startswith("stream_")
+
+
 def _stable_json(value: Any) -> str:
     return json.dumps(
         value,
