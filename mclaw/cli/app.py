@@ -151,7 +151,7 @@ def _clear_terminal_title() -> None:
 
 
 def _handle_right_key(buffer) -> None:
-    """Move right inside text; accept auto-suggestion only at the end."""
+    """Accept a visible history suggestion, otherwise move the cursor right."""
     if buffer.suggestion and buffer.document.is_cursor_at_the_end:
         buffer.insert_text(buffer.suggestion.text)
     else:
@@ -3063,12 +3063,11 @@ class InteractiveChat:
 
         @kb.add("enter")
         def _(event):
+            """Submit only visible input; Tab owns slash-menu completion."""
             buf = event.app.current_buffer
             if _is_shift_enter(event):
                 buf.insert_text("\n")
                 return
-            if not self._pending_key_setup and not self._pending_secret_request:
-                _accept_slash_completion()
             display_text = buf.text.strip()
             if not self._pending_key_setup and not self._pending_secret_request:
                 display_text = paste_store.expand(display_text)
@@ -3133,8 +3132,6 @@ class InteractiveChat:
         @kb.add("right")
         def _(event):
             """→: accept auto-suggestion if present, else cursor right."""
-            if _accept_slash_completion():
-                return
             history_state.deactivate()
             _handle_right_key(event.app.current_buffer)
 
@@ -3155,16 +3152,6 @@ class InteractiveChat:
             """Leave history browsing and move to the end of the input."""
             history_state.deactivate()
             event.app.current_buffer.cursor_position = len(event.app.current_buffer.text)
-
-        @kb.add("c-e")
-        def _(event):
-            """Ctrl+E: accept auto-suggestion."""
-            if _accept_slash_completion():
-                return
-            buffer = event.app.current_buffer
-            if buffer.suggestion:
-                history_state.deactivate()
-                buffer.insert_text(buffer.suggestion.text)
 
         @kb.add("c-u")
         def _(event):

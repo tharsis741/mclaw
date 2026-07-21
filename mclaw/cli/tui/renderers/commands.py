@@ -145,11 +145,11 @@ class CommandsRenderer:
                     ("中断", "Ctrl+C"),
                     ("退出", "Ctrl+D"),
                     ("清空输入", "Ctrl+U"),
-                    ("光标/历史/补全", "Up/Down, Right/Ctrl+E, Tab"),
+                    ("光标/历史/补全", "Up/Down, Right, Tab"),
                     ("ASR 按键说话", push_to_talk_label),
                 ]),
                 spacer_block(),
-                text_block("Ctrl+U = 清空当前输入 · Right/Ctrl+E = 接受历史建议 · Tab = 接受命令补全 · Up/Down = 光标/历史/补全导航", muted=True),
+                text_block("Ctrl+U = 清空当前输入 · Right = 接受历史建议 · Tab = 接受命令补全 · Up/Down = 光标/历史/补全导航", muted=True),
             ),
         ))
 
