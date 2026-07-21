@@ -28,12 +28,12 @@ system, shadows, responsive behavior, and practical agent prompts with exact CSS
 1. Pick a design from the catalog below
 2. Load it: `skill_view(name="popular-web-designs", file_path="templates/<site>.md")`
 3. Use the design tokens and component specs when generating HTML
-4. Pair with the `generative-widgets` skill to serve the result via cloudflared tunnel
+4. Serve the result with an available static server
 
 Each template includes a **M-Claw Implementation Notes** block at the top with:
 - CDN font substitute and Google Fonts `<link>` tag (ready to paste)
 - CSS font-family stacks for primary and monospace
-- Reminders to use `write_file` for HTML creation and `browser_vision` for verification
+- Reminders to use `write_file`, browser tools, and `vision_analyze` for verification
 
 ## HTML Generation Pattern
 
@@ -71,8 +71,8 @@ Each template includes a **M-Claw Implementation Notes** block at the top with:
 </html>
 ```
 
-Write the file with `write_file`, serve with the `generative-widgets` workflow (cloudflared tunnel),
-and verify the result with `browser_vision` to confirm visual accuracy.
+Write the file with `write_file`, serve it with an available static server, then use
+`browser_navigate`, `browser_screenshot`, and `vision_analyze` for visual verification.
 
 ## Font Substitution Reference
 

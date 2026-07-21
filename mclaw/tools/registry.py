@@ -104,6 +104,7 @@ class ToolRegistry:
                 "type": "function",
                 "function": fn_def,
             })
+
         return result
 
 

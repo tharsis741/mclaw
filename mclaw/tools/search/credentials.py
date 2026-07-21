@@ -75,10 +75,15 @@ def resolve_dashscope_creds(
 
     if not result["base_url"]:
         intl_profile = get_runtime_profile("qwen-intl")
-        result["base_url"] = (
+        configured_base_url = (
             env_value(_QWEN_PROFILE.base_url_env_var)
             or env_value(intl_profile.base_url_env_var)
-            or _QWEN_PROFILE.base_url
+        )
+        domestic_key_present = any(env_value(name) for name in _QWEN_PROFILE.env_vars)
+        intl_only_env_vars = tuple(name for name in intl_profile.env_vars if name not in _QWEN_PROFILE.env_vars)
+        intl_only_key_present = any(env_value(name) for name in intl_only_env_vars)
+        result["base_url"] = configured_base_url or (
+            intl_profile.base_url if intl_only_key_present and not domestic_key_present else _QWEN_PROFILE.base_url
         )
     profile = get_runtime_profile(
         "qwen-intl" if "dashscope-intl" in result["base_url"].lower() else "qwen"

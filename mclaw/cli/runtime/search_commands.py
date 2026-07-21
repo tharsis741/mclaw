@@ -58,7 +58,9 @@ class RuntimeSearchCommandCoordinator:
             # Key entry is completed by the host prompt loop so the command can
             # run safely inside prompt_toolkit without blocking on stdin.
             self.hooks.remember_pending_key_setup({
-                "_search_backend": True,
+                "_backend_switch": "search",
+                "backend": getattr(result, "backend", "") or raw_args,
+                "required_for": "tool:web_search",
                 "env_var": getattr(result, "key_env_var", ""),
             })
             self.hooks.render_key_prompt()

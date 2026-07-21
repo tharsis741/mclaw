@@ -1594,6 +1594,7 @@ class InteractiveChat:
                     "model": lambda parsed: self._handle_model_switch(parsed.args.strip()),
                     "model-update": lambda parsed: self._handle_model_update(parsed.args.strip()),
                     "search-backend": self._handle_search_backend_command,
+                    "extract-backend": self._handle_extract_backend_command,
                     "asr-mode": lambda parsed: self._handle_asr_mode(parsed.args.strip()),
                     "keyboard-mode": lambda parsed: self._handle_keyboard_mode(),
                     "asr-status": lambda parsed: self._show_asr_status(),
@@ -1628,18 +1629,17 @@ class InteractiveChat:
 
     def _handle_search_backend_command(self, parsed: ParsedSlashCommand) -> bool:
         from mclaw.cli.runtime.search_commands import RuntimeSearchCommandCoordinator, RuntimeSearchCommandHooks
-        from mclaw.cli.search_backend_switch import get_search_backend_status, switch_search_backend
+        from mclaw.cli.search_backend_switch import (
+            format_search_backend_status,
+            get_search_backend_status,
+            switch_search_backend,
+        )
 
         def _render_status(status) -> None:
             self._get_commands_renderer().render_notice(
                 "M-Claw 搜索后端",
                 "当前搜索后端配置",
-                detail=(
-                    f"当前后端: {getattr(status, 'current', 'dashscope')}\n"
-                    f"DashScope: {'可用' if getattr(status, 'dashscope_available', False) else '未配置'}\n"
-                    f"Tavily: {'可用' if getattr(status, 'tavily_available', False) else '未配置'}\n"
-                    "用法: /search-backend dashscope|tavily|auto"
-                ),
+                detail="\n".join(format_search_backend_status(status)),
                 kind="info",
             )
 
@@ -1650,7 +1650,7 @@ class InteractiveChat:
                 render_backend_status=_render_status,
                 render_key_prompt=lambda: self._get_commands_renderer().render_notice(
                     "M-Claw 搜索后端",
-                    "Tavily API 密钥尚未配置。请输入密钥（或输入 /cancel 取消）：",
+                    "API 密钥尚未配置。请输入密钥（或输入 /cancel 取消）：",
                     kind="warning",
                 ),
                 render_success=lambda message: self._get_commands_renderer().render_notice(
@@ -1668,6 +1668,56 @@ class InteractiveChat:
                 print_fn=_cprint,
             )
         ).handle_search_backend(parsed.args.strip())
+        return True
+
+    def _handle_extract_backend_command(self, parsed: ParsedSlashCommand) -> bool:
+        from mclaw.cli.config import ConfigError
+        from mclaw.cli.search_backend_switch import (
+            get_extract_backend_status,
+            switch_extract_backend,
+        )
+
+        raw_args = parsed.args.strip()
+        if not raw_args:
+            try:
+                status = get_extract_backend_status()
+            except ConfigError as exc:
+                self._get_commands_renderer().render_notice(
+                    "M-Claw 网页提取后端", f"配置错误: {exc}", kind="danger"
+                )
+                return True
+            self._get_commands_renderer().render_extract_backend_status(
+                current=status.current,
+                availability={
+                    "trafilatura": status.trafilatura_available,
+                    "firecrawl": status.firecrawl_available,
+                    "tavily": status.tavily_available,
+                },
+            )
+            return True
+
+        result = switch_extract_backend(raw_args, print_fn=_cprint)
+        if result.needs_api_key:
+            self._pending_key_setup = {
+                "_backend_switch": "extract",
+                "backend": result.backend or raw_args,
+                "required_for": "tool:web_extract",
+                "env_var": result.key_env_var,
+            }
+            self._get_commands_renderer().render_notice(
+                "M-Claw 网页提取后端",
+                f"{result.key_env_var} 尚未配置。请输入密钥（或输入 /cancel 取消）：",
+                kind="warning",
+            )
+        elif result.success:
+            self._sync_extract_backend_config(result.backend)
+            self._get_commands_renderer().render_notice(
+                "M-Claw 网页提取后端", result.info_message, kind="success"
+            )
+        else:
+            self._get_commands_renderer().render_notice(
+                "M-Claw 网页提取后端", result.error_message, kind="danger"
+            )
         return True
 
     def _handle_doctor_command(self, parsed: ParsedSlashCommand) -> bool:
@@ -2036,14 +2086,15 @@ class InteractiveChat:
 
         setup = self._pending_key_setup
         self._pending_key_setup = None
+        backend_switch = str((setup or {}).get("_backend_switch") or "")
+        backend_title = "M-Claw 网页提取后端" if backend_switch == "extract" else "M-Claw 搜索后端"
 
         def _retry_search_backend():
-            from mclaw.cli.search_backend_switch import switch_search_backend
+            from mclaw.cli.search_backend_switch import switch_extract_backend, switch_search_backend
 
-            return switch_search_backend(
-                raw_input="tavily",
-                print_fn=_cprint,
-            )
+            backend = str((setup or {}).get("backend") or "tavily")
+            switch_fn = switch_extract_backend if backend_switch == "extract" else switch_search_backend
+            return switch_fn(raw_input=backend, print_fn=_cprint)
 
         def _retry_model_switch(pending_setup: dict):
             from mclaw.cli.model_switch import switch_model
@@ -2071,13 +2122,17 @@ class InteractiveChat:
                 ),
                 retry_search_backend=_retry_search_backend,
                 render_search_error=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw 搜索后端",
+                    backend_title,
                     message,
                     kind="danger",
                 ),
-                sync_search_backend=self._sync_search_backend_config,
+                sync_search_backend=(
+                    self._sync_extract_backend_config
+                    if backend_switch == "extract"
+                    else self._sync_search_backend_config
+                ),
                 render_search_success=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw 搜索后端",
+                    backend_title,
                     message,
                     kind="success",
                 ),
@@ -2135,6 +2190,13 @@ class InteractiveChat:
 
     def _sync_search_backend_config(self, backend: str):
         """Keep the live agent config in sync after /search-backend changes."""
+        self._sync_web_backend_config("web_search", backend)
+
+    def _sync_extract_backend_config(self, backend: str):
+        """Keep the live agent config in sync after /extract-backend changes."""
+        self._sync_web_backend_config("web_extract", backend)
+
+    def _sync_web_backend_config(self, section_name: str, backend: str):
         if not backend:
             return
         if not isinstance(self.config, dict):
@@ -2143,11 +2205,11 @@ class InteractiveChat:
         if not isinstance(auxiliary, dict):
             auxiliary = {}
             self.config["auxiliary"] = auxiliary
-        web_search = auxiliary.setdefault("web_search", {})
-        if not isinstance(web_search, dict):
-            web_search = {}
-            auxiliary["web_search"] = web_search
-        web_search["backend"] = backend
+        section = auxiliary.setdefault(section_name, {})
+        if not isinstance(section, dict):
+            section = {}
+            auxiliary[section_name] = section
+        section["backend"] = backend
 
         agent = getattr(self, "agent", None)
         if agent is not None:

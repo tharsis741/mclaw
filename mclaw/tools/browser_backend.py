@@ -29,13 +29,18 @@ logger = logging.getLogger(__name__)
 _DEFAULT_VIEWPORT = {"width": 1280, "height": 720}
 _DEFAULT_TIMEOUT = 30_000  # ms
 _MAX_SNAPSHOT_CHARS = 8_000
+_DOM_CONTENT_LOADED_TIMEOUT = 3_000  # ms
+_NETWORK_IDLE_TIMEOUT = 2_000  # ms
+_DOM_SETTLE_MIN = 250  # ms
+_DOM_SETTLE_QUIET = 200  # ms
+_DOM_SETTLE_TIMEOUT = 1_500  # ms
 
 
 def _default_downloads_dir() -> Path:
     return get_mclaw_home() / "downloads"
 
 
-# JavaScript snippet that tags interactive elements and returns metadata.
+# JavaScript snippet that tags interactive elements in the current viewport.
 _SNAPSHOT_JS = """
 (() => {
     // Clear stale refs from the previous snapshot.
@@ -51,13 +56,37 @@ _SNAPSHOT_JS = """
     const candidates = document.querySelectorAll(selectors.join(','));
     const elements = [];
 
-    candidates.forEach((el, idx) => {
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+    const inViewport = rect => (
+        rect.bottom > 0 && rect.right > 0 &&
+        rect.top < viewportHeight && rect.left < viewportWidth
+    );
+    const isVisible = el => {
         const rect = el.getBoundingClientRect();
         const style = window.getComputedStyle(el);
-        if (rect.width === 0 || rect.height === 0) return;
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
+        if (rect.width <= 0 || rect.height <= 0 || !inViewport(rect) ||
+            style.display === 'none' || style.visibility === 'hidden' ||
+            style.opacity === '0') return false;
 
-        const ref = 'e' + (idx + 1);
+        const clips = value => /^(auto|scroll|hidden|clip|overlay)$/.test(value);
+        for (let ancestor = el.parentElement; ancestor; ancestor = ancestor.parentElement) {
+            const ancestorStyle = window.getComputedStyle(ancestor);
+            if (ancestorStyle.display === 'none' || ancestorStyle.visibility === 'hidden' ||
+                ancestorStyle.opacity === '0') return false;
+            const ancestorRect = ancestor.getBoundingClientRect();
+            if (clips(ancestorStyle.overflowY) &&
+                (rect.bottom <= ancestorRect.top || rect.top >= ancestorRect.bottom)) return false;
+            if (clips(ancestorStyle.overflowX) &&
+                (rect.right <= ancestorRect.left || rect.left >= ancestorRect.right)) return false;
+        }
+        return true;
+    };
+
+    candidates.forEach(el => {
+        if (!isVisible(el)) return;
+
+        const ref = 'e' + (elements.length + 1);
         el.setAttribute('data-mclaw-ref', ref);
 
         const tag = el.tagName.toLowerCase();
@@ -81,6 +110,7 @@ _SNAPSHOT_JS = """
 
     const headings = [];
     document.querySelectorAll('h1, h2, h3, h4').forEach(h => {
+        if (!isVisible(h)) return;
         const txt = (h.textContent || '').trim();
         if (txt) headings.push({level: parseInt(h.tagName[1]), text: txt.slice(0, 100)});
     });
@@ -93,18 +123,152 @@ _SNAPSHOT_JS = """
     ];
     document.querySelectorAll(textSelectors.join(',')).forEach(el => {
         if (el.closest('a, button, input, textarea, select, nav, header, footer')) return;
-        const rect = el.getBoundingClientRect();
-        const style = window.getComputedStyle(el);
-        if (rect.width === 0 || rect.height === 0) return;
-        if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return;
+        if (!isVisible(el)) return;
         const txt = (el.textContent || '').replace(/\\s+/g, ' ').trim();
         if (!txt || txt.length < 2 || seenText.has(txt)) return;
         seenText.add(txt);
         textBlocks.push(txt.slice(0, 220));
     });
 
-    return {elements, headings, textBlocks: textBlocks.slice(0, 40)};
+    const scrollY = Math.max(0, Math.round(window.scrollY || document.documentElement.scrollTop || 0));
+    const pageHeight = Math.max(
+        viewportHeight,
+        document.documentElement.scrollHeight,
+        document.body ? document.body.scrollHeight : 0
+    );
+
+    return {
+        elements,
+        headings,
+        textBlocks: textBlocks.slice(0, 40),
+        viewport: {
+            top: scrollY,
+            bottom: Math.min(pageHeight, scrollY + viewportHeight),
+            height: viewportHeight,
+            pageHeight: pageHeight,
+            hasMoreAbove: scrollY > 1,
+            hasMoreBelow: scrollY + viewportHeight < pageHeight - 1
+        }
+    };
 })()
+"""
+
+
+_DOM_SETTLE_JS = """
+({minimumMs, quietMs, timeoutMs}) => new Promise(resolve => {
+    const startedAt = performance.now();
+    let lastMutationAt = startedAt;
+    let finished = false;
+
+    const finish = () => {
+        if (finished) return;
+        finished = true;
+        observer.disconnect();
+        clearInterval(timer);
+        resolve();
+    };
+    const observer = new MutationObserver(() => {
+        lastMutationAt = performance.now();
+    });
+    const root = document.documentElement || document;
+    observer.observe(root, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true
+    });
+    const timer = setInterval(() => {
+        const now = performance.now();
+        if (now - startedAt >= timeoutMs || (
+            now - startedAt >= minimumMs && now - lastMutationAt >= quietMs
+        )) finish();
+    }, 50);
+})
+"""
+
+
+_SCROLL_JS = """
+({dx, dy}) => {
+    const root = document.scrollingElement || document.documentElement;
+    const vertical = dy !== 0;
+    const amount = vertical ? dy : dx;
+    const viewportWidth = window.innerWidth || document.documentElement.clientWidth;
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight;
+
+    const overflowAllowsScroll = (element, axis) => {
+        const style = getComputedStyle(element);
+        const value = axis === 'y' ? style.overflowY : style.overflowX;
+        return /^(auto|scroll|overlay)$/.test(value);
+    };
+    const hasRoom = (element, axis, delta) => {
+        if (axis === 'y') {
+            if (element.scrollHeight <= element.clientHeight + 1) return false;
+            return delta > 0
+                ? element.scrollTop + element.clientHeight < element.scrollHeight - 1
+                : element.scrollTop > 1;
+        }
+        if (element.scrollWidth <= element.clientWidth + 1) return false;
+        return delta > 0
+            ? element.scrollLeft + element.clientWidth < element.scrollWidth - 1
+            : element.scrollLeft > 1;
+    };
+    const canScroll = element => {
+        if (!element || element === document.body || element === document.documentElement) {
+            return false;
+        }
+        const axis = vertical ? 'y' : 'x';
+        return overflowAllowsScroll(element, axis) && hasRoom(element, axis, amount);
+    };
+    const visibleArea = element => {
+        const rect = element.getBoundingClientRect();
+        const width = Math.max(0, Math.min(rect.right, viewportWidth) - Math.max(rect.left, 0));
+        const height = Math.max(0, Math.min(rect.bottom, viewportHeight) - Math.max(rect.top, 0));
+        return width * height;
+    };
+
+    let target = null;
+    const seen = new Set();
+    for (const hit of document.elementsFromPoint(viewportWidth / 2, viewportHeight / 2)) {
+        for (let element = hit; element && element !== document.body; element = element.parentElement) {
+            if (seen.has(element)) continue;
+            seen.add(element);
+            if (canScroll(element)) {
+                target = element;
+                break;
+            }
+        }
+        if (target) break;
+    }
+
+    if (!target) {
+        let largestArea = 0;
+        for (const element of document.querySelectorAll('body *')) {
+            if (!canScroll(element)) continue;
+            const area = visibleArea(element);
+            if (area > largestArea) {
+                largestArea = area;
+                target = element;
+            }
+        }
+    }
+
+    if (!target && hasRoom(root, vertical ? 'y' : 'x', amount)) target = root;
+    if (!target) target = root;
+
+    const before = vertical ? target.scrollTop : target.scrollLeft;
+    target.scrollBy({left: dx, top: dy, behavior: 'auto'});
+    const after = vertical ? target.scrollTop : target.scrollLeft;
+    const label = target === root
+        ? 'document'
+        : target.tagName.toLowerCase() + (target.id ? '#' + target.id : '');
+    return {
+        target: label,
+        axis: vertical ? 'vertical' : 'horizontal',
+        before: Math.round(before),
+        after: Math.round(after),
+        moved: Math.abs(after - before) > 1
+    };
+}
 """
 
 
@@ -133,6 +297,7 @@ class _SessionState:
     downloads_dir: Path = field(default_factory=_default_downloads_dir)
     downloads: list[Path] = field(default_factory=list)
     download_errors: list[str] = field(default_factory=list)
+    needs_settle: bool = False
 
 
 class BrowserBackend:
@@ -281,6 +446,39 @@ class BrowserBackend:
         if not self._started:
             self._start_impl()
 
+    def _wait_for_page_ready(self, page: Any) -> None:
+        """Wait for loading and DOM changes to become briefly quiet, within fixed bounds."""
+        try:
+            page.wait_for_load_state(
+                "domcontentloaded",
+                timeout=_DOM_CONTENT_LOADED_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.debug("DOMContentLoaded wait ended early: %s", exc)
+        try:
+            page.wait_for_load_state("networkidle", timeout=_NETWORK_IDLE_TIMEOUT)
+        except Exception as exc:
+            logger.debug("Network-idle wait ended early: %s", exc)
+        try:
+            page.evaluate(
+                _DOM_SETTLE_JS,
+                {
+                    "minimumMs": _DOM_SETTLE_MIN,
+                    "quietMs": _DOM_SETTLE_QUIET,
+                    "timeoutMs": _DOM_SETTLE_TIMEOUT,
+                },
+            )
+        except Exception as exc:
+            logger.debug("DOM-settle wait ended early: %s", exc)
+
+    def _settle_if_needed(self, page: Any, state: _SessionState) -> None:
+        if not state.needs_settle:
+            return
+        try:
+            self._wait_for_page_ready(page)
+        finally:
+            state.needs_settle = False
+
     # ── Session management ────────────────────────────────────────────────────
 
     def get_or_create_page(self, session_id: str) -> tuple[Any, _SessionState]:
@@ -319,6 +517,22 @@ class BrowserBackend:
             self._sessions[session_id] = state
             return page, state
 
+    def close_session(self, session_id: str) -> None:
+        """Close one isolated browser context without stopping shared Chromium."""
+        if not self._worker_thread or not self._worker_thread.is_alive():
+            return
+        self._run_on_worker(self._close_session_impl, session_id)
+
+    def _close_session_impl(self, session_id: str) -> None:
+        with self._lock:
+            state = self._sessions.pop(session_id, None)
+        if state is None:
+            return
+        try:
+            state.context.close()
+        except Exception as exc:
+            logger.debug("Error closing browser context %s: %s", session_id, exc)
+
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def navigate(self, session_id: str, url: str) -> dict[str, str]:
@@ -327,9 +541,9 @@ class BrowserBackend:
     def _navigate_impl(self, session_id: str, url: str) -> dict[str, str]:
         page, state = self._get_or_create_page_impl(session_id)
         logger.info("Navigating to %s", url)
+        state.needs_settle = True
         try:
             page.goto(url, wait_until="domcontentloaded")
-            page.wait_for_timeout(500)
             state.last_activity = time.time()
             url_val, title_val = _safe_page_info(page)
             return {"url": url_val, "title": title_val}
@@ -344,9 +558,10 @@ class BrowserBackend:
         return self._run_on_worker(self._snapshot_impl, session_id)
 
     def _snapshot_impl(self, session_id: str) -> dict[str, Any]:
-        """Return a compact page snapshot and refresh the ref-to-element map."""
+        """Return a compact current-viewport snapshot and refresh element refs."""
         page, state = self._get_or_create_page_impl(session_id)
         state.last_activity = time.time()
+        self._settle_if_needed(page, state)
         url_val, title_val = _safe_page_info(page)
 
         try:
@@ -363,6 +578,7 @@ class BrowserBackend:
         elements = result.get("elements", [])
         headings = result.get("headings", [])
         text_blocks = result.get("textBlocks", [])
+        viewport = result.get("viewport", {})
 
         lines: list[str] = []
         ref_map: dict[str, Any] = {}
@@ -416,11 +632,29 @@ class BrowserBackend:
 
         state.ref_map = ref_map
 
-        snapshot_text = f"url: {url_val}\ntitle: {title_val}\n\n"
+        viewport_top = int(viewport.get("top") or 0)
+        viewport_bottom = int(viewport.get("bottom") or 0)
+        page_height = int(viewport.get("pageHeight") or viewport_bottom)
+        snapshot_text = (
+            f"url: {url_val}\n"
+            f"title: {title_val}\n"
+            f"viewport: {viewport_top}-{viewport_bottom} of {page_height}px\n\n"
+        )
         snapshot_text += "\n".join(lines)
 
         if not elements:
-            snapshot_text += "\n[No interactive elements detected on this page.]"
+            snapshot_text += "\n[No interactive elements detected in the current viewport.]"
+
+        page_directions = []
+        if viewport.get("hasMoreAbove"):
+            page_directions.append("above")
+        if viewport.get("hasMoreBelow"):
+            page_directions.append("below")
+        if page_directions:
+            snapshot_text += (
+                f"\n[Page continues {' and '.join(page_directions)}; "
+                "use browser_scroll to move the viewport.]"
+            )
 
         if len(snapshot_text) > _MAX_SNAPSHOT_CHARS:
             trunc = snapshot_text[:_MAX_SNAPSHOT_CHARS]
@@ -429,8 +663,7 @@ class BrowserBackend:
                 trunc = trunc[:last_nl]
             snapshot_text = (
                 f"{trunc}\n\n"
-                f"[Snapshot truncated: {len(elements)} interactive elements. "
-                f"Use browser_scroll to see more.]"
+                f"[Current viewport snapshot truncated: {len(elements)} interactive elements.]"
             )
 
         return {
@@ -546,24 +779,30 @@ class BrowserBackend:
         page.on("download", _handle_download)
         try:
             element.click(timeout=5_000)
-            page.wait_for_timeout(800)
+            state.needs_settle = True
             state.last_activity = time.time()
         except Exception as e:
             logger.warning("Click error: %s", e)
             url_val, title_val = _safe_page_info(page)
+            try:
+                page.remove_listener("download", _handle_download)
+            except Exception as exc:
+                logger.debug("Download listener cleanup failed: %s", exc)
             return {
                 "success": False,
                 "error": f"Click failed: {e}",
                 "url": url_val,
                 "title": title_val,
             }
+
+        try:
+            snap = self._snapshot_impl(session_id)
         finally:
             try:
                 page.remove_listener("download", _handle_download)
             except Exception as exc:
                 logger.debug("Download listener cleanup failed: %s", exc)
 
-        snap = self._snapshot_impl(session_id)
         result = {
             "success": True,
             "url": snap["url"],
@@ -594,6 +833,7 @@ class BrowserBackend:
         logger.info("Typing into element @%s", ref)
         try:
             element.fill(text, timeout=5_000)
+            state.needs_settle = True
             state.last_activity = time.time()
         except Exception as e:
             logger.warning("Type error: %s", e)
@@ -620,22 +860,23 @@ class BrowserBackend:
         page, state = self._get_or_create_page_impl(session_id)
         logger.info("Scrolling %s", direction)
 
-        delta = 800
+        delta = 600
+        deltas = {
+            "down": (0, delta),
+            "up": (0, -delta),
+            "left": (-delta, 0),
+            "right": (delta, 0),
+        }
+        if direction not in deltas:
+            return {
+                "success": False,
+                "error": f"Unknown direction '{direction}'. Use up/down/left/right.",
+            }
+
         try:
-            if direction == "down":
-                page.mouse.wheel(0, delta)
-            elif direction == "up":
-                page.mouse.wheel(0, -delta)
-            elif direction == "left":
-                page.mouse.wheel(-delta, 0)
-            elif direction == "right":
-                page.mouse.wheel(delta, 0)
-            else:
-                return {
-                    "success": False,
-                    "error": f"Unknown direction '{direction}'. Use up/down/left/right.",
-                }
-            page.wait_for_timeout(500)
+            dx, dy = deltas[direction]
+            scroll_info = page.evaluate(_SCROLL_JS, {"dx": dx, "dy": dy})
+            state.needs_settle = True
             state.last_activity = time.time()
         except Exception as e:
             logger.warning("Scroll error: %s", e)
@@ -647,6 +888,7 @@ class BrowserBackend:
             "url": snap["url"],
             "title": snap["title"],
             "snapshot": snap["snapshot"],
+            "scroll": scroll_info,
         }
 
     def press(self, session_id: str, key: str) -> dict[str, Any]:
@@ -657,7 +899,7 @@ class BrowserBackend:
         logger.info("Pressing key: %s", key)
         try:
             page.keyboard.press(key)
-            page.wait_for_timeout(500)
+            state.needs_settle = True
             state.last_activity = time.time()
         except Exception as e:
             logger.warning("Press error: %s", e)
@@ -678,6 +920,7 @@ class BrowserBackend:
 
     def _screenshot_impl(self, session_id: str, path: str | None = None) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
+        self._settle_if_needed(page, state)
 
         if not path:
             ts = int(time.time())

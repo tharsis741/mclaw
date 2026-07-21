@@ -86,44 +86,32 @@ def check_web_search_requirements(config: dict | None = None) -> bool:
 
 def web_search(
     query: str,
-    strategy: str = "turbo",
-    freshness: int | None = None,
-    sites: str | None = None,
-    images: bool = False,
+    limit: int = 5,
     parent_agent=None,
 ) -> str:
     """Search the web through the configured backend router.
 
     Args:
         query: Search query string.
-        strategy: "turbo" (fast), "max" (thorough), or "agent" (multi-round).
-        freshness: Only results from last N days (7/30/180/365).
-        sites: Comma-separated list of domains to restrict to.
-        images: Include images in the response.
+        limit: Maximum number of source candidates to return (1-10).
         parent_agent: Optional parent agent for config and credential scoping.
 
     Returns:
-        JSON string with {success, results, _hint?}.
+        JSON string with {success, answer, sources, _backend_profile, _hint?}.
     """
     if not query or not isinstance(query, str):
         return tool_error("query is required", success=False)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
+        return tool_error("limit must be an integer between 1 and 10", success=False)
 
-    logger.info(
-        "Web search: %s (strategy=%s, images=%s)",
-        query[:80],
-        strategy,
-        images,
-    )
+    logger.info("Web search: %s (limit=%d)", query[:80], limit)
 
     from mclaw.tools.search.router import execute_search
 
     try:
         result = execute_search(
             query=query,
-            strategy=strategy,
-            freshness=freshness,
-            sites=sites,
-            images=images,
+            limit=limit,
             parent_agent=parent_agent,
         )
     except ConfigError as exc:
@@ -131,17 +119,23 @@ def web_search(
 
     if not result.get("success"):
         return tool_error(
-            result.get("results", "Search failed"),
+            result.get("error", "Search failed"),
             success=False,
-            backend=result.get("_backend", ""),
-            hint=result.get("_hint", ""),
-            fallback_from=result.get("_fallback_from", ""),
-            fallback_error=result.get("_fallback_error", ""),
+            _backend=result.get("_backend", ""),
+            _backend_profile=result.get("_backend_profile", {}),
+            _hint=result.get("_hint", ""),
+            _fallback_from=result.get("_fallback_from", ""),
+            _fallback_error=result.get("_fallback_error", ""),
         )
 
-    payload: dict[str, Any] = {"success": True, "results": result.get("results", "")}
+    payload: dict[str, Any] = {
+        "success": True,
+        "answer": str(result.get("answer") or ""),
+        "sources": result.get("sources") if isinstance(result.get("sources"), list) else [],
+    }
     for src_key, dst_key in (
         ("_backend", "_backend"),
+        ("_backend_profile", "_backend_profile"),
         ("_hint", "_hint"),
         ("_fallback_from", "_fallback_from"),
         ("_fallback_error", "_fallback_error"),
@@ -150,7 +144,11 @@ def web_search(
         if value:
             payload[dst_key] = value
 
-    logger.info("Web search completed (%d chars)", len(payload["results"]))
+    logger.info(
+        "Web search completed (%d answer chars, %d sources)",
+        len(payload["answer"]),
+        len(payload["sources"]),
+    )
     return json.dumps(payload, ensure_ascii=False)
 
 
@@ -160,54 +158,20 @@ WEB_SEARCH_SCHEMA = {
     "type": "function",
     "function": {
         "name": "web_search",
-        "description": (
-            "Search the web for real-time information using the configured backend "
-            "(DashScope/Qwen or Tavily). Returns a comprehensive answer with source citations - this result "
-            "is usually sufficient to answer the user's question.\n\n"
-            "DO NOT call browser_navigate or browser_snapshot after using this tool "
-            "to fetch the same information again. The search result already aggregates "
-            "multiple sources and includes current data. Only use browser tools when "
-            "the user explicitly asks you to visit a specific website or perform actions "
-            "on a web page (clicking, filling forms, downloading).\n\n"
-            "Use this tool when: (1) the user asks about current events, news, weather, "
-            "stock prices, or anything requiring up-to-date information; (2) the user asks "
-            "you to 'search', 'look up', 'find out', or 'check' something online; (3) the "
-            "user asks a factual question your training data may not cover.\n\n"
-            "Strategies:\n"
-            "- turbo (default): fast, good for quick facts\n"
-            "- max: thorough multi-source verification\n"
-            "- agent: multi-round retrieval for complex questions\n\n"
-            "Results include citation markers like [1], [2] - preserve these in your response."
-        ),
+        "description": "Search the internet and return an answer with sources",
         "parameters": {
             "type": "object",
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "The search query. Be specific for better results.",
+                    "description": "Search query.",
                 },
-                "strategy": {
-                    "type": "string",
-                    "enum": ["turbo", "max", "agent"],
-                    "description": (
-                        "Search strategy. "
-                        "turbo=fast general search (~60-90s). "
-                        "max=thorough multi-source verification (~60-120s), use for broad/hot topics or when turbo times out. "
-                        "agent=multi-round deep research."
-                    ),
-                },
-                "freshness": {
+                "limit": {
                     "type": "integer",
-                    "enum": [7, 30, 180, 365],
-                    "description": "Only return results from the last N days. Only works with turbo strategy.",
-                },
-                "sites": {
-                    "type": "string",
-                    "description": "Comma-separated domain list to restrict search to (e.g. 'github.com,arxiv.org'). Only works with turbo strategy.",
-                },
-                "images": {
-                    "type": "boolean",
-                    "description": "Include images in the response. Results may contain Markdown image links.",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "default": 5,
+                    "description": "Maximum number of sources to return.",
                 },
             },
             "required": ["query"],
@@ -219,10 +183,7 @@ WEB_SEARCH_SCHEMA = {
 def _handle_web_search(args: dict, **kw) -> str:
     return web_search(
         query=args.get("query", ""),
-        strategy=args.get("strategy", "turbo"),
-        freshness=args.get("freshness"),
-        sites=args.get("sites"),
-        images=args.get("images", False),
+        limit=args.get("limit", 5),
         parent_agent=kw.get("parent_agent"),
     )
 
@@ -234,7 +195,7 @@ registry.register(
     handler=_handle_web_search,
     check_fn=check_web_search_requirements,
     diagnose_fn=diagnose_web_search_requirements,
-    description="Search the web for current information",
+    description="Search the internet and return an answer with sources",
     emoji="🌐",
     max_result_size_chars=15_000,
 )

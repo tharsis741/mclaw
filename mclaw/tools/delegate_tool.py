@@ -98,6 +98,7 @@ def _build_child_system_prompt(
     *,
     working_directory: Optional[str] = None,
     max_iterations: int = 10,
+    available_tool_names: Optional[List[str]] = None,
 ) -> str:
     """Build the lightweight child prompt without inheriting the parent prompt."""
     parts = [
@@ -130,6 +131,10 @@ def _build_child_system_prompt(
         "- 未完成项或阻塞点\n\n"
         "你的回复会交给父代理继续处理，保持事实化、简洁；保持简洁。"
     )
+    if any(name.startswith(("web_", "browser_")) for name in available_tool_names or []):
+        from mclaw.agent.prompt_builder import WEB_CONTENT_SAFETY_GUIDANCE
+
+        parts.append(WEB_CONTENT_SAFETY_GUIDANCE)
     return "\n".join(parts)
 
 
@@ -288,7 +293,11 @@ def _build_child_agent(
 
     # Build the child prompt.
     child_prompt = _build_child_system_prompt(
-        goal, context, working_directory=working_directory, max_iterations=max_iterations
+        goal,
+        context,
+        working_directory=working_directory,
+        max_iterations=max_iterations,
+        available_tool_names=list(safe_tool_names),
     )
 
     delegation_cfg = parent_config.get("delegation", {}) if isinstance(parent_config, dict) else {}

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import replace
 
 from mclaw.cli.config import load_config
 from mclaw.tools.search.config import load_search_config
@@ -23,6 +24,7 @@ from mclaw.tools.search.credentials import (
     tavily_creds_ok,
 )
 from mclaw.tools.search.dashscope_backend import search as dashscope_search
+from mclaw.tools.search.profiles import get_search_backend_profile
 from mclaw.tools.search.tavily_backend import search as tavily_search
 from mclaw.tools.search.types import SearchRequest, SearchResponse
 
@@ -78,6 +80,7 @@ def _invoke_backend(backend_name: str, request: SearchRequest, creds: dict, time
     try:
         result = backend_fn(
             query=request.query,
+            limit=request.limit,
             strategy=request.strategy,
             freshness=request.freshness,
             sites=request.sites,
@@ -91,8 +94,9 @@ def _invoke_backend(backend_name: str, request: SearchRequest, creds: dict, time
         logger.warning("%s search backend failed: %s", backend_name, detail, exc_info=True)
         return SearchResponse(
             success=False,
-            results=f"{backend_name} search backend failed: {detail}",
+            error=f"{backend_name} search backend failed: {detail}",
             backend=backend_name,
+            backend_profile=get_search_backend_profile(backend_name).tool_metadata(),
             hint=f"Check {backend_name} configuration, dependencies, and service status.",
         )
 
@@ -104,10 +108,12 @@ def execute_search(
     sites: str | None = None,
     images: bool = False,
     parent_agent=None,
+    limit: int = 5,
 ) -> dict:
     """Route search to the configured backend and apply configured fallback."""
     request = SearchRequest(
         query=query,
+        limit=limit,
         strategy=strategy,
         freshness=freshness,
         sites=sites,
@@ -120,7 +126,7 @@ def execute_search(
         available = ", ".join(BACKENDS.keys())
         return SearchResponse(
             success=False,
-            results=f"未知搜索后端 '{backend_name}'。可用: {available}",
+            error=f"未知搜索后端 '{backend_name}'。可用: {available}",
         ).to_dict()
 
     if backend_name == "tavily":
@@ -143,7 +149,7 @@ def execute_search(
     ):
         # Fallback is deliberately one-way: DashScope can replace Tavily when
         # Tavily fails, but DashScope failures surface directly to the caller.
-        logger.warning("Tavily failed (%s), falling back to DashScope", result.results)
+        logger.warning("Tavily failed (%s), falling back to DashScope", result.error)
         ds_result = _invoke_backend(
             "dashscope",
             request,
@@ -153,24 +159,20 @@ def execute_search(
         if ds_result.success:
             fallback_hint = "Tavily 失败，已自动降级至 DashScope"
             hint = ds_result.hint
-            ds_result = SearchResponse(
-                success=True,
-                results=ds_result.results,
-                backend=ds_result.backend,
+            ds_result = replace(
+                ds_result,
                 hint=f"{hint} [{fallback_hint}]" if hint else fallback_hint,
                 fallback_from="tavily",
-                fallback_error=result.results,
+                fallback_error=result.error,
             )
         else:
             hint = ds_result.hint
-            fallback_hint = f"DashScope fallback also failed after Tavily failure: {result.results}"
-            ds_result = SearchResponse(
-                success=False,
-                results=ds_result.results,
-                backend=ds_result.backend,
+            fallback_hint = f"DashScope fallback also failed after Tavily failure: {result.error}"
+            ds_result = replace(
+                ds_result,
                 hint=f"{hint} [{fallback_hint}]" if hint else fallback_hint,
                 fallback_from="tavily",
-                fallback_error=result.results,
+                fallback_error=result.error,
             )
         result = ds_result
 

@@ -16,7 +16,7 @@ SKILLS_TOOLS = ["skills_list", "skill_tree", "skill_view", "skill_search", "skil
 DELEGATION_SKILL_READ_TOOLS = ["skills_list", "skill_tree", "skill_view"]
 SESSION_SEARCH_TOOLS = ["session_search"]
 DELEGATION_TOOLS = ["delegate_task"]
-WEB_TOOLS = ["web_search"]
+WEB_TOOLS = ["web_search", "web_extract"]
 VISION_TOOLS = ["vision_analyze"]
 BROWSER_TOOLS = [
     "browser_navigate",
@@ -97,8 +97,8 @@ TOOLSETS: dict[str, dict[str, Any]] = {
         "kind": "required",
     },
     "web": {
-        "description": "Web search",
-        "display": {"emoji": "🌐", "summary_zh": "联网搜索"},
+        "description": "Web search and readable page extraction",
+        "display": {"emoji": "🌐", "summary_zh": "联网搜索与网页提取"},
         "tools": WEB_TOOLS,
         "kind": "optional",
     },

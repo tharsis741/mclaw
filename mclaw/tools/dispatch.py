@@ -99,7 +99,7 @@ _NEVER_PARALLEL_TOOLS = frozenset()
 _PARALLEL_SAFE_TOOLS = frozenset({
     "read_file", "search_files",
     "skill_view", "skill_tree", "skills_list", "skill_search", "vision_analyze",
-    "web_search",
+    "web_search", "web_extract",
 })
 
 # Path-scoped tools need overlap checks before concurrent dispatch.
@@ -122,6 +122,7 @@ _MAX_TOOL_WORKERS = 8
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT = 30
 _CONCURRENT_TOOL_TIMEOUTS = {
     "web_search": 180,
+    "web_extract": 180,
     "vision_analyze": 180,
     "skill_search": 60,
 }
@@ -137,6 +138,7 @@ _TOOL_MODULES = (
     "mclaw.tools.delegate_tool",
     "mclaw.tools.vision_tool",
     "mclaw.tools.web_search_tool",
+    "mclaw.tools.web_extract_tool",
     "mclaw.tools.browser_tool",
     "mclaw.tools.weixin_tool",
     "mclaw.tools.dingtalk_tool",
@@ -144,6 +146,8 @@ _TOOL_MODULES = (
 _discovery_done = False
 _discovery_failed_modules: set[str] = set()
 _discovery_lock = threading.Lock()
+
+_BROWSER_WEB_PRIORITY = "For information retrieval, prefer web_search or web_extract."
 
 _worker_loop = None
 _worker_loop_lock = threading.Lock()
@@ -210,6 +214,28 @@ def _discover_tools():
         _discovery_failed_modules.update(failed_modules)
 
 
+def _scope_browser_web_priority(definitions: list[dict], valid_names: set[str]) -> None:
+    """Keep browser_navigate cross-references limited to available web tools."""
+    available_web = [name for name in ("web_search", "web_extract") if name in valid_names]
+    replacement = (
+        f"For information retrieval, prefer {' or '.join(available_web)}."
+        if available_web
+        else ""
+    )
+    if replacement == _BROWSER_WEB_PRIORITY:
+        return
+    for definition in definitions:
+        function = definition.get("function", {})
+        if function.get("name") != "browser_navigate":
+            continue
+        description = str(function.get("description") or "")
+        function["description"] = description.replace(
+            f"{_BROWSER_WEB_PRIORITY} ",
+            f"{replacement} " if replacement else "",
+        )
+        return
+
+
 def get_tool_definitions(
     enabled_toolsets: list[str] | None = None,
     disabled_toolsets: list[str] | None = None,
@@ -227,6 +253,12 @@ def get_tool_definitions(
         disabled_tools = resolve_multiple_toolsets(disabled_toolsets)
         tool_names -= disabled_tools
 
+    if isinstance(config, dict):
+        tools_config = config.get("tools", {})
+        raw_disabled = tools_config.get("disabled", []) if isinstance(tools_config, dict) else []
+        if isinstance(raw_disabled, (list, tuple, set)):
+            tool_names -= {str(name) for name in raw_disabled}
+
     try:
         from mclaw.runtime.manager import RuntimeManager
 
@@ -237,6 +269,7 @@ def get_tool_definitions(
 
     definitions = registry.get_definitions(tool_names, config=config)
     valid_names = {d["function"]["name"] for d in definitions}
+    _scope_browser_web_priority(definitions, valid_names)
     return definitions, valid_names
 
 
@@ -624,6 +657,11 @@ def _concurrent_tool_timeout(tool_name: str, parent_agent: Any = None) -> int:
                     timeout = max(fast_timeout, slow_timeout)
                 else:
                     timeout = fast_timeout
+            elif tool_name == "web_extract":
+                extract_cfg = auxiliary.get("web_extract", {})
+                if isinstance(extract_cfg, dict):
+                    request_timeout = _positive_int(extract_cfg.get("timeout"), 30)
+                    timeout = request_timeout * 5 + 30
             elif tool_name == "vision_analyze":
                 vision_cfg = auxiliary.get("vision", {})
                 if isinstance(vision_cfg, dict):

@@ -2,17 +2,15 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tavily web-search backend.
-
-Provides a thin synchronous wrapper around https://api.tavily.com/search and
-formats the answer plus sources into lightweight Markdown for the agent.
-"""
+"""Tavily web-search backend returning an answer and structured sources."""
 
 from __future__ import annotations
 
 import logging
 
 import requests
+
+from mclaw.tools.search.profiles import get_search_backend_profile
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +25,7 @@ def search(
     images: bool,
     creds: dict,
     timeout: float,
+    limit: int = 5,
 ) -> dict:
     """Search the web using the Tavily API.
 
@@ -43,33 +42,35 @@ def search(
         timeout: Request timeout in seconds.
 
     Returns:
-        {"success": bool, "results": str, "_backend": "tavily", "_hint": str}
+        A provider-neutral mapping with ``answer`` and structured ``sources``.
     """
+    profile = get_search_backend_profile("tavily")
     api_key = creds.get("api_key", "")
     if not api_key:
         logger.warning("Tavily search skipped: missing api_key in creds")
         return {
             "success": False,
-            "results": "Tavily API key is missing. Set it in creds['api_key'].",
+            "error": "Tavily API key is missing. Set it in creds['api_key'].",
             "_backend": "tavily",
+            "_backend_profile": profile.tool_metadata(),
             "_hint": "Set TAVILY_API_KEY in the M-Claw home .env file.",
         }
 
-    # Map M-Claw's strategy names onto Tavily's depth/result-count knobs.
+    # Keep legacy strategy support inside the backend while the model-facing
+    # tool exposes only query + result limit.
     if strategy == "turbo":
         search_depth = "basic"
-        max_results = 5
+        answer_depth = "basic"
     else:
-        # max / agent strategies use deeper search and more results.
         search_depth = "advanced"
-        max_results = 10
+        answer_depth = "advanced"
+    max_results = max(1, min(int(limit), 10))
 
     payload: dict = {
-        "api_key": api_key,
         "query": query,
         "search_depth": search_depth,
         "max_results": max_results,
-        "include_answer": True,
+        "include_answer": answer_depth,
         "include_raw_content": False,
     }
 
@@ -86,15 +87,21 @@ def search(
             payload["include_domains"] = domains
 
     try:
-        response = requests.post(_TAVILY_API_URL, json=payload, timeout=timeout)
+        response = requests.post(
+            _TAVILY_API_URL,
+            headers={"Authorization": f"Bearer {api_key}"},
+            json=payload,
+            timeout=timeout,
+        )
         response.raise_for_status()
         data = response.json()
     except requests.Timeout:
         logger.warning("Tavily search timed out after %.1fs", timeout)
         return {
             "success": False,
-            "results": f"Tavily search timed out after {timeout:.1f}s.",
+            "error": f"Tavily search timed out after {timeout:.1f}s.",
             "_backend": "tavily",
+            "_backend_profile": profile.tool_metadata(),
             "_hint": "Retry or increase timeout in auxiliary.web_search.tavily_timeout config.",
         }
     except requests.HTTPError as exc:
@@ -110,43 +117,44 @@ def search(
             pass
         return {
             "success": False,
-            "results": msg,
+            "error": msg,
             "_backend": "tavily",
+            "_backend_profile": profile.tool_metadata(),
             "_hint": "Check your Tavily API key and account status.",
         }
     except requests.RequestException as exc:
         logger.warning("Tavily search request failed: %s", exc)
         return {
             "success": False,
-            "results": f"Tavily search request failed: {exc}",
+            "error": f"Tavily search request failed: {exc}",
             "_backend": "tavily",
+            "_backend_profile": profile.tool_metadata(),
             "_hint": "Check network connectivity and Tavily service status.",
         }
 
-    answer = data.get("answer", "")
-    sources = data.get("results", [])
-
-    # Build lightweight Markdown output so callers can preserve citations
-    # without needing to understand Tavily's raw JSON shape.
-    lines: list[str] = []
-    if answer:
-        lines.append(answer)
-    else:
-        lines.append("No answer returned by Tavily.")
-
-    if sources:
-        lines.append("")
-        lines.append("### 来源")
-        for idx, src in enumerate(sources, start=1):
-            title = src.get("title", "Untitled")
-            url = src.get("url", "")
-            lines.append(f"[{idx}] {title} — {url}")
-
-    results_text = "\n".join(lines)
+    raw_sources = data.get("results")
+    sources = [
+        {
+            "index": idx,
+            "title": str(src.get("title") or "Untitled"),
+            "url": str(src.get("url") or ""),
+            "snippet": str(src.get("content") or "").strip(),
+        }
+        for idx, src in enumerate(raw_sources, start=1)
+        if isinstance(src, dict) and src.get("url")
+    ] if isinstance(raw_sources, list) else []
+    answer = str(data.get("answer") or "").strip()
+    hint = "" if answer else "Tavily returned sources without a generated answer."
 
     return {
         "success": True,
-        "results": results_text,
+        "answer": answer,
+        "sources": sources,
         "_backend": "tavily",
-        "_hint": "",
+        "_backend_profile": {
+            **profile.tool_metadata(),
+            "search_depth": search_depth,
+            "answer_depth": answer_depth,
+        },
+        "_hint": hint,
     }

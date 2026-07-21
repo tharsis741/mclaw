@@ -1209,7 +1209,10 @@ def _run_setup_impl(args):
     for result in configured.values():
         upsert_fallback_provider_model(config, result.get("provider", ""), result.get("model", ""))
     save_config(config)
-    _print_setup_step("步骤 3/3  配置可选能力", "可启用网页搜索、视觉分析、浏览器自动化、IM 渠道和语音输入。")
+    _print_setup_step(
+        "步骤 3/3  配置可选能力",
+        "可启用网页搜索、网页提取、视觉分析、浏览器自动化、IM 渠道和语音输入。",
+    )
     _run_setup_capability_selection(config)
     save_config(config)
     _run_setup_builtin_skill_selection()
@@ -1264,7 +1267,7 @@ def _merge_channel_config_from_disk(config: dict, channel_name: str, keys: tuple
 
 
 def _run_setup_capability_selection(config: dict) -> None:
-    """Select optional toolsets, channels, and ASR mode during setup."""
+    """Select optional tools, channels, and ASR mode during setup."""
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.tui.console import print_plain
     from mclaw.cli.tui.selection_prompt import prompt_multi_select
@@ -1273,14 +1276,19 @@ def _run_setup_capability_selection(config: dict) -> None:
 
     runtime = RuntimeManager.current(config)
 
-    web_feature = get_feature("web_search")
     vision_feature = get_feature("vision_analyze")
     asr_feature = get_feature("asr")
+    web_tools = ("web_extract", "web_search")
     capability_items = [
         {
-            "id": "web",
-            "label": web_feature.display_name if web_feature else "网页搜索",
-            "description": web_feature.description if web_feature else "优先通过 Tavily 搜索网页，可选 DashScope/Qwen 作为第二搜索源。",
+            "id": "web_extract",
+            "label": "网页提取",
+            "description": "使用 Trafilatura、Tavily 或 Firecrawl 提取网页正文。",
+        },
+        {
+            "id": "web_search",
+            "label": "网页搜索",
+            "description": "通过 Tavily 或 DashScope/Qwen 搜索网页并返回答案与来源。",
         },
         {
             "id": "vision",
@@ -1290,7 +1298,7 @@ def _run_setup_capability_selection(config: dict) -> None:
     ]
     if runtime.features.toolset_enabled("browser"):
         capability_items.append(
-            {"id": "browser", "label": "浏览器自动化", "description": "使用本地浏览器运行时执行网页操作。"}
+            {"id": "browser", "label": "浏览器自动化", "description": "在浏览器中执行点击、输入等网页操作。"}
         )
     channel_items = [
         {
@@ -1305,22 +1313,31 @@ def _run_setup_capability_selection(config: dict) -> None:
         },
     ]
     current_toolsets = [str(item) for item in config.get("toolsets", []) if str(item).strip()]
+    tools_cfg = config.get("tools", {})
+    disabled_tools = {
+        str(item)
+        for item in (tools_cfg.get("disabled", []) if isinstance(tools_cfg, dict) else [])
+    }
     default_optional = [
+        name for name in web_tools
+        if "web" in current_toolsets and name not in disabled_tools
+    ]
+    default_optional.extend(
         item
         for item in current_toolsets
-        if item in {"web", "vision", "browser"} and runtime.features.toolset_enabled(item)
-    ]
+        if item in {"vision", "browser"} and runtime.features.toolset_enabled(item)
+    )
     default_channels = [item for item in current_toolsets if item in {"weixin", "dingtalk"}]
 
     try:
         optional = prompt_multi_select(
-            "M-CLAW 可选工具配置",
+            "M-Claw 可选工具配置",
             capability_items,
             hint="选择需要启用的可选工具；必需工具始终启用。",
             default_selected=default_optional,
         )
         channels = prompt_multi_select(
-            "M-Claw IM交互配置",
+            "M-Claw IM 交互配置",
             channel_items,
             hint="选择需要接入的消息渠道；选中后进入对应登录流程。",
             default_selected=default_channels,
@@ -1341,19 +1358,42 @@ def _run_setup_capability_selection(config: dict) -> None:
         print_plain()
         raise _SetupCancelled
 
-    feature_by_toolset = {"web": "web_search", "vision": "vision_analyze"}
     enabled_optional: list[str] = []
+    enabled_web_tools: list[str] = []
+    if "web_extract" in optional and _setup_configure_web_extract(
+        config, print_plain=print_plain, color=color, Colors=Colors
+    ):
+        enabled_web_tools.append("web_extract")
+    if "web_search" in optional and _setup_configure_web_search_keys(
+        config, print_plain=print_plain, color=color, Colors=Colors
+    ):
+        enabled_web_tools.append("web_search")
+
     for name in optional:
-        feature_name = feature_by_toolset.get(name)
-        if feature_name == "web_search":
-            if not _setup_configure_web_search_keys(config, print_plain=print_plain, color=color, Colors=Colors):
-                continue
-        elif feature_name and not _setup_configure_feature_keys(feature_name, print_plain=print_plain, color=color, Colors=Colors):
+        if name in web_tools:
             continue
-        elif feature_name == "vision_analyze":
+        if name == "vision":
+            if not _setup_configure_feature_keys(
+                "vision_analyze", print_plain=print_plain, color=color, Colors=Colors
+            ):
+                continue
             _ensure_vision_config(config)
+        elif name != "browser":
+            continue
         if name not in enabled_optional:
             enabled_optional.append(name)
+
+    if enabled_web_tools:
+        enabled_optional.insert(0, "web")
+
+    tools_cfg = config.setdefault("tools", {})
+    if not isinstance(tools_cfg, dict):
+        tools_cfg = {}
+        config["tools"] = tools_cfg
+    disabled_tools = {str(item) for item in tools_cfg.get("disabled", [])}
+    disabled_tools.difference_update(web_tools)
+    disabled_tools.update(set(web_tools) - set(enabled_web_tools))
+    tools_cfg["disabled"] = sorted(disabled_tools)
 
     enabled_channels: list[str] = []
     for name in channels:
@@ -1398,7 +1438,150 @@ def _run_setup_capability_selection(config: dict) -> None:
         if isinstance(asr, dict):
             asr["enabled"] = True if asr_enabled else (False if "asr" in asr_choice else "auto")
 
-    print_plain(color(f"\n  已启用工具集: {', '.join(selected_toolsets)}", Colors.DIM))
+    enabled_names = [
+        *enabled_web_tools,
+        *[name for name in enabled_optional if name != "web"],
+        *enabled_channels,
+    ]
+    display_names = {
+        "web_extract": "网页提取",
+        "web_search": "网页搜索",
+        "vision": "视觉分析",
+        "browser": "浏览器自动化",
+        "weixin": "微信",
+        "dingtalk": "钉钉",
+    }
+    enabled_display = "、".join(display_names.get(name, name) for name in enabled_names)
+    print_plain()
+    print_plain(
+        _setup_label("可选能力")
+        + color(enabled_display or "未启用", Colors.GREEN if enabled_display else Colors.DIM)
+    )
+
+
+def _web_auxiliary_config(config: dict) -> dict:
+    auxiliary = config.setdefault("auxiliary", {})
+    if not isinstance(auxiliary, dict):
+        auxiliary = {}
+        config["auxiliary"] = auxiliary
+    return auxiliary
+
+
+def _ensure_web_search_config(config: dict) -> dict:
+    auxiliary = _web_auxiliary_config(config)
+    web_cfg = auxiliary.setdefault("web_search", {})
+    if not isinstance(web_cfg, dict):
+        web_cfg = {}
+        auxiliary["web_search"] = web_cfg
+    web_cfg["backend"] = "auto"
+    web_cfg.setdefault("tavily_timeout", 30)
+    web_cfg.setdefault("dashscope_timeout", 90)
+    web_cfg.setdefault("dashscope_deep_timeout", 120)
+    web_cfg.setdefault("fallback", True)
+    return web_cfg
+
+
+def _ensure_web_extract_config(config: dict) -> dict:
+    auxiliary = _web_auxiliary_config(config)
+    extract_cfg = auxiliary.setdefault("web_extract", {})
+    if not isinstance(extract_cfg, dict):
+        extract_cfg = {}
+        auxiliary["web_extract"] = extract_cfg
+    extract_cfg.setdefault("backend", "trafilatura")
+    extract_cfg.setdefault("timeout", 30)
+    extract_cfg.setdefault("firecrawl_api_url", "https://api.firecrawl.dev/v2/scrape")
+    return extract_cfg
+
+
+def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) -> bool:
+    """Enable local extraction or authorize the configured cloud backend."""
+    from mclaw.cli import config as cli_config
+    from mclaw.runtime.secrets import authorize
+
+    extract_cfg = _ensure_web_extract_config(config)
+    current = str(extract_cfg.get("backend") or "trafilatura").strip().lower()
+    backends = [
+        ("trafilatura", "Trafilatura", "无需 API Key"),
+        ("tavily", "Tavily", "需要 TAVILY_API_KEY"),
+        ("firecrawl", "Firecrawl", "需要 FIRECRAWL_API_KEY"),
+    ]
+    known_backends = {name for name, _label, _description in backends}
+    if current not in known_backends:
+        current = "trafilatura"
+
+    while True:
+        print_plain(color("\n  选择网页提取后端", Colors.BOLD, Colors.BLUE))
+        for index, (name, label, description) in enumerate(backends, 1):
+            marker = color(" *", Colors.BOLD, Colors.CYAN) if name == current else ""
+            print_plain(
+                f"    {_setup_index(index)}. {label} "
+                f"{color(f'({name})', Colors.DIM)}{marker}"
+            )
+            print_plain(color(f"       {description}", Colors.DIM))
+        print_plain()
+
+        choice = _setup_input(f"  输入后端编号或名称 [{current}]: ").strip().lower()
+        if not choice:
+            backend = current
+            break
+        if choice.isdigit() and 1 <= int(choice) <= len(backends):
+            backend = backends[int(choice) - 1][0]
+            break
+        if choice in known_backends:
+            backend = choice
+            break
+        print_plain(color("\n  未识别网页提取后端。请重新输入编号或名称。", Colors.RED))
+        print_plain(color("  可用后端：trafilatura、tavily、firecrawl。", Colors.DIM))
+        _pause_setup_warning()
+    extract_cfg["backend"] = backend
+
+    if backend == "trafilatura":
+        print_plain(color("  网页提取: 已启用 Trafilatura，无需 API Key。", Colors.DIM))
+        return True
+
+    if backend == "firecrawl":
+        env_var = "FIRECRAWL_API_KEY"
+        key_url = "https://www.firecrawl.dev/app/api-keys"
+        backend_label = "Firecrawl"
+    else:
+        env_var = "TAVILY_API_KEY"
+        key_url = "https://www.tavily.com/"
+        backend_label = "Tavily"
+
+    if cli_config.get_env_value(env_var):
+        authorize("tool:web_extract", [env_var])
+        print_plain(
+            color(
+                f"  网页提取: 已检测到 {display_mclaw_path('.env')} 中的 {env_var}。",
+                Colors.DIM,
+            )
+        )
+        return True
+
+    print_plain(
+        color(
+            f"\n  {backend_label} 网页提取需要 {display_mclaw_path('.env')} 中的 {env_var}。"
+            "按 Enter 使用 Trafilatura。",
+            Colors.YELLOW,
+        )
+    )
+    print_plain(color(f"  获取 API Key: {key_url}", Colors.DIM))
+    values = _prompt_secret_batch(
+        [env_var],
+        prompt=color(f"  {env_var}: ", Colors.YELLOW),
+        print_plain=print_plain,
+        color=color,
+        Colors=Colors,
+    )
+    if values and values.get(env_var):
+        cli_config.save_env_value(env_var, values[env_var])
+        authorize("tool:web_extract", [env_var])
+        print_plain(color(f"  网页提取: {backend_label} 凭据已保存。", Colors.DIM))
+        return True
+
+    extract_cfg["backend"] = "trafilatura"
+    print_plain(color("  已使用 Trafilatura，无需 API Key。", Colors.DIM))
+    return True
 
 
 def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors) -> bool:
@@ -1409,8 +1592,9 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
 
     required_for = "tool:web_search"
     qwen_profile = get_runtime_profile("qwen")
-    qwen_env_vars = qwen_profile.env_vars
-    qwen_primary_env = qwen_env_vars[0]
+    qwen_intl_profile = get_runtime_profile("qwen-intl")
+    qwen_env_vars = tuple(dict.fromkeys((*qwen_profile.env_vars, *qwen_intl_profile.env_vars)))
+    _ensure_web_search_config(config)
 
     def _configured(name: str) -> bool:
         return bool(str(cli_config.get_env_value(name) or "").strip())
@@ -1418,30 +1602,35 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
     def _existing_dashscope_env() -> str:
         return next((name for name in qwen_env_vars if _configured(name)), "")
 
-    def _ensure_web_config() -> None:
-        auxiliary = config.setdefault("auxiliary", {})
-        if not isinstance(auxiliary, dict):
-            auxiliary = {}
-            config["auxiliary"] = auxiliary
-        web_cfg = auxiliary.setdefault("web_search", {})
-        if not isinstance(web_cfg, dict):
-            web_cfg = {}
-            auxiliary["web_search"] = web_cfg
-        web_cfg["backend"] = "auto"
-        web_cfg.setdefault("tavily_timeout", 30)
-        web_cfg.setdefault("dashscope_timeout", 90)
-        web_cfg.setdefault("dashscope_deep_timeout", 120)
-        web_cfg.setdefault("fallback", True)
-
     tavily_ready = _configured("TAVILY_API_KEY")
     dashscope_env = _existing_dashscope_env()
 
     if tavily_ready:
         authorize(required_for, ["TAVILY_API_KEY"])
-        print_plain(color("  网页搜索: 已检测到 Tavily API key，将作为首选搜索源。", Colors.DIM))
+        print_plain(
+            color(
+                f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 TAVILY_API_KEY。",
+                Colors.DIM,
+            )
+        )
+    elif dashscope_env:
+        authorize(required_for, [dashscope_env])
+        print_plain(
+            color(
+                f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 {dashscope_env}。",
+                Colors.DIM,
+            )
+        )
+        return True
     else:
-        print_plain(color("\n  网页搜索首选 Tavily。按 Enter 可跳过 Tavily。", Colors.YELLOW))
-        print_plain(color("  获取 Tavily API key: https://www.tavily.com/", Colors.DIM))
+        print_plain(
+            color(
+                f"\n  网页搜索需要 {display_mclaw_path('.env')} 中的 Tavily 凭据。"
+                "按 Enter 跳过此功能。",
+                Colors.YELLOW,
+            )
+        )
+        print_plain(color("  获取 API Key: https://www.tavily.com/", Colors.DIM))
         values = _prompt_secret_batch(
             ["TAVILY_API_KEY"],
             prompt=color("  Tavily API Key: ", Colors.YELLOW),
@@ -1453,37 +1642,14 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
             cli_config.save_env_value("TAVILY_API_KEY", values["TAVILY_API_KEY"])
             authorize(required_for, ["TAVILY_API_KEY"])
             tavily_ready = True
-            print_plain(color("  网页搜索: Tavily 凭据已保存并授权。", Colors.DIM))
+            print_plain(color("  网页搜索: Tavily 凭据已保存。", Colors.DIM))
         else:
-            print_plain(color("  已跳过 Tavily 首选搜索源。", Colors.DIM))
+            print_plain(color("  已跳过网页搜索，不会启用。", Colors.DIM))
+            return False
 
     if dashscope_env:
         authorize(required_for, [dashscope_env])
-        print_plain(color(f"  网页搜索: 已检测到 {dashscope_env}，将作为第二搜索源。", Colors.DIM))
-    elif tavily_ready:
-        choice = _setup_input("  是否配置 Qwen/DashScope API 作为第二搜索源? [y/N]: ").lower()
-        if choice == "y":
-            print_plain(color(f"  DashScope API key 可在 {qwen_profile.key_url} 获取。", Colors.DIM))
-            values = _prompt_secret_batch(
-                [qwen_primary_env],
-                prompt=color("  DashScope API Key: ", Colors.YELLOW),
-                print_plain=print_plain,
-                color=color,
-                Colors=Colors,
-            )
-            if values and values.get(qwen_primary_env):
-                cli_config.save_env_value(qwen_primary_env, values[qwen_primary_env])
-                authorize(required_for, [qwen_primary_env])
-                dashscope_env = qwen_primary_env
-                print_plain(color("  网页搜索: DashScope 第二搜索源已保存并授权。", Colors.DIM))
-            else:
-                print_plain(color("  已跳过 DashScope 第二搜索源。", Colors.DIM))
 
-    if not tavily_ready and not dashscope_env:
-        print_plain(color("  已跳过网页搜索，未配置 Tavily 或 DashScope/Qwen 凭据。", Colors.DIM))
-        return False
-
-    _ensure_web_config()
     return True
 
 

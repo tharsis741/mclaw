@@ -24,6 +24,7 @@ from mclaw.cli.runtime.panels import (
 )
 from mclaw.cli.tui.panel_renderer import render_panel_model
 from mclaw.cli.tui.renderers.status import format_duration
+from mclaw.tools.extract.profiles import EXTRACT_BACKEND_PROFILES, VALID_EXTRACT_BACKENDS
 
 
 class CommandsRenderer:
@@ -106,6 +107,7 @@ class CommandsRenderer:
                     ("/model-update", "刷新和查看 models.dev 模型库缓存"),
                     ("/provider", "查看供应商和密钥状态"),
                     ("/search-backend", "查看或切换联网搜索后端"),
+                    ("/extract-backend", "查看或切换网页提取后端"),
                     ("/schedule", "打开本地任务中心"),
                     ("/skills", "查看和使用技能"),
                     ("/usage", "查看本次会话 Token 用量"),
@@ -172,6 +174,49 @@ class CommandsRenderer:
                     ("/model-update provider <供应商>", "查看接口类型和模型库"),
                     ("/provider", "查看内置/自定义供应商及密钥状态"),
                 ]),
+            ),
+            tone="info",
+        ))
+
+    def render_extract_backend_status(
+        self,
+        *,
+        current: str,
+        availability: dict[str, bool],
+    ) -> None:
+        """Render extraction backends as a compact comparison table."""
+        rows = []
+        for name in VALID_EXTRACT_BACKENDS:
+            profile = EXTRACT_BACKEND_PROFILES[name]
+            available = availability.get(name, False)
+            selected = name == current
+            missing = "未安装" if name == "trafilatura" else "未配置"
+            state = "当前" if selected and available else (
+                f"当前 · {missing}" if selected else ("可用" if available else missing)
+            )
+            rows.append((
+                panel_cell(profile.display_name, "accent" if selected else "primary"),
+                panel_cell(state, "accent" if selected and available else ("success" if available else "warning")),
+                panel_cell(profile.status_description_zh, "muted"),
+            ))
+
+        self._panel_model(PanelModel(
+            title="M-Claw · 网页提取",
+            namespace="extract_backend",
+            blocks=(
+                table_block(
+                    (
+                        PanelColumn("后端", no_wrap=True),
+                        PanelColumn("状态", no_wrap=True),
+                        PanelColumn("行为"),
+                    ),
+                    rows,
+                ),
+                spacer_block(),
+                command_block([(
+                    f"/extract-backend <{'|'.join(VALID_EXTRACT_BACKENDS)}>",
+                    "切换后端",
+                )]),
             ),
             tone="info",
         ))

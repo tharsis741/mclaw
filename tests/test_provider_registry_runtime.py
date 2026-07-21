@@ -538,7 +538,9 @@ def test_qwen_tool_and_feature_metadata_are_registry_derived() -> None:
         dict.fromkeys((*qwen.env_vars, *qwen_intl.env_vars))
     )
     assert search_backend_switch._QWEN_PROFILE is qwen
-    assert search_backend_switch._QWEN_CREDENTIAL_HINT == " or ".join(qwen.env_vars)
+    assert search_backend_switch._QWEN_CREDENTIAL_HINT == " or ".join(
+        dict.fromkeys((*qwen.env_vars, *qwen_intl.env_vars))
+    )
     assert tuple(search_credentials.QWEN_CREDENTIAL_HINT.split(" or ")) == tuple(
         dict.fromkeys((*qwen.env_vars, *qwen_intl.env_vars))
     )
@@ -586,6 +588,17 @@ def test_qwen_tool_consumers_select_regional_registry_metadata(monkeypatch) -> N
     )
     assert search["api_key"] == "intl-secret"
     assert search["base_url"] == qwen_intl.base_url
+
+    monkeypatch.setattr(
+        search_credentials,
+        "env_value",
+        lambda name, default="": key_values.get(name, default),
+    )
+    search_from_intl_key = search_credentials.resolve_dashscope_creds(
+        config={"auxiliary": {"web_search": {}}}
+    )
+    assert search_from_intl_key["api_key"] == "intl-secret"
+    assert search_from_intl_key["base_url"] == qwen_intl.base_url
 
     monkeypatch.setattr(
         search_credentials,

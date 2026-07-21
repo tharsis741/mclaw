@@ -4,11 +4,13 @@
 
 """Browser Tool — 8 sub-tools for web browsing via Playwright.
 
-Sessions are managed per-agent-turn and auto-cleaned after inactivity.
+Logical sessions use isolated contexts in one lazy shared Chromium process and
+are auto-cleaned after inactivity.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import re
@@ -32,23 +34,38 @@ _sessions_lock = threading.Lock()
 _cleanup_started = False
 _REF_RE = re.compile(r"^e\d+$")
 
+# ponytail: one Playwright owner thread serializes calls; add a backend pool only
+# if measured concurrent browser workloads require it.
+_browser_backend = BrowserBackend(headless=True)
+
+
+def _shutdown_browser_backend() -> None:
+    try:
+        _browser_backend.stop()
+    except Exception as exc:
+        logger.debug("Error stopping shared browser backend: %s", exc)
+
+
+atexit.register(_shutdown_browser_backend)
+
 
 class BrowserSession:
-    """Tool-level session wrapper with one backend and inactivity timestamp."""
-    def __init__(self, session_id: str):
+    """Tool-level session with an isolated context and inactivity timestamp."""
+
+    def __init__(self, session_id: str, backend: BrowserBackend | None = None):
         self.session_id = session_id
-        self.backend = BrowserBackend(headless=True)
+        self.backend = backend or _browser_backend
         self.last_activity = time.time()
 
     def touch(self) -> None:
         self.last_activity = time.time()
 
-    def is_expired(self) -> bool:
-        return time.time() - self.last_activity > _SESSION_TIMEOUT
+    def is_expired(self, now: float | None = None) -> bool:
+        return (time.time() if now is None else now) - self.last_activity > _SESSION_TIMEOUT
 
     def close(self) -> None:
         try:
-            self.backend.stop()
+            self.backend.close_session(self.session_id)
         except Exception as e:
             logger.debug("Error closing session %s: %s", self.session_id, e)
 
@@ -65,22 +82,30 @@ def _get_or_create_session(session_id: str) -> BrowserSession:
         return sess
 
 
+def _cleanup_expired_sessions(now: float | None = None) -> int:
+    """Remove expired sessions and close their contexts atomically by session ID."""
+    check_time = time.time() if now is None else now
+    with _sessions_lock:
+        expired = [
+            (sid, sess)
+            for sid, sess in _browser_sessions.items()
+            if sess.is_expired(check_time)
+        ]
+        for sid, sess in expired:
+            _browser_sessions.pop(sid, None)
+            logger.info("Browser session expired, closing: %s", sid)
+            try:
+                sess.close()
+            except Exception as exc:
+                logger.warning("Cleanup error for %s: %s", sid, exc)
+    return len(expired)
+
+
 def _cleanup_loop() -> None:
     """Background thread: close expired sessions."""
     while True:
         time.sleep(_CLEANUP_INTERVAL)
-        with _sessions_lock:
-            expired = [
-                sid for sid, sess in _browser_sessions.items()
-                if sess.is_expired()
-            ]
-            for sid in expired:
-                logger.info("Browser session expired, closing: %s", sid)
-                try:
-                    _browser_sessions[sid].close()
-                except Exception as e:
-                    logger.warning("Cleanup error for %s: %s", sid, e)
-                _browser_sessions.pop(sid, None)
+        _cleanup_expired_sessions()
 
 
 def _start_cleanup_if_needed() -> None:
@@ -167,8 +192,8 @@ def browser_navigate(url: str, parent_agent=None) -> str:
         snap = sess.backend.snapshot(session_id)
         result = {
             "success": not bool(nav.get("error")),
-            "url": nav.get("url", ""),
-            "title": nav.get("title", ""),
+            "url": snap.get("url", nav.get("url", "")),
+            "title": snap.get("title", nav.get("title", "")),
             "snapshot": snap["snapshot"],
         }
         if nav.get("error"):
@@ -182,7 +207,7 @@ def browser_navigate(url: str, parent_agent=None) -> str:
 # ── 2. browser_snapshot ─────────────────────────────────────────────────────
 
 def browser_snapshot(parent_agent=None) -> str:
-    """Get the current page accessibility snapshot."""
+    """Get the current viewport's compact interaction snapshot."""
     _start_cleanup_if_needed()
     session_id = _resolve_session_id(parent_agent)
     sess = _get_or_create_session(session_id)
@@ -332,17 +357,22 @@ def browser_download(
 _BROWSER_TOOLS = [
     {
         "name": "browser_navigate",
+        "short_description": "Navigate the interactive browser to a URL",
         "description": (
-            "Navigate the browser to a URL. Returns the page title and an accessibility "
-            "snapshot with numbered elements you can interact with.\n\n"
-            "Use this as the first step when the user asks you to visit a website."
+            "Navigate to a URL in the interactive browser. Initializes the session, loads "
+            "the page, and returns a compact snapshot of the current viewport with element "
+            "refs. For information "
+            "retrieval, prefer web_search or web_extract. Use browser tools when you need to "
+            "interact with a page, such as clicking or filling forms. Call browser_navigate "
+            "before browser tools that act on or inspect the current page; browser_snapshot "
+            "is not needed immediately after navigation."
         ),
         "params": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "The URL to navigate to. Must include scheme (http:// or https://).",
+                    "description": "Absolute URL to open, including its scheme.",
                 },
             },
             "required": ["url"],
@@ -352,11 +382,8 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_snapshot",
-        "description": (
-            "Capture an accessibility snapshot of the current page. Shows interactive "
-            "elements (links, buttons, inputs) with ref IDs like [e3] link 'Login'.\n\n"
-            "Use this to understand the page structure before clicking or typing."
-        ),
+        "short_description": "Refresh the current viewport snapshot and element refs",
+        "description": "Refresh the compact snapshot of the current viewport and its element refs.",
         "params": {
             "type": "object",
             "properties": {},
@@ -366,17 +393,14 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_screenshot",
-        "description": (
-            "Take a full-page screenshot and save it to a file. Returns the file path.\n\n"
-            "Use this when the user asks about visual aspects of a page (colors, layout, etc.) "
-            "or when you need to share what you see. The screenshot can then be analyzed with vision_analyze."
-        ),
+        "short_description": "Save a full-page screenshot",
+        "description": "Save a full-page screenshot and return its file path.",
         "params": {
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "Optional file path to save the screenshot. If omitted, a default path in the M-Claw downloads directory is used.",
+                    "description": "Output file path. Defaults to the M-Claw downloads directory.",
                 },
             },
         },
@@ -385,17 +409,14 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_click",
-        "description": (
-            "Click an element on the page by its ref ID. Ref IDs come from browser_snapshot "
-            "or browser_navigate output (e.g. 'e5' or '@e5').\n\n"
-            "After clicking, the page may navigate - the result includes the new snapshot."
-        ),
+        "short_description": "Click an element by snapshot ref",
+        "description": "Click an element by ref and return the updated current-viewport snapshot.",
         "params": {
             "type": "object",
             "properties": {
                 "ref": {
                     "type": "string",
-                    "description": "The element ref ID to click, e.g. 'e5' or '@e5'.",
+                    "description": "Element ref from the current page snapshot.",
                 },
             },
             "required": ["ref"],
@@ -405,20 +426,18 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_type",
-        "description": (
-            "Type text into an input field identified by its ref ID.\n\n"
-            "Use browser_snapshot first to find the input's ref ID, then call this tool."
-        ),
+        "short_description": "Set text in an input by snapshot ref",
+        "description": "Set an input's text by ref and return the updated current-viewport snapshot.",
         "params": {
             "type": "object",
             "properties": {
                 "ref": {
                     "type": "string",
-                    "description": "The input element ref ID, e.g. 'e3'.",
+                    "description": "Input ref from the current page snapshot.",
                 },
                 "text": {
                     "type": "string",
-                    "description": "The text to type into the input field.",
+                    "description": "Text to set.",
                 },
             },
             "required": ["ref", "text"],
@@ -430,18 +449,16 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_scroll",
-        "description": (
-            "Scroll the page in a direction.\n\n"
-            "Use this when the snapshot says content is truncated or when you need to "
-            "see elements further down the page."
-        ),
+        "short_description": "Scroll the current page",
+        "description": "Scroll the current page and return a compact snapshot of the new viewport.",
         "params": {
             "type": "object",
             "properties": {
                 "direction": {
                     "type": "string",
                     "enum": ["up", "down", "left", "right"],
-                    "description": "Scroll direction. Default is down.",
+                    "default": "down",
+                    "description": "Scroll direction.",
                 },
             },
         },
@@ -450,16 +467,14 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_press",
-        "description": (
-            "Press a keyboard key (e.g. 'Enter', 'Escape', 'ArrowDown', 'Tab').\n\n"
-            "Useful for form submission (Enter), closing modals (Escape), or keyboard navigation."
-        ),
+        "short_description": "Press a keyboard key on the current page",
+        "description": "Press a keyboard key and return the updated current-viewport snapshot.",
         "params": {
             "type": "object",
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Key to press. Examples: 'Enter', 'Escape', 'ArrowDown', 'Tab', 'Backspace'.",
+                    "description": "Key name, such as Enter, Escape, ArrowDown, or Tab.",
                 },
             },
             "required": ["key"],
@@ -469,27 +484,25 @@ _BROWSER_TOOLS = [
     },
     {
         "name": "browser_download",
+        "short_description": "Download a file by URL or snapshot ref",
         "description": (
-            "Download a file. Modes:\n"
-            "1. Provide a direct download URL - the browser navigates to it and captures the file.\n"
-            "2. Provide a ref from browser_snapshot - the browser clicks it and waits for the download.\n"
-            "3. Omit URL/ref - return the latest download already captured by browser_click.\n\n"
-            "Returns the saved file path and size."
+            "Download from ref if provided, otherwise from url; with neither, return the latest "
+            "captured download."
         ),
         "params": {
             "type": "object",
             "properties": {
                 "url": {
                     "type": "string",
-                    "description": "Optional direct download URL. If omitted, waits for a download triggered by a previous action.",
+                    "description": "Direct download URL.",
                 },
                 "ref": {
                     "type": "string",
-                    "description": "Optional element ref ID for a link/button that triggers a download, e.g. 'e5' or '@e5'.",
+                    "description": "Download-triggering ref from the current page snapshot.",
                 },
                 "path": {
                     "type": "string",
-                    "description": "Optional save file path or existing directory. If omitted, saves to the M-Claw downloads directory.",
+                    "description": "Destination file or directory. Defaults to the M-Claw downloads directory.",
                 },
             },
         },
@@ -515,7 +528,10 @@ for _tool in _BROWSER_TOOLS:
         },
         handler=_tool["handler"],
         check_fn=check_browser_requirements,
-        description=_tool["description"].split("\n", 1)[0],
+        description=_tool.get(
+            "short_description",
+            _tool["description"].split("\n", 1)[0],
+        ),
         emoji=_tool["emoji"],
         max_result_size_chars=12_000,
         diagnose_fn=diagnose_browser_requirements,

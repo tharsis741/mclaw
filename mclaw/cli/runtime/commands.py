@@ -51,6 +51,7 @@ _COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec("model", "切换大模型"),
     SlashCommandSpec("model-update", "刷新/查看 models.dev 模型库缓存"),
     SlashCommandSpec("search-backend", "切换联网搜索后端"),
+    SlashCommandSpec("extract-backend", "切换网页提取后端"),
     SlashCommandSpec("asr-mode", "启用语音输入"),
     SlashCommandSpec("asr-once", "录制一次语音输入"),
     SlashCommandSpec("asr-status", "查看语音输入状态"),

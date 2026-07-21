@@ -2,10 +2,11 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""DashScope web-search backend using Qwen enable_search.
+"""DashScope web search through the native protocol.
 
-Provides a thin synchronous wrapper around DashScope's compatible-mode OpenAI
-chat completions endpoint with enable_search.
+The OpenAI-compatible endpoint returns only generated text. The native
+DashScope protocol also returns ``search_info.search_results``, which lets the
+shared tool keep generated answers separate from supporting sources.
 """
 
 from __future__ import annotations
@@ -19,44 +20,105 @@ from mclaw.tools.search.credentials import (
     QWEN_CREDENTIAL_HINT,
     is_dashscope_configured,
 )
+from mclaw.tools.search.profiles import get_search_backend_profile
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MODEL = "qwen3.5-plus"
+_DEFAULT_MODEL = "qwen-plus"
 _MAX_WEB_SEARCH_CHARS = 12_000
-_NO_LIVE_SEARCH_PHRASES = (
-    "无法访问互联网",
-    "无法联网",
-    "不能访问网络",
-    "没有联网",
-    "知识库有截止",
-    "knowledge cutoff",
-    "training data",
-    "无法提供实时",
-    "无法获取最新",
-    "我没有实时",
-    "无法提供当前",
-    "不能提供实时",
-)
 
 
 def _convert_html_images_to_markdown(text: str) -> str:
-    """Convert HTML <img> tags to Markdown ![](url) format."""
     text = re.sub(r'<img\s+src="([^"]+)"\s+alt="([^"]*)"[^>]*>', r'![\2](\1)', text)
-    text = re.sub(r'<p\s+align="center">\s*', '', text)
-    text = re.sub(r'</p>', '', text)
-    return text
+    text = re.sub(r'<p\s+align="center">\s*', "", text)
+    return re.sub(r"</p>", "", text)
 
 
-def _live_search_failure_phrase(text: str) -> str:
-    """Return the fallback phrase when a short response suggests no live search."""
-    if not text or len(text) >= 300:
+def _native_base_address(base_url: str) -> str:
+    base = str(base_url or DASHSCOPE_BASE_URL).rstrip("/")
+    suffix = "/compatible-mode/v1"
+    return base.removesuffix(suffix) + "/api/v1" if base.endswith(suffix) else base
+
+
+def _value(obj: Any, key: str, default: Any = None) -> Any:
+    getter = getattr(obj, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return getattr(obj, key, default)
+
+
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
         return ""
-    folded = text.casefold()
-    for phrase in _NO_LIVE_SEARCH_PHRASES:
-        if phrase.casefold() in folded:
-            return phrase
-    return ""
+    return "".join(
+        str(item.get("text") or "")
+        for item in content
+        if isinstance(item, dict)
+    )
+
+
+def _response_parts(response: Any) -> tuple[str, list[dict[str, Any]], bool, str]:
+    status_code = _value(response, "status_code", 200)
+    if status_code and int(status_code) != 200:
+        code = str(_value(response, "code", "") or "")
+        message = str(_value(response, "message", "") or "DashScope request failed")
+        return "", [], False, f"{code}: {message}" if code else message
+
+    output = _value(response, "output", {}) or {}
+    search_info = _value(output, "search_info")
+    search_seen = search_info is not None
+    raw_sources = _value(search_info, "search_results", []) if search_seen else []
+    sources = [dict(item) for item in raw_sources if isinstance(item, dict)] if isinstance(raw_sources, list) else []
+    choices = _value(output, "choices", []) or []
+    message = _value(choices[0], "message", {}) if choices else {}
+    answer = _content_text(_value(message, "content", ""))
+    return answer, sources, search_seen, ""
+
+
+def _call_generation(**kwargs):
+    from dashscope import Generation
+
+    return Generation.call(**kwargs)
+
+
+def _call_multimodal(**kwargs):
+    from dashscope import MultiModalConversation
+
+    return MultiModalConversation.call(**kwargs)
+
+
+def _uses_multimodal_api(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized.startswith("qwen3.5-") or "omni" in normalized
+
+
+def _normalize_sources(raw_sources: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    for fallback_index, item in enumerate(raw_sources[:limit], start=1):
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        try:
+            index = int(item.get("index") or fallback_index)
+        except (TypeError, ValueError):
+            index = fallback_index
+        sources.append({
+            "index": index,
+            "title": str(item.get("title") or url),
+            "url": url,
+            "snippet": "",
+        })
+    return sources
+
+
+def _truncate_answer(answer: str) -> tuple[str, str]:
+    if len(answer) <= _MAX_WEB_SEARCH_CHARS:
+        return answer, ""
+    omitted = len(answer) - _MAX_WEB_SEARCH_CHARS
+    truncated = answer[:_MAX_WEB_SEARCH_CHARS] + f"\n\n[... {omitted:,} characters truncated ...]"
+    return truncated, f"Generated answer was truncated by {omitted:,} characters."
 
 
 def search(
@@ -67,194 +129,136 @@ def search(
     images: bool,
     creds: dict,
     timeout: float,
+    limit: int = 5,
 ) -> dict:
-    """Search via DashScope Qwen enable_search.
-
-    The backend accepts the router's provider-neutral request shape and
-    translates it into DashScope compatible-mode chat completion parameters.
-
-    Args:
-        query: Search query string.
-        strategy: "turbo", "max", or "agent".
-        freshness: Only results from last N days (7/30/180/365).
-        sites: Comma-separated list of domains to restrict to.
-        images: Include images in the response.
-        creds: Dict with keys "api_key", "base_url", "model".
-        timeout: Request timeout in seconds.
-
-    Returns:
-        {"success": bool, "results": str, "_backend": "dashscope", "_hint": str}
-    """
+    """Return a Qwen-generated answer plus native DashScope source links."""
+    profile = get_search_backend_profile("dashscope")
+    profile_metadata = profile.tool_metadata()
     api_key = creds.get("api_key", "")
     base_url = creds.get("base_url", "") or DASHSCOPE_BASE_URL
     model = creds.get("model", "") or _DEFAULT_MODEL
 
-    # Non-positive timeout means "use the strategy default".
     if timeout <= 0:
         timeout = 120.0 if strategy in ("max", "agent") else 90.0
 
     if not api_key:
-        logger.warning("DashScope search skipped: missing api_key in creds")
         return {
             "success": False,
-            "results": (
-                "No API key available for web search. "
-                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
-            ),
+            "error": f"No DashScope API key is available. Set {QWEN_CREDENTIAL_HINT}.",
             "_backend": "dashscope",
-            "_hint": (
-                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
-            ),
+            "_backend_profile": profile_metadata,
+            "_hint": f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file.",
         }
-
     if not is_dashscope_configured(creds):
-        logger.warning(
-            "DashScope search skipped: credentials do not point to DashScope "
-            "(api_key_present=%s, base_url=%s)",
-            bool(api_key),
-            base_url,
-        )
         return {
             "success": False,
-            "results": (
-                "web_search requires a DashScope API key (百炼). "
-                "The current API key does not appear to be for DashScope, "
-                "so enable_search (联网搜索) cannot work. "
-                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
-            ),
+            "error": "web_search requires DashScope credentials and a DashScope endpoint.",
             "_backend": "dashscope",
-            "_hint": (
-                f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file."
-            ),
+            "_backend_profile": profile_metadata,
+            "_hint": f"Set {QWEN_CREDENTIAL_HINT} in the M-Claw home .env file.",
         }
-
-    # DashScope enable_search only works with Qwen models.
     if not model.lower().startswith("qwen"):
-        logger.warning(
-            "DashScope search model '%s' is not a Qwen model; forcing to %s for enable_search",
-            model,
-            _DEFAULT_MODEL,
-        )
+        logger.warning("DashScope search model '%s' is not Qwen; using %s", model, _DEFAULT_MODEL)
         model = _DEFAULT_MODEL
 
-    try:
-        import openai
-    except ImportError as exc:
-        raise RuntimeError("openai package is required for web search") from exc
-
-    client = openai.OpenAI(api_key=api_key, base_url=base_url, max_retries=0, timeout=timeout)
-
-    extra_body: dict[str, Any] = {}
-    # DashScope search controls are passed through extra_body rather than the
-    # OpenAI-compatible top-level request schema.
+    max_sources = max(1, min(int(limit), 10))
+    multimodal = _uses_multimodal_api(model)
+    actual_strategy = "agent" if multimodal else strategy
     search_options: dict[str, Any] = {
-        "search_strategy": strategy,
+        "search_strategy": actual_strategy,
         "forced_search": True,
         "enable_source": True,
         "enable_citation": True,
-        "enable_search_extension": True,
+        "citation_format": "[<number>]",
     }
-
-    # Freshness and site filters are only sent for turbo because the deeper
-    # strategies use DashScope's broader multi-source retrieval path.
-    if freshness and strategy == "turbo":
+    if freshness and actual_strategy == "turbo":
         search_options["freshness"] = freshness
-    if sites and strategy == "turbo":
+    if sites and actual_strategy == "turbo":
         search_options["assigned_site_list"] = [s.strip() for s in sites.split(",") if s.strip()]
 
-    extra_body["enable_search"] = True
-    extra_body["search_options"] = search_options
+    prompt = (
+        f"请联网搜索并简要回答：{query}\n"
+        f"最多引用前 {max_sources} 个来源，并使用 [序号] 标注引用。"
+    )
+    request = {
+        "api_key": api_key,
+        "model": model,
+        "enable_search": True,
+        "search_options": search_options,
+        "base_address": _native_base_address(base_url),
+        "request_timeout": timeout,
+    }
 
-    if images:
-        extra_body["enable_text_image_mixed"] = True
-
-    messages = [{"role": "user", "content": query}]
-
-    try:
-        completion = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            extra_body=extra_body,
+    if multimodal:
+        responses = _call_multimodal(
+            **request,
+            messages=[{"role": "user", "content": [{"text": prompt}]}],
+            stream=True,
+            incremental_output=True,
         )
-        result = completion.choices[0].message.content or ""
-
-        if images:
-            result = _convert_html_images_to_markdown(result)
-
-        # Detect whether live search actually executed.
-        no_search_phrase = _live_search_failure_phrase(result)
-        if no_search_phrase:
-            logger.warning(
-                "DashScope search response suggests search did NOT execute (model=%s, len=%d, phrase=%r). "
-                "Possible causes: (1) API key is not a DashScope key, "
-                "(2) model does not support enable_search, "
-                "(3) account lacks search quota. Response: %s",
-                model,
-                len(result),
-                no_search_phrase,
-                result[:200],
-            )
+        answer_parts: list[str] = []
+        raw_sources: list[dict[str, Any]] = []
+        search_seen = False
+        for response in responses:
+            answer_part, response_sources, response_search_seen, error = _response_parts(response)
+            if error:
+                return {
+                    "success": False,
+                    "error": f"DashScope search failed: {error}",
+                    "_backend": "dashscope",
+                    "_backend_profile": profile_metadata,
+                    "_hint": "Check the configured DashScope model and service status.",
+                }
+            answer_parts.append(answer_part)
+            if response_sources:
+                raw_sources = response_sources
+            search_seen = search_seen or response_search_seen
+        answer = "".join(answer_parts)
+    else:
+        response = _call_generation(
+            **request,
+            messages=[{"role": "user", "content": prompt}],
+            result_format="message",
+            enable_text_image_mixed=bool(images),
+        )
+        answer, raw_sources, search_seen, error = _response_parts(response)
+        if error:
             return {
                 "success": False,
-                "results": (
-                    "Web search backend did not execute the query. "
-                    "The model returned a fallback response instead of performing a live search. "
-                    "Suggestion: retry the same query once, or check your DashScope search quota."
-                ),
+                "error": f"DashScope search failed: {error}",
                 "_backend": "dashscope",
-                "_hint": f"DashScope response matched no-live-search phrase {no_search_phrase!r}; retry once or check search quota.",
+                "_backend_profile": profile_metadata,
+                "_hint": "Check the configured DashScope model and service status.",
             }
 
-        logger.info("DashScope search completed (%d chars)", len(result))
-        if result:
-            preview = result[:2000] if len(result) <= 2000 else result[:2000] + " ... [truncated]"
-            logger.info("DashScope search result:\n%s", preview)
-
-        # Internal truncation prevents oversized search results from blowing up context.
-        hint = ""
-        if len(result) > _MAX_WEB_SEARCH_CHARS:
-            head = int(_MAX_WEB_SEARCH_CHARS * 0.4)
-            tail = _MAX_WEB_SEARCH_CHARS - head
-            omitted = len(result) - _MAX_WEB_SEARCH_CHARS
-            result = (
-                result[:head]
-                + f"\n\n[... {omitted:,} characters truncated ...]\n\n"
-                + result[-tail:]
-            )
-            hint = (
-                f"Search result was truncated from {omitted + _MAX_WEB_SEARCH_CHARS:,} "
-                f"to {_MAX_WEB_SEARCH_CHARS:,} characters. "
-                "Use a more specific query if you need full details."
-            )
-
-        return {
-            "success": True,
-            "results": result,
-            "_backend": "dashscope",
-            "_hint": hint,
-        }
-
-    except openai.AuthenticationError as e:
-        logger.error("DashScope search auth error: %s", e)
+    if not search_seen:
         return {
             "success": False,
-            "results": f"Authentication failed. Check {QWEN_CREDENTIAL_HINT}. Error: {e}",
+            "error": "DashScope did not return search_info, so live search could not be verified.",
             "_backend": "dashscope",
-            "_hint": f"Check {QWEN_CREDENTIAL_HINT}.",
+            "_backend_profile": profile_metadata,
+            "_hint": "Retry once or check the model's web-search support and account quota.",
         }
-    except openai.APIError as e:
-        logger.error("DashScope search API error: %s", e)
-        return {
-            "success": False,
-            "results": f"Search API error: {e}",
-            "_backend": "dashscope",
-            "_hint": "Check DashScope service status and your account quota.",
-        }
-    except Exception as e:
-        logger.exception("DashScope search unexpected error: %s", e)
-        return {
-            "success": False,
-            "results": f"Search failed: {e}",
-            "_backend": "dashscope",
-            "_hint": "Unexpected error during search.",
-        }
+
+    if images:
+        answer = _convert_html_images_to_markdown(answer)
+    answer, truncation_hint = _truncate_answer(answer.strip())
+    sources = _normalize_sources(raw_sources, max_sources)
+    hints = [truncation_hint] if truncation_hint else []
+    if not sources:
+        hints.append("DashScope returned no structured source links.")
+    if not answer:
+        hints.append("DashScope returned sources without a generated answer.")
+
+    return {
+        "success": bool(answer or sources),
+        "answer": answer,
+        "sources": sources,
+        "_backend": "dashscope",
+        "_backend_profile": {
+            **profile_metadata,
+            "model": model,
+            "search_strategy": actual_strategy,
+        },
+        "_hint": " ".join(hints),
+    }

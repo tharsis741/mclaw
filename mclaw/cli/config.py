@@ -239,6 +239,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "dashscope_deep_timeout": 120,
             "fallback": True,
         },
+        "web_extract": {
+            "backend": "trafilatura",
+            "timeout": 30,
+            "firecrawl_api_url": "https://api.firecrawl.dev/v2/scrape",
+        },
         "session_search": {
             "provider": "auto",
             "model": "",

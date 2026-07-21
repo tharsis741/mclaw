@@ -45,28 +45,28 @@ class RuntimeKeySetupCoordinator:
             return
 
         env_var = str(setup.get("env_var") or "").strip()
+        backend_switch = str(setup.get("_backend_switch") or "").strip()
         if not env_var:
             message = "缺少待保存的环境变量名。"
-            if setup.get("_search_backend"):
+            if backend_switch:
                 self.hooks.render_search_error(message)
             else:
                 self.hooks.render_model_error(message)
             return
         self.hooks.save_env_value(env_var, api_key)
-        if setup.get("_search_backend") and env_var:
-            # Web search keys must be authorized for the scoped tool after save.
+        if backend_switch and env_var:
             try:
                 from mclaw.runtime.secrets import authorize
 
-                authorize("tool:web_search", [env_var])
+                authorize(str(setup.get("required_for") or "tool:web_search"), [env_var])
             except Exception:
                 pass
         self.hooks.render_key_saved(env_var, mask_api_key(api_key))
 
-        if setup.get("_search_backend"):
+        if backend_switch:
             result = self.hooks.retry_search_backend()
             if not getattr(result, "success", False):
-                self.hooks.render_search_error(str(getattr(result, "error_message", "") or "搜索后端配置失败。"))
+                self.hooks.render_search_error(str(getattr(result, "error_message", "") or "后端配置失败。"))
                 return
             info_message = str(getattr(result, "info_message", "") or "")
             if info_message:

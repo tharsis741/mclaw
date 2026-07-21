@@ -10,8 +10,8 @@
 > ```html
 > <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
 > ```
-> Use `write_file` to create HTML, serve via `generative-widgets` skill (cloudflared tunnel).
-> Verify visual accuracy with `browser_vision` after generating.
+> Use `write_file` to create HTML and serve it with an available static server.
+> Verify visual accuracy with `browser_navigate`, `browser_screenshot`, and `vision_analyze`.
 
 ## 1. Visual Theme & Atmosphere
 
