@@ -684,3 +684,66 @@ def test_doctor_maps_typed_provider_failure_without_exposing_secrets(monkeypatch
     assert "code=missing_credential" in failure.detail
     assert "credential_candidates=OPENAI_API_KEY" in failure.detail
     assert "sk-" not in f"{failure.detail} {failure.fix}"
+
+
+def test_setup_selects_multiple_providers_before_configuring_each_model(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
+    from mclaw.cli import main as cli_main
+    from mclaw.cli.tui import console, selection_prompt
+
+    config = {
+        "active_provider": "qwen-intl",
+        "model": "qwen-existing",
+        "fallback_providers": [
+            {"provider": "openai", "model": "openai-existing"},
+        ],
+    }
+    provider_menu: dict[str, object] = {}
+    provider_calls: list[str] = []
+    input_prompts: list[str] = []
+
+    def choose(title, items, **kwargs):
+        provider_menu.update(title=title, items=items, kwargs=kwargs)
+        return ["qwen", "openai"]
+
+    def configure(_config, provider_key, *_args, **_kwargs):
+        provider_calls.append(provider_key)
+        return {
+            "provider": provider_key,
+            "profile": "",
+            "model": f"{provider_key}-model",
+        }
+
+    def setup_input(prompt, **_kwargs):
+        input_prompts.append(prompt)
+        return "2"
+
+    monkeypatch.setattr(cli_config, "ensure_mclaw_home", lambda: None)
+    monkeypatch.setattr(cli_config, "load_config", lambda: config)
+    monkeypatch.setattr(cli_config, "save_config", lambda _config: None)
+    monkeypatch.setattr(console, "print_plain", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(selection_prompt, "prompt_multi_select", choose)
+    monkeypatch.setattr(cli_main, "_print_setup_intro", lambda: False)
+    monkeypatch.setattr(cli_main, "_print_setup_step", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_main, "_select_setup_profile", lambda _provider: type("Profile", (), {"id": "api"})())
+    monkeypatch.setattr(cli_main, "_setup_api_key_provider", configure)
+    monkeypatch.setattr(cli_main, "_setup_input", setup_input)
+    monkeypatch.setattr(cli_main, "_run_setup_capability_selection", lambda _config: None)
+    monkeypatch.setattr(cli_main, "_run_setup_builtin_skill_selection", lambda: None)
+
+    cli_main._run_setup_impl(object())
+
+    item_ids = [item["id"] for item in provider_menu["items"]]
+    assert provider_menu["title"] == "M-Claw 大模型接入配置"
+    assert provider_menu["kwargs"]["default_selected"] == ["qwen", "openai"]
+    assert "microsoft" in item_ids
+    assert "qwen-intl" not in item_ids
+    assert item_ids[-3:] == [
+        "__other_provider__",
+        "__custom_openai__",
+        "__custom_anthropic__",
+    ]
+    assert provider_calls == ["qwen", "openai"]
+    assert input_prompts == ["  输入编号 [1]: "]
+    assert config["active_provider"] == "openai"
+    assert config["model"] == "openai-model"

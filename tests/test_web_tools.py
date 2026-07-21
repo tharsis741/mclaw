@@ -8,6 +8,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from mclaw.tools import browser_tool, web_extract_tool, web_search_tool
 from mclaw.agent.prompt_builder import build_available_tools_prompt
 from mclaw.tools.dispatch import _scope_browser_web_priority, get_tool_definitions
@@ -428,7 +430,7 @@ def test_setup_selects_web_search_and_extract_independently(monkeypatch) -> None
     from mclaw.cli.tui import console, selection_prompt
     from mclaw.runtime.manager import RuntimeManager
 
-    answers = iter([["web_search", "web_extract"], [], []])
+    answers = iter([["web_search", "web_extract"], [], [], ["trafilatura"]])
     capability_ids: list[str] = []
     capability_descriptions: dict[str, str] = {}
 
@@ -449,7 +451,6 @@ def test_setup_selects_web_search_and_extract_independently(monkeypatch) -> None
         "_setup_configure_web_search_keys",
         lambda *_args, **_kwargs: False,
     )
-    monkeypatch.setattr(cli_main, "_setup_input", lambda _prompt: "1")
     config = {
         "toolsets": ["mclaw-required"],
         "tools": {"disabled": []},
@@ -469,6 +470,7 @@ def test_setup_selects_web_search_and_extract_independently(monkeypatch) -> None
     assert config["toolsets"] == ["mclaw-required", "web"]
     assert config["tools"]["disabled"] == ["web_search"]
     assert config["auxiliary"]["web_extract"]["backend"] == "trafilatura"
+    assert config["auxiliary"]["asr"]["enabled"] is False
     assert "web_extract" in valid_names
     assert "web_search" not in valid_names
     assert "web_search" not in {
@@ -484,9 +486,14 @@ def test_setup_reuses_tavily_key_from_extract_for_search(monkeypatch) -> None:
     stored: dict[str, str] = {}
     requested: list[list[str]] = []
     authorized: list[tuple[str, list[str]]] = []
-    choices = iter(["2"])
+    selections = iter([["tavily"], ["tavily"]])
+    menus: list[tuple[str, list[dict], dict]] = []
 
-    monkeypatch.setattr(cli_main, "_setup_input", lambda _prompt: next(choices))
+    def choose(title, items, **kwargs):
+        menus.append((title, items, kwargs))
+        return next(selections)
+
+    monkeypatch.setattr("mclaw.cli.tui.selection_prompt.prompt_multi_select", choose)
     monkeypatch.setattr(
         cli_main,
         "_prompt_secret_batch",
@@ -500,7 +507,7 @@ def test_setup_reuses_tavily_key_from_extract_for_search(monkeypatch) -> None:
         lambda scope, names: authorized.append((scope, list(names))),
     )
     config = {"auxiliary": {}}
-    colors = SimpleNamespace(BLUE="", BOLD="", CYAN="", DIM="", RED="", YELLOW="")
+    colors = SimpleNamespace(DIM="", YELLOW="")
     color = lambda text, *_styles: text
     output: list[str] = []
     print_plain = lambda text="": output.append(text)
@@ -519,29 +526,49 @@ def test_setup_reuses_tavily_key_from_extract_for_search(monkeypatch) -> None:
         ("tool:web_search", ["TAVILY_API_KEY"]),
     ]
     assert config["auxiliary"]["web_extract"]["backend"] == "tavily"
-    assert config["auxiliary"]["web_search"]["backend"] == "auto"
-    assert any("选择网页提取后端" in line for line in output)
-    assert any("无需 API Key" in line for line in output)
-    assert any("需要 TAVILY_API_KEY" in line for line in output)
-    assert any("需要 FIRECRAWL_API_KEY" in line for line in output)
-    assert not any("自托管" in line for line in output)
+    assert config["auxiliary"]["web_search"]["backend"] == "tavily"
+    assert [title for title, _items, _kwargs in menus] == [
+        "M-Claw 网页提取后端",
+        "M-Claw 网页搜索后端",
+    ]
+    extract_items = menus[0][1]
+    assert [item["id"] for item in extract_items] == ["trafilatura", "tavily", "firecrawl"]
+    assert menus[0][2]["default_selected"] == ["trafilatura", "tavily", "firecrawl"]
+    assert [item["description"] for item in extract_items] == [
+        "无需 API Key",
+        "需要 TAVILY_API_KEY",
+        "需要 FIRECRAWL_API_KEY",
+    ]
+    assert not any("自托管" in str(item) for item in extract_items)
 
 
-def test_setup_web_extract_reprompts_after_unknown_backend(monkeypatch) -> None:
+def test_setup_web_extract_configures_multiple_selected_backends(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
     from mclaw.cli import main as cli_main
+    from mclaw.runtime import secrets
 
-    choices = iter(["unknown", "1"])
+    stored: dict[str, str] = {}
+    requested: list[list[str]] = []
+    authorized: list[tuple[str, list[str]]] = []
     output: list[str] = []
-    colors = SimpleNamespace(BLUE="", BOLD="", CYAN="", DIM="", RED="", YELLOW="")
+    colors = SimpleNamespace(DIM="", YELLOW="")
 
-    monkeypatch.setattr(cli_main, "_setup_input", lambda _prompt: next(choices))
-    monkeypatch.setattr(cli_main, "_pause_setup_warning", lambda: None)
+    monkeypatch.setattr(
+        "mclaw.cli.tui.selection_prompt.prompt_multi_select",
+        lambda *_args, **_kwargs: ["trafilatura", "tavily", "firecrawl"],
+    )
     monkeypatch.setattr(
         cli_main,
         "_prompt_secret_batch",
-        lambda *_args, **_kwargs: None,
+        lambda names, **_kwargs: requested.append(list(names)) or {names[0]: f"{names[0]}-value"},
     )
-    monkeypatch.setattr("mclaw.cli.config.get_env_value", lambda _name: "")
+    monkeypatch.setattr(cli_config, "get_env_value", lambda name: stored.get(name, ""))
+    monkeypatch.setattr(cli_config, "save_env_value", lambda name, value: stored.__setitem__(name, value))
+    monkeypatch.setattr(
+        secrets,
+        "authorize",
+        lambda scope, names: authorized.append((scope, list(names))),
+    )
 
     config = {"auxiliary": {}}
     assert cli_main._setup_configure_web_extract(
@@ -551,8 +578,240 @@ def test_setup_web_extract_reprompts_after_unknown_backend(monkeypatch) -> None:
         Colors=colors,
     )
 
-    assert any("请重新输入编号或名称" in line for line in output)
+    assert requested == [["TAVILY_API_KEY"], ["FIRECRAWL_API_KEY"]]
+    assert authorized == [
+        ("tool:web_extract", ["TAVILY_API_KEY"]),
+        ("tool:web_extract", ["FIRECRAWL_API_KEY"]),
+    ]
     assert config["auxiliary"]["web_extract"]["backend"] == "trafilatura"
+    assert any("已配置 Trafilatura、Tavily、Firecrawl" in line for line in output)
+
+
+def test_setup_web_search_does_not_skip_tavily_when_qwen_key_exists(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
+    from mclaw.cli import main as cli_main
+    from mclaw.runtime import secrets
+
+    stored = {"DASHSCOPE_API_KEY": "qwen-existing"}
+    requested: list[list[str]] = []
+    authorized: list[tuple[str, list[str]]] = []
+    menu: dict[str, object] = {}
+
+    def choose(title, items, **kwargs):
+        menu.update(title=title, items=items, kwargs=kwargs)
+        return ["tavily", "dashscope"]
+
+    monkeypatch.setattr("mclaw.cli.tui.selection_prompt.prompt_multi_select", choose)
+    monkeypatch.setattr(
+        cli_main,
+        "_prompt_secret_batch",
+        lambda names, **_kwargs: requested.append(list(names)) or {"TAVILY_API_KEY": "tvly-new"},
+    )
+    monkeypatch.setattr(cli_config, "get_env_value", lambda name: stored.get(name, ""))
+    monkeypatch.setattr(cli_config, "save_env_value", lambda name, value: stored.__setitem__(name, value))
+    monkeypatch.setattr(
+        secrets,
+        "authorize",
+        lambda scope, names: authorized.append((scope, list(names))),
+    )
+
+    config = {"auxiliary": {}}
+    colors = SimpleNamespace(DIM="", YELLOW="")
+    assert cli_main._setup_configure_web_search_keys(
+        config,
+        print_plain=lambda *_args, **_kwargs: None,
+        color=lambda text, *_styles: text,
+        Colors=colors,
+    )
+
+    assert menu["title"] == "M-Claw 网页搜索后端"
+    assert menu["kwargs"]["default_selected"] == ["tavily", "dashscope"]
+    assert requested == [["TAVILY_API_KEY"]]
+    assert authorized == [
+        ("tool:web_search", ["TAVILY_API_KEY"]),
+        ("tool:web_search", ["DASHSCOPE_API_KEY"]),
+    ]
+    assert config["auxiliary"]["web_search"]["backend"] == "auto"
+
+
+def test_setup_web_search_skips_backend_prompt_when_qwen_and_tavily_exist(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
+    from mclaw.cli import main as cli_main
+    from mclaw.runtime import secrets
+
+    stored = {
+        "DASHSCOPE_API_KEY": "qwen-existing",
+        "TAVILY_API_KEY": "tavily-existing",
+    }
+    authorized: list[tuple[str, list[str]]] = []
+    output: list[str] = []
+
+    monkeypatch.setattr(
+        "mclaw.cli.tui.selection_prompt.prompt_multi_select",
+        lambda *_args, **_kwargs: pytest.fail("search backend prompt should be skipped"),
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_prompt_secret_batch",
+        lambda *_args, **_kwargs: pytest.fail("credential prompt should be skipped"),
+    )
+    monkeypatch.setattr(cli_config, "get_env_value", lambda name: stored.get(name, ""))
+    monkeypatch.setattr(
+        secrets,
+        "authorize",
+        lambda scope, names: authorized.append((scope, list(names))),
+    )
+
+    config = {"auxiliary": {}}
+    colors = SimpleNamespace(DIM="", YELLOW="")
+    assert cli_main._setup_configure_web_search_keys(
+        config,
+        print_plain=lambda text="": output.append(text),
+        color=lambda text, *_styles: text,
+        Colors=colors,
+    )
+
+    assert authorized == [
+        ("tool:web_search", ["DASHSCOPE_API_KEY", "TAVILY_API_KEY"]),
+    ]
+    assert config["auxiliary"]["web_search"]["backend"] == "auto"
+    assert any("Qwen、Tavily 凭据" in line for line in output)
+
+
+def test_setup_qwen_features_report_reused_qwen_credentials(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
+    from mclaw.cli import main as cli_main
+    from mclaw.runtime import secrets
+
+    output: list[str] = []
+    authorized: list[tuple[str, list[str]]] = []
+    monkeypatch.setattr(
+        cli_config,
+        "get_env_value",
+        lambda name: "qwen-existing" if name == "DASHSCOPE_API_KEY" else "",
+    )
+    monkeypatch.setattr(
+        secrets,
+        "authorize",
+        lambda scope, names: authorized.append((scope, list(names))),
+    )
+    colors = SimpleNamespace(DIM="", YELLOW="")
+
+    for feature_name in ("vision_analyze", "asr"):
+        assert cli_main._setup_configure_feature_keys(
+            feature_name,
+            print_plain=lambda text="": output.append(text),
+            color=lambda text, *_styles: text,
+            Colors=colors,
+        )
+
+    assert authorized == [
+        ("tool:vision_analyze", ["DASHSCOPE_API_KEY"]),
+        ("runtime:asr", ["DASHSCOPE_API_KEY"]),
+    ]
+    assert any("视觉分析: 已检测到" in line and "Qwen 凭据" in line for line in output)
+    assert any("语音输入: 已检测到" in line and "Qwen 凭据" in line for line in output)
+
+
+def test_setup_configures_selected_capabilities_in_order_with_qwen_intl(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
+    from mclaw.cli import main as cli_main
+    from mclaw.cli.tui import console, selection_prompt
+    from mclaw.runtime.manager import RuntimeManager
+
+    selections = iter([
+        ["web_extract", "web_search", "vision", "browser"],
+        ["weixin", "dingtalk"],
+        ["asr"],
+    ])
+    prompt_titles: list[str] = []
+    actions: list[str] = []
+
+    def choose(title, _items, **_kwargs):
+        prompt_titles.append(title)
+        return next(selections)
+
+    def configure_feature(name, **_kwargs):
+        actions.append(name)
+        return True
+
+    runtime = SimpleNamespace(
+        features=SimpleNamespace(toolset_enabled=lambda _name: True)
+    )
+    monkeypatch.setattr(selection_prompt, "prompt_multi_select", choose)
+    monkeypatch.setattr(console, "print_plain", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(RuntimeManager, "current", staticmethod(lambda _config: runtime))
+    monkeypatch.setattr(
+        cli_config,
+        "get_env_value",
+        lambda name: "intl-key" if name == "DASHSCOPE_INTL_API_KEY" else "",
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_setup_configure_web_extract",
+        lambda *_args, **_kwargs: actions.append("web_extract") or True,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_setup_configure_web_search_keys",
+        lambda *_args, **_kwargs: actions.append("web_search") or True,
+    )
+    monkeypatch.setattr(cli_main, "_setup_configure_feature_keys", configure_feature)
+    monkeypatch.setattr(
+        cli_main,
+        "_run_setup_weixin_login",
+        lambda: actions.append("weixin") or True,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_run_setup_dingtalk_login",
+        lambda: actions.append("dingtalk") or True,
+    )
+    monkeypatch.setattr(
+        cli_main,
+        "_merge_channel_config_from_disk",
+        lambda *_args, **_kwargs: actions.append("merge_dingtalk"),
+    )
+    config = {
+        "toolsets": ["mclaw-required"],
+        "tools": {"disabled": []},
+        "auxiliary": {
+            "vision": {"provider": "qwen", "base_url": ""},
+            "asr": {"provider": "qwen", "websocket_url": ""},
+        },
+    }
+
+    cli_main._run_setup_capability_selection(config)
+
+    assert prompt_titles == [
+        "M-Claw 可选工具配置",
+        "M-Claw IM 交互配置",
+        "M-Claw 语音输入",
+    ]
+    assert actions == [
+        "web_extract",
+        "web_search",
+        "vision_analyze",
+        "weixin",
+        "dingtalk",
+        "merge_dingtalk",
+        "asr",
+    ]
+    assert config["toolsets"] == [
+        "mclaw-required",
+        "web",
+        "vision",
+        "browser",
+        "weixin",
+        "dingtalk",
+    ]
+    assert config["auxiliary"]["vision"]["provider"] == "qwen-intl"
+    assert config["auxiliary"]["asr"] == {
+        "provider": "qwen-intl",
+        "websocket_url": "",
+        "enabled": True,
+        "region": "intl",
+    }
 
 
 def test_web_extract_blocks_private_urls_before_provider_call(monkeypatch) -> None:

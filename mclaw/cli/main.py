@@ -1088,8 +1088,9 @@ def _run_setup_impl(args):
     )
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.model_resolver import resolve_provider_key
-    from mclaw.cli.provider_profiles import CORE_PROVIDER_KEYS
+    from mclaw.cli.provider_profiles import CORE_PROVIDER_KEYS, get_provider_profiles
     from mclaw.cli.tui.console import print_plain
+    from mclaw.cli.tui.selection_prompt import prompt_multi_select
 
     ensure_mclaw_home()
     config = load_config()
@@ -1100,82 +1101,133 @@ def _run_setup_impl(args):
     _SETUP_CONFIGURED_COUNT = 0
     configured: dict = {}
     common_providers = [p for p in CORE_PROVIDER_KEYS if p in PROVIDER_REGISTRY]
-    provider_step_leading_blank = not intro_paused
+    represented_runtime_providers = {
+        profile.runtime_provider
+        for provider_key in common_providers
+        for profile in get_provider_profiles(provider_key)
+        if profile.runtime_provider
+    }
+    additional_providers = [
+        provider_key
+        for provider_key in PROVIDER_REGISTRY
+        if provider_key not in common_providers
+        and provider_key not in represented_runtime_providers
+    ]
+    selectable_providers = [*common_providers, *additional_providers]
+    other_provider_id = "__other_provider__"
+    custom_openai_id = "__custom_openai__"
+    custom_anthropic_id = "__custom_anthropic__"
+    provider_items = [
+        {
+            "id": provider_key,
+            "label": PROVIDER_REGISTRY[provider_key].display_name,
+            "category": provider_key,
+        }
+        for provider_key in selectable_providers
+    ]
+    provider_items.extend([
+        {
+            "id": other_provider_id,
+            "label": "其他接入方",
+            "category": "models.dev",
+            "description": "按名称查找",
+        },
+        {
+            "id": custom_openai_id,
+            "label": "自定义 OpenAI 兼容接口",
+            "category": "自定义",
+        },
+        {
+            "id": custom_anthropic_id,
+            "label": "自定义 Anthropic 兼容接口",
+            "category": "自定义",
+        },
+    ])
 
-    while True:
-        _print_setup_step(
-            "步骤 1/3  选择大模型接入方",
-            "可输入编号、接入方名称，或选择自定义兼容接口。",
-            leading_blank=provider_step_leading_blank,
+    configured_provider_keys = {str(config.get("active_provider") or "").strip()}
+    fallback_providers = config.get("fallback_providers", [])
+    if isinstance(fallback_providers, list):
+        configured_provider_keys.update(
+            str(item.get("provider") or "").strip()
+            for item in fallback_providers
+            if isinstance(item, dict)
         )
-        provider_step_leading_blank = True
-        for idx, provider_key in enumerate(common_providers, 1):
-            pcfg = PROVIDER_REGISTRY[provider_key]
-            print_plain(f"    {_setup_index(idx)}. {pcfg.display_name} {color(f'({provider_key})', Colors.DIM)}")
-        search_more_idx = len(common_providers) + 1
-        custom_openai_idx = len(common_providers) + 2
-        custom_anthropic_idx = len(common_providers) + 3
-        print_plain(f"    {_setup_index(search_more_idx)}. {color('更多已知接入方', Colors.CYAN)} {color('按名称匹配', Colors.DIM)}")
-        print_plain(f"    {_setup_index(custom_openai_idx)}. {color('自定义 OpenAI 兼容接口', Colors.CYAN)}")
-        print_plain(f"    {_setup_index(custom_anthropic_idx)}. {color('自定义 Anthropic 兼容接口', Colors.CYAN)}")
-        print_plain()
+    configured_provider_keys.discard("")
+    default_selected = [
+        provider_key
+        for provider_key in selectable_providers
+        if configured_provider_keys.intersection(
+            {provider_key}
+            | {
+                profile.runtime_provider
+                for profile in get_provider_profiles(provider_key)
+                if profile.runtime_provider
+            }
+        )
+    ]
+    if "custom" in configured_provider_keys:
+        default_selected.append(custom_openai_id)
+    if "custom_anthropic" in configured_provider_keys:
+        default_selected.append(custom_anthropic_id)
 
-        choice = _setup_input("  输入编号或接入方 [1]: ")
+    _print_setup_step(
+        "步骤 1/3  选择大模型接入方",
+        "使用 Tab/Space 选择一个或多个接入方；确认后依次配置。",
+        leading_blank=not intro_paused,
+    )
+    selected_provider_ids = prompt_multi_select(
+        "M-Claw 大模型接入配置",
+        provider_items,
+        hint="选择需要配置的接入方；每个接入方分别输入 API Key 并选择模型。",
+        default_selected=default_selected,
+    )
 
-        choice = choice or "1"
+    for selected_id in selected_provider_ids:
         result = None
-        if choice.isdigit() and int(choice) == custom_openai_idx:
+        provider_key = selected_id
+        if selected_id == custom_openai_id:
             result = _setup_custom_endpoint(config, api_format="openai", provider_key="custom")
-        elif choice.isdigit() and int(choice) == custom_anthropic_idx:
+            if result is None:
+                continue
+        elif selected_id == custom_anthropic_id:
             result = _setup_custom_endpoint(config, api_format="anthropic", provider_key="custom_anthropic")
-        else:
-            provider_key = ""
-            if choice.isdigit() and int(choice) == search_more_idx:
-                provider_query = _setup_input("  输入接入方名称或 provider key: ")
-                provider_key = resolve_provider_key(provider_query)
-                if not provider_key or provider_key not in PROVIDER_REGISTRY:
-                    models_dev_provider = _select_models_dev_provider_from_query(provider_query)
-                    if models_dev_provider:
-                        result = _setup_models_dev_provider(config, models_dev_provider)
-                        provider_key = ""
-            elif choice.isdigit():
-                idx = int(choice) - 1
-                if 0 <= idx < len(common_providers):
-                    provider_key = common_providers[idx]
-            else:
-                provider_key = resolve_provider_key(choice)
+            if result is None:
+                continue
+        elif selected_id == other_provider_id:
+            provider_query = _setup_input("  输入接入方名称或 provider key: ")
+            provider_key = resolve_provider_key(provider_query)
+            if not provider_key or provider_key not in PROVIDER_REGISTRY:
+                models_dev_provider = _select_models_dev_provider_from_query(provider_query)
+                if models_dev_provider:
+                    result = _setup_models_dev_provider(config, models_dev_provider)
+                    if result is None:
+                        continue
+                provider_key = ""
 
-            if result is None and (not provider_key or provider_key not in PROVIDER_REGISTRY):
-                print_plain(color("\n  未识别这个接入方。请重新输入编号或接入方名称。", Colors.RED))
-                print_plain(color("  如果它是私有部署或网关服务，请选择自定义兼容接口。", Colors.DIM))
-                print_plain(color("  如果不确定官方 provider 名称，请到对应大模型平台官网查看接入说明。", Colors.DIM))
-                _pause_setup_warning()
+            if result is None and not provider_key:
+                print_plain(color("\n  未识别这个接入方，已跳过。", Colors.RED))
+                print_plain(color("  私有部署或网关服务可使用自定义兼容接口。", Colors.DIM))
                 continue
 
-            if result is None:
-                pcfg = PROVIDER_REGISTRY[provider_key]
-                profile = _select_setup_profile(provider_key)
-                if profile is None:
-                    continue
-                result = _setup_api_key_provider(
-                    config,
-                    provider_key,
-                    pcfg.api_key_env_vars[0],
-                    pcfg.display_name,
-                    pcfg.key_url,
-                    profile_id=profile.id,
-                )
+        if result is None:
+            pcfg = PROVIDER_REGISTRY[provider_key]
+            profile = _select_setup_profile(provider_key)
+            if profile is None:
+                continue
+            result = _setup_api_key_provider(
+                config,
+                provider_key,
+                pcfg.api_key_env_vars[0],
+                pcfg.display_name,
+                pcfg.key_url,
+                profile_id=profile.id,
+            )
 
         if result:
             configured[result["provider"]] = result
             upsert_fallback_provider_model(config, result.get("provider", ""), result.get("model", ""))
             save_config(config)
             _SETUP_CONFIGURED_COUNT = len(configured)
-
-        print_plain()
-        more = _setup_input("  是否添加更多接入方？[Y/N]: ").lower()
-        if more != "y":
-            break
 
     if not configured:
         print_plain(color("\n  未配置任何接入方，退出。\n", Colors.RED))
@@ -1436,7 +1488,16 @@ def _run_setup_capability_selection(config: dict) -> None:
     if isinstance(auxiliary, dict):
         asr = auxiliary.setdefault("asr", {})
         if isinstance(asr, dict):
-            asr["enabled"] = True if asr_enabled else (False if "asr" in asr_choice else "auto")
+            asr["enabled"] = bool(asr_enabled)
+            if (
+                asr_enabled
+                and _setup_qwen_provider() == "qwen-intl"
+                and str(asr.get("provider") or "qwen").strip().lower() in {"", "auto", "dashscope", "qwen"}
+                and not str(asr.get("websocket_url") or "").strip()
+                and str(asr.get("region") or "").strip().lower() not in {"cn", "china"}
+            ):
+                asr["provider"] = "qwen-intl"
+                asr["region"] = "intl"
 
     enabled_names = [
         *enabled_web_tools,
@@ -1473,7 +1534,7 @@ def _ensure_web_search_config(config: dict) -> dict:
     if not isinstance(web_cfg, dict):
         web_cfg = {}
         auxiliary["web_search"] = web_cfg
-    web_cfg["backend"] = "auto"
+    web_cfg.setdefault("backend", "auto")
     web_cfg.setdefault("tavily_timeout", 30)
     web_cfg.setdefault("dashscope_timeout", 90)
     web_cfg.setdefault("dashscope_deep_timeout", 120)
@@ -1494,99 +1555,118 @@ def _ensure_web_extract_config(config: dict) -> dict:
 
 
 def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) -> bool:
-    """Enable local extraction or authorize the configured cloud backend."""
+    """Select and configure one or more extraction backends."""
     from mclaw.cli import config as cli_config
+    from mclaw.cli.tui.selection_prompt import prompt_multi_select
     from mclaw.runtime.secrets import authorize
 
     extract_cfg = _ensure_web_extract_config(config)
     current = str(extract_cfg.get("backend") or "trafilatura").strip().lower()
-    backends = [
-        ("trafilatura", "Trafilatura", "无需 API Key"),
-        ("tavily", "Tavily", "需要 TAVILY_API_KEY"),
-        ("firecrawl", "Firecrawl", "需要 FIRECRAWL_API_KEY"),
+    backend_items = [
+        {"id": "trafilatura", "label": "Trafilatura", "description": "无需 API Key"},
+        {
+            "id": "tavily",
+            "label": "Tavily",
+            "description": (
+                "已配置 TAVILY_API_KEY"
+                if cli_config.get_env_value("TAVILY_API_KEY")
+                else "需要 TAVILY_API_KEY"
+            ),
+        },
+        {
+            "id": "firecrawl",
+            "label": "Firecrawl",
+            "description": (
+                "已配置 FIRECRAWL_API_KEY"
+                if cli_config.get_env_value("FIRECRAWL_API_KEY")
+                else "需要 FIRECRAWL_API_KEY"
+            ),
+        },
     ]
-    known_backends = {name for name, _label, _description in backends}
-    if current not in known_backends:
+    backend_config = {
+        "tavily": ("TAVILY_API_KEY", "Tavily", "https://www.tavily.com/"),
+        "firecrawl": (
+            "FIRECRAWL_API_KEY",
+            "Firecrawl",
+            "https://www.firecrawl.dev/app/api-keys",
+        ),
+    }
+    backend_labels = {item["id"]: item["label"] for item in backend_items}
+    if current not in backend_labels:
         current = "trafilatura"
+    next(item for item in backend_items if item["id"] == current)["category"] = "当前"
 
-    while True:
-        print_plain(color("\n  选择网页提取后端", Colors.BOLD, Colors.BLUE))
-        for index, (name, label, description) in enumerate(backends, 1):
-            marker = color(" *", Colors.BOLD, Colors.CYAN) if name == current else ""
+    selected = prompt_multi_select(
+        "M-Claw 网页提取后端",
+        backend_items,
+        hint="可选择多个后端；当前后端会继续使用，之后可用 /extract-backend 切换。",
+        default_selected=[item["id"] for item in backend_items],
+    )
+    if not selected:
+        print_plain(color("  已跳过网页提取，不会启用。", Colors.DIM))
+        return False
+
+    configured: list[str] = []
+    for backend in selected:
+        if backend == "trafilatura":
+            configured.append(backend)
+            continue
+
+        env_var, backend_label, key_url = backend_config[backend]
+        if cli_config.get_env_value(env_var):
+            authorize("tool:web_extract", [env_var])
             print_plain(
-                f"    {_setup_index(index)}. {label} "
-                f"{color(f'({name})', Colors.DIM)}{marker}"
+                color(
+                    f"  网页提取: 已检测到 {display_mclaw_path('.env')} 中的 {env_var}。",
+                    Colors.DIM,
+                )
             )
-            print_plain(color(f"       {description}", Colors.DIM))
-        print_plain()
+            configured.append(backend)
+            continue
 
-        choice = _setup_input(f"  输入后端编号或名称 [{current}]: ").strip().lower()
-        if not choice:
-            backend = current
-            break
-        if choice.isdigit() and 1 <= int(choice) <= len(backends):
-            backend = backends[int(choice) - 1][0]
-            break
-        if choice in known_backends:
-            backend = choice
-            break
-        print_plain(color("\n  未识别网页提取后端。请重新输入编号或名称。", Colors.RED))
-        print_plain(color("  可用后端：trafilatura、tavily、firecrawl。", Colors.DIM))
-        _pause_setup_warning()
-    extract_cfg["backend"] = backend
-
-    if backend == "trafilatura":
-        print_plain(color("  网页提取: 已启用 Trafilatura，无需 API Key。", Colors.DIM))
-        return True
-
-    if backend == "firecrawl":
-        env_var = "FIRECRAWL_API_KEY"
-        key_url = "https://www.firecrawl.dev/app/api-keys"
-        backend_label = "Firecrawl"
-    else:
-        env_var = "TAVILY_API_KEY"
-        key_url = "https://www.tavily.com/"
-        backend_label = "Tavily"
-
-    if cli_config.get_env_value(env_var):
-        authorize("tool:web_extract", [env_var])
         print_plain(
             color(
-                f"  网页提取: 已检测到 {display_mclaw_path('.env')} 中的 {env_var}。",
-                Colors.DIM,
+                f"\n  {backend_label} 网页提取需要 {display_mclaw_path('.env')} 中的 {env_var}。"
+                f"按 Enter 跳过 {backend_label}。",
+                Colors.YELLOW,
             )
         )
-        return True
-
-    print_plain(
-        color(
-            f"\n  {backend_label} 网页提取需要 {display_mclaw_path('.env')} 中的 {env_var}。"
-            "按 Enter 使用 Trafilatura。",
-            Colors.YELLOW,
+        print_plain(color(f"  获取 API Key: {key_url}", Colors.DIM))
+        values = _prompt_secret_batch(
+            [env_var],
+            prompt=color(f"  {env_var}: ", Colors.YELLOW),
+            print_plain=print_plain,
+            color=color,
+            Colors=Colors,
         )
-    )
-    print_plain(color(f"  获取 API Key: {key_url}", Colors.DIM))
-    values = _prompt_secret_batch(
-        [env_var],
-        prompt=color(f"  {env_var}: ", Colors.YELLOW),
-        print_plain=print_plain,
-        color=color,
-        Colors=Colors,
-    )
-    if values and values.get(env_var):
+        if not values or not values.get(env_var):
+            print_plain(color(f"  已跳过 {backend_label}。", Colors.DIM))
+            continue
         cli_config.save_env_value(env_var, values[env_var])
         authorize("tool:web_extract", [env_var])
+        configured.append(backend)
         print_plain(color(f"  网页提取: {backend_label} 凭据已保存。", Colors.DIM))
-        return True
 
-    extract_cfg["backend"] = "trafilatura"
-    print_plain(color("  已使用 Trafilatura，无需 API Key。", Colors.DIM))
+    if not configured:
+        print_plain(color("  网页提取没有可用后端，不会启用。", Colors.DIM))
+        return False
+
+    active = current if current in configured else configured[0]
+    extract_cfg["backend"] = active
+    configured_labels = "、".join(backend_labels[name] for name in configured)
+    print_plain(
+        color(
+            f"  网页提取: 已配置 {configured_labels}；当前后端为 {backend_labels[active]}。",
+            Colors.DIM,
+        )
+    )
     return True
 
 
 def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors) -> bool:
-    """Configure web_search with Tavily as the preferred source."""
+    """Select and configure one or more search backends."""
     from mclaw.cli import config as cli_config
+    from mclaw.cli.tui.selection_prompt import prompt_multi_select
     from mclaw.providers.registry import get_runtime_profile
     from mclaw.runtime.secrets import authorize
 
@@ -1594,7 +1674,7 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
     qwen_profile = get_runtime_profile("qwen")
     qwen_intl_profile = get_runtime_profile("qwen-intl")
     qwen_env_vars = tuple(dict.fromkeys((*qwen_profile.env_vars, *qwen_intl_profile.env_vars)))
-    _ensure_web_search_config(config)
+    web_cfg = _ensure_web_search_config(config)
 
     def _configured(name: str) -> bool:
         return bool(str(cli_config.get_env_value(name) or "").strip())
@@ -1605,52 +1685,144 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
     tavily_ready = _configured("TAVILY_API_KEY")
     dashscope_env = _existing_dashscope_env()
 
-    if tavily_ready:
-        authorize(required_for, ["TAVILY_API_KEY"])
+    current = str(web_cfg.get("backend") or "auto").strip().lower()
+    if current == "auto" and tavily_ready and dashscope_env:
+        web_cfg["backend"] = "auto"
+        authorize(required_for, [dashscope_env, "TAVILY_API_KEY"])
         print_plain(
             color(
-                f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 TAVILY_API_KEY。",
-                Colors.DIM,
-            )
-        )
-    elif dashscope_env:
-        authorize(required_for, [dashscope_env])
-        print_plain(
-            color(
-                f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 {dashscope_env}。",
+                f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 Qwen、Tavily 凭据。",
                 Colors.DIM,
             )
         )
         return True
+
+    if current in {"tavily", "dashscope"}:
+        default_selected = [current]
     else:
-        print_plain(
-            color(
-                f"\n  网页搜索需要 {display_mclaw_path('.env')} 中的 Tavily 凭据。"
-                "按 Enter 跳过此功能。",
-                Colors.YELLOW,
-            )
-        )
-        print_plain(color("  获取 API Key: https://www.tavily.com/", Colors.DIM))
-        values = _prompt_secret_batch(
-            ["TAVILY_API_KEY"],
-            prompt=color("  Tavily API Key: ", Colors.YELLOW),
-            print_plain=print_plain,
-            color=color,
-            Colors=Colors,
-        )
-        if values and values.get("TAVILY_API_KEY"):
-            cli_config.save_env_value("TAVILY_API_KEY", values["TAVILY_API_KEY"])
+        default_selected = ["tavily", "dashscope"]
+
+    search_items = [
+        {
+            "id": "tavily",
+            "label": "Tavily",
+            "description": "已配置 TAVILY_API_KEY" if tavily_ready else "需要 TAVILY_API_KEY",
+        },
+        {
+            "id": "dashscope",
+            "label": "DashScope/Qwen",
+            "description": (
+                f"已配置 {dashscope_env}" if dashscope_env else "需要 DashScope/Qwen API Key"
+            ),
+        },
+    ]
+    selected = prompt_multi_select(
+        "M-Claw 网页搜索后端",
+        search_items,
+        hint="可选择多个后端；同时启用时由搜索路由自动选择。",
+        default_selected=default_selected,
+    )
+    if not selected:
+        print_plain(color("  已跳过网页搜索，不会启用。", Colors.DIM))
+        return False
+
+    configured: list[str] = []
+    if "tavily" in selected:
+        if tavily_ready:
             authorize(required_for, ["TAVILY_API_KEY"])
-            tavily_ready = True
-            print_plain(color("  网页搜索: Tavily 凭据已保存。", Colors.DIM))
+            print_plain(
+                color(
+                    f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 TAVILY_API_KEY。",
+                    Colors.DIM,
+                )
+            )
+            configured.append("tavily")
         else:
-            print_plain(color("  已跳过网页搜索，不会启用。", Colors.DIM))
-            return False
+            print_plain(
+                color(
+                    f"\n  Tavily 网页搜索需要 {display_mclaw_path('.env')} 中的 TAVILY_API_KEY。"
+                    "按 Enter 跳过 Tavily。",
+                    Colors.YELLOW,
+                )
+            )
+            print_plain(color("  获取 API Key: https://www.tavily.com/", Colors.DIM))
+            values = _prompt_secret_batch(
+                ["TAVILY_API_KEY"],
+                prompt=color("  Tavily API Key: ", Colors.YELLOW),
+                print_plain=print_plain,
+                color=color,
+                Colors=Colors,
+            )
+            if values and values.get("TAVILY_API_KEY"):
+                cli_config.save_env_value("TAVILY_API_KEY", values["TAVILY_API_KEY"])
+                authorize(required_for, ["TAVILY_API_KEY"])
+                configured.append("tavily")
+                print_plain(color("  网页搜索: Tavily 凭据已保存。", Colors.DIM))
+            else:
+                print_plain(color("  已跳过 Tavily。", Colors.DIM))
 
-    if dashscope_env:
-        authorize(required_for, [dashscope_env])
+    if "dashscope" in selected:
+        if dashscope_env:
+            authorize(required_for, [dashscope_env])
+            print_plain(
+                color(
+                    f"  网页搜索: 已检测到 {display_mclaw_path('.env')} 中的 {dashscope_env}。",
+                    Colors.DIM,
+                )
+            )
+            configured.append("dashscope")
+        else:
+            dashscope_env = qwen_profile.env_vars[0]
+            print_plain(
+                color(
+                    f"\n  DashScope/Qwen 网页搜索需要 {display_mclaw_path('.env')} 中的凭据。"
+                    "按 Enter 跳过 DashScope/Qwen。",
+                    Colors.YELLOW,
+                )
+            )
+            print_plain(color(f"  获取 API Key: {qwen_profile.key_url}", Colors.DIM))
+            values = _prompt_secret_batch(
+                [dashscope_env],
+                prompt=color("  DashScope API Key: ", Colors.YELLOW),
+                print_plain=print_plain,
+                color=color,
+                Colors=Colors,
+            )
+            if values and values.get(dashscope_env):
+                cli_config.save_env_value(dashscope_env, values[dashscope_env])
+                authorize(required_for, [dashscope_env])
+                configured.append("dashscope")
+                print_plain(color("  网页搜索: DashScope/Qwen 凭据已保存。", Colors.DIM))
+            else:
+                print_plain(color("  已跳过 DashScope/Qwen。", Colors.DIM))
 
+    if not configured:
+        print_plain(color("  网页搜索没有可用后端，不会启用。", Colors.DIM))
+        return False
+
+    web_cfg["backend"] = "auto" if len(configured) > 1 else configured[0]
+    labels = {"tavily": "Tavily", "dashscope": "DashScope/Qwen"}
+    configured_labels = "、".join(labels[name] for name in configured)
+    print_plain(color(f"  网页搜索: 已配置 {configured_labels}。", Colors.DIM))
     return True
+
+
+def _setup_qwen_provider() -> str:
+    """Resolve the Qwen region implied by the credentials collected in setup."""
+    from mclaw.cli.config import get_env_value
+    from mclaw.providers.registry import get_runtime_profile
+
+    domestic = get_runtime_profile("qwen")
+    international = get_runtime_profile("qwen-intl")
+    domestic_ready = any(get_env_value(name) for name in domestic.env_vars)
+    international_only = (
+        name for name in international.env_vars if name not in domestic.env_vars
+    )
+    return (
+        "qwen-intl"
+        if not domestic_ready and any(get_env_value(name) for name in international_only)
+        else "qwen"
+    )
 
 
 def _ensure_vision_config(config: dict) -> None:
@@ -1663,8 +1835,13 @@ def _ensure_vision_config(config: dict) -> None:
         vision_cfg = {}
         auxiliary["vision"] = vision_cfg
     provider = str(vision_cfg.get("provider") or "").strip().lower()
-    if provider in {"", "auto", "dashscope"}:
-        vision_cfg["provider"] = "qwen"
+    qwen_provider = _setup_qwen_provider()
+    if provider in {"", "auto", "dashscope"} or (
+        provider == "qwen"
+        and qwen_provider == "qwen-intl"
+        and not str(vision_cfg.get("base_url") or "").strip()
+    ):
+        vision_cfg["provider"] = qwen_provider
     vision_cfg.setdefault("model", "qwen-vl-max")
     if not str(vision_cfg.get("model") or "").strip():
         vision_cfg["model"] = "qwen-vl-max"
@@ -1682,11 +1859,18 @@ def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colo
     spec = get_feature(feature_name)
     if spec is None:
         return True
+    credential_label = "Qwen 凭据" if feature_name in {"vision_analyze", "asr"} else "凭据"
 
     existing = configured_env_vars(spec, cli_config.get_env_value)
     if existing:
         authorize(spec.required_for, existing)
-        print_plain(color(f"  {spec.display_name or spec.name}: 已检测到 {display_mclaw_path('.env')} 中的凭据。", Colors.DIM))
+        print_plain(
+            color(
+                f"  {spec.display_name or spec.name}: 已检测到 "
+                f"{display_mclaw_path('.env')} 中的 {credential_label}。",
+                Colors.DIM,
+            )
+        )
         return True
 
     requests = secret_requests_for_feature(spec, cli_config.get_env_value)
@@ -1695,7 +1879,8 @@ def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colo
 
     print_plain(
         color(
-            f"\n  {spec.display_name or spec.name} 需要 {display_mclaw_path('.env')} 中的凭据。按 Enter 跳过此功能。",
+            f"\n  {spec.display_name or spec.name} 需要 {display_mclaw_path('.env')} "
+            f"中的 {credential_label}。按 Enter 跳过此功能。",
             Colors.YELLOW,
         )
     )
@@ -1719,7 +1904,7 @@ def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colo
 
     configured = configured_env_vars(spec, cli_config.get_env_value) or list(values)
     authorize(spec.required_for, configured)
-    print_plain(color(f"  {spec.display_name or spec.name}: 凭据已保存并授权。", Colors.DIM))
+    print_plain(color(f"  {spec.display_name or spec.name}: {credential_label}已保存。", Colors.DIM))
     return True
 
 

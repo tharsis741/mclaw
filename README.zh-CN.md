@@ -140,9 +140,9 @@ M-Claw 当前已经包含：
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
 | dingtalk | `dingtalk_send_file` | 在当前钉钉会话中发送文件。 |
 
-网页搜索支持 Tavily 和 DashScope/Qwen。`mclaw setup` 会使用已有凭据；如果网页提取已配置 Tavily，网页搜索会直接复用该凭据。可使用 `/search-backend dashscope|tavily|auto` 查看或切换搜索后端。
+网页搜索支持 Tavily 和 DashScope/Qwen。Qwen 和 Tavily 凭据都已可用时，`mclaw setup` 会直接复用；否则进入后端选择并索取所选后端缺少的凭据。可使用 `/search-backend dashscope|tavily|auto` 查看或切换搜索后端。
 
-网页提取支持 Trafilatura、Tavily 和 Firecrawl。Trafilatura 无需 API Key；Tavily 需要 `TAVILY_API_KEY`；Firecrawl 需要 `FIRECRAWL_API_KEY`。可通过 `mclaw setup` 配置，也可使用 `/extract-backend trafilatura|tavily|firecrawl` 查看或切换提取后端。
+网页提取支持 Trafilatura、Tavily 和 Firecrawl。`mclaw setup` 默认勾选三个后端并依次补齐所需凭据；Trafilatura 无需 API Key。可使用 `/extract-backend trafilatura|tavily|firecrawl` 查看或切换当前后端。
 
 普通联网查询使用 `web_search`；读取指定网页正文使用 `web_extract`；需要点击、输入、截图或检查页面外观时使用 browser 工具。
 
