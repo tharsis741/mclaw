@@ -67,9 +67,13 @@ class VoiceInputService:
 
     def start(self, listen_mode: str | None = None):
         """Enable voice input, starting continuous capture only for wake-word mode."""
-        if listen_mode:
-            self.listen_mode = listen_mode
-            self.config["listen_mode"] = listen_mode
+        listen_mode = str(listen_mode or self.listen_mode or "wake_word")
+        if listen_mode not in {"wake_word", "push_to_talk"}:
+            self.last_error = f"Unsupported ASR listen mode: {listen_mode}"
+            self._status("error")
+            return False
+        self.listen_mode = listen_mode
+        self.config["listen_mode"] = listen_mode
         if not self.config.get("api_key"):
             self.last_error = "DashScope/Qwen API key is not configured."
             self._status("error")
@@ -91,16 +95,6 @@ class VoiceInputService:
         self.recording = False
         self._status("off")
 
-    def start_once(self):
-        """Capture a single utterance and stop after the first accepted transcript."""
-        if not self.running:
-            ok = self.start("once")
-            if not ok:
-                return False
-        self.listen_mode = "once"
-        self.config["listen_mode"] = "once"
-        return self._start_audio_session()
-
     def toggle_push_to_talk(self):
         """Toggle manual recording, committing buffered audio when recording stops."""
         if self.listen_mode != "push_to_talk":
@@ -119,14 +113,10 @@ class VoiceInputService:
         result = self._filter.process(text, mode=self.listen_mode)
         if result.action == "submit" and result.text:
             self.on_text(result.text)
-            if self.listen_mode in ("once", "push_to_talk"):
+            if self.listen_mode == "push_to_talk":
                 if not self._finishing_manual:
                     self._stop_audio_session()
-                if self.listen_mode == "once":
-                    self.running = False
-                    self._status("off")
-                else:
-                    self._status("push_to_talk ready")
+                self._status("push_to_talk ready")
         elif result.action == "interrupt":
             if self.on_interrupt:
                 self.on_interrupt()
@@ -160,7 +150,7 @@ class VoiceInputService:
                 raise RuntimeError("No audio input device detected by configured recorder backends.")
 
             backend_config = dict(self.config)
-            backend_config["enable_server_vad"] = self.listen_mode in ("wake_word", "once")
+            backend_config["enable_server_vad"] = self.listen_mode == "wake_word"
             self._backend = QwenRealtimeASRBackend(
                 backend_config,
                 on_transcript=self.handle_transcript,
@@ -207,16 +197,17 @@ class VoiceInputService:
         """Stop capture and optionally commit queued audio for manual ASR turns."""
         recorder = self._recorder
         backend = self._backend
+        audio_queue = self._audio_queue
         self._recorder = None
-        self._backend = None
         if recorder is not None:
             try:
                 recorder.stop()
             except Exception:
                 pass
-        self._stop_audio_worker()
+        self._stop_audio_worker(wait=True)
+        self._backend = None
         if backend is not None:
-            self._drain_audio_queue()
+            self._drain_audio_queue(audio_queue, backend)
             self._finishing_manual = bool(commit)
             try:
                 min_chunks = int(self.config.get("min_voice_chunks") or 0)
@@ -233,10 +224,8 @@ class VoiceInputService:
                 self._finishing_manual = False
         self.recording = False
 
-    def _drain_audio_queue(self):
+    def _drain_audio_queue(self, audio_queue, backend):
         """Flush already accepted audio before committing a manual recording."""
-        audio_queue = self._audio_queue
-        backend = self._backend
         if audio_queue is None or backend is None:
             return
         while True:
@@ -278,11 +267,13 @@ class VoiceInputService:
         """Start the worker that serializes recorder callbacks into backend sends."""
         self._audio_queue = queue.Queue(maxsize=int(self.config.get("audio_queue_size") or 50))
         self._audio_stop = threading.Event()
+        audio_queue = self._audio_queue
+        stop = self._audio_stop
 
         def _worker():
-            while self._audio_stop is not None and not self._audio_stop.is_set():
+            while not stop.is_set():
                 try:
-                    chunk = self._audio_queue.get(timeout=0.1)
+                    chunk = audio_queue.get(timeout=0.1)
                 except queue.Empty:
                     continue
                 backend = self._backend
@@ -296,7 +287,7 @@ class VoiceInputService:
         self._audio_worker = threading.Thread(target=_worker, daemon=True)
         self._audio_worker.start()
 
-    def _stop_audio_worker(self):
+    def _stop_audio_worker(self, wait: bool = False):
         """Signal the audio worker and release queue references during teardown."""
         stop = self._audio_stop
         worker = self._audio_worker
@@ -306,4 +297,4 @@ class VoiceInputService:
         if stop is not None:
             stop.set()
         if worker is not None:
-            worker.join(timeout=1.0)
+            worker.join(timeout=None if wait else 1.0)

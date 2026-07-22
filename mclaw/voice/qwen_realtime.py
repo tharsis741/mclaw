@@ -129,22 +129,7 @@ class QwenRealtimeASRBackend:
 
             def on_event(self, response):
                 try:
-                    event_type = response.get("type", "")
-                    if event_type == "conversation.item.input_audio_transcription.completed":
-                        transcript = (response.get("transcript") or "").strip()
-                        if transcript:
-                            backend.on_transcript(transcript)
-                    elif event_type == "conversation.item.input_audio_transcription.text":
-                        stash = response.get("stash") or ""
-                        if stash:
-                            backend._status(f"hearing {stash[:24]}")
-                    elif event_type == "input_audio_buffer.speech_started":
-                        backend._status("speech started")
-                    elif event_type == "input_audio_buffer.speech_stopped":
-                        backend._status("speech stopped")
-                    elif event_type == "error":
-                        message = str(response.get("error") or response)
-                        backend._error(message)
+                    backend._handle_event(response)
                 except Exception as exc:
                     backend._error(str(exc))
 
@@ -171,6 +156,28 @@ class QwenRealtimeASRBackend:
         )
         self.connected = True
         self._status("ready")
+
+    def _handle_event(self, response: dict):
+        """Forward one SDK event to transcript, status, or error callbacks."""
+        event_type = response.get("type", "")
+        if event_type == "conversation.item.input_audio_transcription.completed":
+            transcript = (response.get("transcript") or "").strip()
+            if transcript:
+                self.on_transcript(transcript)
+        elif event_type == "conversation.item.input_audio_transcription.text":
+            preview = f"{response.get('text') or ''}{response.get('stash') or ''}".strip()
+            if preview:
+                self._status(f"hearing {preview[:24]}")
+        elif event_type == "conversation.item.input_audio_transcription.failed":
+            error = response.get("error") or {}
+            message = error.get("message") if isinstance(error, dict) else str(error)
+            self._error(message or "Qwen ASR transcription failed")
+        elif event_type == "input_audio_buffer.speech_started":
+            self._status("speech started")
+        elif event_type == "input_audio_buffer.speech_stopped":
+            self._status("speech stopped")
+        elif event_type == "error":
+            self._error(str(response.get("error") or response))
 
     def send_audio(self, pcm_bytes: bytes):
         """Append one PCM chunk after converting to the SDK's base64 payload."""

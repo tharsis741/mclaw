@@ -52,7 +52,7 @@ class TranscriptFilter:
 
     def _strip_wake_word(self, text: str, mode: str) -> str | None:
         require = bool(self.config.get("require_wake_word"))
-        if mode in ("push_to_talk", "once"):
+        if mode == "push_to_talk":
             require = False
         if not require:
             return text

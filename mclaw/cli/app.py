@@ -1029,8 +1029,6 @@ class InteractiveChat:
             return "PTT"
         if "wake" in text:
             return "WAKE"
-        if "once" in text:
-            return "ONCE"
         if "error" in text:
             return "ERR"
         if "ready" in text:
@@ -1598,7 +1596,6 @@ class InteractiveChat:
                     "asr-mode": lambda parsed: self._handle_asr_mode(parsed.args.strip()),
                     "keyboard-mode": lambda parsed: self._handle_keyboard_mode(),
                     "asr-status": lambda parsed: self._show_asr_status(),
-                    "asr-once": lambda parsed: self._handle_asr_once(),
                     "pet": lambda parsed: self._handle_pet_command(parsed.args.strip()),
                     "usage": lambda parsed: self._show_usage(),
                     "doctor": self._handle_doctor_command,
@@ -2291,9 +2288,6 @@ class InteractiveChat:
 
     def _handle_keyboard_mode(self):
         self._get_asr_command_coordinator().handle_keyboard_mode()
-
-    def _handle_asr_once(self):
-        self._get_asr_command_coordinator().handle_asr_once()
 
     def _handle_push_to_talk_key(self):
         """Start one ASR push-to-talk worker while coalescing repeated key presses."""

@@ -53,7 +53,6 @@ _COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec("search-backend", "切换联网搜索后端"),
     SlashCommandSpec("extract-backend", "切换网页提取后端"),
     SlashCommandSpec("asr-mode", "启用语音输入"),
-    SlashCommandSpec("asr-once", "录制一次语音输入"),
     SlashCommandSpec("asr-status", "查看语音输入状态"),
     SlashCommandSpec("keyboard-mode", "关闭语音输入并切回键盘"),
     SlashCommandSpec("pet", "控制桌面宠物"),

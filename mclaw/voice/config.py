@@ -141,6 +141,9 @@ def resolve_asr_config(parent_agent=None, config: dict | None = None) -> Dict[st
     raw_asr = auxiliary.get("asr", {})
     asr_cfg = raw_asr if isinstance(raw_asr, dict) else {}
     result = _deep_merge(DEFAULT_ASR_CONFIG, asr_cfg)
+    if result.get("listen_mode") not in {"wake_word", "push_to_talk"}:
+        result["listen_mode"] = "wake_word"
+        result["require_wake_word"] = True
     enabled, enabled_mode = _resolve_enabled(result.get("enabled"), result)
     result["enabled"] = enabled
     result["enabled_mode"] = enabled_mode

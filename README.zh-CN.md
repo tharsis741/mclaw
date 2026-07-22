@@ -75,7 +75,7 @@ M-Claw 当前已经包含：
 
 - **21 个基础工具**：默认工具集，覆盖凭据授权、文件读写、终端、记忆、Skill、历史会话检索和子代理委派。
 - **13 个可选工具**：覆盖联网搜索、网页提取、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
-- **23 个内置命令**：包括模型切换、搜索/提取后端、语音输入、历史会话、rollback、checkpoint、定时任务、Skill 管理和运行环境诊断。
+- **22 个内置命令**：包括模型切换、搜索/提取后端、语音输入、历史会话、rollback、checkpoint、定时任务、Skill 管理和运行环境诊断。
 - **模型库与多 Provider 管理**：支持 OpenAI-compatible 与 Anthropic Messages 两类调用协议，并通过 models.dev 获取模型目录与上下文元数据。
 - **三层记忆体系**：会话级记忆、长期记忆和 Skill 级运行/优化记忆。
 - **系统运行时适配**：针对M Roboots OS以及Kaihong OS的路径策略、运行环境变量、shell profile 和运行域能力过滤。
@@ -140,11 +140,9 @@ M-Claw 当前已经包含：
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
 | dingtalk | `dingtalk_send_file` | 在当前钉钉会话中发送文件。 |
 
-网页搜索支持 Tavily 和 DashScope/Qwen。Qwen 和 Tavily 凭据都已可用时，`mclaw setup` 会直接复用；否则进入后端选择并索取所选后端缺少的凭据。可使用 `/search-backend dashscope|tavily|auto` 查看或切换搜索后端。
+网页搜索支持 Tavily 和 DashScope/Qwen。可使用 `/search-backend dashscope|tavily|auto` 查看或切换搜索后端。
 
-网页提取支持 Trafilatura、Tavily 和 Firecrawl。`mclaw setup` 默认勾选三个后端并依次补齐所需凭据；Trafilatura 无需 API Key。可使用 `/extract-backend trafilatura|tavily|firecrawl` 查看或切换当前后端。
-
-普通联网查询使用 `web_search`；读取指定网页正文使用 `web_extract`；需要点击、输入、截图或检查页面外观时使用 browser 工具。
+网页提取支持 Trafilatura、Tavily 和 Firecrawl。可使用 `/extract-backend trafilatura|tavily|firecrawl` 查看或切换当前后端。
 
 ## 三层记忆体系
 
@@ -219,7 +217,7 @@ KaihongRuntime 会禁用 checkpoint、桌面宠物和浏览器自动化，并保
 M-Claw 支持以下交互入口：
 
 - **CLI/TUI**：基于 Rich 与 prompt_toolkit 终端交互入口。
-- **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word、push-to-talk 和一次性录音模式。
+- **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word 和 push-to-talk 两种模式。
 - **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
 
 
@@ -283,6 +281,16 @@ mclaw setup
 
 ```powershell
 mclaw
+```
+
+更新 M-Claw：
+
+退出正在运行的 M-Claw 后
+
+```powershell
+git status --porcelain
+git pull --ff-only
+pip install -e .
 ```
 
 ### Kaihong OS / M-Robots OS

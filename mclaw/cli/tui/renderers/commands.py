@@ -132,7 +132,6 @@ class CommandsRenderer:
                 section_block("语音与桌面宠物"),
                 command_block([
                     ("/asr-mode [wake_word|push_to_talk]", "启用语音输入"),
-                    ("/asr-once", "录制一次语音输入"),
                     ("/asr-status", "查看 ASR 状态"),
                     ("/keyboard-mode", "关闭 ASR，切回键盘输入"),
                     ("/pet [on|off|status|save|test]", "控制桌面宠物"),
