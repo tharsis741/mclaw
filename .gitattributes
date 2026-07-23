@@ -1,0 +1,8 @@
+# Normalize text in the index while keeping platform-native checkout endings.
+* text=auto
+
+# POSIX scripts must stay LF-only, including on Windows checkouts.
+*.sh text eol=lf
+
+# Skills are bundled assets rather than core MClaw source.
+mclaw/skills/** linguist-vendored
