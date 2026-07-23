@@ -231,19 +231,18 @@ def test_web_search_preserves_backend_profile_on_error(monkeypatch) -> None:
 def test_tavily_search_returns_answer_and_structured_sources(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_post(url, **kwargs):
-        captured["url"] = url
+    async def fake_request(**kwargs):
         captured.update(kwargs)
-        return _Response({
+        return {
             "answer": "A concise generated answer.",
             "results": [{
                 "title": "Example source",
                 "url": "https://example.com/article",
                 "content": "A short source snippet.",
             }],
-        })
+        }
 
-    monkeypatch.setattr(tavily_backend.requests, "post", fake_post)
+    monkeypatch.setattr(tavily_backend, "_request_tavily", fake_request)
     result = tavily_backend.search(
         query="example",
         strategy="turbo",
@@ -256,9 +255,9 @@ def test_tavily_search_returns_answer_and_structured_sources(monkeypatch) -> Non
     )
 
     assert captured["headers"]["Authorization"] == "Bearer tvly-test-secret"
-    assert captured["json"]["max_results"] == 3
-    assert captured["json"]["include_answer"] == "basic"
-    assert captured["json"]["include_raw_content"] is False
+    assert captured["payload"]["max_results"] == 3
+    assert captured["payload"]["include_answer"] == "basic"
+    assert captured["payload"]["include_raw_content"] is False
     assert result["answer"] == "A concise generated answer."
     assert result["sources"] == [{
         "index": 1,
@@ -875,9 +874,9 @@ def test_tavily_extract_preserves_partial_failures(monkeypatch) -> None:
     captured: dict = {}
     monkeypatch.setattr(web_extract_tool, "_authorized_env_value", lambda _name: "tvly-secret")
 
-    def fake_post(*args, **kwargs):
-        captured.update(kwargs)
-        return _Response({
+    async def fake_post(_url, *, headers, payload, timeout):
+        captured.update({"headers": headers, "json": payload, "timeout": timeout})
+        data = {
             "results": [{
                 "url": "https://example.com/ok",
                 "raw_content": "# Good page\n\nUseful content.",
@@ -889,13 +888,10 @@ def test_tavily_extract_preserves_partial_failures(monkeypatch) -> None:
             "response_time": 0.42,
             "usage": {"credits": 2},
             "request_id": "req-test",
-        })
+        }
+        return _Response(data), data
 
-    monkeypatch.setattr(
-        web_extract_tool.requests,
-        "post",
-        fake_post,
-    )
+    monkeypatch.setattr(web_extract_tool, "_post_json_async", fake_post)
 
     results = web_extract_tool._extract_with_tavily(
         ["https://example.com/ok", "https://example.com/fail"],
@@ -919,10 +915,14 @@ def test_firecrawl_scrape_disables_llm_cleaning(monkeypatch) -> None:
     monkeypatch.setattr(web_extract_tool, "_authorized_env_value", lambda _name: "fc-secret")
     monkeypatch.setattr(web_extract_tool, "_is_safe_url", lambda _url: True)
 
-    def fake_post(url, **kwargs):
-        captured["url"] = url
-        captured.update(kwargs)
-        return _Response({
+    async def fake_post(url, *, headers, payload, timeout):
+        captured.update({
+            "url": url,
+            "headers": headers,
+            "json": payload,
+            "timeout": timeout,
+        })
+        data = {
             "success": True,
             "data": {
                 "markdown": (
@@ -944,9 +944,10 @@ def test_firecrawl_scrape_disables_llm_cleaning(monkeypatch) -> None:
                     "contentType": "text/html",
                 },
             },
-        })
+        }
+        return _Response(data), data
 
-    monkeypatch.setattr(web_extract_tool.requests, "post", fake_post)
+    monkeypatch.setattr(web_extract_tool, "_post_json_async", fake_post)
     result = web_extract_tool._extract_with_firecrawl(
         ["https://example.com/article"],
         10,
@@ -974,7 +975,7 @@ def test_long_content_continues_from_cache_without_recalling_provider(monkeypatc
     calls: list[list[str]] = []
     monkeypatch.setattr(web_extract_tool, "_is_safe_url", lambda _url: True)
 
-    def fake_extract(urls, _timeout):
+    def fake_extract(urls, _timeout, **_kwargs):
         calls.append(urls)
         return [web_extract_tool._content_result(urls[0], content)]
 
@@ -1015,7 +1016,7 @@ def test_continuation_cursor_requires_its_original_single_url(monkeypatch) -> No
     monkeypatch.setattr(
         web_extract_tool,
         "_extract_with_trafilatura",
-        lambda urls, _timeout: [web_extract_tool._content_result(urls[0], content)],
+        lambda urls, _timeout, **_kwargs: [web_extract_tool._content_result(urls[0], content)],
     )
     parent = SimpleNamespace(config={"auxiliary": {"web_extract": {"backend": "trafilatura"}}})
     first = json.loads(web_extract_tool.web_extract([url], parent_agent=parent))
@@ -1081,10 +1082,8 @@ def test_firecrawl_unexpected_cache_hit_is_warning_not_partial(monkeypatch) -> N
         "warned because a cache hit contradicts the forced-fresh Firecrawl profile. "
         "The agent can inspect this warning and decide whether independent verification is needed."
     )
-    monkeypatch.setattr(
-        web_extract_tool.requests,
-        "post",
-        lambda *args, **kwargs: _Response({
+    async def fake_post(*_args, **_kwargs):
+        data = {
             "success": True,
             "data": {
                 "markdown": body,
@@ -1094,8 +1093,10 @@ def test_firecrawl_unexpected_cache_hit_is_warning_not_partial(monkeypatch) -> N
                     "cachedAt": "2026-07-20T10:00:00Z",
                 },
             },
-        }),
-    )
+        }
+        return _Response(data), data
+
+    monkeypatch.setattr(web_extract_tool, "_post_json_async", fake_post)
 
     result = web_extract_tool._extract_with_firecrawl(
         ["https://example.com/article"],
@@ -1111,16 +1112,16 @@ def test_firecrawl_unexpected_cache_hit_is_warning_not_partial(monkeypatch) -> N
 
 def test_firecrawl_logical_failure_keeps_safe_request_diagnostics(monkeypatch) -> None:
     monkeypatch.setattr(web_extract_tool, "_authorized_env_value", lambda _name: "fc-secret")
-    monkeypatch.setattr(
-        web_extract_tool.requests,
-        "post",
-        lambda *args, **kwargs: _Response({
+    async def fake_post(*_args, **_kwargs):
+        data = {
             "success": False,
             "error": "upstream renderer failed",
             "request_id": "request-123",
             "scrapeId": "scrape-456",
-        }),
-    )
+        }
+        return _Response(data), data
+
+    monkeypatch.setattr(web_extract_tool, "_post_json_async", fake_post)
 
     result = web_extract_tool._extract_with_firecrawl(
         ["https://example.com/article"],
@@ -1153,7 +1154,7 @@ def test_web_extract_summarizes_partial_results_for_agent(monkeypatch) -> None:
     monkeypatch.setattr(
         web_extract_tool,
         "_extract_with_trafilatura",
-        lambda urls, _timeout: [
+        lambda urls, _timeout, **_kwargs: [
             web_extract_tool._content_result(urls[0], "Short but usable text."),
             web_extract_tool._error_result(urls[1], "download failed"),
         ],

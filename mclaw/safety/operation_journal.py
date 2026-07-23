@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
 import uuid
 from collections.abc import Iterable
@@ -20,25 +21,40 @@ from pathlib import Path
 from typing import Any
 
 from mclaw.constants import get_mclaw_home
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 
 
 def _now_iso() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
 
-def _sha256_file(path: Path) -> str | None:
+def _sha256_file(
+    path: Path,
+    cancel_event: threading.Event | None = None,
+) -> str | None:
+    cancel_event = cancel_event or get_interrupt_event()
     try:
         h = hashlib.sha256()
         with path.open("rb") as fh:
             for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                cancellation_checkpoint(cancel_event)
                 h.update(chunk)
+        cancellation_checkpoint(cancel_event)
         return h.hexdigest()
+    except InterruptedError:
+        raise
     except OSError:
         return None
 
 
-def inspect_path(path_value: str) -> dict[str, Any]:
+def inspect_path(
+    path_value: str,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     """Capture stable path metadata used to compare rollback states later."""
+    cancel_event = cancel_event or get_interrupt_event()
+    cancellation_checkpoint(cancel_event)
     path = Path(path_value).expanduser()
     try:
         resolved = path.resolve()
@@ -55,7 +71,9 @@ def inspect_path(path_value: str) -> dict[str, Any]:
             "kind": "directory" if resolved.is_dir() else "file",
         })
         if resolved.is_file():
-            out["sha256"] = _sha256_file(resolved)
+            out["sha256"] = _sha256_file(resolved, cancel_event=cancel_event)
+    except InterruptedError:
+        raise
     except OSError as exc:
         out["error"] = str(exc)
     return out
@@ -87,12 +105,16 @@ class OperationJournal:
         checkpoint_commit: str | None = None,
         checkpoint_status: str | None = None,
         checkpoint_reason: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Start an audit record before executing a mutating tool call."""
+        cancel_event = cancel_event or get_interrupt_event()
+        cancellation_checkpoint(cancel_event)
         operation_id = f"op_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         target_records: list[dict[str, Any]] = []
         for target in targets or []:
-            before = inspect_path(str(target))
+            cancellation_checkpoint(cancel_event)
+            before = inspect_path(str(target), cancel_event=cancel_event)
             target_records.append({
                 "path": before.get("path") or str(target),
                 "before": before,
@@ -120,6 +142,7 @@ class OperationJournal:
             "created_at": _now_iso(),
             "updated_at": _now_iso(),
         }
+        cancellation_checkpoint(cancel_event)
         self._write_record(record)
         return record
 
@@ -130,12 +153,25 @@ class OperationJournal:
         success: bool,
         result_preview: str = "",
         after_commit: str | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
         """Complete an operation record with post-execution target snapshots."""
         if not record:
             return {}
+        cancel_event = cancel_event or get_interrupt_event()
+        inspection_cancelled = bool(cancel_event is not None and cancel_event.is_set())
         for target in record.get("targets") or []:
-            target["after"] = inspect_path(target.get("path") or "")
+            if inspection_cancelled:
+                target["after"] = {"path": target.get("path") or "", "inspection_skipped": "cancelled"}
+                continue
+            try:
+                target["after"] = inspect_path(
+                    target.get("path") or "",
+                    cancel_event=cancel_event,
+                )
+            except InterruptedError:
+                inspection_cancelled = True
+                target["after"] = {"path": target.get("path") or "", "inspection_skipped": "cancelled"}
         record["status"] = "completed" if success else "failed"
         record["after_commit"] = after_commit
         record["result_preview"] = (result_preview or "")[:1000]

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
@@ -17,7 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
-import requests
+import httpx
 
 from mclaw.cli.config import ConfigError, get_env_value, load_config
 from mclaw.tools.extract.profiles import (
@@ -25,6 +26,7 @@ from mclaw.tools.extract.profiles import (
     VALID_EXTRACT_BACKENDS,
     get_extract_backend_profile,
 )
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 from mclaw.tools.vision.image_io import _is_safe_url
 
@@ -37,6 +39,79 @@ _CONTINUATION_TTL_SECONDS = 15 * 60
 _MAX_CONTINUATION_ENTRIES = 16
 _MAX_CONTINUATION_CACHE_CHARS = 5_000_000
 _REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+
+
+class _WebExtractCancelled(InterruptedError):
+    """Stop remaining extraction phases after the owning turn is cancelled."""
+
+
+def _raise_if_cancelled() -> None:
+    cancel_event = get_interrupt_event()
+    if cancel_event is not None and cancel_event.is_set():
+        raise _WebExtractCancelled("Web extraction interrupted by user")
+
+
+def _cancelled_result() -> str:
+    return tool_error(
+        "Web extraction interrupted by user",
+        success=False,
+        interrupted=True,
+        status="cancelled",
+    )
+
+
+def _run_http(coro, *, parent_agent, timeout: float, operation: str):
+    from mclaw.tools.dispatch import _run_async
+
+    try:
+        return _run_async(
+            coro,
+            parent_agent=parent_agent,
+            diagnostic_name=f"web_extract_{operation}_http",
+            timeout_seconds=timeout,
+            raise_on_stop=True,
+        )
+    except InterruptedError as exc:
+        raise _WebExtractCancelled("Web extraction interrupted by user") from exc
+
+
+async def _url_validation_errors_async(urls: list[str]) -> list[str]:
+    errors: list[str] = []
+    for url in urls:
+        _raise_if_cancelled()
+        errors.append(await asyncio.to_thread(_url_error, url))
+    return errors
+
+
+def _url_validation_errors(
+    urls: list[str],
+    *,
+    parent_agent,
+    timeout: float,
+) -> list[str]:
+    return _run_http(
+        _url_validation_errors_async(urls),
+        parent_agent=parent_agent,
+        timeout=timeout,
+        operation="url_validation",
+    )
+
+
+async def _post_json_async(
+    url: str,
+    *,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+) -> tuple[httpx.Response, dict[str, Any]]:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with asyncio.timeout(max(0.001, timeout)):
+            response = await client.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("Provider returned a non-object response.")
+    return response, data
 
 
 @dataclass
@@ -442,64 +517,84 @@ def _load_continuation(
         return entry, token, offset
 
 
-def _fetch_public_page(url: str, timeout: float) -> tuple[bytes, str]:
+async def _fetch_public_page_async(url: str, timeout: float) -> tuple[bytes, str]:
     """Download one page while validating every redirect before following it."""
-    import httpx
-
     current = url
     headers = {
         "User-Agent": "M-Claw-WebExtract/1.0",
         "Accept": "text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.1",
     }
-    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
-        for _ in range(6):
-            error = _url_error(current)
-            if error:
-                raise ValueError(error)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+        async with asyncio.timeout(max(0.001, timeout)):
+            for _ in range(6):
+                _raise_if_cancelled()
+                error = (await _url_validation_errors_async([current]))[0]
+                if error:
+                    raise ValueError(error)
 
-            with client.stream("GET", current, headers=headers) as response:
-                if response.status_code in _REDIRECT_STATUSES:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise ValueError("Redirect response did not include a Location header.")
-                    current = urljoin(current, location)
-                    continue
-
-                response.raise_for_status()
-                content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
-                if content_type and content_type not in {
-                    "text/html",
-                    "application/xhtml+xml",
-                    "text/plain",
-                }:
-                    raise ValueError(
-                        f"Unsupported content type {content_type!r}; local extraction accepts HTML or text pages."
-                    )
-
-                content_length = response.headers.get("content-length")
-                if content_length:
-                    try:
-                        declared_size = int(content_length)
-                    except ValueError:
-                        declared_size = 0
-                    if declared_size > _MAX_DOWNLOAD_BYTES:
-                        raise ValueError("Page exceeds the 5 MB download limit.")
-
-                chunks: list[bytes] = []
-                total = 0
-                for chunk in response.iter_bytes():
-                    if not chunk:
+                async with client.stream("GET", current, headers=headers) as response:
+                    if response.status_code in _REDIRECT_STATUSES:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise ValueError("Redirect response did not include a Location header.")
+                        current = urljoin(current, location)
                         continue
-                    total += len(chunk)
-                    if total > _MAX_DOWNLOAD_BYTES:
-                        raise ValueError("Page exceeds the 5 MB download limit.")
-                    chunks.append(chunk)
-                return b"".join(chunks), str(response.url)
+
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+                    if content_type and content_type not in {
+                        "text/html",
+                        "application/xhtml+xml",
+                        "text/plain",
+                    }:
+                        raise ValueError(
+                            f"Unsupported content type {content_type!r}; local extraction accepts HTML or text pages."
+                        )
+
+                    content_length = response.headers.get("content-length")
+                    if content_length:
+                        try:
+                            declared_size = int(content_length)
+                        except ValueError:
+                            declared_size = 0
+                        if declared_size > _MAX_DOWNLOAD_BYTES:
+                            raise ValueError("Page exceeds the 5 MB download limit.")
+
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in response.aiter_bytes():
+                        _raise_if_cancelled()
+                        if not chunk:
+                            continue
+                        total += len(chunk)
+                        if total > _MAX_DOWNLOAD_BYTES:
+                            raise ValueError("Page exceeds the 5 MB download limit.")
+                        chunks.append(chunk)
+                    return b"".join(chunks), str(response.url)
 
     raise ValueError("Too many redirects (maximum 5).")
 
 
-def _extract_with_trafilatura(urls: list[str], timeout: float) -> list[dict[str, Any]]:
+def _fetch_public_page(
+    url: str,
+    timeout: float,
+    *,
+    parent_agent=None,
+) -> tuple[bytes, str]:
+    return _run_http(
+        _fetch_public_page_async(url, timeout),
+        parent_agent=parent_agent,
+        timeout=timeout,
+        operation="page_fetch",
+    )
+
+
+def _extract_with_trafilatura(
+    urls: list[str],
+    timeout: float,
+    *,
+    parent_agent=None,
+) -> list[dict[str, Any]]:
     try:
         import trafilatura
     except ImportError:
@@ -508,9 +603,18 @@ def _extract_with_trafilatura(urls: list[str], timeout: float) -> list[dict[str,
     profile = get_extract_backend_profile("trafilatura")
     results: list[dict[str, Any]] = []
     for url in urls:
+        _raise_if_cancelled()
         started = time.perf_counter()
         try:
-            html, final_url = _fetch_public_page(url, timeout)
+            if parent_agent is None:
+                html, final_url = _fetch_public_page(url, timeout)
+            else:
+                html, final_url = _fetch_public_page(
+                    url,
+                    timeout,
+                    parent_agent=parent_agent,
+                )
+            _raise_if_cancelled()
             content = trafilatura.extract(
                 html,
                 url=final_url,
@@ -540,6 +644,8 @@ def _extract_with_trafilatura(urls: list[str], timeout: float) -> list[dict[str,
                     },
                 )
             )
+        except _WebExtractCancelled:
+            raise
         except Exception as exc:
             results.append(
                 _error_result(
@@ -570,7 +676,7 @@ def _request_error_results(
 def _http_failure_context(
     provider: str,
     started: float,
-    exc: requests.RequestException,
+    exc: httpx.HTTPError,
 ) -> tuple[object, dict[str, Any]]:
     """Preserve safe HTTP/provider failure details for actionable diagnostics."""
     response = getattr(exc, "response", None)
@@ -602,7 +708,13 @@ def _http_failure_context(
     return detail, diagnostics
 
 
-def _extract_with_tavily(urls: list[str], timeout: float) -> list[dict[str, Any]]:
+def _extract_with_tavily(
+    urls: list[str],
+    timeout: float,
+    *,
+    parent_agent=None,
+) -> list[dict[str, Any]]:
+    _raise_if_cancelled()
     profile = get_extract_backend_profile("tavily")
     api_key = _authorized_env_value("TAVILY_API_KEY")
     if not api_key:
@@ -617,26 +729,39 @@ def _extract_with_tavily(urls: list[str], timeout: float) -> list[dict[str, Any]
     try:
         request_payload = profile.request_options()
         request_payload.update({"urls": urls, "timeout": timeout})
-        response = requests.post(
-            _TAVILY_EXTRACT_URL,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=request_payload,
-            timeout=timeout + 5,
+        request_timeout = timeout + 5
+        response, data = _run_http(
+            _post_json_async(
+                _TAVILY_EXTRACT_URL,
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                },
+                payload=request_payload,
+                timeout=request_timeout,
+            ),
+            parent_agent=parent_agent,
+            timeout=request_timeout,
+            operation="tavily",
         )
-        response.raise_for_status()
-        data = response.json()
-        if not isinstance(data, dict):
-            raise ValueError("Tavily returned a non-object response.")
-    except requests.RequestException as exc:
+        _raise_if_cancelled()
+    except httpx.HTTPError as exc:
         detail, diagnostics = _http_failure_context("Tavily", started, exc)
         return _request_error_results(
             urls,
             "Tavily",
             detail,
             diagnostics=diagnostics,
+        )
+    except TimeoutError as exc:
+        return _request_error_results(
+            urls,
+            "Tavily",
+            exc,
+            diagnostics={
+                "backend": "tavily",
+                "elapsed_ms": round((time.perf_counter() - started) * 1000),
+            },
         )
     except ValueError as exc:
         return _request_error_results(
@@ -680,6 +805,7 @@ def _extract_with_tavily(urls: list[str], timeout: float) -> list[dict[str, Any]
 
     results: list[dict[str, Any]] = []
     for url in urls:
+        _raise_if_cancelled()
         key = url.rstrip("/")
         if key in extracted:
             result = dict(extracted[key])
@@ -702,6 +828,8 @@ def _extract_with_firecrawl(
     urls: list[str],
     timeout: float,
     api_url: str,
+    *,
+    parent_agent=None,
 ) -> list[dict[str, Any]]:
     profile = get_extract_backend_profile("firecrawl")
     api_key = _authorized_env_value("FIRECRAWL_API_KEY")
@@ -711,6 +839,7 @@ def _extract_with_firecrawl(
 
     results: list[dict[str, Any]] = []
     for url in urls:
+        _raise_if_cancelled()
         started = time.perf_counter()
         try:
             request_payload = profile.request_options()
@@ -718,16 +847,19 @@ def _extract_with_firecrawl(
                 "url": url,
                 "timeout": int(timeout * 1000),
             })
-            response = requests.post(
-                api_url,
-                headers=headers,
-                json=request_payload,
-                timeout=timeout + 5,
+            request_timeout = timeout + 5
+            response, data = _run_http(
+                _post_json_async(
+                    api_url,
+                    headers=headers,
+                    payload=request_payload,
+                    timeout=request_timeout,
+                ),
+                parent_agent=parent_agent,
+                timeout=request_timeout,
+                operation="firecrawl",
             )
-            response.raise_for_status()
-            data = response.json()
-            if not isinstance(data, dict):
-                raise ValueError("Firecrawl returned a non-object response.")
+            _raise_if_cancelled()
             if data.get("success") is False:
                 results.append(
                     _error_result(
@@ -747,7 +879,11 @@ def _extract_with_firecrawl(
             document = data.get("data") if isinstance(data.get("data"), dict) else data
             metadata = document.get("metadata") if isinstance(document.get("metadata"), dict) else {}
             final_url = metadata.get("sourceURL") or metadata.get("url") or ""
-            if final_url and _url_error(str(final_url)):
+            if final_url and _url_validation_errors(
+                [str(final_url)],
+                parent_agent=parent_agent,
+                timeout=timeout,
+            )[0]:
                 raise ValueError("Firecrawl reported a private or unsafe final URL.")
 
             containers = (metadata, document, data)
@@ -795,13 +931,25 @@ def _extract_with_firecrawl(
                     diagnostics=diagnostics,
                 )
             )
-        except requests.RequestException as exc:
+        except httpx.HTTPError as exc:
             detail, diagnostics = _http_failure_context("Firecrawl", started, exc)
             results.append(
                 _error_result(
                     url,
                     f"Firecrawl extraction failed: {_safe_error(detail)}",
                     diagnostics=diagnostics,
+                )
+            )
+        except TimeoutError as exc:
+            results.append(
+                _error_result(
+                    url,
+                    f"Firecrawl extraction failed: {_safe_error(exc)}",
+                    diagnostics={
+                        "backend": "firecrawl",
+                        "freshness": "forced_fresh",
+                        "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                    },
                 )
             )
         except (ValueError, TypeError) as exc:
@@ -874,6 +1022,11 @@ def web_extract(
     cursor: str | None = None,
 ) -> str:
     """Extract or continue main content from known public URLs."""
+    try:
+        _raise_if_cancelled()
+    except _WebExtractCancelled:
+        return _cancelled_result()
+
     if not isinstance(urls, list):
         return tool_error("urls must be a list of 1 to 5 URLs", success=False)
     if not 1 <= len(urls) <= _MAX_URLS:
@@ -908,28 +1061,45 @@ def web_extract(
     except ConfigError as exc:
         return tool_error(f"Configuration error: {exc}", success=False)
 
-    safe_urls: list[str] = []
-    validation: list[str] = []
-    for url in normalized:
-        error = _url_error(url)
-        validation.append(error)
-        if not error:
-            safe_urls.append(url)
+    try:
+        validation = _url_validation_errors(
+            normalized,
+            parent_agent=parent_agent,
+            timeout=cfg["timeout"],
+        )
+    except _WebExtractCancelled:
+        return _cancelled_result()
+    except TimeoutError as exc:
+        return tool_error(f"URL validation timed out: {_safe_error(exc)}", success=False)
+    safe_urls = [url for url, error in zip(normalized, validation, strict=True) if not error]
 
     backend = cfg["backend"]
     profile = get_extract_backend_profile(backend)
-    if not safe_urls:
-        provider_results = []
-    elif backend == "trafilatura":
-        provider_results = _extract_with_trafilatura(safe_urls, cfg["timeout"])
-    elif backend == "tavily":
-        provider_results = _extract_with_tavily(safe_urls, cfg["timeout"])
-    else:
-        provider_results = _extract_with_firecrawl(
-            safe_urls,
-            cfg["timeout"],
-            cfg["firecrawl_api_url"],
-        )
+    try:
+        if not safe_urls:
+            provider_results = []
+        elif backend == "trafilatura":
+            provider_results = _extract_with_trafilatura(
+                safe_urls,
+                cfg["timeout"],
+                parent_agent=parent_agent,
+            )
+        elif backend == "tavily":
+            provider_results = _extract_with_tavily(
+                safe_urls,
+                cfg["timeout"],
+                parent_agent=parent_agent,
+            )
+        else:
+            provider_results = _extract_with_firecrawl(
+                safe_urls,
+                cfg["timeout"],
+                cfg["firecrawl_api_url"],
+                parent_agent=parent_agent,
+            )
+        _raise_if_cancelled()
+    except _WebExtractCancelled:
+        return _cancelled_result()
 
     provider_iter = iter(provider_results)
     results: list[dict[str, Any]] = []
@@ -953,6 +1123,10 @@ def web_extract(
     backend_profile = profile.tool_metadata()
     chunks: list[dict[str, Any]] = []
     for result in results:
+        try:
+            _raise_if_cancelled()
+        except _WebExtractCancelled:
+            return _cancelled_result()
         if result.get("status") == "error":
             chunks.append(result)
             continue

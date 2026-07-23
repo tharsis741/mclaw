@@ -11,10 +11,13 @@ shared tool keep generated answers separate from supporting sources.
 
 from __future__ import annotations
 
+import inspect
 import logging
 import re
+import threading
 from typing import Any
 
+from mclaw.tools.cancellation import cancellation_checkpoint
 from mclaw.tools.search.credentials import (
     DASHSCOPE_BASE_URL,
     QWEN_CREDENTIAL_HINT,
@@ -77,16 +80,36 @@ def _response_parts(response: Any) -> tuple[str, list[dict[str, Any]], bool, str
     return answer, sources, search_seen, ""
 
 
-def _call_generation(**kwargs):
-    from dashscope import Generation
+async def _call_generation(**kwargs):
+    from dashscope import AioGeneration
 
-    return Generation.call(**kwargs)
+    return await AioGeneration.call(**kwargs)
 
 
-def _call_multimodal(**kwargs):
-    from dashscope import MultiModalConversation
+async def _call_multimodal(**kwargs):
+    from dashscope import AioMultiModalConversation
 
-    return MultiModalConversation.call(**kwargs)
+    responses = await AioMultiModalConversation.call(**kwargs)
+    if hasattr(responses, "__aiter__"):
+        return [response async for response in responses]
+    return responses
+
+
+async def _invoke_call(call, kwargs: dict):
+    value = call(**kwargs)
+    return await value if inspect.isawaitable(value) else value
+
+
+def _run_request(coro, *, parent_agent, timeout: float):
+    from mclaw.tools.dispatch import _run_async
+
+    return _run_async(
+        coro,
+        parent_agent=parent_agent,
+        diagnostic_name="web_search_dashscope_http",
+        timeout_seconds=timeout,
+        raise_on_stop=True,
+    )
 
 
 def _uses_multimodal_api(model: str) -> bool:
@@ -130,8 +153,11 @@ def search(
     creds: dict,
     timeout: float,
     limit: int = 5,
+    parent_agent=None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """Return a Qwen-generated answer plus native DashScope source links."""
+    cancellation_checkpoint(cancel_event)
     profile = get_search_backend_profile("dashscope")
     profile_metadata = profile.tool_metadata()
     api_key = creds.get("api_key", "")
@@ -190,16 +216,25 @@ def search(
     }
 
     if multimodal:
-        responses = _call_multimodal(
-            **request,
-            messages=[{"role": "user", "content": [{"text": prompt}]}],
-            stream=True,
-            incremental_output=True,
+        responses = _run_request(
+            _invoke_call(
+                _call_multimodal,
+                {
+                    **request,
+                    "messages": [{"role": "user", "content": [{"text": prompt}]}],
+                    "stream": True,
+                    "incremental_output": True,
+                },
+            ),
+            parent_agent=parent_agent,
+            timeout=timeout,
         )
+        cancellation_checkpoint(cancel_event)
         answer_parts: list[str] = []
         raw_sources: list[dict[str, Any]] = []
         search_seen = False
         for response in responses:
+            cancellation_checkpoint(cancel_event)
             answer_part, response_sources, response_search_seen, error = _response_parts(response)
             if error:
                 return {
@@ -215,12 +250,20 @@ def search(
             search_seen = search_seen or response_search_seen
         answer = "".join(answer_parts)
     else:
-        response = _call_generation(
-            **request,
-            messages=[{"role": "user", "content": prompt}],
-            result_format="message",
-            enable_text_image_mixed=bool(images),
+        response = _run_request(
+            _invoke_call(
+                _call_generation,
+                {
+                    **request,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "result_format": "message",
+                    "enable_text_image_mixed": bool(images),
+                },
+            ),
+            parent_agent=parent_agent,
+            timeout=timeout,
         )
+        cancellation_checkpoint(cancel_event)
         answer, raw_sources, search_seen, error = _response_parts(response)
         if error:
             return {
@@ -230,6 +273,8 @@ def search(
                 "_backend_profile": profile_metadata,
                 "_hint": "Check the configured DashScope model and service status.",
             }
+
+    cancellation_checkpoint(cancel_event)
 
     if not search_seen:
         return {

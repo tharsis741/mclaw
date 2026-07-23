@@ -76,6 +76,13 @@ class RuntimeSessionState:
         self.active_tools.clear()
         if final_result.get("pending_skill_import_confirmation"):
             self.set_status(RuntimeStatus.WAITING_FOR_USER, "Waiting for skill confirmation")
+        elif final_result.get("abort_reason") == "tool_timeout":
+            self.set_status(RuntimeStatus.ERROR, "Tool execution timed out")
+        elif final_result.get("abort_reason") == "tool_completion_unknown":
+            self.set_status(
+                RuntimeStatus.ERROR,
+                str(final_result.get("abort_message") or "Tool completion is unknown"),
+            )
         elif final_result.get("interrupted"):
             self.set_status(RuntimeStatus.INTERRUPTED, "Interrupted")
         elif final_result.get("error"):

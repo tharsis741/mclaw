@@ -15,6 +15,7 @@ import logging
 from typing import Any
 
 from mclaw.cli.config import ConfigError
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 from mclaw.tools.search.config import load_search_config
 from mclaw.tools.search.credentials import (
@@ -24,6 +25,15 @@ from mclaw.tools.search.credentials import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _cancelled_result() -> str:
+    return tool_error(
+        "Web search interrupted by user",
+        success=False,
+        interrupted=True,
+        status="cancelled",
+    )
 
 
 def diagnose_web_search_requirements(config: dict | None = None) -> dict:
@@ -104,6 +114,10 @@ def web_search(
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
         return tool_error("limit must be an integer between 1 and 10", success=False)
 
+    cancel_event = get_interrupt_event()
+    if cancel_event is not None and cancel_event.is_set():
+        return _cancelled_result()
+
     logger.info("Web search: %s (limit=%d)", query[:80], limit)
 
     from mclaw.tools.search.router import execute_search
@@ -113,9 +127,20 @@ def web_search(
             query=query,
             limit=limit,
             parent_agent=parent_agent,
+            cancel_event=cancel_event,
         )
+    except InterruptedError:
+        return _cancelled_result()
     except ConfigError as exc:
+        if cancel_event is not None and cancel_event.is_set():
+            return _cancelled_result()
         return tool_error(f"Configuration error: {exc}", success=False)
+
+    if (
+        (cancel_event is not None and cancel_event.is_set())
+        or result.get("interrupted")
+    ):
+        return _cancelled_result()
 
     if not result.get("success"):
         return tool_error(

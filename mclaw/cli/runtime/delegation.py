@@ -13,6 +13,9 @@ from dataclasses import dataclass
 from typing import Any
 
 from mclaw.prompts.delegation import build_delegate_synthesis_extra_system
+from mclaw.tools.interrupt import get_interrupt_event
+
+_SYNTHESIS_CANCEL_UNWIND_GRACE_SECONDS = 0.2
 
 
 @dataclass(frozen=True)
@@ -42,6 +45,10 @@ class RuntimeDelegationHooks:
     render_synthesis_timeout: Callable[[], None]
     log_info: Callable[[str, tuple[Any, ...]], None]
     log_warning: Callable[[str, tuple[Any, ...]], None]
+    register_synthesis_worker: Callable[[threading.Thread], None] | None = None
+    unregister_synthesis_worker: Callable[[threading.Thread], None] | None = None
+    get_abort_details: Callable[[], dict[str, str]] = lambda: {}
+    render_abort: Callable[[str], None] = lambda _message: None
 
 
 class RuntimeDelegationCoordinator:
@@ -68,7 +75,11 @@ class RuntimeDelegationCoordinator:
         self.render_settle_seconds = render_settle_seconds
         self.synthesis_timeout_seconds = synthesis_timeout_seconds
 
-    def handle_pending_delegate(self, result: dict[str, Any]) -> bool:
+    def handle_pending_delegate(
+        self,
+        result: dict[str, Any],
+        cancel_event: threading.Event | None = None,
+    ) -> bool:
         """Resolve one pending delegation payload and optionally run synthesis."""
         if not result.get("pending_delegate"):
             return False
@@ -78,8 +89,11 @@ class RuntimeDelegationCoordinator:
         num_tasks = int(pending_data.get("num_tasks") or 1)
         task_info = pending_data.get("task_info", {}) or {}
         goals = task_info.get("goals", []) or []
+        if cancel_event is None:
+            cancel_event = get_interrupt_event()
 
         manager = self.hooks.make_subtask_manager(num_tasks, goals)
+        setattr(manager, "delegation_id", task_id)
         self.hooks.set_subtask_manager(manager)
         self.hooks.replay_pending_subagent_events(manager)
         self.hooks.update_subagent_status()
@@ -88,13 +102,23 @@ class RuntimeDelegationCoordinator:
         self.hooks.invalidate()
         self.hooks.log_info("[DELEGATE TUI] polling started task_id=%s num_tasks=%s", (task_id, num_tasks))
 
-        self.hooks.sleep(self.startup_delay_seconds)
-        pending_result = self._poll_result(task_id, manager)
+        if cancel_event is not None:
+            cancel_event.wait(max(0.0, self.startup_delay_seconds))
+        else:
+            self.hooks.sleep(self.startup_delay_seconds)
+        pending_result = self._poll_result(task_id, manager, cancel_event)
+        if cancel_event is not None and cancel_event.is_set():
+            return self._finish_cancelled(result, task_id)
         if pending_result is None:
             self.hooks.log_warning("[DELEGATE TUI] result timeout or missing task_id=%s", (task_id,))
 
         self.hooks.invalidate()
-        self.hooks.sleep(self.render_settle_seconds)
+        if cancel_event is not None:
+            cancel_event.wait(max(0.0, self.render_settle_seconds))
+            if cancel_event.is_set():
+                return self._finish_cancelled(result, task_id)
+        else:
+            self.hooks.sleep(self.render_settle_seconds)
 
         self.hooks.set_aggregating_status()
         synthesis_prompt = self._render_result(pending_result)
@@ -102,10 +126,40 @@ class RuntimeDelegationCoordinator:
         self.hooks.emit_delegation_completed(pending_result or {})
 
         if synthesis_prompt:
-            self._run_synthesis(synthesis_prompt)
+            self._run_synthesis(synthesis_prompt, cancel_event)
+            if cancel_event is not None and cancel_event.is_set():
+                result["interrupted"] = True
+                result["completed"] = False
+                self._apply_abort_details(result)
         return True
 
-    def _poll_result(self, task_id: str, manager: Any) -> dict[str, Any] | None:
+    def _finish_cancelled(self, result: dict[str, Any], task_id: str) -> bool:
+        """Close the parent-side delegation UI without waiting for stale children."""
+        result["interrupted"] = True
+        result["completed"] = False
+        self._apply_abort_details(result)
+        self.hooks.clear_subagent_state()
+        self.hooks.emit_delegation_completed({"task_id": task_id, "interrupted": True})
+        self.hooks.invalidate()
+        return True
+
+    def _apply_abort_details(self, result: dict[str, Any]) -> None:
+        details = self.hooks.get_abort_details() or {}
+        abort_reason = str(details.get("abort_reason") or "")
+        abort_message = str(details.get("abort_message") or "")
+        if abort_reason:
+            result["abort_reason"] = abort_reason
+            result["stop_reason"] = abort_reason
+        if abort_message:
+            result["abort_message"] = abort_message
+            self.hooks.render_abort(abort_message)
+
+    def _poll_result(
+        self,
+        task_id: str,
+        manager: Any,
+        cancel_event: threading.Event | None = None,
+    ) -> dict[str, Any] | None:
         """Poll the subagent result queue with completion-event grace windows."""
         deadline = (
             None
@@ -113,6 +167,8 @@ class RuntimeDelegationCoordinator:
             else time.time() + max(0.0, self.poll_timeout_seconds)
         )
         while deadline is None or time.time() < deadline:
+            if cancel_event is not None and cancel_event.is_set():
+                return None
             pending_result = self.hooks.get_pending_result(task_id, 0.2)
             if pending_result:
                 self.hooks.log_info("[DELEGATE TUI] result received task_id=%s", (task_id,))
@@ -121,6 +177,8 @@ class RuntimeDelegationCoordinator:
                 self.hooks.log_info("[DELEGATE TUI] completion event set task_id=%s; entering queue grace", (task_id,))
                 grace_deadline = time.time() + max(0.0, self.queue_grace_seconds)
                 while time.time() < grace_deadline:
+                    if cancel_event is not None and cancel_event.is_set():
+                        return None
                     pending_result = self.hooks.get_pending_result(task_id, 0.3)
                     if pending_result:
                         self.hooks.log_info("[DELEGATE TUI] result received during grace task_id=%s", (task_id,))
@@ -129,8 +187,12 @@ class RuntimeDelegationCoordinator:
             self.hooks.invalidate()
             self.hooks.sleep(0.05)
 
+        if cancel_event is not None and cancel_event.is_set():
+            return None
         if _completion_event_is_set(manager):
             for _ in range(max(0, self.final_attempts)):
+                if cancel_event is not None and cancel_event.is_set():
+                    return None
                 pending_result = self.hooks.get_pending_result(task_id, self.final_attempt_timeout_seconds)
                 if pending_result:
                     self.hooks.log_info("[DELEGATE TUI] result received during final fallback task_id=%s", (task_id,))
@@ -148,8 +210,14 @@ class RuntimeDelegationCoordinator:
             self.hooks.render_display_error(str(exc))
             return ""
 
-    def _run_synthesis(self, synthesis_prompt: str) -> None:
+    def _run_synthesis(
+        self,
+        synthesis_prompt: str,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
         """Run parent synthesis in a worker so UI timeout policy stays local."""
+        if cancel_event is not None and cancel_event.is_set():
+            return
         self.hooks.set_synthesis_status()
         self.hooks.invalidate()
         self.hooks.clear_stream_state()
@@ -162,14 +230,38 @@ class RuntimeDelegationCoordinator:
             except Exception as exc:
                 self.hooks.log_warning("Synthesis error: %s", (exc,))
                 result_container[0] = {"final_response": None, "error": str(exc)}
+            finally:
+                if self.hooks.unregister_synthesis_worker is not None:
+                    self.hooks.unregister_synthesis_worker(threading.current_thread())
 
         thread = threading.Thread(target=_target, daemon=True)
-        thread.start()
-        if self.synthesis_timeout_seconds is None:
-            thread.join()
-        else:
-            thread.join(timeout=max(0.0, self.synthesis_timeout_seconds))
+        if self.hooks.register_synthesis_worker is not None:
+            self.hooks.register_synthesis_worker(thread)
+        try:
+            thread.start()
+        except BaseException:
+            if self.hooks.unregister_synthesis_worker is not None:
+                self.hooks.unregister_synthesis_worker(thread)
+            raise
+        deadline = (
+            None
+            if self.synthesis_timeout_seconds is None
+            else time.monotonic() + max(0.0, self.synthesis_timeout_seconds)
+        )
+        while thread.is_alive():
+            if cancel_event is not None and cancel_event.wait(0.05):
+                thread.join(_SYNTHESIS_CANCEL_UNWIND_GRACE_SECONDS)
+                return
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                thread.join(timeout=min(0.05, remaining))
+            else:
+                thread.join(timeout=0.05)
 
+        if cancel_event is not None and cancel_event.is_set():
+            return
         synth_result = result_container[0] or {"final_response": None}
         if synth_result.get("final_response"):
             self.hooks.render_synthesis_response(synth_result)

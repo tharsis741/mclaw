@@ -7,15 +7,20 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import threading
 from collections.abc import Callable, Iterable
 from typing import Any
 
 from mclaw.cli.config import get_env_value, save_env_value
 from mclaw.constants import get_mclaw_home
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_cancel_id, safe_cancel_trace
 from mclaw.utils import atomic_json_write
 
+logger = logging.getLogger(__name__)
 ENV_VAR_RE = re.compile(r"^[A-Z_][A-Z0-9_]{0,63}$")
 ALLOWLIST_FILENAME = "secret_allowlist.json"
 ALLOWLIST_VERSION = 1
@@ -209,16 +214,19 @@ def secret_request_many(
     prompt_callback: Callable[[str, list[dict[str, str]]], dict[str, Any] | None] | None = None,
     *,
     force_refresh: bool = False,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Coordinate secret prompts, storage, and scoped authorization.
 
     Plaintext values can be saved through config helpers but are never returned
     in the result payload; callers receive only env var names and status lists.
     """
+    cancellation_checkpoint(cancel_event)
     bucket, _scope_id = parse_scope(required_for)
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     for item in secrets or []:
+        cancellation_checkpoint(cancel_event)
         secret = _normalize_secret_item(item)
         env_var = secret["env_var"]
         if env_var in seen:
@@ -234,6 +242,7 @@ def secret_request_many(
     needs_prompt: list[dict[str, str]] = []
 
     for secret in normalized:
+        cancellation_checkpoint(cancel_event)
         env_var = secret["env_var"]
         has_value = bool(get_env_value(env_var))
         if has_value and is_authorized(required_for, env_var) and not force_refresh:
@@ -248,7 +257,15 @@ def secret_request_many(
 
     response: dict[str, Any] = {}
     if needs_prompt and prompt_callback is not None:
-        response = prompt_callback(required_for, needs_prompt) or {}
+        cancellation_checkpoint(cancel_event)
+        try:
+            response = prompt_callback(required_for, needs_prompt) or {}
+        except BaseException:
+            cancellation_checkpoint(cancel_event)
+            raise
+        # The prompt can block while another thread cancels the turn.  This
+        # checkpoint is deliberately before parsing or persisting its response.
+        cancellation_checkpoint(cancel_event)
     values = response.get("values", {}) if isinstance(response.get("values"), dict) else {}
     requested_authorized = response.get("authorized", [])
     if isinstance(requested_authorized, str):
@@ -262,7 +279,10 @@ def secret_request_many(
         for item in requested_authorized
         if str(item or "").strip()
     }
+    cancellation_checkpoint(cancel_event)
 
+    # Commit point: once persistence starts, finish the matching allowlist
+    # updates and return the committed result even if cancellation arrives.
     for need in needs_prompt:
         env_var = need["env_var"]
         if env_var in requested_skipped:
@@ -287,6 +307,18 @@ def secret_request_many(
         if prompt_callback is None:
             skipped.append(env_var)
         missing.append(env_var)
+
+    if cancel_event is not None and cancel_event.is_set():
+        safe_cancel_trace(
+            lambda: logger.info(
+                "[CANCEL_TRACE] secret_commit_completed_after_cancel "
+                "cancel_id=%s scope=%s configured_count=%d authorized_count=%d",
+                get_cancel_id(cancel_event),
+                required_for,
+                len(set(configured)),
+                len(set(authorized_now)),
+            )
+        )
 
     return {
         "success": not missing and not skipped,

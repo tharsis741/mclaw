@@ -53,9 +53,13 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from mclaw.constants import get_mclaw_home
+from mclaw.runtime.process import run_captured_process
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -336,6 +340,21 @@ def _git_env(
     return env
 
 
+def _remove_index_lock(index_file: Optional[Path], *, reason: str) -> None:
+    """Remove the lock left by a stopped Git command using this private index."""
+    if index_file is None:
+        return
+    lock_path = Path(f"{index_file}.lock")
+    try:
+        lock_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        logger.warning("Could not remove %s checkpoint index lock: %s", reason, lock_path)
+    else:
+        logger.info("[CANCEL_TRACE] checkpoint_index_lock_removed reason=%s path=%s", reason, lock_path)
+
+
 def _run_git(
     args: List[str],
     store: Path,
@@ -364,15 +383,12 @@ def _run_git(
     cmd = ["git"] + list(args)
     allowed_returncodes = allowed_returncodes or set()
     try:
-        result = subprocess.run(
+        result = run_captured_process(
             cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
             timeout=timeout,
             env=env,
             cwd=str(normalized_working_dir),
+            cancel_event=get_interrupt_event(),
         )
         ok = result.returncode == 0
         stdout = result.stdout.strip()
@@ -383,7 +399,11 @@ def _run_git(
                 " ".join(cmd), result.returncode, stderr,
             )
         return ok, stdout, stderr
+    except InterruptedError:
+        _remove_index_lock(index_file, reason="cancelled")
+        raise
     except subprocess.TimeoutExpired:
+        _remove_index_lock(index_file, reason="timed-out")
         msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
         logger.error(msg, exc_info=True)
         return False, "", msg
@@ -396,6 +416,8 @@ def _run_git(
         logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
         return False, "", msg
     except Exception as exc:
+        if getattr(exc, "termination_fence", None) is not None:
+            raise
         logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
         return False, "", str(exc)
 
@@ -446,13 +468,17 @@ def _init_store(store: Path) -> Optional[str]:
               "GIT_ALTERNATE_OBJECT_DIRECTORIES"):
         init_env.pop(k, None)
     try:
-        result = subprocess.run(
+        result = run_captured_process(
             ["git", "init", "--bare", str(store)],
-            capture_output=True, text=True,
-            env=init_env, timeout=_GIT_TIMEOUT,
+            env=init_env,
+            cwd=str(base),
+            timeout=_GIT_TIMEOUT,
+            cancel_event=get_interrupt_event(),
         )
         if result.returncode != 0:
             return f"Shadow store init failed: {result.stderr.strip()}"
+    except InterruptedError:
+        raise
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         return f"Shadow store init failed: {exc}"
 
@@ -538,14 +564,21 @@ def _list_projects(store: Path) -> List[Dict]:
     return out
 
 
-def _dir_file_count(path: str) -> int:
+def _dir_file_count(
+    path: str,
+    cancel_event: threading.Event | None = None,
+) -> int:
     """Quick file count estimate (stops early if over _MAX_FILES)."""
+    cancel_event = cancel_event or get_interrupt_event()
     count = 0
     try:
         for _ in Path(path).rglob("*"):
+            cancellation_checkpoint(cancel_event)
             count += 1
             if count > _MAX_FILES:
                 return count
+    except InterruptedError:
+        raise
     except (PermissionError, OSError):
         pass
     return count
@@ -553,14 +586,18 @@ def _dir_file_count(path: str) -> int:
 
 def _dir_size_bytes(path: Path) -> int:
     """Best-effort recursive size in bytes.  Returns 0 on error."""
+    cancel_event = get_interrupt_event()
     total = 0
     try:
         for p in path.rglob("*"):
+            cancellation_checkpoint(cancel_event)
             try:
                 if p.is_file():
                     total += p.stat().st_size
             except OSError:
                 continue
+    except InterruptedError:
+        raise
     except OSError:
         pass
     return total
@@ -690,7 +727,11 @@ class CheckpointManager:
                 else:
                     self._checkpointed_dirs.add(abs_dir)
             return taken
+        except InterruptedError:
+            raise
         except Exception as e:
+            if getattr(e, "termination_fence", None) is not None:
+                raise
             logger.debug("Checkpoint failed (non-fatal): %s", e)
             self._record_attempt("failed", abs_dir, reason, detail=str(e))
             return False
@@ -720,7 +761,11 @@ class CheckpointManager:
 
         try:
             return self._take(abs_dir, reason, metadata=metadata, target_paths=target_paths)
+        except InterruptedError:
+            raise
         except Exception as e:
+            if getattr(e, "termination_fence", None) is not None:
+                raise
             logger.debug("Forced checkpoint failed (non-fatal): %s", e)
             self._record_attempt("failed", abs_dir, reason, detail=str(e))
             return False
@@ -1019,6 +1064,7 @@ class CheckpointManager:
         oversize: List[str] = []
         seen: Set[str] = set()
         for item in target_paths:
+            cancellation_checkpoint(get_interrupt_event())
             if not item:
                 continue
             path = _normalize_path(str(item))
@@ -1255,6 +1301,7 @@ class CheckpointManager:
     ) -> None:
         """Force-stage only the explicit targets tracked by a targeted checkpoint."""
         for rel in target_info.get("rel", []):
+            cancellation_checkpoint(get_interrupt_event())
             if rel in target_info.get("oversize", []):
                 _run_git(["rm", "--cached", "--ignore-unmatch", "--", rel], store, working_dir, index_file=index_file)
                 continue
@@ -1368,6 +1415,7 @@ class CheckpointManager:
         abs_workdir = _normalize_path(working_dir)
         oversize: List[str] = []
         for rel in paths:
+            cancellation_checkpoint(get_interrupt_event())
             try:
                 size = (abs_workdir / rel).stat().st_size
             except OSError:
@@ -1384,6 +1432,7 @@ class CheckpointManager:
         # Chunk into manageable batches.
         BATCH = 200
         for i in range(0, len(oversize), BATCH):
+            cancellation_checkpoint(get_interrupt_event())
             chunk = oversize[i:i + BATCH]
             _run_git(
                 ["rm", "--cached", "--quiet", "--"] + chunk,

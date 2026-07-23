@@ -13,10 +13,13 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 from typing import Any
 
 from mclaw.tools.dispatch import get_current_session_id, get_session_db
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -63,15 +66,23 @@ def _resolve_workspace(parent_agent: Any = None) -> str:
     return str(getattr(parent_agent, "workspace_path", "") or "").strip()
 
 
-def _resolve_to_parent(session_id: str, db: Any) -> str:
+def _resolve_to_parent(
+    session_id: str,
+    db: Any,
+    cancel_event: threading.Event | None = None,
+) -> str:
     """Walk a session parent chain to the root session."""
     visited = set()
     sid = session_id
     while sid and sid not in visited:
+        cancellation_checkpoint(cancel_event)
         visited.add(sid)
         try:
             session = db.get_session(sid)
+        except InterruptedError:
+            raise
         except Exception:
+            cancellation_checkpoint(cancel_event)
             break
         if not session:
             break
@@ -79,6 +90,7 @@ def _resolve_to_parent(session_id: str, db: Any) -> str:
         if not parent:
             break
         sid = parent
+    cancellation_checkpoint(cancel_event)
     return sid
 
 
@@ -95,10 +107,14 @@ def _format_timestamp(ts: Any) -> str:
         return str(ts)
 
 
-def _build_conversation_text(messages: list[dict[str, Any]]) -> str:
+def _build_conversation_text(
+    messages: list[dict[str, Any]],
+    cancel_event: threading.Event | None = None,
+) -> str:
     """Render stored messages into a compact transcript for summarization."""
     parts: list[str] = []
     for msg in messages:
+        cancellation_checkpoint(cancel_event)
         role = str(msg.get("role") or "unknown").upper()
         content = msg.get("content") or ""
         if isinstance(content, list):
@@ -125,6 +141,7 @@ def _build_conversation_text(messages: list[dict[str, Any]]) -> str:
         if len(content) > 4_000:
             content = f"{content[:2_500]}\n...[truncated]...\n{content[-1_000:]}"
         parts.append(f"[{role}] {content}")
+    cancellation_checkpoint(cancel_event)
     return "\n\n".join(parts)
 
 
@@ -213,8 +230,10 @@ def _summarize_conversation(
     query: str,
     session_meta: dict[str, Any],
     parent_agent: Any = None,
+    cancel_event: threading.Event | None = None,
 ) -> tuple[str, bool, str | None]:
     """Summarize a matched session, returning a preview fallback on LLM failure."""
+    cancellation_checkpoint(cancel_event)
     system_prompt = (
         "你在为当前 Agent 召回历史会话。围绕检索主题输出中文事实摘要。"
         "保留用户目标、已做操作、关键决定、命令、文件路径、错误、结果和未解决事项。"
@@ -230,6 +249,7 @@ def _summarize_conversation(
     try:
         from mclaw.agent.auxiliary_client import call_auxiliary_llm
 
+        cancellation_checkpoint(cancel_event)
         summary = _strip_reasoning_blocks(call_auxiliary_llm(
             task="session_search",
             messages=[
@@ -240,6 +260,7 @@ def _summarize_conversation(
             temperature=0.1,
             max_tokens=MAX_SUMMARY_TOKENS,
         ))
+        cancellation_checkpoint(cancel_event)
         if summary:
             logger.info(
                 "session_search summarizer returned summary: query=%r source=%s summary_len=%d",
@@ -255,7 +276,10 @@ def _summarize_conversation(
             )
             return summary, False, None
         summary_error = "Auxiliary model returned an empty summary."
+    except InterruptedError:
+        raise
     except Exception as exc:
+        cancellation_checkpoint(cancel_event)
         summary_error = _safe_error_detail(exc)
         logger.warning("Session summarization unavailable: %s", summary_error)
     fallback = _fallback_summary(conversation_text)
@@ -280,16 +304,29 @@ def _build_session_summary(
     query: str,
     match_info: dict[str, Any],
     parent_agent: Any = None,
+    cancel_event: threading.Event | None = None,
 ) -> dict[str, Any] | None:
     """Build one search result by loading, trimming, and summarizing a session."""
+    cancellation_checkpoint(cancel_event)
     session_meta = db.get_session(session_id) or {}
+    cancellation_checkpoint(cancel_event)
     messages = db.get_messages_as_conversation(session_id)
+    cancellation_checkpoint(cancel_event)
     if not messages:
         return None
 
-    conversation_text = _build_conversation_text(messages)
+    conversation_text = _build_conversation_text(messages, cancel_event=cancel_event)
+    cancellation_checkpoint(cancel_event)
     conversation_text = _truncate_around_matches(conversation_text, query)
-    summary, fallback, summary_error = _summarize_conversation(conversation_text, query, session_meta, parent_agent)
+    cancellation_checkpoint(cancel_event)
+    summary, fallback, summary_error = _summarize_conversation(
+        conversation_text,
+        query,
+        session_meta,
+        parent_agent,
+        cancel_event=cancel_event,
+    )
+    cancellation_checkpoint(cancel_event)
 
     entry = {
         "session_id": session_id,
@@ -323,18 +360,26 @@ def _list_recent_sessions(
     limit: int,
     current_session_id: str,
     workspace: str = "",
+    cancel_event: threading.Event | None = None,
 ) -> list[dict[str, Any]]:
     """List recent session metadata while hiding tool-only and current-root sessions."""
+    cancellation_checkpoint(cancel_event)
     rows = db.list_sessions_rich(
         exclude_sources=list(_HIDDEN_SESSION_SOURCES),
         limit=limit + 5,
         workspace=workspace or None,
     )
-    current_root = _resolve_to_parent(current_session_id, db) if current_session_id else None
+    cancellation_checkpoint(cancel_event)
+    current_root = (
+        _resolve_to_parent(current_session_id, db, cancel_event=cancel_event)
+        if current_session_id
+        else None
+    )
     results = []
     for row in rows:
+        cancellation_checkpoint(cancel_event)
         sid = row.get("id", "")
-        resolved = _resolve_to_parent(sid, db) if sid else sid
+        resolved = _resolve_to_parent(sid, db, cancel_event=cancel_event) if sid else sid
         if current_root and resolved == current_root:
             continue
         results.append({
@@ -348,17 +393,21 @@ def _list_recent_sessions(
         })
         if len(results) >= limit:
             break
+    cancellation_checkpoint(cancel_event)
     return results
 
 
-def session_search(
+def _session_search(
     query: str = "",
     role_filter: str | None = None,
     limit: int = DEFAULT_LIMIT,
     parent_agent: Any = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Search past sessions by keyword or browse recent session metadata."""
+    cancellation_checkpoint(cancel_event)
     db = _resolve_db(parent_agent)
+    cancellation_checkpoint(cancel_event)
     if db is None:
         return tool_error("Session database not available.", success=False)
 
@@ -367,7 +416,14 @@ def session_search(
     workspace = _resolve_workspace(parent_agent)
 
     if not query or not str(query).strip():
-        recent = _list_recent_sessions(db, limit, current_session_id, workspace=workspace)
+        recent = _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            workspace=workspace,
+            cancel_event=cancel_event,
+        )
+        cancellation_checkpoint(cancel_event)
         return json.dumps({
             "success": True,
             "mode": "recent",
@@ -379,6 +435,7 @@ def session_search(
     role_list = [r.strip() for r in role_filter.split(",") if r.strip()] if role_filter else None
 
     try:
+        cancellation_checkpoint(cancel_event)
         raw_results = db.search_messages(
             query=query,
             role_filter=role_list,
@@ -387,7 +444,11 @@ def session_search(
             offset=0,
             workspace=workspace or None,
         )
+        cancellation_checkpoint(cancel_event)
+    except InterruptedError:
+        raise
     except Exception as exc:
+        cancellation_checkpoint(cancel_event)
         detail = _safe_error_detail(exc)
         logger.warning("Session search query failed: %s", detail, exc_info=True)
         return tool_error(
@@ -400,6 +461,7 @@ def session_search(
         )
 
     if not raw_results:
+        cancellation_checkpoint(cancel_event)
         return json.dumps({
             "success": True,
             "mode": "search",
@@ -410,13 +472,18 @@ def session_search(
             "message": "No matching sessions found.",
         }, ensure_ascii=False)
 
-    current_root = _resolve_to_parent(current_session_id, db) if current_session_id else None
+    current_root = (
+        _resolve_to_parent(current_session_id, db, cancel_event=cancel_event)
+        if current_session_id
+        else None
+    )
     seen_sessions: dict[str, dict[str, Any]] = {}
     for result in raw_results:
+        cancellation_checkpoint(cancel_event)
         raw_sid = result.get("session_id", "")
         if not raw_sid:
             continue
-        resolved_sid = _resolve_to_parent(raw_sid, db)
+        resolved_sid = _resolve_to_parent(raw_sid, db, cancel_event=cancel_event)
         if current_root and resolved_sid == current_root:
             continue
         if resolved_sid not in seen_sessions:
@@ -427,11 +494,22 @@ def session_search(
     summaries: list[dict[str, Any]] = []
     partial_errors: list[dict[str, str]] = []
     for sid, match_info in seen_sessions.items():
+        cancellation_checkpoint(cancel_event)
         try:
-            summary = _build_session_summary(db, sid, query, match_info, parent_agent)
+            summary = _build_session_summary(
+                db,
+                sid,
+                query,
+                match_info,
+                parent_agent,
+                cancel_event=cancel_event,
+            )
             if summary:
                 summaries.append(summary)
+        except InterruptedError:
+            raise
         except Exception as exc:
+            cancellation_checkpoint(cancel_event)
             detail = _safe_error_detail(exc)
             logger.warning("Failed to summarize session %s: %s", sid, detail, exc_info=True)
             partial_errors.append({"session_id": sid, "error": detail})
@@ -446,7 +524,35 @@ def session_search(
     }
     if partial_errors:
         payload["partial_errors"] = partial_errors
+    cancellation_checkpoint(cancel_event)
     return json.dumps(payload, ensure_ascii=False)
+
+
+def session_search(
+    query: str = "",
+    role_filter: str | None = None,
+    limit: int = DEFAULT_LIMIT,
+    parent_agent: Any = None,
+) -> str:
+    """Run session recall with one shared turn cancellation event."""
+
+    cancel_event = get_interrupt_event()
+    try:
+        cancellation_checkpoint(cancel_event)
+        return _session_search(
+            query=query,
+            role_filter=role_filter,
+            limit=limit,
+            parent_agent=parent_agent,
+            cancel_event=cancel_event,
+        )
+    except InterruptedError as exc:
+        return tool_error(
+            str(exc),
+            success=False,
+            status="cancelled",
+            interrupted=True,
+        )
 
 
 SESSION_SEARCH_SCHEMA = {

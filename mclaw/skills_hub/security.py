@@ -7,26 +7,32 @@
 from __future__ import annotations
 
 import json
+import threading
 from pathlib import Path
 from typing import Any
 
 from mclaw.skills_hub.security_scan import format_scan_report, risk_label, scan_skill, should_allow_install
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 
 
-def review_skill_package(skill_dir: Path, *, source: str = "community") -> dict[str, Any]:
+def review_skill_package(
+    skill_dir: Path,
+    *,
+    source: str = "community",
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     """Run the guard scanner and serialize the install policy decision."""
-    result = scan_skill(skill_dir, source=source)
+    cancel_event = cancel_event or get_interrupt_event()
+    result = scan_skill(skill_dir, source=source, cancel_event=cancel_event)
+    cancellation_checkpoint(cancel_event)
     allowed, reason = should_allow_install(result)
     risk_level = risk_label(result.verdict)
     summary = result.summary
-    return {
-        "risk_level": risk_level,
-        "verdict": result.verdict,
-        "install_allowed": allowed,
-        "install_policy_reason": reason,
-        "summary": summary,
-        "scan_report": format_scan_report(result),
-        "findings": [
+    findings: list[dict[str, Any]] = []
+    for finding in result.findings:
+        cancellation_checkpoint(cancel_event)
+        findings.append(
             {
                 "pattern_id": finding.pattern_id,
                 "severity": finding.severity,
@@ -35,8 +41,16 @@ def review_skill_package(skill_dir: Path, *, source: str = "community") -> dict[
                 "line": finding.line,
                 "description": finding.description,
             }
-            for finding in result.findings
-        ],
+        )
+    cancellation_checkpoint(cancel_event)
+    return {
+        "risk_level": risk_level,
+        "verdict": result.verdict,
+        "install_allowed": allowed,
+        "install_policy_reason": reason,
+        "summary": summary,
+        "scan_report": format_scan_report(result),
+        "findings": findings,
     }
 
 

@@ -14,6 +14,8 @@ from typing import Any
 from mclaw.skills_hub import search
 from mclaw.skills_hub.models import ExternalSkill
 from mclaw.skills_hub.skill_store import list_skills, tree_skill, view_skill
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -124,12 +126,27 @@ def skill_tree(name: str, max_entries: int = 500, task_id: str | None = None) ->
         )
 
 
-def skill_search(query: str, task_id: str | None = None) -> str:
+def skill_search(
+    query: str,
+    task_id: str | None = None,
+    *,
+    parent_agent=None,
+) -> str:
     """Search ClawHub and return install suggestions that still require consent."""
+    cancel_event = get_interrupt_event()
     try:
-        results = search(query)
-        serialized = [_serialize_external_skill(item) for item in results]
+        cancellation_checkpoint(cancel_event)
+        search_kwargs = {"cancel_event": cancel_event}
+        if parent_agent is not None:
+            search_kwargs["parent_agent"] = parent_agent
+        results = search(query, **search_kwargs)
+        cancellation_checkpoint(cancel_event)
+        serialized = []
+        for item in results:
+            cancellation_checkpoint(cancel_event)
+            serialized.append(_serialize_external_skill(item))
         search_intent = _infer_search_intent(query, results)
+        cancellation_checkpoint(cancel_event)
         return json.dumps(
             {
                 "success": True,
@@ -150,7 +167,23 @@ def skill_search(query: str, task_id: str | None = None) -> str:
             },
             ensure_ascii=False,
         )
+    except InterruptedError as exc:
+        return tool_error(
+            str(exc),
+            success=False,
+            status="cancelled",
+            interrupted=True,
+        )
     except Exception as exc:
+        try:
+            cancellation_checkpoint(cancel_event)
+        except InterruptedError as cancel_exc:
+            return tool_error(
+                str(cancel_exc),
+                success=False,
+                status="cancelled",
+                interrupted=True,
+            )
         return tool_error(str(exc), success=False)
 
 
@@ -259,7 +292,11 @@ registry.register(
     name="skill_search",
     toolset="skills",
     schema=SKILL_SEARCH_SCHEMA,
-    handler=lambda args, **kw: skill_search(query=args.get("query", ""), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: skill_search(
+        query=args.get("query", ""),
+        task_id=kw.get("task_id"),
+        parent_agent=kw.get("parent_agent"),
+    ),
     description="Search ClawHub Skills",
     emoji="🔎",
 )

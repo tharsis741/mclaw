@@ -11,8 +11,10 @@ persistence, and recovery state remain ordered across CLI, channel, and
 scheduler runtimes.
 """
 
+import hashlib
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -39,12 +41,19 @@ from mclaw.agent.usage import UsageRecord
 from mclaw.prompts.background import build_memory_flush_system_prompt
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
-from mclaw.tools.interrupt import set_interrupt
-
+from mclaw.tools.interrupt import get_cancel_id, safe_cancel_trace
 logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
 _COMPRESSION_FALLBACK_TARGET_RATIO = 0.80
+
+# ponytail: one process-global commit lock keeps cancel/begin linearizable;
+# split it per workspace only if contention is ever measured.
+# Cancellation fences normally live on one MClaw instance.  A cancelled tool
+# can outlive that instance when a host replaces the session, though, so retain
+# cancelled agents by canonical workspace until their turn and workers drain.
+_WORKSPACE_ABORT_QUARANTINE_LOCK = threading.RLock()
+_WORKSPACE_ABORT_QUARANTINE: dict[str, list[Any]] = {}
 
 SKILL_WRITE_ACTIONS = frozenset({
     "create_scaffold",
@@ -83,6 +92,210 @@ def _redact_log_secrets(value: Any) -> Any:
                 redacted[key] = _redact_log_secrets(item)
         return redacted
     return value
+
+
+def _workspace_quarantine_key(workspace: str | None) -> str:
+    """Return a stable process-local key for a workspace."""
+    return os.path.normcase(os.path.realpath(os.path.abspath(workspace or os.getcwd())))
+
+
+def _workspace_log_id(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _safe_cancel_trace(log_fn: Callable[..., Any], message: str, *args: Any) -> None:
+    """Keep diagnostic logging from affecting cancellation state."""
+    safe_cancel_trace(lambda: log_fn(message, *args))
+
+
+def _workspace_abort_fence_status(agent: Any) -> tuple[bool, str | None]:
+    """Snapshot one cancelled agent without holding the registry lock."""
+    interrupt_lock = getattr(agent, "_interrupt_lock", None)
+    if interrupt_lock is None:
+        return False, None
+    with interrupt_lock:
+        turn_active = bool(getattr(agent, "_turn_active", False))
+        fenced_event = getattr(agent, "_workspace_abort_event", None)
+        current_event = getattr(agent, "_turn_cancel_event", None)
+
+    # The same MClaw may already have started a later, healthy turn after the
+    # cancelled generation drained.  A stale registry snapshot must not treat
+    # that new turn's workers as part of the old cancellation fence.
+    if turn_active and fenced_event is not current_event:
+        return False, None
+
+    persistent_reason = getattr(agent, "_persistent_turn_worker_reason", None)
+    if callable(persistent_reason):
+        reason = persistent_reason()
+        if reason:
+            return True, str(reason)
+
+    worker_reason = getattr(agent, "_turn_worker_block_reason", None)
+    if callable(worker_reason):
+        reason = worker_reason()
+        if reason:
+            return True, str(reason)
+
+    if turn_active:
+        return (
+            True,
+            "A cancelled turn in this workspace is still shutting down; "
+            "wait for it to finish before starting another turn",
+        )
+    return False, None
+
+
+def _publish_workspace_abort_fence(
+    agent: Any,
+) -> tuple[bool, str, threading.Event | None]:
+    """Make a cancelled turn visible to replacement agents in the workspace."""
+    key = getattr(agent, "_workspace_quarantine_key", None)
+    if not key:
+        key = f"agent:{id(agent)}"
+    event = getattr(agent, "_turn_cancel_event", None)
+    new_generation = getattr(agent, "_workspace_abort_event", None) is not event
+    agent._workspace_abort_event = event
+    with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+        bucket = _WORKSPACE_ABORT_QUARANTINE.setdefault(key, [])
+        if all(existing is not agent for existing in bucket):
+            bucket.append(agent)
+    return new_generation, key, event
+
+
+def _trace_workspace_abort_publish(
+    agent: Any,
+    trace: tuple[bool, str, threading.Event | None] | None,
+) -> None:
+    if trace is None or not trace[0]:
+        return
+    try:
+        args = (
+            get_cancel_id(trace[2]),
+            getattr(agent, "session_id", "?"),
+            _workspace_log_id(trace[1]),
+            getattr(agent, "_turn_worker_log_snapshot", lambda: "[]")(),
+        )
+    except BaseException:
+        return
+    _safe_cancel_trace(
+        logger.warning,
+        "[CANCEL_TRACE] quarantine_publish cancel_id=%s session=%s "
+        "workspace_id=%s workers=%s",
+        *args,
+    )
+
+
+def _workspace_abort_block_reason(
+    key: str,
+    *,
+    exclude: Any = None,
+) -> tuple[
+    str | None,
+    list[tuple[Any, threading.Event | None]],
+    list[tuple[Any, threading.Event | None]],
+]:
+    """Return a live cancellation fence while pruning agents that have drained."""
+    with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+        snapshot = [
+            (agent, getattr(agent, "_workspace_abort_event", None))
+            for agent in _WORKSPACE_ABORT_QUARANTINE.get(key, ())
+        ]
+
+    resolved: list[tuple[Any, threading.Event | None]] = []
+    live_agents: list[tuple[Any, threading.Event | None]] = []
+    reasons: list[str] = []
+    for agent, generation in snapshot:
+        if agent is exclude:
+            continue
+        live, reason = _workspace_abort_fence_status(agent)
+        if live:
+            live_agents.append((agent, generation))
+            if reason:
+                reasons.append(reason)
+        else:
+            resolved.append((agent, generation))
+
+    if resolved:
+        resolved_generations = {id(agent): generation for agent, generation in resolved}
+        with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+            current = _WORKSPACE_ABORT_QUARANTINE.get(key)
+            if current is not None:
+                current[:] = [
+                    agent
+                    for agent in current
+                    if not (
+                        id(agent) in resolved_generations
+                        and getattr(agent, "_workspace_abort_event", None)
+                        is resolved_generations[id(agent)]
+                    )
+                ]
+                if not current:
+                    _WORKSPACE_ABORT_QUARANTINE.pop(key, None)
+    return (reasons[0] if reasons else None), resolved, live_agents
+
+
+def _trace_workspace_abort_scan(
+    key: str,
+    reason: str | None,
+    resolved: list[tuple[Any, threading.Event | None]],
+    live_agents: list[tuple[Any, threading.Event | None]],
+) -> None:
+    if resolved:
+        _safe_cancel_trace(
+            logger.info,
+            "[CANCEL_TRACE] quarantine_prune workspace_id=%s sessions=%s cancel_ids=%s",
+            _workspace_log_id(key),
+            [getattr(agent, "session_id", "?") for agent, _event in resolved],
+            [get_cancel_id(event) for _agent, event in resolved],
+        )
+    if reason:
+        owners = [
+            (
+                getattr(agent, "session_id", "?"),
+                get_cancel_id(event),
+            )
+            for agent, event in live_agents
+        ]
+        _safe_cancel_trace(
+            logger.warning,
+            "[CANCEL_TRACE] quarantine_block workspace_id=%s owners=%s reason=%s",
+            _workspace_log_id(key),
+            owners,
+            reason,
+        )
+
+
+def _clear_workspace_abort_fence(
+    agent: Any,
+) -> tuple[bool, str, threading.Event | None]:
+    """Drop this agent's resolved generation before committing its next turn."""
+    key = getattr(agent, "_workspace_quarantine_key", f"agent:{id(agent)}")
+    removed = False
+    with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+        current = _WORKSPACE_ABORT_QUARANTINE.get(key)
+        if current is not None:
+            remaining = [item for item in current if item is not agent]
+            removed = len(remaining) != len(current)
+            if remaining:
+                _WORKSPACE_ABORT_QUARANTINE[key] = remaining
+            else:
+                _WORKSPACE_ABORT_QUARANTINE.pop(key, None)
+    return removed, key, getattr(agent, "_workspace_abort_event", None)
+
+
+def _trace_workspace_abort_clear(
+    agent: Any,
+    trace: tuple[bool, str, threading.Event | None] | None,
+) -> None:
+    if trace is None or not trace[0]:
+        return
+    _safe_cancel_trace(
+        logger.info,
+        "[CANCEL_TRACE] quarantine_prune workspace_id=%s sessions=%s cancel_ids=%s",
+        _workspace_log_id(trace[1]),
+        [getattr(agent, "session_id", "?")],
+        [get_cancel_id(trace[2])],
+    )
 
 
 class MClaw:
@@ -141,6 +354,7 @@ class MClaw:
 
         self.session_id = session_id or f"session_{uuid.uuid4().hex[:12]}"
         self.workspace_path = str(workspace or "").strip()
+        self._workspace_quarantine_key = _workspace_quarantine_key(self.workspace_path)
         self._session_db = session_db
         self._print_fn = print_fn or print
         self._stream_callback = stream_callback
@@ -155,6 +369,16 @@ class MClaw:
 
         self.messages: List[Dict[str, Any]] = []
         self._interrupted = False
+        self._interrupt_lock = threading.Lock()
+        self._turn_cancel_event = threading.Event()
+        self._turn_active = False
+        self._turn_abort_reason: str | None = None
+        self._workspace_abort_event: threading.Event | None = None
+        self._turn_workers_lock = threading.Lock()
+        self._outstanding_turn_workers: set[Any] = set()
+        self._turn_workers_drained = threading.Event()
+        self._turn_workers_drained.set()
+        self._turn_worker_parent: "MClaw | None" = None
         self._prompt_epoch_dirty = False
         self._tool_call_ids_pending_visibility: Set[str] = set()
         self._tool_visibility_state_reliable = False
@@ -515,7 +739,7 @@ class MClaw:
                             enabled=cache_enabled,
                         ),
                     ),
-                    interrupted=lambda: cancelled.is_set() or self._interrupted,
+                    interrupted=lambda: cancelled.is_set() or self._is_interrupted(),
                 )
                 if result.usage is not None:
                     self._record_usage(
@@ -600,13 +824,416 @@ class MClaw:
                 logger.debug("Memory snapshot refresh failed: %s", e)
 
     def interrupt(self):
-        logger.info("[INTERRUPT] requested session=%s", self.session_id or "?")
-        self._interrupted = True
-        set_interrupt(True)
+        cancel_event = None
+        publish_trace = None
+        with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+            with self._interrupt_lock:
+                if self._turn_active:
+                    self._interrupted = True
+                    if self._turn_abort_reason is None:
+                        self._turn_abort_reason = "user_cancelled"
+                    cancel_event = self._turn_cancel_event
+                    publish_trace = _publish_workspace_abort_fence(self)
+                    cancel_event.set()
+        if cancel_event is None:
+            _safe_cancel_trace(
+                logger.info,
+                "[CANCEL_TRACE] interrupt_ignored session=%s reason=idle",
+                self.session_id or "?",
+            )
+            return
+        _trace_workspace_abort_publish(self, publish_trace)
+        _safe_cancel_trace(
+            logger.warning,
+            "[CANCEL_TRACE] interrupt_request cancel_id=%s session=%s "
+            "trigger=user_interrupt workers=%s",
+            get_cancel_id(cancel_event),
+            self.session_id or "?",
+            self._turn_worker_log_snapshot(),
+        )
 
     def clear_interrupt(self):
-        self._interrupted = False
-        set_interrupt(False)
+        """Reset idle interrupt state without clearing an active turn token."""
+        with self._interrupt_lock:
+            self._interrupted = False
+            if not self._turn_active:
+                self._turn_cancel_event = threading.Event()
+
+    def _acquire_turn_cancel_event(
+        self,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[threading.Event, bool]:
+        """Return the current turn token and whether this call owns its lifecycle."""
+        # The registry lock is the linearization point for both publishing a
+        # cancellation fence and committing a new turn.  Always acquire it
+        # before any agent interrupt lock to avoid cross-agent ABBA deadlocks.
+        workspace_key = getattr(self, "_workspace_quarantine_key", f"agent:{id(self)}")
+        workspace_block_reason = None
+        resolved_agents: list[Any] = []
+        live_agents: list[Any] = []
+        worker_block_reason = None
+        clear_trace = None
+        publish_trace = None
+        event = None
+        with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+            with self._interrupt_lock:
+                if self._turn_active:
+                    if cancel_event is not None and cancel_event is not self._turn_cancel_event:
+                        raise RuntimeError("Agent turn already uses a different cancellation event")
+                    return self._turn_cancel_event, False
+                (
+                    workspace_block_reason,
+                    resolved_agents,
+                    live_agents,
+                ) = _workspace_abort_block_reason(
+                    workspace_key,
+                    exclude=self,
+                )
+                if workspace_block_reason is None:
+                    worker_block_reason = self._turn_worker_block_reason()
+                if workspace_block_reason is None and worker_block_reason is None:
+                    clear_trace = _clear_workspace_abort_fence(self)
+                    event = cancel_event or self._turn_cancel_event
+                    get_cancel_id(event)
+                    self._turn_cancel_event = event
+                    self._turn_active = True
+                    self._interrupted = event.is_set()
+                    self._turn_abort_reason = None
+                    if event.is_set():
+                        publish_trace = _publish_workspace_abort_fence(self)
+
+        _trace_workspace_abort_scan(
+            workspace_key,
+            workspace_block_reason,
+            resolved_agents,
+            live_agents,
+        )
+        if workspace_block_reason is not None:
+            _safe_cancel_trace(
+                logger.warning,
+                "[CANCEL_TRACE] turn_blocked scope=workspace session=%s "
+                "workspace_id=%s reason=%s workers=%s",
+                self.session_id or "?",
+                _workspace_log_id(workspace_key),
+                workspace_block_reason,
+                self._turn_worker_log_snapshot(),
+            )
+            raise RuntimeError(workspace_block_reason)
+        if worker_block_reason is not None:
+            _safe_cancel_trace(
+                logger.warning,
+                "[CANCEL_TRACE] turn_blocked cancel_id=%s scope=agent session=%s "
+                "reason=%s workers=%s",
+                get_cancel_id(getattr(self, "_workspace_abort_event", None)),
+                self.session_id or "?",
+                worker_block_reason,
+                self._turn_worker_log_snapshot(),
+            )
+            raise RuntimeError(worker_block_reason)
+        _trace_workspace_abort_clear(self, clear_trace)
+        _trace_workspace_abort_publish(self, publish_trace)
+        return event, True
+
+    def _request_turn_abort(
+        self,
+        reason: str,
+        cancel_event: threading.Event,
+    ) -> None:
+        """Abort the active turn while retaining the strongest known cause."""
+        priorities = {
+            "user_cancelled": 1,
+            "tool_timeout": 2,
+            "tool_completion_unknown": 3,
+        }
+        propagate = False
+        stale = False
+        effective_reason = None
+        publish_trace = None
+        previous_reason = None
+        with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+            with self._interrupt_lock:
+                if not self._turn_active or self._turn_cancel_event is not cancel_event:
+                    stale = True
+                else:
+                    current = self._turn_abort_reason
+                    previous_reason = current
+                    # Late cleanup is fenced independently and must not replace
+                    # an already-observed user cancellation as the turn outcome.
+                    if current != "user_cancelled" and priorities.get(
+                        reason, 1
+                    ) >= priorities.get(current or "", 0):
+                        self._turn_abort_reason = reason
+                    effective_reason = self._turn_abort_reason
+                    self._interrupted = True
+                    propagate = True
+                    publish_trace = _publish_workspace_abort_fence(self)
+                cancel_event.set()
+        if stale:
+            _safe_cancel_trace(
+                logger.info,
+                "[CANCEL_TRACE] abort_stale cancel_id=%s session=%s reason=%s",
+                get_cancel_id(cancel_event),
+                self.session_id or "?",
+                reason,
+            )
+            return
+        parent = self._turn_worker_parent
+        if propagate and parent is not None and parent is not self:
+            parent_abort = getattr(parent, "_request_turn_abort", None)
+            if callable(parent_abort):
+                parent_abort(reason, cancel_event)
+        _trace_workspace_abort_publish(self, publish_trace)
+        _safe_cancel_trace(
+            logger.warning,
+            "[CANCEL_TRACE] abort_request cancel_id=%s session=%s reason=%s "
+            "previous=%s effective=%s workers=%s",
+            get_cancel_id(cancel_event),
+            self.session_id or "?",
+            reason,
+            previous_reason or "none",
+            effective_reason or "none",
+            self._turn_worker_log_snapshot(),
+        )
+
+    def _register_turn_worker(self, worker: Any) -> None:
+        """Fence a worker that may still use this agent after its turn returns."""
+        try:
+            if not hasattr(worker, "_mclaw_registered_at"):
+                worker._mclaw_registered_at = time.monotonic()
+            worker._mclaw_cancel_event = self._turn_cancel_event
+        except Exception:
+            pass
+        with self._turn_workers_lock:
+            self._outstanding_turn_workers.add(worker)
+            self._turn_workers_drained.clear()
+        if self._turn_cancel_event.is_set():
+            _safe_cancel_trace(
+                logger.warning,
+                "[CANCEL_TRACE] worker_registered_after_abort cancel_id=%s "
+                "session=%s worker=%s",
+                get_cancel_id(self._turn_cancel_event),
+                self.session_id or "?",
+                self._turn_worker_log_label(worker),
+            )
+        parent = self._turn_worker_parent
+        if parent is not None and parent is not self:
+            register = getattr(parent, "_register_turn_worker", None)
+            if callable(register):
+                register(worker)
+
+    def _unregister_turn_worker(self, worker: Any) -> None:
+        removed = False
+        drained = False
+        with self._turn_workers_lock:
+            removed = worker in self._outstanding_turn_workers
+            self._outstanding_turn_workers.discard(worker)
+            if not self._outstanding_turn_workers:
+                self._turn_workers_drained.set()
+                drained = True
+        worker_event = self._turn_worker_attr(worker, "_mclaw_cancel_event")
+        try:
+            worker_cancelled = worker_event is not None and worker_event.is_set()
+        except BaseException:
+            worker_cancelled = False
+        if removed and worker_cancelled:
+            _safe_cancel_trace(
+                logger.info,
+                "[CANCEL_TRACE] worker_drained cancel_id=%s session=%s "
+                "worker=%s remaining=%s",
+                get_cancel_id(worker_event),
+                self.session_id or "?",
+                self._turn_worker_log_label(worker),
+                self._turn_worker_log_snapshot(),
+            )
+        if removed and drained:
+            key = getattr(self, "_workspace_quarantine_key", f"agent:{id(self)}")
+            reason, resolved, live_agents = _workspace_abort_block_reason(key)
+            _trace_workspace_abort_scan(key, reason, resolved, live_agents)
+        parent = self._turn_worker_parent
+        if parent is not None and parent is not self:
+            unregister = getattr(parent, "_unregister_turn_worker", None)
+            if callable(unregister):
+                unregister(worker)
+
+    def _has_outstanding_turn_workers(self) -> bool:
+        return self._turn_worker_block_reason() is not None
+
+    @staticmethod
+    def _turn_worker_attr(worker: Any, name: str, default: Any = None) -> Any:
+        try:
+            return getattr(worker, name, default)
+        except BaseException:
+            return default
+
+    @staticmethod
+    def _turn_worker_is_alive(worker: Any) -> bool:
+        try:
+            return bool(worker.is_alive())
+        except BaseException:
+            return True
+
+    @staticmethod
+    def _turn_worker_truthy(value: Any) -> bool:
+        try:
+            return bool(value)
+        except BaseException:
+            return False
+
+    @staticmethod
+    def _turn_worker_log_label(worker: Any) -> str:
+        """Return a compact, non-argument worker label for cancellation logs."""
+        name = MClaw._turn_worker_attr(worker, "diagnostic_name")
+        if not MClaw._turn_worker_truthy(name):
+            name = MClaw._turn_worker_attr(worker, "name", type(worker).__name__)
+        try:
+            name = str(name)
+        except BaseException:
+            name = type(worker).__name__
+        registered_at = MClaw._turn_worker_attr(worker, "_mclaw_registered_at")
+        age = (
+            f"{max(0.0, time.monotonic() - registered_at):.3f}s"
+            if isinstance(registered_at, (int, float))
+            else "unknown"
+        )
+        alive = MClaw._turn_worker_is_alive(worker)
+        persistent = MClaw._turn_worker_truthy(
+            MClaw._turn_worker_attr(worker, "persistent", False)
+        )
+        return (
+            f"{name}@{id(worker):x}(alive={alive},age={age},"
+            f"persistent={persistent})"
+        )
+
+    def _turn_worker_log_snapshot(self) -> str:
+        with self._turn_workers_lock:
+            workers = list(self._outstanding_turn_workers)
+        return "[" + ",".join(self._turn_worker_log_label(worker) for worker in workers) + "]"
+
+    def _turn_worker_block_reason(self) -> str | None:
+        with self._turn_workers_lock:
+            finished = {
+                worker
+                for worker in self._outstanding_turn_workers
+                if not self._turn_worker_is_alive(worker)
+            }
+            self._outstanding_turn_workers.difference_update(finished)
+            if not self._outstanding_turn_workers:
+                self._turn_workers_drained.set()
+                block_reason = None
+            else:
+                block_reason = None
+                for worker in self._outstanding_turn_workers:
+                    reason = self._turn_worker_attr(worker, "blocking_reason")
+                    if self._turn_worker_truthy(reason):
+                        try:
+                            block_reason = str(reason)
+                        except BaseException:
+                            pass
+                        if block_reason:
+                            break
+                if block_reason is None:
+                    block_reason = (
+                        "上一轮已停止，但工具仍在收尾；为避免旧结果混入新一轮，"
+                        "请稍后再试。"
+                    )
+        return block_reason
+
+    def _persistent_turn_worker_reason(self) -> str | None:
+        with self._turn_workers_lock:
+            for worker in self._outstanding_turn_workers:
+                if self._turn_worker_truthy(
+                    self._turn_worker_attr(worker, "persistent", False)
+                ):
+                    reason = self._turn_worker_attr(worker, "blocking_reason")
+                    if self._turn_worker_truthy(reason):
+                        try:
+                            return str(reason)
+                        except BaseException:
+                            pass
+                    return "An unresolved external operation requires a runtime restart"
+        return None
+
+    def _replacement_block_reason(self) -> str | None:
+        """Explain why replacing this session would violate cancellation fencing."""
+        persistent_reason = self._persistent_turn_worker_reason()
+        if persistent_reason:
+            return persistent_reason
+        worker_reason = self._turn_worker_block_reason()
+        if worker_reason:
+            return worker_reason
+        with self._interrupt_lock:
+            if self._turn_active:
+                return (
+                    "The current turn is still shutting down; wait for it to finish "
+                    "before replacing the session"
+                )
+        return None
+
+    def begin_turn(self, cancel_event: threading.Event | None = None) -> threading.Event:
+        """Create or adopt the cancellation token before exposing a turn as active."""
+        event, _owned = self._acquire_turn_cancel_event(cancel_event)
+        return event
+
+    def end_turn(self, cancel_event: threading.Event | None = None) -> None:
+        """Release one turn without clearing the token held by late workers."""
+        publish_trace = None
+        cancelled_event = None
+        with _WORKSPACE_ABORT_QUARANTINE_LOCK:
+            with self._interrupt_lock:
+                event = cancel_event or self._turn_cancel_event
+                if not self._turn_active or self._turn_cancel_event is not event:
+                    return
+                if event.is_set():
+                    publish_trace = _publish_workspace_abort_fence(self)
+                    cancelled_event = event
+                self._turn_active = False
+                self._interrupted = False
+                self._turn_abort_reason = None
+                self._turn_cancel_event = threading.Event()
+        _trace_workspace_abort_publish(self, publish_trace)
+        if cancelled_event is not None:
+            _safe_cancel_trace(
+                logger.info,
+                "[CANCEL_TRACE] turn_end_cancelled cancel_id=%s session=%s workers=%s",
+                get_cancel_id(cancelled_event),
+                self.session_id or "?",
+                self._turn_worker_log_snapshot(),
+            )
+            key = getattr(self, "_workspace_quarantine_key", f"agent:{id(self)}")
+            reason, resolved, live_agents = _workspace_abort_block_reason(key)
+            _trace_workspace_abort_scan(key, reason, resolved, live_agents)
+
+    def current_turn_cancel_event(self) -> threading.Event | None:
+        """Return the active turn token without exposing the idle placeholder."""
+        with self._interrupt_lock:
+            return self._turn_cancel_event if self._turn_active else None
+
+    def current_turn_abort_details(self) -> dict[str, str]:
+        """Return a user-visible reason for a non-user turn abort, if present."""
+        with self._interrupt_lock:
+            reason = self._turn_abort_reason if self._turn_active else None
+        if reason == "tool_timeout":
+            return {
+                "abort_reason": reason,
+                "abort_message": (
+                    "A tool exceeded its execution deadline, so this turn was stopped."
+                ),
+            }
+        if reason == "tool_completion_unknown":
+            worker_reason = self._turn_worker_block_reason()
+            return {
+                "abort_reason": reason,
+                "abort_message": worker_reason
+                or (
+                    "A tool may still be running. This turn was stopped and the next "
+                    "turn will wait until cleanup finishes."
+                ),
+            }
+        return {}
+
+    def _is_interrupted(self, cancel_event: threading.Event | None = None) -> bool:
+        event = cancel_event or self._turn_cancel_event
+        return self._interrupted or event.is_set()
 
     def _emit_status(self, msg: str):
         if self._status_callback:
@@ -892,8 +1519,10 @@ class MClaw:
         *,
         call_source: str = "turn",
         deadline_monotonic: float | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn and discard stale estimates on failure."""
+        turn_cancel_event, owns_turn = self._acquire_turn_cancel_event(cancel_event)
         try:
             return self._run_conversation_impl(
                 user_message,
@@ -903,10 +1532,14 @@ class MClaw:
                 advance_background_review=advance_background_review,
                 call_source=call_source,
                 deadline_monotonic=deadline_monotonic,
+                cancel_event=turn_cancel_event,
             )
         except Exception:
             self._clear_unconfirmed_context_display()
             raise
+        finally:
+            if owns_turn:
+                self.end_turn(turn_cancel_event)
 
     def _run_conversation_impl(
         self,
@@ -918,6 +1551,7 @@ class MClaw:
         *,
         call_source: str = "turn",
         deadline_monotonic: float | None = None,
+        cancel_event: threading.Event,
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -925,7 +1559,6 @@ class MClaw:
         api_calls, assistant_rounds, and any pending handoff metadata needed by
         the hosting runtime.
         """
-        self.clear_interrupt()
         self._memory_changed_in_turn = False
         self._skills_changed_in_turn = False
         with self._usage_lock:
@@ -1036,7 +1669,7 @@ class MClaw:
                 break
             assistant_iteration_count += 1
             logger.info("[LOOP] starting iteration %d", assistant_iteration_count)
-            if self._interrupted:
+            if self._is_interrupted(cancel_event):
                 interrupted = True
                 break
 
@@ -1176,7 +1809,7 @@ class MClaw:
                     break
                 if api_call_limit is not None and api_call_count >= api_call_limit:
                     break
-                if self._interrupted:
+                if self._is_interrupted(cancel_event):
                     interrupted = True
                     break
                 try:
@@ -1262,7 +1895,7 @@ class MClaw:
                             ),
                         ),
                         stream_callback=self._stream_callback,
-                        interrupted=lambda: self._interrupted,
+                        interrupted=cancel_event.is_set,
                     )
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
@@ -1386,7 +2019,7 @@ class MClaw:
                         self._emit_status(f"Retrying in {wait:.0f}s...")
                         deadline = time.time() + wait
                         while time.time() < deadline:
-                            if self._interrupted:
+                            if self._is_interrupted(cancel_event):
                                 break
                             time.sleep(0.2)
                         continue
@@ -1413,7 +2046,7 @@ class MClaw:
                     self._clear_unconfirmed_context_display()
                     raise
 
-            if self._interrupted:
+            if self._is_interrupted(cancel_event):
                 interrupted = True
 
             if result is not None and result.usage is not None:
@@ -1507,8 +2140,12 @@ class MClaw:
                     messages,
                     assistant_content=assistant_content,
                     reasoning=result.reasoning,
+                    cancel_event=cancel_event,
                 )
                 logger.info("[POST-TOOL] _execute_tool_calls returned, pending=%s", pending_result is not None)
+                if self._is_interrupted(cancel_event):
+                    interrupted = True
+                    break
                 if pending_result is not None:
                     # delegate_task started in non-blocking mode; return for TUI polling.
                     # Restore tools before returning so they are not left disabled.
@@ -1547,6 +2184,12 @@ class MClaw:
         else:
             stop_reason = "max_iterations"
             logger.info("[LOOP] iteration limit reached (%s)", self.max_iterations)
+
+        abort_details = self.current_turn_abort_details() if cancel_event.is_set() else {}
+        abort_reason = abort_details.get("abort_reason")
+        abort_message = abort_details.get("abort_message", "")
+        if abort_reason:
+            stop_reason = abort_reason
 
         if getattr(self, "_delegate_depth", 0) > 0:
             logger.info("[subagent-%s] exited loop, api_calls=%d", self.session_id[-6:], api_call_count)
@@ -1630,6 +2273,8 @@ class MClaw:
             "session_id": self.session_id,
             "api_calls": api_call_count,
             "interrupted": interrupted,
+            "abort_reason": abort_reason,
+            "abort_message": abort_message,
             "stop_reason": stop_reason,
             "completed": bool(
                 not interrupted and not incomplete_response and final_response
@@ -1658,6 +2303,7 @@ class MClaw:
         messages: List[Dict],
         assistant_content: str = "",
         reasoning: ReasoningTrace | None = None,
+        cancel_event: threading.Event | None = None,
     ):
         """Dispatch tool calls and append normalized results to the conversation.
 
@@ -1665,7 +2311,11 @@ class MClaw:
         tools share the checkpoint manager so filesystem recovery metadata stays
         aligned with the assistant tool call that produced it.
         """
-        from mclaw.tools.dispatch import handle_function_calls, set_tool_context
+        from mclaw.tools.dispatch import (
+            handle_function_calls,
+            reset_tool_context,
+            set_tool_context,
+        )
 
         if not tool_calls:
             return
@@ -1673,18 +2323,8 @@ class MClaw:
         is_subagent = getattr(self, "_delegate_depth", 0) > 0
         _sid_tail = self.session_id[-6:] if self.session_id else "?"
 
-        # Set per-call context so tools such as session_search can access SessionDB.
-        set_tool_context(session_db=self._session_db, session_id=self.session_id)
-
-        if self._interrupted:
-            for tc in tool_calls:
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": json.dumps({"error": "Interrupted by user"}),
-                })
-            return
-
+        if cancel_event is None:
+            cancel_event = self._turn_cancel_event
         assistant_msg = self._build_assistant_msg(
             assistant_content or "",
             tool_calls,
@@ -1753,13 +2393,22 @@ class MClaw:
         if is_subagent:
             logger.info("[subagent-%s] dispatching tools: %s", _sid_tail, tool_names)
 
-        results = handle_function_calls(
-            calls=tool_calls,
-            tool_names=set(self.valid_tool_names),
-            memory_manager=self._memory_manager,
-            checkpoint_manager=checkpoint_mgr,
-            parent_agent=self,
+        context_tokens = set_tool_context(
+            session_db=self._session_db,
+            session_id=self.session_id,
+            cancel_event=cancel_event,
         )
+        try:
+            results = handle_function_calls(
+                calls=tool_calls,
+                tool_names=set(self.valid_tool_names),
+                memory_manager=self._memory_manager,
+                checkpoint_manager=checkpoint_mgr,
+                parent_agent=self,
+                cancel_event=cancel_event,
+            )
+        finally:
+            reset_tool_context(context_tokens)
 
         logger.info("[TOOL DISPATCH END] tools=%s results=%d", tool_names, len(results))
         if is_subagent:

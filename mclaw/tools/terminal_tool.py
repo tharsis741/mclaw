@@ -24,6 +24,7 @@ from mclaw.runtime.secrets import SecretRequestError, build_scoped_env, redact_s
 from mclaw.safety.mutation_detector import is_destructive_terminal_command
 from mclaw.safety.path_resolver import extract_mutation_targets_from_command
 from mclaw.skills_hub.paths import get_skill_drafting_dir
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry
 
 logger = logging.getLogger(__name__)
@@ -267,6 +268,7 @@ def terminal_tool(
     notify_on_complete: bool = False,
     required_for: str | None = None,
     session_key: str | None = None,
+    parent_agent=None,
 ) -> str:
     """Execute a shell command; optional background via process registry."""
     effective_timeout = _coerce_timeout(timeout) or DEFAULT_TIMEOUT
@@ -297,7 +299,10 @@ def terminal_tool(
         )
 
     if background:
-        from mclaw.tools.process_registry import process_registry
+        from mclaw.tools.process_registry import (
+            BackgroundSpawnCancellationError,
+            process_registry,
+        )
 
         effective_task_id = task_id or active_session or ""
 
@@ -325,6 +330,19 @@ def terminal_tool(
                     "Install ptyprocess (Unix) or pywinpty (Windows) to enable PTY."
                 )
 
+        cancel_event = get_interrupt_event()
+        if cancel_event is not None and cancel_event.is_set():
+            return json.dumps(
+                {
+                    "output": "",
+                    "returncode": 130,
+                    "error": "Background process was not started because the turn was cancelled",
+                    "success": False,
+                    "interrupted": True,
+                    "status": "cancelled",
+                },
+                ensure_ascii=False,
+            )
         try:
             proc_session = process_registry.spawn_local(
                 command=command,
@@ -334,6 +352,36 @@ def terminal_tool(
                 env_vars=bg_env_vars,
                 use_pty=use_pty,
                 scoped_secret_keys=scoped_secret_keys,
+                cancel_event=cancel_event,
+            )
+        except BackgroundSpawnCancellationError as exc:
+            register = getattr(parent_agent, "_register_turn_worker", None)
+            if callable(register):
+                register(exc.termination_fence)
+            return json.dumps(
+                {
+                    "output": "",
+                    "returncode": 130,
+                    "error": str(exc),
+                    "success": False,
+                    "interrupted": True,
+                    "status": "cancel_requested",
+                    "completion_unknown": True,
+                    "pid": exc.pid,
+                },
+                ensure_ascii=False,
+            )
+        except InterruptedError:
+            return json.dumps(
+                {
+                    "output": "",
+                    "returncode": 130,
+                    "error": "Background process was not started because the turn was cancelled",
+                    "success": False,
+                    "interrupted": True,
+                    "status": "cancelled",
+                },
+                ensure_ascii=False,
             )
         except Exception as exc:
             return json.dumps(
@@ -440,6 +488,7 @@ def terminal_tool(
             timeout=effective_timeout,
             env=session.env,
             scoped_secret_keys=session.scoped_secret_keys,
+            cancel_event=get_interrupt_event(),
         )
         session.cwd = result.cwd
     except Exception as exc:
@@ -466,14 +515,29 @@ def terminal_tool(
     else:
         error = ""
 
-    return json.dumps(
-        {
-            "output": output,
-            "returncode": returncode,
-            "error": redact_secret_values(error, scoped_env),
-        },
-        ensure_ascii=False,
-    )
+    payload = {
+        "output": output,
+        "returncode": returncode,
+        "error": redact_secret_values(error, scoped_env),
+    }
+    termination_confirmed = bool(getattr(result, "termination_confirmed", False))
+    if not termination_confirmed:
+        termination_fence = getattr(result, "termination_fence", None)
+        register = getattr(parent_agent, "_register_turn_worker", None)
+        if termination_fence is not None and callable(register):
+            register(termination_fence)
+    if returncode == 130:
+        completion_unknown = not termination_confirmed
+        payload.update(
+            success=False,
+            interrupted=True,
+            status="cancel_requested" if completion_unknown else "cancelled",
+        )
+        if completion_unknown:
+            payload["completion_unknown"] = True
+    elif returncode == 124 and not termination_confirmed:
+        payload["completion_unknown"] = True
+    return json.dumps(payload, ensure_ascii=False)
 
 
 def _handle_terminal(args: dict, **kwargs) -> str:
@@ -501,6 +565,7 @@ def _handle_terminal(args: dict, **kwargs) -> str:
         notify_on_complete=bool(args.get("notify_on_complete", False)),
         required_for=args.get("required_for"),
         session_key=session_key or None,
+        parent_agent=parent_agent,
     )
 
 

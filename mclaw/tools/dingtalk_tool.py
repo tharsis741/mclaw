@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 from mclaw.channels.dingtalk.outbound_registry import get_dingtalk_outbound_target
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 
 
@@ -28,12 +29,32 @@ def dingtalk_send_file(file_path: str, caption: str = "", parent_agent=None) -> 
     path = Path(str(file_path or "")).expanduser()
     if not path.is_file():
         return tool_error(f"File not found: {file_path}", success=False)
+    cancel_event = get_interrupt_event()
+    if cancel_event is None:
+        current_event = getattr(parent_agent, "current_turn_cancel_event", None)
+        cancel_event = current_event() if callable(current_event) else None
     try:
-        result = target.send_file(file_path=str(path), caption=caption or "")
+        result = target.send_file(
+            file_path=str(path),
+            caption=caption or "",
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
+        )
     except Exception as exc:
         return tool_error(f"DingTalk file send failed: {exc}", success=False)
     if not result.success:
-        return tool_error(result.error or "DingTalk file send failed", success=False)
+        interrupted = bool(getattr(result, "interrupted", False))
+        completion_unknown = bool(getattr(result, "completion_unknown", False))
+        details = {"success": False}
+        if interrupted:
+            details.update(
+                interrupted=True,
+                status="cancel_requested" if completion_unknown else "cancelled",
+                completion_unknown=completion_unknown,
+            )
+        elif completion_unknown:
+            details.update(status="timeout", completion_unknown=True)
+        return tool_error(result.error or "DingTalk file send failed", **details)
     return json.dumps(
         {
             "success": True,

@@ -26,6 +26,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 
 if TYPE_CHECKING:
@@ -62,6 +63,18 @@ DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_SUBAGENT_TIMEOUT_SECONDS = 600
 MAX_INLINE_SUMMARY_CHARS = 800
 
+
+def normalize_timeout_seconds(value: Any) -> float:
+    """Apply the delegate tool's single timeout fallback rule."""
+    try:
+        timeout = float(value)
+        if timeout <= 0:
+            raise ValueError
+        return timeout
+    except (TypeError, ValueError):
+        return float(DEFAULT_SUBAGENT_TIMEOUT_SECONDS)
+
+
 class SubtaskEvent:
     """Thread-safe progress event emitted by a child agent."""
     def __init__(
@@ -70,11 +83,13 @@ class SubtaskEvent:
         event_type: str,
         data: Any = None,
         timestamp: float = None,
+        delegation_id: str = "",
     ):
         self.task_index = task_index
         self.event_type = event_type  # "started" | "tool_call" | "completed" | "error"
         self.data = data
         self.timestamp = timestamp or time.time()
+        self.delegation_id = delegation_id
 
     def __repr__(self):
         return f"SubtaskEvent(task={self.task_index}, type={self.event_type})"
@@ -372,6 +387,7 @@ def _build_child_agent(
     # Set child depth for recursive-delegation enforcement.
     parent_depth = getattr(parent_agent, "_delegate_depth", 0)
     child._delegate_depth = parent_depth + 1
+    child._turn_worker_parent = parent_agent
 
     # Keep a private handoff location for oversized summaries only.
     child._delegation_dir = child_delegation_dir
@@ -397,6 +413,8 @@ def _run_single_child(
     parent_agent,
     progress_callback: ProgressCallback = None,
     timeout_seconds: float | None = None,
+    cancel_event: threading.Event | None = None,
+    delegation_id: str = "",
 ) -> Dict[str, Any]:
     """Run one child agent and collect its result."""
     child_start = time.monotonic()
@@ -413,7 +431,8 @@ def _run_single_child(
         def _relay_tool(tool_name: str, args: dict):
             progress_callback(SubtaskEvent(
                 task_index, SUBAGENT_TOOL_CALL,
-                {"tool": tool_name, "args_bytes": len(str(args))}
+                {"tool": tool_name, "args_bytes": len(str(args))},
+                delegation_id=delegation_id,
             ))
 
         child._tool_callback = _relay_tool
@@ -421,7 +440,8 @@ def _run_single_child(
         # Emit a started event.
         progress_callback(SubtaskEvent(
             task_index, SUBAGENT_STARTED,
-            {"goal": goal[:100], "depth": child._delegate_depth}
+            {"goal": goal[:100], "depth": child._delegate_depth},
+            delegation_id=delegation_id,
         ))
 
     api_calls_before = int(getattr(child, "session_api_calls", 0) or 0)
@@ -442,6 +462,7 @@ def _run_single_child(
                     user_message=f"{effective_goal}\n\n{summary_instruction}",
                     disable_tools=True,
                     call_source="delegation",
+                    cancel_event=cancel_event,
                 )
             else:
                 child.max_iterations = call_limit - 1
@@ -454,6 +475,7 @@ def _run_single_child(
                     user_message=effective_goal,
                     call_source="delegation",
                     deadline_monotonic=deadline,
+                    cancel_event=cancel_event,
                 )
                 exploration_api_calls = int(result.get("api_calls", 0) or 0)
                 exploration_stop_reason = result.get("stop_reason")
@@ -466,6 +488,7 @@ def _run_single_child(
                             task_index,
                             SUBAGENT_FINALIZING,
                             {"reason": exploration_stop_reason or "max_iterations"},
+                            delegation_id=delegation_id,
                         ))
                     child.max_iterations = 1
                     result = child.run_conversation(
@@ -474,6 +497,7 @@ def _run_single_child(
                         disable_tools=True,
                         advance_background_review=False,
                         call_source="delegation",
+                        cancel_event=cancel_event,
                     )
                     result["api_calls"] = exploration_api_calls + int(
                         result.get("api_calls", 0) or 0
@@ -489,9 +513,16 @@ def _run_single_child(
         summary = result.get("final_response") or ""
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
+        abort_reason = str(result.get("abort_reason") or "")
         api_calls = result.get("api_calls", 0)
 
-        if interrupted:
+        if abort_reason == "tool_timeout":
+            status = "timed_out"
+            exit_reason = "tool_timeout"
+        elif abort_reason == "tool_completion_unknown":
+            status = "completion_unknown"
+            exit_reason = "tool_completion_unknown"
+        elif interrupted:
             status = "interrupted"
             exit_reason = "interrupted"
         elif summary and not result.get("error"):
@@ -531,7 +562,7 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": child.model if isinstance(child.model, str) else None,
             "exit_reason": exit_reason,
-            "timed_out": exploration_stop_reason == "timeout",
+            "timed_out": abort_reason == "tool_timeout" or exploration_stop_reason == "timeout",
             "tokens": {
                 "input": input_tokens if isinstance(input_tokens, (int, float)) else 0,
                 "output": output_tokens if isinstance(output_tokens, (int, float)) else 0,
@@ -553,7 +584,8 @@ def _run_single_child(
                     "duration": duration,
                     "summary": inline_summary,
                     "api_calls": api_calls,
-                }
+                },
+                delegation_id=delegation_id,
             ))
 
         return entry
@@ -566,7 +598,8 @@ def _run_single_child(
         if progress_callback:
             progress_callback(SubtaskEvent(
                 task_index, SUBAGENT_ERROR,
-                {"error": str(exc)}
+                {"error": str(exc)},
+                delegation_id=delegation_id,
             ))
 
         return {
@@ -596,6 +629,7 @@ def _run_all_children_background(
     task_id: str,
     start_time: float,
     timeout_seconds: float,
+    cancel_event: threading.Event | None = None,
 ) -> None:
     """Run all children in a daemon thread and queue their final results.
 
@@ -619,6 +653,8 @@ def _run_all_children_background(
                 parent_agent=parent_agent,
                 progress_callback=progress_callback,
                 timeout_seconds=timeout_seconds,
+                cancel_event=cancel_event,
+                delegation_id=task_id,
             )
             futures[fut] = i
 
@@ -639,11 +675,14 @@ def _run_all_children_background(
                 if progress_callback:
                     progress_callback(SubtaskEvent(
                         idx, SUBAGENT_ERROR,
-                        {"error": str(exc)}
+                        {"error": str(exc)},
+                        delegation_id=task_id,
                     ))
             results.append(entry)
 
     results.sort(key=lambda r: r["task_index"])
+    if cancel_event is not None and cancel_event.is_set():
+        return
     _subagent_results.put({
         "task_id": task_id,
         "results": results,
@@ -754,12 +793,7 @@ def delegate_task(
     configured_timeout = delegation_cfg.get(
         "timeout_seconds", DEFAULT_SUBAGENT_TIMEOUT_SECONDS
     )
-    try:
-        effective_timeout = float(configured_timeout)
-        if effective_timeout <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        effective_timeout = float(DEFAULT_SUBAGENT_TIMEOUT_SECONDS)
+    effective_timeout = normalize_timeout_seconds(configured_timeout)
 
     # Parse task list.
     if not isinstance(tasks, list):
@@ -814,24 +848,47 @@ def delegate_task(
     # Run child agents.
     start_time = time.time()
     task_id = str(uuid.uuid4())[:8]
+    cancel_event = get_interrupt_event()
+
+    if cancel_event is not None and cancel_event.is_set():
+        return tool_error(
+            "delegate_task was not started because the turn was cancelled",
+            success=False,
+            interrupted=True,
+            status="cancelled",
+        )
 
     if progress_callback is not None:
         # Keep collection off the TUI thread. The coordinator waits for every
         # child to finalize before publishing one complete result set.
-        thread = threading.Thread(
-            target=_run_all_children_background,
-            args=(
-                task_list,
-                children,
-                parent_agent,
-                progress_callback,
-                task_id,
-                start_time,
-                effective_timeout,
-            ),
-            daemon=True,
-        )
-        thread.start()
+        def _background_target() -> None:
+            try:
+                _run_all_children_background(
+                    task_list,
+                    children,
+                    parent_agent,
+                    progress_callback,
+                    task_id,
+                    start_time,
+                    effective_timeout,
+                    cancel_event,
+                )
+            finally:
+                unregister = getattr(parent_agent, "_unregister_turn_worker", None)
+                if callable(unregister):
+                    unregister(threading.current_thread())
+
+        thread = threading.Thread(target=_background_target, daemon=True)
+        register = getattr(parent_agent, "_register_turn_worker", None)
+        if callable(register):
+            register(thread)
+        try:
+            thread.start()
+        except BaseException:
+            unregister = getattr(parent_agent, "_unregister_turn_worker", None)
+            if callable(unregister):
+                unregister(thread)
+            raise
 
         task_info = {
             "task_id": task_id,
@@ -861,6 +918,7 @@ def delegate_task(
             child,
             parent_agent,
             timeout_seconds=effective_timeout,
+            cancel_event=cancel_event,
         )
         results.append(result)
     else:
@@ -875,6 +933,7 @@ def delegate_task(
                     child=child,
                     parent_agent=parent_agent,
                     timeout_seconds=effective_timeout,
+                    cancel_event=cancel_event,
                 )
                 futures[future] = i
 

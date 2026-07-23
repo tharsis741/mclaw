@@ -527,6 +527,44 @@ def test_interactive_resume_failure_preserves_current_state(monkeypatch) -> None
     assert Lock.instances[-1].released is True
 
 
+def test_interactive_resume_refuses_to_release_a_fenced_session() -> None:
+    chat = object.__new__(InteractiveChat)
+    chat.session_id = "current"
+    chat.agent = SimpleNamespace(
+        _replacement_block_reason=lambda: "previous tool is still shutting down"
+    )
+    side_effects = []
+    chat._create_agent = lambda *_args: side_effects.append("create")
+    chat._session_db = SimpleNamespace(
+        switch_active_session=lambda *_args, **_kwargs: side_effects.append("switch")
+    )
+
+    with pytest.raises(RuntimeError, match="Cannot resume.*still shutting down"):
+        chat._apply_resume("target", _context(model="gpt-5.6"), [])
+
+    assert chat.session_id == "current"
+    assert side_effects == []
+
+
+def test_new_session_refuses_before_ending_a_fenced_session() -> None:
+    chat = object.__new__(InteractiveChat)
+    chat.agent = SimpleNamespace(
+        _replacement_block_reason=lambda: "external process requires restart"
+    )
+    ended = []
+    notices = []
+    chat._end_current_session = lambda *_args, **_kwargs: ended.append(True)
+    chat._get_commands_renderer = lambda: SimpleNamespace(
+        render_notice=lambda *args, **kwargs: notices.append((args, kwargs))
+    )
+
+    chat._new_session()
+
+    assert ended == []
+    assert notices
+    assert "requires restart" in notices[0][0][1]
+
+
 def test_startup_resume_lock_failure_does_not_reopen_target(monkeypatch, tmp_path) -> None:
     from mclaw import state
     from mclaw.cli import app

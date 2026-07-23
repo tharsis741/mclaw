@@ -6,14 +6,27 @@
 
 from __future__ import annotations
 
+import threading
+
 from mclaw.skills_hub import install_service, skill_store
 from mclaw.skills_hub.models import ExternalSkill
 from mclaw.skills_hub.search import search_all
 
 
-def search(query: str, limit: int = 10) -> list[ExternalSkill]:
+def search(
+    query: str,
+    limit: int = 10,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> list[ExternalSkill]:
     """Search ClawHub for Skills."""
-    return search_all(query, limit=limit)
+    return search_all(
+        query,
+        limit=limit,
+        cancel_event=cancel_event,
+        parent_agent=parent_agent,
+    )
 
 
 __all__ = [

@@ -247,6 +247,23 @@ class WeixinAdapter:
                 reset = getattr(self.runner, "reset_session", None)
                 if reset:
                     reset(routed.session_id)
+                replacement_block_reason = getattr(
+                    self.runner,
+                    "session_replacement_block_reason",
+                    None,
+                )
+                reason = (
+                    replacement_block_reason(routed.session_id)
+                    if callable(replacement_block_reason)
+                    else None
+                )
+                if reason:
+                    message_text = f"A new session was not created yet. {reason}"
+                    await self.send(chat_id, message_text)
+                    return AgentTurnResult(
+                        session_id=routed.session_id,
+                        final_response=message_text,
+                    )
                 routed = self.session_router.new_session(
                     source,
                     model=self.runner.startup_provider_runtime.model,
@@ -254,7 +271,15 @@ class WeixinAdapter:
                 await self.send(chat_id, command.text)
             elif command.action == "stop":
                 interrupted = self.runner.interrupt(routed.session_id)
-                await self.send(chat_id, "Interrupted current turn." if interrupted else "No running turn.")
+                await self.send(
+                    chat_id,
+                    (
+                        "Cancellation requested. Cleanup continues in the background; "
+                        "if process termination cannot be confirmed, restart the runtime."
+                        if interrupted
+                        else "No running turn."
+                    ),
+                )
             else:
                 await self.send(chat_id, command.text)
             return AgentTurnResult(session_id=routed.session_id)

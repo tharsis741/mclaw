@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,7 @@ from mclaw.skills_hub.skill_yaml_store import (
     write_skill_yaml,
 )
 from mclaw.skills_hub.source_resolver import ResolvedSource, materialize_source, resolve_source
+from mclaw.tools.cancellation import cancellation_checkpoint
 
 
 INSTALL_AUDIT_FILENAME = "install_audit.json"
@@ -218,21 +220,41 @@ def _fallback_name(resolved: ResolvedSource, source: str) -> str:
     return Path(source.rstrip("/\\")).name
 
 
-def install_prepare(source: str, user_intent: str | None = None) -> dict[str, Any]:
+def install_prepare(
+    source: str,
+    user_intent: str | None = None,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> dict[str, Any]:
     """Materialize an external Skill into drafting state and request confirmation."""
 
+    cancellation_checkpoint(cancel_event)
     ensure_runtime_roots()
-    resolved = resolve_source(source)
+    cancellation_checkpoint(cancel_event)
+    resolve_kwargs = {"cancel_event": cancel_event}
+    if parent_agent is not None:
+        resolve_kwargs["parent_agent"] = parent_agent
+    resolved = resolve_source(source, **resolve_kwargs)
+    cancellation_checkpoint(cancel_event)
     did = _drafting_id()
     drafting_root = get_skill_drafting_dir() / did
     package = drafting_root / "skill"
     try:
         # External content stays in the drafting root until validation, dependency
         # hints, and security review have all completed.
-        materialize_source(resolved, package)
+        cancellation_checkpoint(cancel_event)
+        materialize_kwargs = {"cancel_event": cancel_event}
+        if parent_agent is not None:
+            materialize_kwargs["parent_agent"] = parent_agent
+        materialize_source(resolved, package, **materialize_kwargs)
+        cancellation_checkpoint(cancel_event)
         skill_md = _read_root_skill_md(package)
+        cancellation_checkpoint(cancel_event)
         name, short_description = _read_package_metadata(package, skill_md, _fallback_name(resolved, source))
+        cancellation_checkpoint(cancel_event)
         _validate_skill_md(skill_md, name)
+        cancellation_checkpoint(cancel_event)
         write_skill_yaml(
             package,
             build_skill_yaml(
@@ -244,10 +266,19 @@ def install_prepare(source: str, user_intent: str | None = None) -> dict[str, An
                 status="prepared",
             ),
         )
+        cancellation_checkpoint(cancel_event)
         write_default(package)
-        dependency_hints = scan_skill_dependencies(package)
-        review = review_skill_package(package, source=resolved.type)
+        cancellation_checkpoint(cancel_event)
+        dependency_hints = scan_skill_dependencies(package, cancel_event=cancel_event)
+        cancellation_checkpoint(cancel_event)
+        review = review_skill_package(
+            package,
+            source=resolved.type,
+            cancel_event=cancel_event,
+        )
+        cancellation_checkpoint(cancel_event)
         write_security_review(drafting_root, review)
+        cancellation_checkpoint(cancel_event)
         allowed = review.get("install_allowed")
         blocked = allowed is False
         manifest = {
@@ -266,7 +297,9 @@ def install_prepare(source: str, user_intent: str | None = None) -> dict[str, An
             "user_intent": user_intent or "",
             "dependency_hints": dependency_hints,
         }
+        cancellation_checkpoint(cancel_event)
         _write_manifest(drafting_root, manifest)
+        cancellation_checkpoint(cancel_event)
         if blocked:
             return {
                 "success": False,
@@ -287,6 +320,7 @@ def install_prepare(source: str, user_intent: str | None = None) -> dict[str, An
                 "user_intent": user_intent or "",
                 "dependency_hints": dependency_hints,
             }
+        cancellation_checkpoint(cancel_event)
         return {
             "success": False,
             "requires_confirmation": True,
@@ -307,6 +341,7 @@ def install_prepare(source: str, user_intent: str | None = None) -> dict[str, An
         }
     except BaseException:
         shutil.rmtree(drafting_root, ignore_errors=True)
+        cancellation_checkpoint(cancel_event)
         raise
 
 
@@ -400,15 +435,27 @@ def cancel_drafting(drafting_id: str) -> dict[str, Any]:
     }
 
 
-def security_review(drafting_id: str) -> dict[str, Any]:
+def security_review(
+    drafting_id: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     """Re-run the security review for a still-drafted external Skill."""
 
+    cancellation_checkpoint(cancel_event)
     drafting_root, manifest = _read_manifest(drafting_id)
+    cancellation_checkpoint(cancel_event)
     package = drafting_root / "skill"
     if not package.is_dir():
         raise SkillStoreError("Drafting package is missing.")
-    review = review_skill_package(package, source=str(manifest.get("source", {}).get("type") or "community"))
+    review = review_skill_package(
+        package,
+        source=str(manifest.get("source", {}).get("type") or "community"),
+        cancel_event=cancel_event,
+    )
+    cancellation_checkpoint(cancel_event)
     review_path = write_security_review(drafting_root, review)
+    cancellation_checkpoint(cancel_event)
     return {
         "success": True,
         "action": "security_review",

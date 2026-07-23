@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 
 from mclaw.runtime.secrets import SecretRequestError, secret_request_many
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry
 
 
@@ -82,17 +84,27 @@ SECRET_REQUEST_SCHEMA = {
 
 def _handle_secret_request_many(args: dict, **kwargs) -> str:
     """Bridge model tool calls to the scoped secret authorization service."""
+    cancel_event = get_interrupt_event()
     parent_agent = kwargs.get("parent_agent")
     callback = getattr(parent_agent, "secret_request_callback", None) if parent_agent is not None else None
     if not callable(callback):
         callback = None
     try:
+        cancellation_checkpoint(cancel_event)
         result = secret_request_many(
             str(args.get("required_for") or ""),
             list(args.get("secrets") or []),
             prompt_callback=callback,
             force_refresh=bool(args.get("force_refresh", False)),
+            cancel_event=cancel_event,
         )
+    except InterruptedError as exc:
+        result = {
+            "success": False,
+            "error": str(exc),
+            "status": "cancelled",
+            "interrupted": True,
+        }
     except SecretRequestError as exc:
         result = {"success": False, "error": str(exc)}
     return json.dumps(result, ensure_ascii=False)

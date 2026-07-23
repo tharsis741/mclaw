@@ -14,6 +14,7 @@ import json
 from pathlib import Path
 
 from mclaw.channels.weixin.outbound_registry import get_weixin_outbound_target
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 
 
@@ -30,9 +31,30 @@ def weixin_send_file(file_path: str, caption: str = "", as_file: bool = False, p
     if not path.is_file():
         return tool_error(f"File not found: {file_path}", success=False)
 
-    result = target.send_file(file_path=str(path), caption=caption or "", as_file=bool(as_file))
+    cancel_event = get_interrupt_event()
+    if cancel_event is None:
+        current_event = getattr(parent_agent, "current_turn_cancel_event", None)
+        cancel_event = current_event() if callable(current_event) else None
+    result = target.send_file(
+        file_path=str(path),
+        caption=caption or "",
+        as_file=bool(as_file),
+        cancel_event=cancel_event,
+        parent_agent=parent_agent,
+    )
     if not result.success:
-        return tool_error(result.error or "Weixin file send failed", success=False)
+        interrupted = bool(getattr(result, "interrupted", False))
+        completion_unknown = bool(getattr(result, "completion_unknown", False))
+        details = {"success": False}
+        if interrupted:
+            details.update(
+                interrupted=True,
+                status="cancel_requested" if completion_unknown else "cancelled",
+                completion_unknown=completion_unknown,
+            )
+        elif completion_unknown:
+            details.update(status="timeout", completion_unknown=True)
+        return tool_error(result.error or "Weixin file send failed", **details)
     return json.dumps(
         {
             "success": True,

@@ -7,9 +7,13 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Tuple
+
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 
 TRUST_BUNDLED = "bundled"
 TRUST_COMMUNITY = "community"
@@ -97,14 +101,21 @@ def _detect_trust_level(source: str) -> str:
     return TRUST_COMMUNITY
 
 
-def scan_skill(skill_dir: Path, source: str = "community") -> ScanResult:
+def scan_skill(
+    skill_dir: Path,
+    source: str = "community",
+    cancel_event: threading.Event | None = None,
+) -> ScanResult:
     """Scan text files in a Skill package for known injection/exfiltration patterns."""
+    cancel_event = cancel_event or get_interrupt_event()
+    cancellation_checkpoint(cancel_event)
     trust_level = _detect_trust_level(source)
     verdict = "safe"
     findings: List[Finding] = []
 
     skill_dir = Path(skill_dir)
     for fpath in skill_dir.rglob("*"):
+        cancellation_checkpoint(cancel_event)
         if not fpath.is_file():
             continue
         if fpath.stat().st_size > 2 * 1024 * 1024:
@@ -113,8 +124,10 @@ def scan_skill(skill_dir: Path, source: str = "community") -> ScanResult:
             text = fpath.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
+        cancellation_checkpoint(cancel_event)
 
         for lineno, line in enumerate(text.splitlines(), 1):
+            cancellation_checkpoint(cancel_event)
             for pattern, pid, severity, category, description in THREAT_PATTERNS:
                 m = re.search(pattern, line, re.IGNORECASE)
                 if not m:
@@ -132,6 +145,7 @@ def scan_skill(skill_dir: Path, source: str = "community") -> ScanResult:
                 )
                 verdict = _max_verdict(verdict, _severity_to_verdict(severity))
 
+    cancellation_checkpoint(cancel_event)
     summary = f"{len(findings)} findings; verdict={verdict}"
     return ScanResult(
         skill_name=skill_dir.name,

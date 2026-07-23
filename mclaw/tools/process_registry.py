@@ -27,14 +27,35 @@ from typing import Any
 from mclaw.cli.config import ConfigError, load_config
 from mclaw.constants import get_mclaw_home
 from mclaw.runtime.manager import RuntimeManager
-from mclaw.runtime.process import kill_process_tree, sanitize_subprocess_env
+from mclaw.runtime.base import UnresolvedOperationFence
+from mclaw.runtime.process import (
+    PROCESS_TERMINATION_BUDGET_SECONDS,
+    kill_process_group,
+    kill_process_tree,
+    sanitize_subprocess_env,
+    wait_for_process_group_exit,
+)
 from mclaw.runtime.secrets import redact_secret_values
 from mclaw.tools.ansi_strip import strip_ansi
-from mclaw.tools.interrupt import is_interrupted
+from mclaw.tools.interrupt import (
+    get_cancel_id,
+    get_interrupt_event,
+    is_interrupted,
+    safe_cancel_trace,
+)
 from mclaw.tools.registry import registry, tool_error
 from mclaw.utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+
+class BackgroundSpawnCancellationError(InterruptedError):
+    """A just-spawned detached process could not be confirmed terminated."""
+
+    def __init__(self, pid: int, message: str | None = None) -> None:
+        super().__init__(message or f"Background process {pid} may still be running after cancellation")
+        self.pid = pid
+        self.termination_fence = UnresolvedOperationFence()
 
 _IS_WINDOWS = _platform_mod.system() == "Windows"
 CHECKPOINT_PATH = get_mclaw_home() / "processes.json"
@@ -210,33 +231,150 @@ class ProcessRegistry:
         self, session: ProcessSession, exc: BaseException
     ) -> None:
         """Terminate a just-spawned process that could not be persisted."""
-        try:
-            if session._pty is not None:
-                try:
-                    session._pty.terminate(force=True)
-                except Exception as terminate_exc:
-                    logger.debug(
-                        "Failed to terminate PTY process after checkpoint failure for %s: %s",
-                        session.id,
-                        terminate_exc,
-                    )
-            elif session.pid:
-                kill_process_tree(session.pid)
-        finally:
+        session._termination_trigger = "checkpoint_failure"
+        termination_confirmed = self._terminate_uncommitted_spawn(session)
+        if termination_confirmed:
             with self._lock:
                 self._running.pop(session.id, None)
             with session._lock:
                 session.exited = True
                 session.exit_code = None
+        else:
+            raise BackgroundSpawnCancellationError(
+                session.pid or 0,
+                (
+                    f"Background process {session.pid or 0} could not be persisted, "
+                    "and its termination could not be confirmed"
+                ),
+            ) from exc
         raise RuntimeError(
             f"Failed to persist background process registry for {session.id}: {exc}"
         ) from exc
 
-    def _register_running_or_abort(self, session: ProcessSession) -> None:
-        """Register a running session and persist it before returning to caller."""
+    def _terminate_uncommitted_spawn(self, session: ProcessSession) -> bool:
+        """Best-effort stop a spawn and confirm both its tree and direct handle."""
+        cancel_id = getattr(session, "_cancel_id", "none")
+        trigger = getattr(session, "_termination_trigger", "cancel_before_commit")
+        started = time.monotonic()
+        termination_deadline = started + PROCESS_TERMINATION_BUDGET_SECONDS
+        process_group_id = session.process_group_id if not _IS_WINDOWS else None
+        if process_group_id:
+            tree_targeted = kill_process_group(process_group_id)
+        elif session.pid:
+            # Target the recorded tree even if the direct parent already
+            # exited; parent state alone says nothing about descendants.
+            tree_targeted = kill_process_tree(session.pid)
+        else:
+            tree_targeted = False
+        safe_cancel_trace(
+            lambda: logger.warning(
+                "[CANCEL_TRACE] termination_start cancel_id=%s "
+                "operation=background_spawn pid=%s trigger=%s",
+                cancel_id,
+                session.pid,
+                trigger,
+            )
+        )
+
+        direct_termination_confirmed = False
+        if session._pty is not None:
+            try:
+                isalive = getattr(session._pty, "isalive", None)
+                direct_deadline = min(
+                    termination_deadline,
+                    time.monotonic() + 0.5,
+                )
+                while callable(isalive):
+                    if not isalive():
+                        direct_termination_confirmed = True
+                        break
+                    remaining = direct_deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(0.05, remaining))
+            except Exception:
+                safe_cancel_trace(
+                    lambda: logger.debug(
+                        "Failed to stop PTY cancelled during spawn", exc_info=True
+                    )
+                )
+        elif session.process is not None:
+            wait_budget = min(
+                0.5,
+                max(0.0, termination_deadline - time.monotonic()),
+            )
+            try:
+                if wait_budget <= 0:
+                    raise subprocess.TimeoutExpired("background_spawn", 0)
+                session.process.wait(timeout=wait_budget)
+            except (subprocess.TimeoutExpired, OSError):
+                direct_termination_confirmed = False
+            else:
+                direct_termination_confirmed = session.process.poll() is not None
+
+        tree_termination_confirmed = (
+            wait_for_process_group_exit(
+                process_group_id,
+                timeout=max(0.0, termination_deadline - time.monotonic()),
+            )
+            if process_group_id
+            else tree_targeted if _IS_WINDOWS else False
+        )
+        termination_confirmed = tree_termination_confirmed and direct_termination_confirmed
+        log = logger.info if termination_confirmed else logger.warning
+        safe_cancel_trace(
+            lambda: log(
+                "[CANCEL_TRACE] termination_result cancel_id=%s "
+                "operation=background_spawn pid=%s trigger=%s tree_targeted=%s "
+                "tree_confirmed=%s "
+                "direct_exit_confirmed=%s termination_confirmed=%s "
+                "persistent_fence=%s elapsed_ms=%d",
+                cancel_id,
+                session.pid,
+                trigger,
+                tree_targeted,
+                tree_termination_confirmed,
+                direct_termination_confirmed,
+                termination_confirmed,
+                not termination_confirmed,
+                int((time.monotonic() - started) * 1000),
+            )
+        )
+        return termination_confirmed
+
+    def _abort_cancelled_spawn(self, session: ProcessSession) -> None:
+        """Stop an uncommitted spawn or raise a permanent completion fence."""
+        if not self._terminate_uncommitted_spawn(session):
+            raise BackgroundSpawnCancellationError(session.pid or 0)
+        raise InterruptedError("Background process start was cancelled")
+
+    def _register_running_or_abort(
+        self,
+        session: ProcessSession,
+        cancel_event: threading.Event | None = None,
+    ) -> None:
+        """Commit a running session, with cancellation checked at the commit point."""
         with self._lock:
-            self._prune_if_needed()
-            self._running[session.id] = session
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+            else:
+                cancelled = False
+                self._prune_if_needed()
+                self._running[session.id] = session
+        if cancelled:
+            session._cancel_id = get_cancel_id(cancel_event)
+            try:
+                self._abort_cancelled_spawn(session)
+            finally:
+                safe_cancel_trace(
+                    lambda: logger.warning(
+                        "[CANCEL_TRACE] background_cancel_at_commit cancel_id=%s "
+                        "session_id=%s pid=%s",
+                        session._cancel_id,
+                        session.id,
+                        session.pid,
+                    )
+                )
         try:
             self._write_checkpoint()
         except Exception as exc:
@@ -413,6 +551,7 @@ class ProcessRegistry:
         env_vars: dict | None = None,
         use_pty: bool = False,
         scoped_secret_keys: set[str] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> ProcessSession:
         """Spawn a local background command and persist it before returning."""
         session = ProcessSession(
@@ -446,6 +585,7 @@ class ProcessRegistry:
             env=bg_env,
             use_pty=use_pty,
             scoped_secret_keys=allowed,
+            cancel_event=cancel_event,
         )
         session.process = spawned.process
         session.pid = spawned.pid
@@ -458,8 +598,22 @@ class ProcessRegistry:
                 session.process_group_id = os.getpgid(session.pid)
             except OSError:
                 session.process_group_id = None
+        if cancel_event is not None and cancel_event.is_set():
+            session._cancel_id = get_cancel_id(cancel_event)
+            try:
+                self._abort_cancelled_spawn(session)
+            finally:
+                safe_cancel_trace(
+                    lambda: logger.warning(
+                        "[CANCEL_TRACE] background_cancel_post_spawn cancel_id=%s "
+                        "session_id=%s pid=%s",
+                        session._cancel_id,
+                        session.id,
+                        session.pid,
+                    )
+                )
         if spawned.pty_disabled_reason:
-            logger.warning(spawned.pty_disabled_reason)
+            safe_cancel_trace(lambda: logger.warning(spawned.pty_disabled_reason))
         if session._pty is not None:
             reader = threading.Thread(
                 target=self._pty_reader_loop,
@@ -468,8 +622,8 @@ class ProcessRegistry:
                 name=f"proc-pty-reader-{session.id}",
             )
             session._reader_thread = reader
+            self._register_running_or_abort(session, cancel_event)
             reader.start()
-            self._register_running_or_abort(session)
             return session
         reader = threading.Thread(
             target=self._reader_loop,
@@ -478,8 +632,8 @@ class ProcessRegistry:
             name=f"proc-reader-{session.id}",
         )
         session._reader_thread = reader
+        self._register_running_or_abort(session, cancel_event)
         reader.start()
-        self._register_running_or_abort(session)
         return session
 
     # ── Reader thread ──
@@ -652,8 +806,9 @@ class ProcessRegistry:
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
 
+        cancel_event = get_interrupt_event()
         deadline = time.monotonic() + effective_timeout
-        while time.monotonic() < deadline:
+        while True:
             session = self._refresh_detached_session(session)
             assert session is not None
             if session.exited:
@@ -668,13 +823,20 @@ class ProcessRegistry:
             if is_interrupted():
                 result = {
                     "status": "interrupted",
+                    "interrupted": True,
                     "output": self._redacted_output_tail(session, 1000),
                     "note": "User interrupted wait",
                 }
                 if timeout_note:
                     result["timeout_note"] = timeout_note
                 return result
-            time.sleep(1)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if cancel_event is not None:
+                cancel_event.wait(min(0.1, remaining))
+            else:
+                time.sleep(min(0.1, remaining))
 
         result = {
             "status": "timeout",

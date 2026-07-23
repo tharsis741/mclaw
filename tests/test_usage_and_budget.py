@@ -457,7 +457,7 @@ def test_configured_iteration_limit_returns_incomplete_stop_reason(monkeypatch) 
         },
     )
 
-    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+    def execute(tool_calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(agent._build_assistant_msg(assistant_content, tool_calls, reasoning))
         for call in tool_calls:
             messages.append({
@@ -527,7 +527,7 @@ def test_delegated_child_reserves_final_call_for_tool_free_summary(
     }]
     child.valid_tool_names = {"lookup"}
 
-    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+    def execute(tool_calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(child._build_assistant_msg(assistant_content, tool_calls, reasoning))
         for call in tool_calls:
             messages.append({
@@ -607,7 +607,7 @@ def test_delegated_timeout_summarizes_completed_tool_results(monkeypatch) -> Non
     }]
     child.valid_tool_names = {"write_file"}
 
-    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+    def execute(tool_calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(child._build_assistant_msg(assistant_content, tool_calls, reasoning))
         messages.append({
             "role": "tool",
@@ -893,7 +893,7 @@ def test_successful_large_write_is_visible_once_before_pruning(monkeypatch) -> N
         config={"compression": {"enabled": True}},
     )
 
-    def execute(tool_calls, messages, assistant_content="", reasoning=None):
+    def execute(tool_calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(agent._build_assistant_msg(
             assistant_content,
             tool_calls,
@@ -1007,7 +1007,7 @@ def test_non_write_tool_results_remain_raw_after_seen_once(
         config={"compression": {"enabled": True}},
     )
 
-    def execute(calls, messages, assistant_content="", reasoning=None):
+    def execute(calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(agent._build_assistant_msg(
             assistant_content,
             calls,
@@ -1084,7 +1084,7 @@ def test_failed_follow_up_keeps_pending_write_raw(monkeypatch) -> None:
         config={"compression": {"enabled": True}},
     )
 
-    def execute(calls, messages, assistant_content="", reasoning=None):
+    def execute(calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(agent._build_assistant_msg(
             assistant_content,
             calls,
@@ -1173,7 +1173,7 @@ def test_tui_context_uses_first_estimate_then_provider_input_usage(
     )
     transport.agent = agent
 
-    def execute(calls, messages, assistant_content="", reasoning=None):
+    def execute(calls, messages, assistant_content="", reasoning=None, cancel_event=None):
         messages.append(agent._build_assistant_msg(
             assistant_content,
             calls,

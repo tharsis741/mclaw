@@ -16,6 +16,8 @@ import json
 import logging
 import os
 import threading
+import time
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from pathlib import Path
@@ -23,6 +25,13 @@ from typing import Any
 
 from mclaw.safety.mutation_detector import terminal_action
 from mclaw.safety.path_resolver import repair_common_mojibake
+from mclaw.tools.interrupt import (
+    get_cancel_id,
+    get_interrupt_event,
+    reset_interrupt_event,
+    safe_cancel_trace,
+    set_interrupt_event,
+)
 from mclaw.tools.registry import registry
 from mclaw.tools.toolsets import resolve_multiple_toolsets
 
@@ -35,10 +44,25 @@ _tool_whitelist: ContextVar[set[str] | None] = ContextVar("tool_whitelist", defa
 _tool_action_whitelist: ContextVar[dict[str, set[str]] | None] = ContextVar("tool_action_whitelist", default=None)
 
 
-def set_tool_context(session_db: Any = None, session_id: str = "") -> None:
+def set_tool_context(
+    session_db: Any = None,
+    session_id: str = "",
+    cancel_event: threading.Event | None = None,
+) -> tuple:
     """Set context for the duration of tool execution. Call from core.py."""
-    _current_session_db.set(session_db)
-    _current_session_id.set(session_id)
+    return (
+        _current_session_db.set(session_db),
+        _current_session_id.set(session_id),
+        set_interrupt_event(cancel_event),
+    )
+
+
+def reset_tool_context(tokens: tuple) -> None:
+    """Restore the context that preceded one ``set_tool_context`` call."""
+    session_db_token, session_id_token, interrupt_token = tokens
+    reset_interrupt_event(interrupt_token)
+    _current_session_id.reset(session_id_token)
+    _current_session_db.reset(session_db_token)
 
 
 def get_session_db() -> Any:
@@ -118,7 +142,9 @@ _CHECKPOINT_METADATA_REDACT_KEYS = {
     "api_key",
     "secret",
 }
-_MAX_TOOL_WORKERS = 8
+_INTERRUPT_POLL_INTERVAL = 0.05
+_INTERRUPT_CLEANUP_GRACE = 1.0
+_ASYNC_HANDLER_TIMEOUT_SECONDS = 600.0
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT = 30
 _CONCURRENT_TOOL_TIMEOUTS = {
     "web_search": 180,
@@ -169,16 +195,213 @@ def _get_worker_loop():
         return _worker_loop
 
 
-def _run_async(coro):
-    """Bridge an async tool handler to sync context."""
+class _AsyncHandlerFence:
+    """Track the real lifetime of one async handler, including slow cancellation."""
+
+    def __init__(self, diagnostic_name: str = "async_tool_handler") -> None:
+        self.future: Future | None = None
+        self._task: asyncio.Task | None = None
+        self._lock = threading.Lock()
+        self._finished = threading.Event()
+        self._cancel_requested = False
+        self._outcome_ready = False
+        self._outcome = None
+        self._outcome_error: BaseException | None = None
+        self.created_at = time.monotonic()
+        self.diagnostic_name = diagnostic_name
+
+    @property
+    def blocking_reason(self) -> str:
+        return (
+            "An async tool handler is still shutting down after cancellation "
+            f"({max(0.0, time.monotonic() - self.created_at):.1f}s)"
+        )
+
+    def is_alive(self) -> bool:
+        return not self._finished.is_set()
+
+    def bind_task(self, task: asyncio.Task) -> bool:
+        """Bind the real asyncio task and report a cancellation raced submission."""
+        with self._lock:
+            self._task = task
+            return self._cancel_requested
+
+    def request_cancel(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Request Task cancellation without marking the proxy Future done early."""
+        with self._lock:
+            self._cancel_requested = True
+            task = self._task
+        if task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                # A stopped loop cannot prove that the coroutine reached a terminal
+                # state. Leave the fence alive so the parent remains fail-closed.
+                safe_cancel_trace(
+                    lambda: logger.debug(
+                        "Async tool loop stopped before cancellation was delivered"
+                    )
+                )
+
+    def set_terminal_outcome(
+        self,
+        *,
+        result: Any = None,
+        error: BaseException | None = None,
+    ) -> None:
+        with self._lock:
+            self._outcome_ready = True
+            self._outcome = result
+            self._outcome_error = error
+
+    def terminal_outcome(self) -> tuple[bool, Any, BaseException | None]:
+        with self._lock:
+            return self._outcome_ready, self._outcome, self._outcome_error
+
+    def finish(self) -> None:
+        self._finished.set()
+
+
+def _close_unsubmitted_coroutine(coro: Any) -> None:
+    close = getattr(coro, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:
+            logger.debug("Failed to close an unsubmitted async tool coroutine", exc_info=True)
+
+
+def _run_async(
+    coro,
+    parent_agent: Any = None,
+    *,
+    diagnostic_name: str = "async_tool_handler",
+    timeout_seconds: float | None = None,
+    raise_on_stop: bool = False,
+):
+    """Bridge an async tool handler while fencing its real asyncio Task lifetime."""
+    cancel_event = get_interrupt_event()
+    if cancel_event is None:
+        current_event = getattr(parent_agent, "current_turn_cancel_event", None)
+        cancel_event = current_event() if callable(current_event) else None
+    if cancel_event is not None and cancel_event.is_set():
+        _close_unsubmitted_coroutine(coro)
+        if raise_on_stop:
+            raise InterruptedError(f"{diagnostic_name} cancelled before start")
+        return _cancelled_tool_result("async handler", started=False)
+
     loop = _get_worker_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    fence = _AsyncHandlerFence(diagnostic_name)
+    _register_turn_worker(parent_agent, fence)
+
+    async def _tracked_handler():
+        task = asyncio.current_task()
+        cancel_raced_submission = task is not None and fence.bind_task(task)
+        if cancel_raced_submission and task is not None:
+            task.cancel()
+        try:
+            result = await coro
+        except BaseException as exc:
+            fence.set_terminal_outcome(error=exc)
+            raise
+        else:
+            fence.set_terminal_outcome(result=result)
+            return result
+        finally:
+            fence.finish()
+            _unregister_turn_worker(parent_agent, fence)
+
+    tracked = _tracked_handler()
     try:
-        return future.result(timeout=600)
-    except RuntimeError:
-        loop = _get_worker_loop()
-        future = asyncio.run_coroutine_threadsafe(coro, loop)
-        return future.result(timeout=600)
+        future = asyncio.run_coroutine_threadsafe(tracked, loop)
+        fence.future = future
+    except BaseException:
+        tracked.close()
+        _close_unsubmitted_coroutine(coro)
+        fence.finish()
+        _unregister_turn_worker(parent_agent, fence)
+        raise
+
+    handler_timeout = (
+        _ASYNC_HANDLER_TIMEOUT_SECONDS
+        if timeout_seconds is None
+        else max(0.001, float(timeout_seconds))
+    )
+    deadline = time.monotonic() + handler_timeout
+    while True:
+        # Prefer a real terminal result when completion won the race with a
+        # cancellation signal or the hard deadline.
+        if future.done():
+            return future.result()
+        if cancel_event is not None and cancel_event.is_set():
+            fence.request_cancel(loop)
+            outcome_ready, outcome, outcome_error = fence.terminal_outcome()
+            if outcome_ready and not isinstance(outcome_error, asyncio.CancelledError):
+                safe_cancel_trace(
+                    lambda: logger.info(
+                        "[CANCEL_TRACE] async_handler_completion_won_stop "
+                        "cancel_id=%s session=%s trigger=event success=%s elapsed_ms=%d",
+                        get_cancel_id(cancel_event),
+                        getattr(parent_agent, "session_id", "?"),
+                        outcome_error is None,
+                        int((time.monotonic() - fence.created_at) * 1000),
+                    )
+                )
+                if outcome_error is not None:
+                    raise outcome_error
+                return outcome
+            safe_cancel_trace(
+                lambda: logger.warning(
+                    "[CANCEL_TRACE] async_handler_cancel cancel_id=%s session=%s "
+                    "trigger=event elapsed_ms=%d completion_unknown=true",
+                    get_cancel_id(cancel_event),
+                    getattr(parent_agent, "session_id", "?"),
+                    int((time.monotonic() - fence.created_at) * 1000),
+                )
+            )
+            if raise_on_stop:
+                raise InterruptedError(f"{diagnostic_name} cancelled")
+            return _cancelled_tool_result("async handler", started=True)
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            fence.request_cancel(loop)
+            outcome_ready, outcome, outcome_error = fence.terminal_outcome()
+            if outcome_ready and not isinstance(outcome_error, asyncio.CancelledError):
+                safe_cancel_trace(
+                    lambda: logger.info(
+                        "[CANCEL_TRACE] async_handler_completion_won_stop "
+                        "cancel_id=%s session=%s trigger=deadline success=%s elapsed_ms=%d",
+                        get_cancel_id(cancel_event),
+                        getattr(parent_agent, "session_id", "?"),
+                        outcome_error is None,
+                        int((time.monotonic() - fence.created_at) * 1000),
+                    )
+                )
+                if outcome_error is not None:
+                    raise outcome_error
+                return outcome
+            safe_cancel_trace(
+                lambda: logger.warning(
+                    "[CANCEL_TRACE] async_handler_cancel cancel_id=%s session=%s "
+                    "trigger=deadline elapsed_ms=%d completion_unknown=true",
+                    get_cancel_id(cancel_event),
+                    getattr(parent_agent, "session_id", "?"),
+                    int((time.monotonic() - fence.created_at) * 1000),
+                )
+            )
+            if raise_on_stop:
+                raise TimeoutError(
+                    f"{diagnostic_name} exceeded its {handler_timeout}-second deadline"
+                )
+            return _timed_out_tool_result(
+                diagnostic_name.replace("_", " "),
+                handler_timeout,
+            )
+        try:
+            return future.result(timeout=min(_INTERRUPT_POLL_INTERVAL, remaining))
+        except FutureTimeout:
+            continue
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -461,6 +684,8 @@ def _maybe_checkpoint_before_tool(
     """Take a pre-mutation checkpoint and start an operation journal entry."""
     if checkpoint_manager is None:
         return None
+    operation = None
+    journal = None
     try:
         if tool_name == "terminal":
             include_terminal = True
@@ -480,8 +705,6 @@ def _maybe_checkpoint_before_tool(
         raw_command = plan.intent.raw_command
         if not work_dir:
             return None
-        operation = None
-        journal = None
         if _operation_journal_enabled(parent_agent):
             try:
                 from mclaw.safety.operation_journal import default_journal
@@ -502,7 +725,18 @@ def _maybe_checkpoint_before_tool(
                     targets=target_paths,
                     risk=getattr(plan.decision, "level", "normal"),
                     checkpoint_reason=_checkpoint_reason(tool_name, arguments),
+                    cancel_event=get_interrupt_event(),
                 )
+                if operation is not None and parent_agent is not None:
+                    op_map = getattr(parent_agent, "_tool_operation_ids", None)
+                    if op_map is None:
+                        op_map = {}
+                        setattr(parent_agent, "_tool_operation_ids", op_map)
+                    tool_call_id = operation.get("tool_call_id")
+                    if tool_call_id:
+                        op_map[tool_call_id] = operation.get("operation_id")
+            except InterruptedError:
+                raise
             except Exception:
                 logger.debug("Operation journal begin failed for %s", tool_name, exc_info=True)
         checkpoint_manager.ensure_checkpoint(
@@ -532,7 +766,11 @@ def _maybe_checkpoint_before_tool(
             setattr(parent_agent, "_last_checkpoint_targets", attempt.get("target_paths") or [])
             setattr(parent_agent, "_last_checkpoint_attempt", attempt)
         return operation
-    except Exception:
+    except InterruptedError:
+        return operation
+    except Exception as exc:
+        if getattr(exc, "termination_fence", None) is not None:
+            raise
         logger.debug("Checkpoint preflight failed for %s", tool_name, exc_info=True)
         return None
 
@@ -555,6 +793,17 @@ def _tool_result_success(result: str) -> bool:
     return True
 
 
+def _tool_result_completion_unknown(result: Any) -> bool:
+    """Return whether a structured tool result leaves external effects unresolved."""
+    if not isinstance(result, str):
+        return False
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("completion_unknown") is True
+
+
 def _finalize_operation(operation: dict | None, result: str, success: bool, parent_agent: Any = None) -> None:
     """Finalize an operation journal entry after tool execution."""
     if not operation:
@@ -566,15 +815,8 @@ def _finalize_operation(operation: dict | None, result: str, success: bool, pare
             success=success,
             result_preview=result if isinstance(result, str) else str(result),
             after_commit=None,
+            cancel_event=get_interrupt_event(),
         )
-        if parent_agent is not None:
-            op_map = getattr(parent_agent, "_tool_operation_ids", None)
-            if op_map is None:
-                op_map = {}
-                setattr(parent_agent, "_tool_operation_ids", op_map)
-            tool_call_id = operation.get("tool_call_id")
-            if tool_call_id:
-                op_map[tool_call_id] = operation.get("operation_id")
     except Exception:
         logger.debug("Operation journal finalize failed", exc_info=True)
 
@@ -646,17 +888,18 @@ def _concurrent_tool_timeout(tool_name: str, parent_agent: Any = None) -> int:
                     fallback = parse_bool_config(web_cfg.get("fallback"), default=True)
                 except Exception:
                     fallback = True
-                if backend == "dashscope" or fallback:
-                    slow_timeout = _positive_int(
-                        web_cfg.get(
-                            "dashscope_deep_timeout",
-                            web_cfg.get("dashscope_timeout", 90),
-                        ),
-                        90,
-                    )
-                    timeout = max(fast_timeout, slow_timeout)
+                slow_timeout = max(
+                    _positive_int(web_cfg.get("dashscope_timeout"), 90),
+                    _positive_int(web_cfg.get("dashscope_deep_timeout"), 120),
+                )
+                if backend == "dashscope":
+                    timeout = slow_timeout + 10
+                elif backend == "tavily":
+                    timeout = fast_timeout + (slow_timeout if fallback else 0) + 10
+                elif fallback:
+                    timeout = fast_timeout + slow_timeout + 10
                 else:
-                    timeout = fast_timeout
+                    timeout = max(fast_timeout, slow_timeout) + 10
             elif tool_name == "web_extract":
                 extract_cfg = auxiliary.get("web_extract", {})
                 if isinstance(extract_cfg, dict):
@@ -665,35 +908,54 @@ def _concurrent_tool_timeout(tool_name: str, parent_agent: Any = None) -> int:
             elif tool_name == "vision_analyze":
                 vision_cfg = auxiliary.get("vision", {})
                 if isinstance(vision_cfg, dict):
-                    timeout = (
-                        _positive_int(vision_cfg.get("timeout"), timeout)
-                        + _positive_int(vision_cfg.get("download_timeout"), 0)
-                    )
+                    model_timeout = _positive_int(vision_cfg.get("timeout"), timeout)
+                    download_timeout = _positive_int(vision_cfg.get("download_timeout"), 30)
+                    timeout = 2 * model_timeout + 3 * download_timeout + 16
     return max(1, timeout)
 
 
 def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -> int:
     """Return per-call timeout for tools that must run on the serial path."""
     timeout = 120
-    if tool_name != "terminal":
-        return timeout
-    try:
-        from mclaw.tools.terminal_tool import DEFAULT_TIMEOUT
-    except ImportError:
-        return timeout
-    timeout = DEFAULT_TIMEOUT
     cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
-    if isinstance(cfg, dict):
-        terminal_cfg = cfg.get("terminal", {})
-        if isinstance(terminal_cfg, dict):
-            timeout = _positive_int(terminal_cfg.get("timeout"), timeout)
+    if not isinstance(cfg, dict):
+        cfg = {}
     try:
         args = json.loads(func.get("arguments", "{}") or "{}")
     except (json.JSONDecodeError, TypeError, ValueError):
         args = {}
-    if isinstance(args, dict) and args.get("timeout") is not None:
-        timeout = _positive_int(args.get("timeout"), timeout)
-    return max(1, timeout) + 5
+    if not isinstance(args, dict):
+        args = {}
+
+    if tool_name == "terminal":
+        try:
+            from mclaw.tools.terminal_tool import _resolve_timeout
+        except ImportError:
+            return timeout
+        # Runtime cleanup can include taskkill(10s), pipe drain(5s), and the
+        # bounded parent fallback(1.2s). Keep the outer dispatcher beyond it.
+        return _resolve_timeout(args.get("timeout"), cfg) + 18
+
+    if tool_name == "process" and args.get("action") == "wait":
+        terminal_cfg = cfg.get("terminal", {})
+        if not isinstance(terminal_cfg, dict):
+            terminal_cfg = {}
+        default_wait = _positive_int(terminal_cfg.get("timeout"), 180)
+        requested_wait = _positive_int(args.get("timeout"), default_wait)
+        return min(requested_wait, default_wait) + 5
+
+    if tool_name == "delegate_task":
+        from mclaw.tools.delegate_tool import normalize_timeout_seconds
+
+        delegation_cfg = cfg.get("delegation", {})
+        if not isinstance(delegation_cfg, dict):
+            delegation_cfg = {}
+        configured = normalize_timeout_seconds(
+            delegation_cfg.get("timeout_seconds", 600)
+        )
+        return configured + 30
+
+    return timeout
 
 
 def _invoke_tool_builtin(
@@ -828,6 +1090,14 @@ def _dispatch_single(
         return safety_error
     operation = _maybe_checkpoint_before_tool(tool_name, arguments_with_call, checkpoint_manager, parent_agent)
 
+    # Safety/checkpoint preparation can perform I/O. Recheck immediately before
+    # entering any handler so a cancellation during preparation cannot mutate.
+    cancel_event = get_interrupt_event()
+    if cancel_event is not None and cancel_event.is_set():
+        result = _cancelled_tool_result(tool_name, started=False)
+        _finalize_operation(operation, result, False, parent_agent)
+        return result
+
     # Layer 1: direct builtins, including memory when a manager is provided.
     builtin_result = _invoke_tool_builtin(tool_name, arguments, memory_manager, parent_agent)
     if builtin_result is not None:
@@ -837,6 +1107,8 @@ def _dispatch_single(
     try:
         result = registry.dispatch(tool_name, arguments, parent_agent=parent_agent)
     except Exception as e:
+        if getattr(e, "termination_fence", None) is not None:
+            raise
         from mclaw.tools.registry import tool_error
         result = tool_error(str(e), success=False)
         _finalize_operation(operation, result, False, parent_agent)
@@ -909,93 +1181,527 @@ def _dispatch_single(
     return result
 
 
+def _run_tool_worker(
+    result_slot: dict,
+    call: dict,
+    tool_names: set,
+    checkpoint_manager: Any,
+    memory_manager: Any,
+    parent_agent: Any,
+    cancel_event: threading.Event | None,
+) -> None:
+    """Run one tool into a private slot that the dispatcher snapshots once."""
+    token = set_interrupt_event(cancel_event) if cancel_event is not None else None
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            tool_name = call.get("function", {}).get("name", "?")
+            result_slot["result"] = _cancelled_tool_result(tool_name, started=False)
+            return
+        result_slot["result"] = _dispatch_single(
+            call,
+            tool_names,
+            checkpoint_manager,
+            memory_manager,
+            parent_agent,
+        )
+    except Exception as exc:
+        from mclaw.tools.registry import tool_error
+
+        termination_fence = getattr(exc, "termination_fence", None)
+        if termination_fence is not None:
+            _register_turn_worker(parent_agent, termination_fence)
+            result_slot["result"] = tool_error(
+                str(exc),
+                success=False,
+                completion_unknown=True,
+            )
+        else:
+            result_slot["result"] = tool_error(str(exc), success=False)
+    finally:
+        result_slot["finished_at"] = time.monotonic()
+        if token is not None:
+            reset_interrupt_event(token)
+        _unregister_turn_worker(parent_agent, threading.current_thread())
+
+
+def _register_turn_worker(parent_agent: Any, worker: threading.Thread) -> None:
+    """Fence a worker so its agent cannot begin another turn while it is alive."""
+    register = getattr(parent_agent, "_register_turn_worker", None)
+    if callable(register):
+        register(worker)
+
+
+def _unregister_turn_worker(parent_agent: Any, worker: threading.Thread) -> None:
+    unregister = getattr(parent_agent, "_unregister_turn_worker", None)
+    if callable(unregister):
+        unregister(worker)
+
+
+def _start_tool_worker(parent_agent: Any, worker: threading.Thread) -> None:
+    """Register before start, undoing the fence if thread creation fails."""
+    _register_turn_worker(parent_agent, worker)
+    try:
+        worker.start()
+    except BaseException:
+        _unregister_turn_worker(parent_agent, worker)
+        raise
+
+
+def _abort_tool_turn(
+    parent_agent: Any,
+    cancel_event: threading.Event,
+    reason: str,
+    tool_name: str = "batch",
+) -> None:
+    request_abort = getattr(parent_agent, "_request_turn_abort", None)
+    if callable(request_abort):
+        request_abort(reason, cancel_event)
+    else:
+        cancel_event.set()
+    _log_dispatch_stop(
+        parent_agent,
+        cancel_event,
+        tool_name=tool_name,
+        trigger="deadline" if reason == "tool_timeout" else "completion_unknown",
+    )
+
+
+def _log_dispatch_stop(
+    parent_agent: Any,
+    cancel_event: threading.Event,
+    *,
+    tool_name: str,
+    trigger: str,
+) -> None:
+    """Record one dispatcher stop decision without changing cancellation state."""
+    safe_cancel_trace(
+        lambda: logger.warning(
+            "[CANCEL_TRACE] dispatch_stop cancel_id=%s session=%s tool=%s "
+            "trigger=%s event_was_set=%s",
+            get_cancel_id(cancel_event),
+            getattr(parent_agent, "session_id", "?"),
+            tool_name,
+            trigger,
+            cancel_event.is_set(),
+        )
+    )
+
+
+def _wait_for_tool_worker(
+    thread: threading.Thread,
+    deadline: float,
+    cancel_event: threading.Event | None,
+) -> str:
+    """Wait until completion, the absolute deadline, or turn cancellation."""
+    while thread.is_alive():
+        if cancel_event is not None and cancel_event.is_set():
+            return "cancelled"
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return "timeout"
+        wait_for = min(_INTERRUPT_POLL_INTERVAL, remaining)
+        if cancel_event is None:
+            thread.join(wait_for)
+        else:
+            cancel_event.wait(wait_for)
+    return "done"
+
+
+def _completed_tool_result(result_slot: dict, tool_name: str) -> Any:
+    """Snapshot a completed worker result without exposing its mutable slot."""
+    if result_slot["result"] is not None:
+        return result_slot["result"]
+    from mclaw.tools.registry import tool_error
+
+    return tool_error(f"Tool '{tool_name}' returned no result", success=False)
+
+
+def _wait_for_tool_cleanup(thread: threading.Thread, deadline: float) -> None:
+    """Give a cancelled worker a bounded chance to report its real result."""
+    while thread.is_alive():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        thread.join(min(_INTERRUPT_POLL_INTERVAL, remaining))
+
+
+def _cancelled_tool_result(tool_name: str, *, started: bool) -> str:
+    from mclaw.tools.registry import tool_error
+
+    if started:
+        return tool_error(
+            f"Cancellation requested for tool '{tool_name}'; completion is unknown",
+            success=False,
+            interrupted=True,
+            status="cancel_requested",
+            completion_unknown=True,
+        )
+    return tool_error(
+        f"Tool '{tool_name}' was not started because the turn was cancelled",
+        success=False,
+        interrupted=True,
+        status="cancelled",
+    )
+
+
+def _timed_out_tool_result(
+    tool_name: str,
+    timeout: int | float,
+    *,
+    completion_unknown: bool = True,
+) -> str:
+    from mclaw.tools.registry import tool_error
+
+    return tool_error(
+        (
+            f"Tool '{tool_name}' timed out after {timeout} seconds; completion is unknown"
+            if completion_unknown
+            else f"Tool '{tool_name}' exceeded its {timeout}-second deadline and has stopped"
+        ),
+        success=False,
+        status="timeout",
+        completion_unknown=completion_unknown,
+    )
+
+
+def _skipped_after_unknown_result(tool_name: str) -> str:
+    from mclaw.tools.registry import tool_error
+
+    return tool_error(
+        f"Tool '{tool_name}' was skipped because the previous tool may still be running",
+        success=False,
+        status="skipped",
+        reason="previous_completion_unknown",
+    )
+
+
 def handle_function_calls(
     calls: list,
     tool_names: set,
     memory_manager: Any = None,
     checkpoint_manager: Any = None,
     parent_agent: Any = None,
+    cancel_event: threading.Event | None = None,
 ) -> list:
-    """Dispatch a batch of tool calls, automatically choosing serial or concurrent.
-
-    Concurrent path is chosen when all calls are read-only and pass the
-    _should_parallelize_tool_batch() checks (no path overlap, all in whitelist).
-    Serial path uses CheckpointManager (passed in) for write tools.
-
-    checkpoint_manager should be created once per agent turn and passed in to
-    ensure the same file is snapshotted at most once per turn.
-    """
+    """Dispatch a batch of tool calls with turn cancellation and time bounds."""
     if not calls:
         return []
 
+    if cancel_event is None:
+        cancel_event = get_interrupt_event()
     use_concurrent = _should_parallelize_tool_batch(calls)
 
     if use_concurrent:
-        # Concurrent path: read-only tools do not checkpoint. Memory tools are
-        # excluded from _PARALLEL_SAFE_TOOLS, so they stay on the serial path.
-        _tool_names = [c.get("function", {}).get("name", "?") for c in calls]
-        logger.info("[TOOL CONCURRENT START] tools=%s", _tool_names)
+        tool_call_names = [c.get("function", {}).get("name", "?") for c in calls]
+        logger.info("[TOOL CONCURRENT START] tools=%s", tool_call_names)
         results: list = [None] * len(calls)
-        # Daemon threads keep timed-out tool calls from blocking shutdown.
-        _tool_threads: list[tuple[threading.Thread, int]] = []
-        for i, call in enumerate(calls):
+        workers: dict[int, tuple[threading.Thread, dict, float, int | float]] = {}
+        timed_out_indices: set[int] = set()
+
+        for idx, call in enumerate(calls):
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            tool_name = tool_call_names[idx]
+            tool_timeout = _concurrent_tool_timeout(tool_name, parent_agent)
+            result_slot = {"result": None, "finished_at": None}
             ctx = copy_context()
-            t = threading.Thread(
-                target=lambda c, idx, context: context.run(
-                    lambda: results.__setitem__(
-                        idx,
-                        _dispatch_single(c, tool_names, None, memory_manager, parent_agent),
-                    )
+            thread = threading.Thread(
+                target=ctx.run,
+                args=(
+                    _run_tool_worker,
+                    result_slot,
+                    call,
+                    tool_names,
+                    None,
+                    memory_manager,
+                    parent_agent,
+                    cancel_event,
                 ),
-                args=(call, i, ctx),
                 daemon=True,
+                name=f"mclaw-tool-{tool_name}",
             )
-            t.start()
-            _tool_threads.append((t, i))
-        for t, idx in _tool_threads:
-            tname = _tool_names[idx]
-            tool_timeout = _concurrent_tool_timeout(tname, parent_agent)
-            t.join(timeout=tool_timeout)
-            if results[idx] is None:
-                from mclaw.tools.registry import tool_error
-                logger.warning("[TOOL TIMEOUT] %s (idx=%d)", tname, idx)
-                results[idx] = tool_error(
-                    f"Tool '{tname}' timed out after {tool_timeout} seconds", success=False
+            if cancel_event is not None and cancel_event.is_set():
+                break
+            deadline = time.monotonic() + tool_timeout
+            _start_tool_worker(parent_agent, thread)
+            workers[idx] = (thread, result_slot, deadline, tool_timeout)
+
+        cancelled = cancel_event is not None and cancel_event.is_set()
+        if not cancelled:
+            deadline_order = sorted(workers.items(), key=lambda item: item[1][2])
+            for idx, (thread, result_slot, deadline, tool_timeout) in deadline_order:
+                outcome = _wait_for_tool_worker(thread, deadline, cancel_event)
+                tool_name = tool_call_names[idx]
+                if outcome == "cancelled":
+                    if cancel_event is not None:
+                        _log_dispatch_stop(
+                            parent_agent,
+                            cancel_event,
+                            tool_name=tool_name,
+                            trigger="user_interrupt",
+                        )
+                    cancelled = True
+                    break
+                if outcome == "timeout":
+                    safe_cancel_trace(
+                        lambda: logger.warning(
+                            "[TOOL TIMEOUT] %s (idx=%d)", tool_name, idx
+                        )
+                    )
+                    timed_out_indices.add(idx)
+                    results[idx] = _timed_out_tool_result(tool_name, tool_timeout)
+                    if cancel_event is not None:
+                        _abort_tool_turn(
+                            parent_agent,
+                            cancel_event,
+                            "tool_timeout",
+                            tool_name,
+                        )
+                        cancelled = True
+                        break
+                else:
+                    if result_slot["finished_at"] > deadline:
+                        safe_cancel_trace(
+                            lambda: logger.warning(
+                                "[TOOL TIMEOUT] %s (idx=%d)", tool_name, idx
+                            )
+                        )
+                        timed_out_indices.add(idx)
+                        results[idx] = _timed_out_tool_result(tool_name, tool_timeout)
+                        if cancel_event is not None:
+                            _abort_tool_turn(
+                                parent_agent,
+                                cancel_event,
+                                "tool_timeout",
+                                tool_name,
+                            )
+                            cancelled = True
+                            break
+                    else:
+                        results[idx] = _completed_tool_result(result_slot, tool_name)
+                        if (
+                            cancel_event is not None
+                            and _tool_result_completion_unknown(results[idx])
+                        ):
+                            _abort_tool_turn(
+                                parent_agent,
+                                cancel_event,
+                                "tool_completion_unknown",
+                                tool_name,
+                            )
+                            cancelled = True
+                            break
+                        logger.info(
+                            "[TOOL DONE] %s (idx=%d) result_len=%d",
+                            tool_name,
+                            idx,
+                            len(results[idx]) if isinstance(results[idx], str) else 0,
+                        )
+
+        if timed_out_indices and not cancelled:
+            # Without a turn Event (legacy/direct callers), every worker above was
+            # still observed through its own deadline. Refine timeout completion
+            # state from the real worker lifetime without adding another wait.
+            for idx in timed_out_indices:
+                thread, _result_slot, _deadline, tool_timeout = workers[idx]
+                results[idx] = _timed_out_tool_result(
+                    tool_call_names[idx],
+                    tool_timeout,
+                    completion_unknown=thread.is_alive(),
                 )
-            else:
-                logger.info(
-                    "[TOOL DONE] %s (idx=%d) result_len=%d",
-                    tname,
-                    idx,
-                    len(results[idx]) if isinstance(results[idx], str) else 0,
+
+        if cancelled:
+            cleanup_deadline = time.monotonic() + _INTERRUPT_CLEANUP_GRACE
+            for thread, _slot, _deadline, _timeout in workers.values():
+                _wait_for_tool_cleanup(thread, cleanup_deadline)
+            for idx, tool_name in enumerate(tool_call_names):
+                worker = workers.get(idx)
+                if worker is None:
+                    if results[idx] is None:
+                        results[idx] = _cancelled_tool_result(tool_name, started=False)
+                    continue
+                thread, result_slot, deadline, tool_timeout = worker
+                if idx in timed_out_indices:
+                    results[idx] = _timed_out_tool_result(
+                        tool_name,
+                        tool_timeout,
+                        completion_unknown=thread.is_alive(),
+                    )
+                    continue
+                if results[idx] is not None:
+                    continue
+                if thread.is_alive():
+                    results[idx] = _cancelled_tool_result(tool_name, started=True)
+                elif result_slot["finished_at"] > deadline:
+                    safe_cancel_trace(
+                        lambda: logger.warning(
+                            "[TOOL TIMEOUT] %s (idx=%d)", tool_name, idx
+                        )
+                    )
+                    results[idx] = _timed_out_tool_result(
+                        tool_name,
+                        tool_timeout,
+                        completion_unknown=False,
+                    )
+                else:
+                    results[idx] = _completed_tool_result(result_slot, tool_name)
+            if cancel_event is not None and any(
+                _tool_result_completion_unknown(result) for result in results
+            ):
+                _abort_tool_turn(
+                    parent_agent,
+                    cancel_event,
+                    "tool_completion_unknown",
+                    "batch",
                 )
+
         logger.info("[TOOL CONCURRENT END]")
         return results
 
-    # Serial path: write tools checkpoint through the caller-provided manager.
     results = []
-    for i, call in enumerate(calls):
+    for idx, call in enumerate(calls):
         func = call.get("function", {})
-        tname = func.get("name", "?")
-        logger.debug("Serial tool %d/%d: %s", i + 1, len(calls), tname)
-        # Wrap each tool call with a timeout so one stuck tool cannot block the
-        # agent loop indefinitely.
-        tool_result = [None]
+        tool_name = func.get("name", "?")
+        if cancel_event is not None and cancel_event.is_set():
+            results.extend(
+                _cancelled_tool_result(
+                    pending.get("function", {}).get("name", "?"),
+                    started=False,
+                )
+                for pending in calls[idx:]
+            )
+            break
+
+        logger.debug("Serial tool %d/%d: %s", idx + 1, len(calls), tool_name)
+        result_slot = {"result": None, "finished_at": None}
         ctx = copy_context()
-        def _run():
-            try:
-                tool_result[0] = _dispatch_single(call, tool_names, checkpoint_manager, memory_manager, parent_agent)
-            except Exception as exc:
-                from mclaw.tools.registry import tool_error
-                tool_result[0] = tool_error(str(exc), success=False)
-        t = threading.Thread(target=lambda: ctx.run(_run), daemon=True)
-        t.start()
-        tool_timeout = _serial_tool_timeout(tname, func, parent_agent)
-        t.join(timeout=tool_timeout)
-        if tool_result[0] is None:
-            from mclaw.tools.registry import tool_error
-            logger.warning("Serial tool %s timed out after %ss", tname, tool_timeout)
-            results.append(tool_error(f"Tool '{tname}' timed out after {tool_timeout} seconds", success=False))
+        thread = threading.Thread(
+            target=ctx.run,
+            args=(
+                _run_tool_worker,
+                result_slot,
+                call,
+                tool_names,
+                checkpoint_manager,
+                memory_manager,
+                parent_agent,
+                cancel_event,
+            ),
+            daemon=True,
+            name=f"mclaw-tool-{tool_name}",
+        )
+        tool_timeout = _serial_tool_timeout(tool_name, func, parent_agent)
+        if cancel_event is not None and cancel_event.is_set():
+            results.extend(
+                _cancelled_tool_result(
+                    pending.get("function", {}).get("name", "?"),
+                    started=False,
+                )
+                for pending in calls[idx:]
+            )
+            break
+        deadline = time.monotonic() + tool_timeout
+        _start_tool_worker(parent_agent, thread)
+        outcome = _wait_for_tool_worker(thread, deadline, cancel_event)
+        if outcome == "cancelled" and cancel_event is not None:
+            _log_dispatch_stop(
+                parent_agent,
+                cancel_event,
+                tool_name=tool_name,
+                trigger="user_interrupt",
+            )
+
+        if outcome == "done" and result_slot["finished_at"] <= deadline:
+            completed_result = _completed_tool_result(result_slot, tool_name)
+            results.append(completed_result)
+            if _tool_result_completion_unknown(completed_result):
+                if cancel_event is not None:
+                    _abort_tool_turn(
+                        parent_agent,
+                        cancel_event,
+                        "tool_completion_unknown",
+                        tool_name,
+                    )
+                results.extend(
+                    _skipped_after_unknown_result(
+                        pending.get("function", {}).get("name", "?"),
+                    )
+                    for pending in calls[idx + 1:]
+                )
+                break
+            continue
+        if outcome in {"done", "timeout"}:
+            safe_cancel_trace(
+                lambda: logger.warning(
+                    "Serial tool %s timed out after %ss", tool_name, tool_timeout
+                )
+            )
+            if cancel_event is not None:
+                _abort_tool_turn(
+                    parent_agent,
+                    cancel_event,
+                    "tool_timeout",
+                    tool_name,
+                )
+            _wait_for_tool_cleanup(thread, time.monotonic() + _INTERRUPT_CLEANUP_GRACE)
+            completion_unknown = thread.is_alive()
+            if cancel_event is not None and completion_unknown:
+                _abort_tool_turn(
+                    parent_agent,
+                    cancel_event,
+                    "tool_completion_unknown",
+                    tool_name,
+                )
+            results.append(
+                _timed_out_tool_result(
+                    tool_name,
+                    tool_timeout,
+                    completion_unknown=completion_unknown,
+                )
+            )
+            if cancel_event is not None:
+                results.extend(
+                    _cancelled_tool_result(
+                        pending.get("function", {}).get("name", "?"),
+                        started=False,
+                    )
+                    for pending in calls[idx + 1:]
+                )
+            else:
+                results.extend(
+                    _skipped_after_unknown_result(
+                        pending.get("function", {}).get("name", "?"),
+                    )
+                    for pending in calls[idx + 1:]
+                )
+            break
+
+        _wait_for_tool_cleanup(thread, time.monotonic() + _INTERRUPT_CLEANUP_GRACE)
+        if thread.is_alive():
+            results.append(_cancelled_tool_result(tool_name, started=True))
+        elif result_slot["finished_at"] > deadline:
+            results.append(
+                _timed_out_tool_result(
+                    tool_name,
+                    tool_timeout,
+                    completion_unknown=False,
+                )
+            )
         else:
-            results.append(tool_result[0])
+            results.append(_completed_tool_result(result_slot, tool_name))
+        if cancel_event is not None and _tool_result_completion_unknown(results[-1]):
+            _abort_tool_turn(
+                parent_agent,
+                cancel_event,
+                "tool_completion_unknown",
+                tool_name,
+            )
+        results.extend(
+            _cancelled_tool_result(
+                pending.get("function", {}).get("name", "?"),
+                started=False,
+            )
+            for pending in calls[idx + 1:]
+        )
+        break
     return results

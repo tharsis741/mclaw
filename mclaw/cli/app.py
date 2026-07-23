@@ -629,11 +629,22 @@ class InteractiveChat:
         later. This covers the race where the daemon thread starts emitting
         progress before chat() has created the manager.
         """
-        if not hasattr(self, "subtask_manager") or self.subtask_manager is None:
+        manager = getattr(self, "subtask_manager", None)
+        if manager is None:
             # Keep only the most recent progress events to bound memory growth.
             self._pending_subagent_events.append(event)
             if len(self._pending_subagent_events) > 50:
                 self._pending_subagent_events.pop(0)
+            return
+
+        manager_id = str(getattr(manager, "delegation_id", "") or "")
+        event_id = str(getattr(event, "delegation_id", "") or "")
+        if manager_id and event_id != manager_id:
+            logger.debug(
+                "Ignoring stale delegate event manager=%s event=%s",
+                manager_id,
+                event_id,
+            )
             return
 
         if event.event_type == "started":
@@ -645,8 +656,18 @@ class InteractiveChat:
         elif event.event_type == "error":
             self._pet_emit(PetEventType.DELEGATION_TASK_FAILED, state=PetState.FAILED, payload={"task_index": event.task_index, "data": event.data})
 
-        self.subtask_manager.on_progress(event)
+        manager.on_progress(event)
         self._update_subagent_status_detail()
+
+    def _replay_pending_delegate_events(self, manager) -> None:
+        """Replay only progress belonging to this delegation instance."""
+        manager_id = str(getattr(manager, "delegation_id", "") or "")
+        pending = self._pending_subagent_events
+        self._pending_subagent_events = []
+        for event in pending:
+            event_id = str(getattr(event, "delegation_id", "") or "")
+            if not manager_id or event_id == manager_id:
+                manager.on_progress(event)
 
     def _update_subagent_status_detail(self):
         """Refresh canonical delegation detail from current subtask state."""
@@ -752,7 +773,40 @@ class InteractiveChat:
         )
         if self._app:
             self._app.invalidate()
-        if not event.wait(timeout=115):
+        try:
+            from mclaw.tools.interrupt import get_interrupt_event
+
+            prompt_cancel_event = get_interrupt_event()
+        except Exception:
+            prompt_cancel_event = None
+        if prompt_cancel_event is None:
+            current_turn_cancel_event = getattr(self.agent, "current_turn_cancel_event", None)
+            try:
+                prompt_cancel_event = (
+                    current_turn_cancel_event()
+                    if callable(current_turn_cancel_event)
+                    else None
+                )
+            except Exception:
+                prompt_cancel_event = None
+        deadline = time.monotonic() + 115
+        cancelled = False
+        timed_out = False
+        while not event.is_set():
+            try:
+                if prompt_cancel_event is not None and prompt_cancel_event.is_set():
+                    cancelled = True
+                    break
+            except Exception:
+                # Prompt cancellation diagnostics must not break credential UI.
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            event.wait(timeout=min(0.1, remaining))
+
+        if cancelled or timed_out:
             if getattr(self, "_pending_secret_request", None) is pending:
                 self._pending_secret_request = None
                 self._last_rendered_secret_request_signature = None
@@ -766,7 +820,12 @@ class InteractiveChat:
                 for item in needs
                 if str(item.get("env_var") or "").strip()
             ]
-            return {"values": {}, "authorized": [], "skipped": skipped, "timed_out": True}
+            result = {"values": {}, "authorized": [], "skipped": skipped}
+            if cancelled:
+                result.update({"cancelled": True, "status": "cancelled"})
+            if timed_out:
+                result["timed_out"] = True
+            return result
         response = pending.get("response")
         return response if isinstance(response, dict) else {"action": "skip"}
 
@@ -1168,9 +1227,6 @@ class InteractiveChat:
                 stream_text=lambda: self._runtime_state().stream_text,
                 stream_started=lambda: self._runtime_state().stream_started,
                 render_response=self._render_response,
-                render_interrupted=lambda: self._get_runtime_renderer().interrupted(
-                    self._sym("⚡")
-                ),
                 emit_waiting_for_skill_confirmation=_emit_waiting_for_skill_confirmation,
                 remember_pending_skill_confirmation=lambda confirmation: setattr(
                     self,
@@ -1186,6 +1242,10 @@ class InteractiveChat:
                     confirmation.get("skill_name"),
                 ),
                 invalidate_skill_registry=lambda: self.skill_registry.invalidate(),
+                render_abort=lambda message: self._get_runtime_renderer().warning(
+                    message,
+                    leading_newline=True,
+                ),
             )
         )
 
@@ -1195,9 +1255,7 @@ class InteractiveChat:
                 self._app.invalidate()
 
         def _replay_pending_events(manager) -> None:
-            for ev in self._pending_subagent_events:
-                manager.on_progress(ev)
-            self._pending_subagent_events.clear()
+            self._replay_pending_delegate_events(manager)
 
         def _set_subtask_manager(manager) -> None:
             self.subtask_manager = manager
@@ -1241,7 +1299,7 @@ class InteractiveChat:
         def _render_synthesis_response(synth_result: dict) -> None:
             self._get_turn_result_coordinator().handle_result(synth_result)
 
-        return RuntimeDelegationCoordinator(
+        coordinator = RuntimeDelegationCoordinator(
             RuntimeDelegationHooks(
                 emit_delegation_started=lambda payload: self._pet_emit_for_runtime_status(
                     PetEventType.DELEGATION_STARTED,
@@ -1284,8 +1342,30 @@ class InteractiveChat:
                 ),
                 log_info=lambda message, args: logger.info(message, *args),
                 log_warning=lambda message, args: logger.warning(message, *args),
+                register_synthesis_worker=getattr(
+                    self.agent,
+                    "_register_turn_worker",
+                    None,
+                ),
+                unregister_synthesis_worker=getattr(
+                    self.agent,
+                    "_unregister_turn_worker",
+                    None,
+                ),
+                get_abort_details=getattr(
+                    self.agent,
+                    "current_turn_abort_details",
+                    lambda: {},
+                ),
+                render_abort=lambda message: self._get_runtime_renderer().warning(
+                    message,
+                    leading_newline=True,
+                ),
             )
-        ).handle_pending_delegate(result)
+        )
+        current_cancel_event = getattr(self.agent, "current_turn_cancel_event", None)
+        cancel_event = current_cancel_event() if callable(current_cancel_event) else None
+        return coordinator.handle_pending_delegate(result, cancel_event=cancel_event)
 
     def _render_skill_import_confirmation(self, confirmation: dict):
         drafting_id = confirmation.get("drafting_id") or ""
@@ -1412,6 +1492,31 @@ class InteractiveChat:
             return True
         self._resolve_secret_request({"values": values, "authorized": authorize_envs, "skipped": []})
         return True
+
+    def _handle_interrupt_key(self, event) -> None:
+        """Route Ctrl+C through the active turn before resolving prompt UI."""
+        now = time.time()
+        double_tap = (now - self._last_interrupt_at) < 2.0
+
+        if self._pending_secret_request:
+            event.app.current_buffer.reset()
+            if self.agent:
+                self.agent.interrupt()
+            self._handle_secret_request_input("__mclaw_confirm_esc__")
+            return
+
+        if self._agent_running:
+            if double_tap:
+                self._force_exit_no_flush = True
+                self._should_exit = True
+                event.app.exit()
+            else:
+                self._last_interrupt_at = now
+                if self.agent:
+                    self.agent.interrupt()
+        else:
+            self._should_exit = True
+            event.app.exit()
 
     @staticmethod
     def _parse_secret_batch_values(text: str, env_vars: list[str]) -> tuple[dict[str, str], str]:
@@ -1836,6 +1941,11 @@ class InteractiveChat:
         history: list[dict],
     ) -> None:
         """Atomically replace the active session after target setup succeeds."""
+        replacement_block_reason = getattr(self.agent, "_replacement_block_reason", None)
+        if callable(replacement_block_reason):
+            reason = replacement_block_reason()
+            if reason:
+                raise RuntimeError(f"Cannot resume another session yet: {reason}")
         current_session_id = self.session_id
         current_lock = self._session_lock
         target_lock = current_lock
@@ -2705,6 +2815,16 @@ class InteractiveChat:
         self._session_db.end_session(self.session_id, reason)
 
     def _new_session(self, clear_screen: bool = False):
+        replacement_block_reason = getattr(self.agent, "_replacement_block_reason", None)
+        if callable(replacement_block_reason):
+            reason = replacement_block_reason()
+            if reason:
+                self._get_commands_renderer().render_notice(
+                    "M-Claw 会话",
+                    f"当前会话仍在安全收尾，暂不能新建会话: {reason}",
+                    kind="danger",
+                )
+                return
         self._end_current_session("user_new_session", flush=False)
         new_session_id = f"session_{uuid.uuid4().hex[:12]}"
         try:
@@ -2774,6 +2894,8 @@ class InteractiveChat:
         from mclaw.cli.runtime.turns import RuntimeTurnCoordinator, RuntimeTurnHooks
         from mclaw.cli.runtime.workers import RuntimeWorkerHooks
 
+        active_turn_cancel_event = None
+
         def _safe_invalidate() -> None:
             try:
                 invalidate()
@@ -2799,6 +2921,10 @@ class InteractiveChat:
                 return None
 
         def _begin_background_turn(_notice: str) -> None:
+            nonlocal active_turn_cancel_event
+            begin_turn = getattr(self.agent, "begin_turn", None)
+            if callable(begin_turn):
+                active_turn_cancel_event = begin_turn()
             self._agent_running = True
             state = self._runtime_state()
             state.begin_turn()
@@ -2811,10 +2937,20 @@ class InteractiveChat:
             self.chat(notice)
 
         def _finish_agent_turn(*, emit_done_status: bool) -> None:
+            nonlocal active_turn_cancel_event
             result = getattr(self, "_last_chat_result", {}) or {}
             state = self._runtime_state()
             duration = state.finish_turn(result)
-            self._agent_running = False
+            end_turn = getattr(self.agent, "end_turn", None)
+            try:
+                if callable(end_turn):
+                    if active_turn_cancel_event is None:
+                        end_turn()
+                    else:
+                        end_turn(active_turn_cancel_event)
+            finally:
+                active_turn_cancel_event = None
+                self._agent_running = False
             if emit_done_status:
                 self._emit_runtime_event(
                     EventType.STATUS_CHANGED,
@@ -2867,6 +3003,10 @@ class InteractiveChat:
             self._get_runtime_renderer().command_echo(self._sym("⚙️"), user_input)
 
         def _begin_user_turn(user_input: str) -> None:
+            nonlocal active_turn_cancel_event
+            begin_turn = getattr(self.agent, "begin_turn", None)
+            if callable(begin_turn):
+                active_turn_cancel_event = begin_turn()
             self._agent_running = True
             state = self._runtime_state()
             state.begin_turn()
@@ -3094,29 +3234,7 @@ class InteractiveChat:
 
         @kb.add("c-c")
         def _(event):
-            now = time.time()
-            double_tap = (now - self._last_interrupt_at) < 2.0
-
-            if self._pending_secret_request:
-                event.app.current_buffer.reset()
-                self._handle_secret_request_input("__mclaw_confirm_esc__")
-                return
-
-            if self._agent_running:
-                if double_tap:
-                    # Force exit: skip flush.
-                    self._force_exit_no_flush = True
-                    self._should_exit = True
-                    event.app.exit()
-                else:
-                    # First tap: interrupt only the current task and keep the loop alive.
-                    self._last_interrupt_at = now
-                    if self.agent:
-                        self.agent.interrupt()
-            else:
-                # Ctrl+C while idle exits gracefully.
-                self._should_exit = True
-                event.app.exit()
+            self._handle_interrupt_key(event)
 
         @kb.add("c-d")
         def _(event):

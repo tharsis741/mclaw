@@ -533,29 +533,17 @@ def test_auxiliary_uses_inherited_or_independent_transport_and_parent_usage(
     from mclaw.agent import auxiliary_client
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "auxiliary-secret")
-    calls: list[tuple[ProviderRuntimeContext, dict]] = []
+    calls: list[tuple[ProviderRuntimeContext, list[dict], object]] = []
     usage = UsageRecord(input_tokens=5, output_tokens=2, source="auxiliary")
 
-    class FakeTransport:
-        def __init__(self, context: ProviderRuntimeContext) -> None:
-            self.context = context
-
-        def call(self, **kwargs):
-            calls.append((self.context, kwargs))
-            return ModelCallResult(
-                content="",
-                tool_calls=None,
-                finish_reason="stop",
-                reasoning=ReasoningTrace(text="auxiliary answer"),
-                usage=usage,
-                was_streamed=False,
-                provider=self.context.provider,
-                model=self.context.model,
-            )
+    async def fake_call(context, messages, options):
+        calls.append((context, messages, options))
+        return "auxiliary answer", usage
 
     monkeypatch.setattr(
-        "mclaw.agent.transports.factory.create_transport",
-        lambda context: FakeTransport(context),
+        auxiliary_client,
+        "_call_auxiliary_model",
+        fake_call,
     )
     parent = SimpleNamespace(
         provider_runtime=_context(),
@@ -580,8 +568,8 @@ def test_auxiliary_uses_inherited_or_independent_transport_and_parent_usage(
     )
     assert inherited == "auxiliary answer"
     assert calls[-1][0] is parent.provider_runtime
-    assert calls[-1][1]["options"].source == "auxiliary"
-    assert calls[-1][1]["options"].cache_plan is None
+    assert calls[-1][2].source == "auxiliary"
+    assert calls[-1][2].cache_plan is None
     assert auxiliary_client.extract_content_or_reasoning(
         SimpleNamespace(
             content="",

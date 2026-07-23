@@ -11,18 +11,20 @@ JavaScript that tags interactive elements with data-mclaw-ref IDs.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import queue
 import shutil
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import Future
+from concurrent.futures import Future, TimeoutError as FutureTimeout
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from mclaw.constants import get_mclaw_home
+from mclaw.tools.interrupt import get_cancel_id, get_interrupt_event, safe_cancel_trace
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +36,57 @@ _NETWORK_IDLE_TIMEOUT = 2_000  # ms
 _DOM_SETTLE_MIN = 250  # ms
 _DOM_SETTLE_QUIET = 200  # ms
 _DOM_SETTLE_TIMEOUT = 1_500  # ms
+_INTERRUPT_POLL_INTERVAL = 0.05
+_CANCEL_SESSION_GRACE = 0.35
+_CANCEL_CONNECTION_GRACE = 0.35
+
+
+class BrowserOperationCancelled(RuntimeError):
+    """Raised when the current turn cancels a browser operation."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        completion_unknown: bool = False,
+        fence: "_WorkerTask | None" = None,
+    ) -> None:
+        super().__init__(message)
+        self.completion_unknown = completion_unknown
+        self.fence = fence
+
+
+@dataclass(eq=False)
+class _WorkerTask:
+    fn: Callable
+    args: tuple
+    kwargs: dict
+    future: Future
+    cancel_session_id: str | None = None
+    cancel_id: str = "none"
+    completion_lock: threading.Lock = field(default_factory=threading.Lock)
+    operation_finished: threading.Event = field(default_factory=threading.Event)
+    cancel_requested: bool = False
+    connection_aborted: bool = False
+    cleanup_committed: bool = False
+    phase: str = "queued"
+    created_at: float = field(default_factory=time.monotonic)
+
+    def is_alive(self) -> bool:
+        return not self.future.done()
+
+    @property
+    def diagnostic_name(self) -> str:
+        name = getattr(self.fn, "__name__", type(self.fn).__name__)
+        return f"browser:{name.strip('_').removesuffix('_impl')}"
+
+    @property
+    def blocking_reason(self) -> str:
+        age = max(0.0, time.monotonic() - self.created_at)
+        return (
+            f"Browser operation '{self.diagnostic_name}' is still {self.phase} "
+            f"after cancellation ({age:.1f}s); wait for browser cleanup to finish"
+        )
 
 
 def _default_downloads_dir() -> Path:
@@ -310,7 +363,7 @@ class BrowserBackend:
         self._sessions: dict[str, _SessionState] = {}
         self._lock = threading.Lock()
         self._started = False
-        self._task_queue: "queue.Queue[tuple[Callable, tuple, dict, Future] | None]" = queue.Queue()
+        self._task_queue: "queue.Queue[_WorkerTask | None]" = queue.Queue()
         self._worker_lock = threading.Lock()
         self._worker_thread: threading.Thread | None = None
         self._worker_thread_id: int | None = None
@@ -336,23 +389,301 @@ class BrowserBackend:
             task = self._task_queue.get()
             if task is None:
                 break
-            fn, args, kwargs, future = task
-            if future.cancelled():
+            future = task.future
+            if not future.set_running_or_notify_cancel():
                 continue
+            with task.completion_lock:
+                task.phase = "running"
             try:
-                future.set_result(fn(*args, **kwargs))
+                result = task.fn(*task.args, **task.kwargs)
             except Exception as exc:
-                future.set_exception(exc)
+                result = exc
+                failed = True
+            else:
+                failed = False
+            task.operation_finished.set()
+
+            with task.completion_lock:
+                cancelled = task.cancel_requested
+                if not cancelled:
+                    if failed:
+                        future.set_exception(result)
+                    else:
+                        future.set_result(result)
+
+            if cancelled:
+                # Linearize cleanup selection with the fallback connection abort.
+                # A connection abort may still unblock close_session; the worker
+                # rechecks it before publishing a terminal future and resets all
+                # handles if the abort won that race.
+                reset_browser = False
+                close_session_id = None
+                with task.completion_lock:
+                    if task.connection_aborted:
+                        task.cleanup_committed = True
+                        task.phase = "resetting_browser"
+                        reset_browser = True
+                    elif task.cancel_session_id is not None:
+                        task.phase = "closing_session"
+                        close_session_id = task.cancel_session_id
+                    else:
+                        task.cleanup_committed = True
+                        task.phase = "finishing"
+                if reset_browser:
+                    self._reset_aborted_browser_impl()
+                elif close_session_id is not None:
+                    self._close_session_impl(close_session_id)
+                    with task.completion_lock:
+                        task.cleanup_committed = True
+                        reset_browser = task.connection_aborted
+                        task.phase = (
+                            "resetting_browser" if reset_browser else "finishing"
+                        )
+                    if reset_browser:
+                        self._reset_aborted_browser_impl()
+                    else:
+                        safe_cancel_trace(
+                            lambda: logger.info(
+                                "[CANCEL_TRACE] browser_session_close cancel_id=%s "
+                                "task_id=%x session=%s elapsed_ms=%d",
+                                task.cancel_id,
+                                id(task),
+                                close_session_id,
+                                int((time.monotonic() - task.created_at) * 1000),
+                            )
+                        )
+                with task.completion_lock:
+                    task.phase = "finishing"
+                future.set_exception(
+                    BrowserOperationCancelled(
+                        "Browser operation interrupted by user",
+                    )
+                )
+                safe_cancel_trace(
+                    lambda: logger.info(
+                        "[CANCEL_TRACE] browser_task_finished cancel_id=%s "
+                        "task_id=%x operation=%s elapsed_ms=%d",
+                        task.cancel_id,
+                        id(task),
+                        task.diagnostic_name,
+                        int((time.monotonic() - task.created_at) * 1000),
+                    )
+                )
         self._worker_thread_id = None
 
-    def _run_on_worker(self, fn: Callable, *args, **kwargs):
+    @staticmethod
+    def _submit_cancel_coro(loop, coro) -> Future | None:
+        """Submit Playwright cleanup to its live owner loop."""
+        try:
+            return asyncio.run_coroutine_threadsafe(coro, loop)
+        except BaseException:
+            coro.close()
+            return None
+
+    def _request_session_cancel(self, task: _WorkerTask) -> bool:
+        """Close the active context on Playwright's loop to abort its current call."""
+        session_id = task.cancel_session_id
+        if session_id is None or not self._lock.acquire(timeout=0.01):
+            return False
+        try:
+            state = self._sessions.get(session_id)
+        finally:
+            self._lock.release()
+        if state is None:
+            return False
+        impl = getattr(state.context, "_impl_obj", None)
+        loop = getattr(impl, "_loop", None)
+        close = getattr(impl, "close", None)
+        if loop is None or not callable(close):
+            return False
+        submitted = self._submit_cancel_coro(
+            loop,
+            close("M-Claw browser operation interrupted"),
+        )
+        if submitted is None:
+            return False
+        with task.completion_lock:
+            task.phase = "cancelling_session"
+        safe_cancel_trace(
+            lambda: logger.info(
+                "[CANCEL_TRACE] browser_session_cancel_requested cancel_id=%s "
+                "task_id=%x session=%s",
+                task.cancel_id,
+                id(task),
+                session_id,
+            )
+        )
+        return True
+
+    def _request_connection_abort(self, task: _WorkerTask) -> bool:
+        """Last-resort abort for startup or a context that cannot close promptly."""
+        owner = self._browser or self._playwright
+        impl = getattr(owner, "_impl_obj", None)
+        connection = getattr(impl, "_connection", None)
+        loop = getattr(impl, "_loop", None)
+        stop_async = getattr(connection, "stop_async", None)
+        if loop is None or not callable(stop_async):
+            return False
+        with task.completion_lock:
+            if task.cleanup_committed:
+                return False
+            previous_phase = task.phase
+            task.connection_aborted = True
+            task.phase = "aborting_connection"
+            submitted = self._submit_cancel_coro(loop, stop_async())
+            if submitted is None:
+                task.connection_aborted = False
+                task.phase = previous_phase
+                return False
+        safe_cancel_trace(
+            lambda: logger.warning(
+                "[CANCEL_TRACE] browser_connection_abort cancel_id=%s task_id=%x "
+                "operation=%s",
+                task.cancel_id,
+                id(task),
+                task.diagnostic_name,
+            )
+        )
+        return True
+
+    def _wait_for_cancel_drain(self, task: _WorkerTask, timeout: float) -> bool:
+        try:
+            task.future.result(timeout=timeout)
+        except FutureTimeout:
+            return False
+        except BaseException:
+            return True
+        return True
+
+    def _reset_aborted_browser_impl(self) -> None:
+        """Discard objects backed by an aborted Playwright connection."""
+        with self._lock:
+            self._sessions.clear()
+            playwright = self._playwright
+            self._browser = None
+            self._playwright = None
+            self._started = False
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception as exc:
+                safe_cancel_trace(
+                    lambda: logger.debug(
+                        "Error finalizing aborted Playwright connection: %s", exc
+                    )
+                )
+
+    def _run_on_worker(
+        self,
+        fn: Callable,
+        *args,
+        cancel_session_id: str | None = None,
+        **kwargs,
+    ):
         """Marshal browser work onto the Playwright owner thread."""
         if threading.get_ident() == self._worker_thread_id:
             return fn(*args, **kwargs)
+
+        cancel_event = get_interrupt_event()
+        if cancel_event is not None and cancel_event.is_set():
+            safe_cancel_trace(
+                lambda: logger.info(
+                    "[CANCEL_TRACE] browser_cancel_before_queue cancel_id=%s operation=%s",
+                    get_cancel_id(cancel_event),
+                    getattr(fn, "__name__", type(fn).__name__),
+                )
+            )
+            raise BrowserOperationCancelled("Browser operation interrupted by user")
+
         self._ensure_worker()
         future: Future = Future()
-        self._task_queue.put((fn, args, kwargs, future))
-        return future.result()
+        task = _WorkerTask(
+            fn,
+            args,
+            kwargs,
+            future,
+            cancel_session_id,
+            get_cancel_id(cancel_event),
+        )
+        self._task_queue.put(task)
+
+        while True:
+            try:
+                return future.result(timeout=_INTERRUPT_POLL_INTERVAL)
+            except FutureTimeout:
+                if future.done():
+                    return future.result()
+                if cancel_event is None or not cancel_event.is_set():
+                    continue
+                if future.cancel():
+                    safe_cancel_trace(
+                        lambda: logger.info(
+                            "[CANCEL_TRACE] browser_cancel_queued cancel_id=%s "
+                            "task_id=%x operation=%s elapsed_ms=%d",
+                            task.cancel_id,
+                            id(task),
+                            task.diagnostic_name,
+                            int((time.monotonic() - task.created_at) * 1000),
+                        )
+                    )
+                    raise BrowserOperationCancelled("Browser operation interrupted by user")
+                with task.completion_lock:
+                    if future.done():
+                        return future.result()
+                    if task.operation_finished.is_set():
+                        completion_won = True
+                    else:
+                        completion_won = False
+                        task.cancel_requested = True
+                    phase = task.phase
+                if completion_won:
+                    safe_cancel_trace(
+                        lambda: logger.info(
+                            "[CANCEL_TRACE] browser_completion_won_cancel "
+                            "cancel_id=%s task_id=%x operation=%s elapsed_ms=%d",
+                            task.cancel_id,
+                            id(task),
+                            task.diagnostic_name,
+                            int((time.monotonic() - task.created_at) * 1000),
+                        )
+                    )
+                    return future.result()
+                safe_cancel_trace(
+                    lambda: logger.info(
+                        "[CANCEL_TRACE] browser_cancel_detected cancel_id=%s task_id=%x "
+                        "session=%s operation=%s phase=%s elapsed_ms=%d",
+                        task.cancel_id,
+                        id(task),
+                        cancel_session_id or "none",
+                        task.diagnostic_name,
+                        phase,
+                        int((time.monotonic() - task.created_at) * 1000),
+                    )
+                )
+                self._request_session_cancel(task)
+                if self._wait_for_cancel_drain(task, _CANCEL_SESSION_GRACE):
+                    raise BrowserOperationCancelled(
+                        "Browser operation interrupted by user"
+                    )
+                self._request_connection_abort(task)
+                if self._wait_for_cancel_drain(task, _CANCEL_CONNECTION_GRACE):
+                    raise BrowserOperationCancelled(
+                        "Browser operation interrupted by user"
+                    )
+                safe_cancel_trace(
+                    lambda: logger.warning(
+                        "[CANCEL_TRACE] browser_cancel_unresolved cancel_id=%s "
+                        "task_id=%x operation=%s completion_unknown=true",
+                        task.cancel_id,
+                        id(task),
+                        task.diagnostic_name,
+                    )
+                )
+                raise BrowserOperationCancelled(
+                    "Browser cancellation requested; operation completion is unknown",
+                    completion_unknown=True,
+                    fence=task,
+                )
 
     def _shutdown_worker(self) -> None:
         """Stop the worker after browser resources have been closed."""
@@ -482,7 +813,11 @@ class BrowserBackend:
     # ── Session management ────────────────────────────────────────────────────
 
     def get_or_create_page(self, session_id: str) -> tuple[Any, _SessionState]:
-        return self._run_on_worker(self._get_or_create_page_impl, session_id)
+        return self._run_on_worker(
+            self._get_or_create_page_impl,
+            session_id,
+            cancel_session_id=session_id,
+        )
 
     def _get_or_create_page_impl(self, session_id: str) -> tuple[Any, _SessionState]:
         """Create an isolated context and page for a session on first use."""
@@ -531,12 +866,42 @@ class BrowserBackend:
         try:
             state.context.close()
         except Exception as exc:
-            logger.debug("Error closing browser context %s: %s", session_id, exc)
+            safe_cancel_trace(
+                lambda: logger.debug(
+                    "Error closing browser context %s: %s", session_id, exc
+                )
+            )
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
     def navigate(self, session_id: str, url: str) -> dict[str, str]:
-        return self._run_on_worker(self._navigate_impl, session_id, url)
+        return self._run_on_worker(
+            self._navigate_impl,
+            session_id,
+            url,
+            cancel_session_id=session_id,
+        )
+
+    def navigate_and_snapshot(
+        self,
+        session_id: str,
+        url: str,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        """Keep navigation and its result snapshot inside one cancellable task."""
+        return self._run_on_worker(
+            self._navigate_and_snapshot_impl,
+            session_id,
+            url,
+            cancel_session_id=session_id,
+        )
+
+    def _navigate_and_snapshot_impl(
+        self,
+        session_id: str,
+        url: str,
+    ) -> tuple[dict[str, str], dict[str, Any]]:
+        nav = self._navigate_impl(session_id, url)
+        return nav, self._snapshot_impl(session_id)
 
     def _navigate_impl(self, session_id: str, url: str) -> dict[str, str]:
         page, state = self._get_or_create_page_impl(session_id)
@@ -555,7 +920,11 @@ class BrowserBackend:
     # ── Snapshot ──────────────────────────────────────────────────────────────
 
     def snapshot(self, session_id: str) -> dict[str, Any]:
-        return self._run_on_worker(self._snapshot_impl, session_id)
+        return self._run_on_worker(
+            self._snapshot_impl,
+            session_id,
+            cancel_session_id=session_id,
+        )
 
     def _snapshot_impl(self, session_id: str) -> dict[str, Any]:
         """Return a compact current-viewport snapshot and refresh element refs."""
@@ -749,7 +1118,12 @@ class BrowserBackend:
         return dest
 
     def click(self, session_id: str, ref: str) -> dict[str, Any]:
-        return self._run_on_worker(self._click_impl, session_id, ref)
+        return self._run_on_worker(
+            self._click_impl,
+            session_id,
+            ref,
+            cancel_session_id=session_id,
+        )
 
     def _click_impl(self, session_id: str, ref: str) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
@@ -814,7 +1188,13 @@ class BrowserBackend:
         return result
 
     def type_text(self, session_id: str, ref: str, text: str) -> dict[str, Any]:
-        return self._run_on_worker(self._type_text_impl, session_id, ref, text)
+        return self._run_on_worker(
+            self._type_text_impl,
+            session_id,
+            ref,
+            text,
+            cancel_session_id=session_id,
+        )
 
     def _type_text_impl(self, session_id: str, ref: str, text: str) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
@@ -854,7 +1234,12 @@ class BrowserBackend:
         }
 
     def scroll(self, session_id: str, direction: str = "down") -> dict[str, Any]:
-        return self._run_on_worker(self._scroll_impl, session_id, direction)
+        return self._run_on_worker(
+            self._scroll_impl,
+            session_id,
+            direction,
+            cancel_session_id=session_id,
+        )
 
     def _scroll_impl(self, session_id: str, direction: str = "down") -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
@@ -892,7 +1277,12 @@ class BrowserBackend:
         }
 
     def press(self, session_id: str, key: str) -> dict[str, Any]:
-        return self._run_on_worker(self._press_impl, session_id, key)
+        return self._run_on_worker(
+            self._press_impl,
+            session_id,
+            key,
+            cancel_session_id=session_id,
+        )
 
     def _press_impl(self, session_id: str, key: str) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
@@ -916,7 +1306,12 @@ class BrowserBackend:
     # ── Screenshot ────────────────────────────────────────────────────────────
 
     def screenshot(self, session_id: str, path: str | None = None) -> dict[str, Any]:
-        return self._run_on_worker(self._screenshot_impl, session_id, path)
+        return self._run_on_worker(
+            self._screenshot_impl,
+            session_id,
+            path,
+            cancel_session_id=session_id,
+        )
 
     def _screenshot_impl(self, session_id: str, path: str | None = None) -> dict[str, Any]:
         page, state = self._get_or_create_page_impl(session_id)
@@ -952,7 +1347,14 @@ class BrowserBackend:
         path: str | None = None,
         ref: str | None = None,
     ) -> dict[str, Any]:
-        return self._run_on_worker(self._download_impl, session_id, url, path, ref)
+        return self._run_on_worker(
+            self._download_impl,
+            session_id,
+            url,
+            path,
+            ref,
+            cancel_session_id=session_id,
+        )
 
     def _download_impl(
         self,

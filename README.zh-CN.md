@@ -200,7 +200,7 @@ RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可
 
 ### 当前缺陷
 
-**M-Claw 1.0.0 不提供安全沙箱或权限分级。Full access 模式下的凭据与破坏性操作保护是降低误操作风险的防护栏，不能替代操作系统级隔离。**
+**M-Claw 1.0.0 不提供安全沙箱或权限分级。**
 
 ## 系统运行时适配
 
@@ -239,7 +239,7 @@ mclaw dingtalk                # 启动钉钉 Stream 网关
 
 ## 安装与启动
 
-**当前以源码形式分发，请在源码目录中安装。**
+**当前以源码形式分发**
 
 ### Windows / Linux
 
@@ -285,7 +285,7 @@ mclaw
 
 更新 M-Claw：
 
-退出正在运行的 M-Claw 后
+退出正在运行的 M-Claw
 
 ```powershell
 git status --porcelain

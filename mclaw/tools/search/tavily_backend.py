@@ -6,15 +6,51 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 
-import requests
+import httpx
 
+from mclaw.tools.cancellation import cancellation_checkpoint
 from mclaw.tools.search.profiles import get_search_backend_profile
 
 logger = logging.getLogger(__name__)
 
 _TAVILY_API_URL = "https://api.tavily.com/search"
+
+
+async def _request_tavily(
+    *,
+    headers: dict,
+    payload: dict,
+    timeout: float,
+) -> dict:
+    """Issue one natively cancellable Tavily request with an absolute deadline."""
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with asyncio.timeout(max(0.001, timeout)):
+            response = await client.post(
+                _TAVILY_API_URL,
+                headers=headers,
+                json=payload,
+            )
+            response.raise_for_status()
+            data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("Tavily returned a non-object response.")
+    return data
+
+
+def _run_request(coro, *, parent_agent, timeout: float):
+    from mclaw.tools.dispatch import _run_async
+
+    return _run_async(
+        coro,
+        parent_agent=parent_agent,
+        diagnostic_name="web_search_tavily_http",
+        timeout_seconds=timeout,
+        raise_on_stop=True,
+    )
 
 
 def search(
@@ -26,6 +62,8 @@ def search(
     creds: dict,
     timeout: float,
     limit: int = 5,
+    parent_agent=None,
+    cancel_event: threading.Event | None = None,
 ) -> dict:
     """Search the web using the Tavily API.
 
@@ -44,6 +82,7 @@ def search(
     Returns:
         A provider-neutral mapping with ``answer`` and structured ``sources``.
     """
+    cancellation_checkpoint(cancel_event)
     profile = get_search_backend_profile("tavily")
     api_key = creds.get("api_key", "")
     if not api_key:
@@ -87,15 +126,17 @@ def search(
             payload["include_domains"] = domains
 
     try:
-        response = requests.post(
-            _TAVILY_API_URL,
-            headers={"Authorization": f"Bearer {api_key}"},
-            json=payload,
+        data = _run_request(
+            _request_tavily(
+                headers={"Authorization": f"Bearer {api_key}"},
+                payload=payload,
+                timeout=timeout,
+            ),
+            parent_agent=parent_agent,
             timeout=timeout,
         )
-        response.raise_for_status()
-        data = response.json()
-    except requests.Timeout:
+        cancellation_checkpoint(cancel_event)
+    except (TimeoutError, httpx.TimeoutException):
         logger.warning("Tavily search timed out after %.1fs", timeout)
         return {
             "success": False,
@@ -104,7 +145,7 @@ def search(
             "_backend_profile": profile.tool_metadata(),
             "_hint": "Retry or increase timeout in auxiliary.web_search.tavily_timeout config.",
         }
-    except requests.HTTPError as exc:
+    except httpx.HTTPStatusError as exc:
         logger.warning("Tavily search HTTP error: %s", exc)
         msg = f"Tavily search HTTP error: {exc}"
         try:
@@ -122,7 +163,7 @@ def search(
             "_backend_profile": profile.tool_metadata(),
             "_hint": "Check your Tavily API key and account status.",
         }
-    except requests.RequestException as exc:
+    except httpx.HTTPError as exc:
         logger.warning("Tavily search request failed: %s", exc)
         return {
             "success": False,

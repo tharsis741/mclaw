@@ -263,6 +263,29 @@ class DingTalkAdapter:
                 reset = getattr(self.runner, "reset_session", None)
                 if reset:
                     reset(routed.session_id)
+                replacement_block_reason = getattr(
+                    self.runner,
+                    "session_replacement_block_reason",
+                    None,
+                )
+                reason = (
+                    replacement_block_reason(routed.session_id)
+                    if callable(replacement_block_reason)
+                    else None
+                )
+                if reason:
+                    message_text = f"A new session was not created yet. {reason}"
+                    await self.send(
+                        chat_id,
+                        message_text,
+                        reply_to=message_id,
+                        route=reply_route,
+                        done_message=message,
+                    )
+                    return AgentTurnResult(
+                        session_id=routed.session_id,
+                        final_response=message_text,
+                    )
                 routed = self.session_router.new_session(
                     source,
                     model=self.runner.startup_provider_runtime.model,
@@ -272,7 +295,12 @@ class DingTalkAdapter:
                 interrupted = self.runner.interrupt(routed.session_id)
                 await self.send(
                     chat_id,
-                    "Interrupted current turn." if interrupted else "No running turn.",
+                    (
+                        "Cancellation requested. Cleanup continues in the background; "
+                        "if process termination cannot be confirmed, restart the runtime."
+                        if interrupted
+                        else "No running turn."
+                    ),
                     reply_to=message_id,
                     route=reply_route,
                     done_message=message,

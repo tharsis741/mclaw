@@ -7,11 +7,12 @@
 from __future__ import annotations
 
 import asyncio
-from concurrent.futures import TimeoutError as FutureTimeoutError
+import threading
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from mclaw.channels.base import SendResult
+from mclaw.channels.outbound_bridge import run_outbound_coroutine
 
 if TYPE_CHECKING:
     from mclaw.channels.dingtalk.adapter import DingTalkAdapter
@@ -25,31 +26,25 @@ class DingTalkOutboundTarget:
     chat_id: str
     loop: asyncio.AbstractEventLoop
 
-    def send_file(self, *, file_path: str, caption: str = "") -> "SendResult":
+    def send_file(
+        self,
+        *,
+        file_path: str,
+        caption: str = "",
+        cancel_event: threading.Event | None = None,
+        parent_agent: Any = None,
+    ) -> SendResult:
         """Schedule a file send with a longer timeout for upload work."""
-        return self._run(
+        return run_outbound_coroutine(
             self.adapter.send_file(self.chat_id, file_path=file_path, caption=caption),
+            loop=self.loop,
             timeout=600,
+            platform="dingtalk",
+            display_name="DingTalk",
             label="file",
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
         )
-
-    def _run(self, coro, *, timeout: float, label: str) -> "SendResult":
-        """Run an async DingTalk send from synchronous tool execution."""
-        if self.loop.is_closed():
-            coro.close()
-            return SendResult(success=False, error="DingTalk event loop is closed")
-        try:
-            future = asyncio.run_coroutine_threadsafe(coro, self.loop)
-        except RuntimeError as exc:
-            coro.close()
-            return SendResult(success=False, error=f"DingTalk event loop is unavailable: {exc}")
-        try:
-            return future.result(timeout=timeout)
-        except FutureTimeoutError:
-            future.cancel()
-            return SendResult(success=False, error=f"DingTalk {label} send timed out")
-        except Exception as exc:
-            return SendResult(success=False, error=f"DingTalk {label} send failed: {exc}")
 
 
 _targets: dict[str, DingTalkOutboundTarget] = {}

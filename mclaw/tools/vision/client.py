@@ -6,7 +6,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Protocol
+
+import openai
 
 from mclaw.tools.vision.types import VisionCredentials
 
@@ -15,7 +18,12 @@ class VisionClient(Protocol):
     """Provider adapter contract for multimodal image analysis."""
     provider: str
 
-    def analyze(self, messages: list, credentials: VisionCredentials, timeout: float) -> str:
+    async def analyze(
+        self,
+        messages: list,
+        credentials: VisionCredentials,
+        timeout: float,
+    ) -> str:
         """Return model text for a prepared multimodal message payload."""
         ...
 
@@ -29,17 +37,17 @@ class QwenVisionClient:
     """OpenAI-compatible client for Qwen/DashScope vision models."""
     provider = "qwen"
 
-    def analyze(self, messages: list, credentials: VisionCredentials, timeout: float) -> str:
+    async def analyze(
+        self,
+        messages: list,
+        credentials: VisionCredentials,
+        timeout: float,
+    ) -> str:
         """Call the Qwen vision model and fall back when temperature is rejected."""
-        try:
-            import openai
-        except ImportError as exc:
-            raise RuntimeError("openai package is required for vision analysis") from exc
-
-        client = openai.OpenAI(
+        client = openai.AsyncOpenAI(
             api_key=credentials.api_key or openai.NOT_GIVEN,
             base_url=credentials.base_url or openai.NOT_GIVEN,
-            max_retries=1,
+            max_retries=0,
             timeout=timeout,
         )
         kwargs: dict[str, Any] = {
@@ -49,14 +57,16 @@ class QwenVisionClient:
             "temperature": 0.1,
         }
 
-        try:
-            response = client.chat.completions.create(**kwargs)
-        except openai.BadRequestError as exc:
-            err_msg = str(exc).lower()
-            if "temperature" not in err_msg:
-                raise
-            kwargs.pop("temperature", None)
-            response = client.chat.completions.create(**kwargs)
+        async with client:
+            async with asyncio.timeout(max(0.001, timeout)):
+                try:
+                    response = await client.chat.completions.create(**kwargs)
+                except openai.BadRequestError as exc:
+                    err_msg = str(exc).lower()
+                    if "temperature" not in err_msg:
+                        raise
+                    kwargs.pop("temperature", None)
+                    response = await client.chat.completions.create(**kwargs)
 
         if not response.choices:
             return ""
@@ -70,6 +80,7 @@ class QwenVisionClient:
 _qwen_client = QwenVisionClient()
 _CLIENTS: dict[str, VisionClient] = {
     "qwen": _qwen_client,
+    "qwen-intl": _qwen_client,
     "dashscope": _qwen_client,
 }
 
@@ -83,7 +94,7 @@ def get_vision_client(provider: str) -> VisionClient:
     return client
 
 
-def call_vision_llm(
+async def call_vision_llm(
     messages: list,
     model: str,
     api_key: str,
@@ -98,4 +109,8 @@ def call_vision_llm(
         base_url=base_url,
         model=model,
     )
-    return get_vision_client(credentials.provider).analyze(messages, credentials, timeout)
+    return await get_vision_client(credentials.provider).analyze(
+        messages,
+        credentials,
+        timeout,
+    )

@@ -13,12 +13,16 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import tempfile
+import threading
 from pathlib import Path
 
 from mclaw.runtime.manager import RuntimeManager
+from mclaw.tools.cancellation import cancellation_checkpoint
 
 logger = logging.getLogger(__name__)
+_TEXT_IO_CHUNK_CHARS = 1024 * 1024
 
 
 def _runtime():
@@ -47,6 +51,22 @@ def _skip_chars(handle, count: int) -> None:
         remaining -= len(chunk)
 
 
+def _read_text_cancellable(
+    path: Path,
+    cancel_event: threading.Event | None,
+) -> str:
+    chunks: list[str] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        while True:
+            cancellation_checkpoint(cancel_event)
+            chunk = handle.read(_TEXT_IO_CHUNK_CHARS)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            cancellation_checkpoint(cancel_event)
+    return "".join(chunks)
+
+
 def read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
     """Read UTF-8 text after runtime path approval."""
     abs_path = _checked_path(path, "read")
@@ -65,9 +85,14 @@ def read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
         raise OSError(f"Cannot read file: {path}") from exc
 
 
-def write_file(path: str, content: str) -> str:
+def write_file(
+    path: str,
+    content: str,
+    cancel_event: threading.Event | None = None,
+) -> str:
     """Write UTF-8 content through a same-directory temporary file."""
     abs_path = _checked_path(path, "write")
+    cancellation_checkpoint(cancel_event)
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_name = ""
     try:
@@ -79,9 +104,29 @@ def write_file(path: str, content: str) -> str:
             dir=str(abs_path.parent),
             delete=False,
         ) as tmp:
-            tmp.write(content)
             tmp_name = tmp.name
+            for offset in range(0, len(content), _TEXT_IO_CHUNK_CHARS):
+                cancellation_checkpoint(cancel_event)
+                tmp.write(content[offset:offset + _TEXT_IO_CHUNK_CHARS])
+                cancellation_checkpoint(cancel_event)
+        if abs_path.exists():
+            try:
+                shutil.copymode(abs_path, tmp_name)
+            except OSError:
+                logger.warning(
+                    "Could not preserve file mode before atomic replace: %s",
+                    abs_path,
+                    exc_info=True,
+                )
+        cancellation_checkpoint(cancel_event)
         os.replace(tmp_name, abs_path)
+    except InterruptedError:
+        if tmp_name:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                logger.debug("Failed to remove cancelled temporary write: %s", tmp_name, exc_info=True)
+        raise
     except OSError as exc:
         if tmp_name:
             try:
@@ -92,23 +137,42 @@ def write_file(path: str, content: str) -> str:
     return str(abs_path)
 
 
-def patch_file(path: str, old_str: str, new_str: str) -> str:
+def patch_file(
+    path: str,
+    old_str: str,
+    new_str: str,
+    cancel_event: threading.Event | None = None,
+) -> str:
     """Replace the first exact string occurrence after write-policy approval."""
     abs_path = _checked_path(path, "write")
     try:
-        content = abs_path.read_text(encoding="utf-8", errors="replace")
+        content = _read_text_cancellable(abs_path, cancel_event)
+    except InterruptedError:
+        raise
     except OSError as exc:
         raise OSError(f"Cannot read file for patching: {path}") from exc
     if old_str not in content:
         raise ValueError(f"String to replace not found in file: {path}")
-    return write_file(str(abs_path), content.replace(old_str, new_str, 1))
+    cancellation_checkpoint(cancel_event)
+    return write_file(
+        str(abs_path),
+        content.replace(old_str, new_str, 1),
+        cancel_event=cancel_event,
+    )
 
 
-def edit_file(path: str, old_block: str, new_block: str) -> str:
+def edit_file(
+    path: str,
+    old_block: str,
+    new_block: str,
+    cancel_event: threading.Event | None = None,
+) -> str:
     """Replace one exact multi-line block after write-policy approval."""
     abs_path = _checked_path(path, "write")
     try:
-        content = abs_path.read_text(encoding="utf-8", errors="replace")
+        content = _read_text_cancellable(abs_path, cancel_event)
+    except InterruptedError:
+        raise
     except OSError as exc:
         raise OSError(f"Cannot read file for editing: {path}") from exc
     idx = content.find(old_block)
@@ -117,10 +181,18 @@ def edit_file(path: str, old_block: str, new_block: str) -> str:
             f"Could not find block to edit in {path}. "
             "The file content may have changed."
         )
-    return write_file(str(abs_path), content[:idx] + new_block + content[idx + len(old_block):])
+    cancellation_checkpoint(cancel_event)
+    return write_file(
+        str(abs_path),
+        content[:idx] + new_block + content[idx + len(old_block):],
+        cancel_event=cancel_event,
+    )
 
 
-def delete_file(path: str) -> str:
+def delete_file(
+    path: str,
+    cancel_event: threading.Event | None = None,
+) -> str:
     """Delete a single file; directory removal is intentionally out of scope."""
     abs_path = _checked_path(path, "delete")
     if not abs_path.exists():
@@ -128,7 +200,10 @@ def delete_file(path: str) -> str:
     if abs_path.is_dir():
         raise IsADirectoryError(f"Refusing to delete directory with delete_file: {path}")
     try:
+        cancellation_checkpoint(cancel_event)
         abs_path.unlink()
+    except InterruptedError:
+        raise
     except OSError as exc:
         raise OSError(f"Cannot delete file: {path}") from exc
     return str(abs_path)
@@ -139,6 +214,7 @@ def search_files(
     pattern: str,
     file_pattern: str | None = None,
     limit: int | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> str:
     """Delegate content search to the active runtime search provider."""
     return _runtime().search.search(
@@ -146,6 +222,7 @@ def search_files(
         pattern,
         file_pattern=file_pattern,
         limit=limit or 50,
+        cancel_event=cancel_event,
     )
 
 

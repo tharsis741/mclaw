@@ -15,6 +15,8 @@ import logging
 from typing import Any
 
 from mclaw.skills_hub import install_service, skill_store
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,7 @@ def skill_manage(
     section: str | None = None,
     operation: str | None = None,
     actor: str = "main_agent",
+    parent_agent=None,
 ) -> str:
     """Route model-callable Skill mutations through the service layer.
 
@@ -76,7 +79,9 @@ def skill_manage(
     audit actor propagation, and model-friendly error serialization.
     """
     action = str(action or "").strip()
+    cancel_event = get_interrupt_event()
     try:
+        cancellation_checkpoint(cancel_event)
         if action == "create_scaffold":
             result = skill_store.create_skill_scaffold(
                 name=name,
@@ -119,9 +124,15 @@ def skill_manage(
         elif action == "delete":
             result = skill_store.delete_skill(name=name)
         elif action == "validate":
-            result = skill_store.validate_skill(name=name)
+            result = skill_store.validate_skill(name=name, cancel_event=cancel_event)
         elif action == "install_prepare":
-            result = install_service.install_prepare(source or "", user_intent=user_intent)
+            install_kwargs = {
+                "user_intent": user_intent,
+                "cancel_event": cancel_event,
+            }
+            if parent_agent is not None:
+                install_kwargs["parent_agent"] = parent_agent
+            result = install_service.install_prepare(source or "", **install_kwargs)
         elif action == "enable_drafting":
             result = install_service.enable_drafting(drafting_id or "")
         elif action == "cancel_drafting":
@@ -135,14 +146,33 @@ def skill_manage(
                 old_text=old_text,
             )
         elif action == "security_review":
-            result = install_service.security_review(drafting_id or "")
+            result = install_service.security_review(
+                drafting_id or "",
+                cancel_event=cancel_event,
+            )
         else:
             return tool_error(
                 f"Unknown action. Use: {', '.join(SKILL_MANAGE_ACTION_ORDER)}",
                 success=False,
             )
         return _json(result)
+    except InterruptedError as exc:
+        return tool_error(
+            str(exc),
+            success=False,
+            status="cancelled",
+            interrupted=True,
+        )
     except Exception as exc:
+        try:
+            cancellation_checkpoint(cancel_event)
+        except InterruptedError as cancel_exc:
+            return tool_error(
+                str(cancel_exc),
+                success=False,
+                status="cancelled",
+                interrupted=True,
+            )
         logger.debug("skill_manage failed action=%s: %s", action, exc, exc_info=True)
         return tool_error(str(exc), success=False)
 
@@ -265,6 +295,7 @@ def _handle_skill_manage(args: dict[str, Any], **kw) -> str:
         section=args.get("section"),
         operation=args.get("operation"),
         actor=actor,
+        parent_agent=parent_agent,
     )
 
 

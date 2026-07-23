@@ -5,17 +5,48 @@
 """ClawHub-backed search layer for external Skills."""
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from typing import List
 
 import httpx
 
 from mclaw.skills_hub.models import ExternalSkill
+from mclaw.tools.cancellation import cancellation_checkpoint
 
 logger = logging.getLogger(__name__)
 
 CLAW_HUB_API_BASE = "https://clawhub.ai/api/v1"
 CLAW_HUB_DETAIL_STATS_LIMIT = 3
+
+
+async def _get_json_async(
+    url: str,
+    *,
+    params: dict[str, str] | None = None,
+    timeout: float = 10.0,
+) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with asyncio.timeout(max(0.001, timeout)):
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("ClawHub returned a non-object response.")
+    return data
+
+
+def _run_request(coro, *, parent_agent, timeout: float = 10.0):
+    from mclaw.tools.dispatch import _run_async
+
+    return _run_async(
+        coro,
+        parent_agent=parent_agent,
+        diagnostic_name="clawhub_http",
+        timeout_seconds=timeout,
+        raise_on_stop=True,
+    )
 
 
 class ClawHubSearchError(RuntimeError):
@@ -55,38 +86,59 @@ def _extract_stats(item: dict) -> tuple[int, int]:
 class ClawHubSearcher:
     """Small adapter around ClawHub search and detail endpoints."""
 
-    def get_skill_detail(self, slug: str, *, raise_on_error: bool = False) -> dict:
+    def get_skill_detail(
+        self,
+        slug: str,
+        *,
+        raise_on_error: bool = False,
+        cancel_event: threading.Event | None = None,
+        parent_agent=None,
+    ) -> dict:
         """Fetch detail metadata for one slug, optionally surfacing network failures."""
 
+        cancellation_checkpoint(cancel_event)
         if not slug:
             return {}
         try:
-            response = httpx.get(
+            data = _run_request(
+                _get_json_async(
                 f"{CLAW_HUB_API_BASE}/skills/{slug}",
                 timeout=10.0,
+                ),
+                parent_agent=parent_agent,
             )
-            response.raise_for_status()
-            data = response.json()
-            if isinstance(data, dict):
-                return data
-        except (httpx.HTTPError, ValueError) as exc:
+            cancellation_checkpoint(cancel_event)
+            return data
+        except (httpx.HTTPError, TimeoutError, ValueError) as exc:
+            cancellation_checkpoint(cancel_event)
             logger.debug("ClawHub detail fetch failed slug=%s", slug, exc_info=True)
             if raise_on_error:
                 raise ClawHubSearchError(f"ClawHub detail fetch failed for slug '{slug}'.") from exc
         return {}
 
-    def search(self, query: str, limit: int = 10) -> List[ExternalSkill]:
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        cancel_event: threading.Event | None = None,
+        parent_agent=None,
+    ) -> List[ExternalSkill]:
         """Search ClawHub and return provider-neutral external Skill records."""
 
+        cancellation_checkpoint(cancel_event)
         try:
-            response = httpx.get(
-                f"{CLAW_HUB_API_BASE}/search",
-                params={"q": query},
-                timeout=10.0,
+            data = _run_request(
+                _get_json_async(
+                    f"{CLAW_HUB_API_BASE}/search",
+                    params={"q": query},
+                    timeout=10.0,
+                ),
+                parent_agent=parent_agent,
             )
-            response.raise_for_status()
-            data = response.json()
-        except (httpx.HTTPError, ValueError):
+            cancellation_checkpoint(cancel_event)
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            cancellation_checkpoint(cancel_event)
             logger.debug("ClawHub search failed", exc_info=True)
             return []
         if not isinstance(data, dict):
@@ -96,6 +148,7 @@ class ClawHubSearcher:
             return []
         results: List[ExternalSkill] = []
         for index, item in enumerate(items[:limit]):
+            cancellation_checkpoint(cancel_event)
             if not isinstance(item, dict):
                 continue
             slug = str(item.get("slug") or "").strip()
@@ -110,7 +163,11 @@ class ClawHubSearcher:
             if slug and not (downloads or stars) and index < CLAW_HUB_DETAIL_STATS_LIMIT:
                 # Search results can omit counters, so enrich only a small prefix with
                 # detail calls to keep interactive search latency bounded.
-                detail = self.get_skill_detail(slug)
+                detail = self.get_skill_detail(
+                    slug,
+                    cancel_event=cancel_event,
+                    parent_agent=parent_agent,
+                )
                 skill_detail = detail.get("skill") if isinstance(detail, dict) else {}
                 if isinstance(skill_detail, dict):
                     detail_downloads, detail_stars = _extract_stats(skill_detail)
@@ -134,10 +191,22 @@ class ClawHubSearcher:
                     frontmatter={},
                 )
             )
+        cancellation_checkpoint(cancel_event)
         return results
 
 
-def search_all(query: str, limit: int = 10) -> List[ExternalSkill]:
+def search_all(
+    query: str,
+    limit: int = 10,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> List[ExternalSkill]:
     """Convenience entry point used by tools and slash commands."""
 
-    return ClawHubSearcher().search(query, limit=limit)
+    return ClawHubSearcher().search(
+        query,
+        limit=limit,
+        cancel_event=cancel_event,
+        parent_agent=parent_agent,
+    )

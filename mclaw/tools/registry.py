@@ -179,9 +179,14 @@ class ToolRegistry:
         try:
             if entry.is_async:
                 from mclaw.tools.dispatch import _run_async
-                return _run_async(entry.handler(args, **kwargs))
+                return _run_async(
+                    entry.handler(args, **kwargs),
+                    parent_agent=kwargs.get("parent_agent"),
+                )
             return entry.handler(args, **kwargs)
         except Exception as e:
+            if getattr(e, "termination_fence", None) is not None:
+                raise
             logger.exception("Tool %s dispatch error: %s", name, e)
             return json.dumps({"error": f"Tool execution failed: {type(e).__name__}: {e}"})
 

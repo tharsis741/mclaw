@@ -16,7 +16,9 @@ import os
 from pathlib import Path
 
 from mclaw.tools import file_operations as ops
-from mclaw.tools.registry import registry
+from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.interrupt import get_interrupt_event
+from mclaw.tools.registry import registry, tool_error
 from mclaw.constants import get_skills_dir
 from mclaw.skills_hub.paths import get_skill_drafting_dir
 
@@ -235,12 +237,16 @@ def write_file_tool(path: str, content: str) -> str:
     blocked = _skill_store_mutation_error(path, "write_file")
     if blocked:
         return json.dumps({"success": False, "error": blocked}, ensure_ascii=False)
+    cancel_event = get_interrupt_event()
     try:
-        written = ops.write_file(path, content)
+        cancellation_checkpoint(cancel_event)
+        written = ops.write_file(path, content, cancel_event=cancel_event)
         return json.dumps({
             "path": written,
             "bytes_written": len(content.encode("utf-8")),
         }, ensure_ascii=False)
+    except InterruptedError as exc:
+        return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
     except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -261,9 +267,13 @@ def patch_tool(path: str, old_str: str, new_str: str) -> str:
     blocked = _skill_store_mutation_error(path, "patch")
     if blocked:
         return json.dumps({"success": False, "error": blocked}, ensure_ascii=False)
+    cancel_event = get_interrupt_event()
     try:
-        patched = ops.patch_file(path, old_str, new_str)
+        cancellation_checkpoint(cancel_event)
+        patched = ops.patch_file(path, old_str, new_str, cancel_event=cancel_event)
         return json.dumps({"path": patched}, ensure_ascii=False)
+    except InterruptedError as exc:
+        return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
     except (OSError, ValueError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -286,9 +296,13 @@ def edit_file_tool(path: str, old_block: str, new_block: str) -> str:
     blocked = _skill_store_mutation_error(path, "edit_file")
     if blocked:
         return json.dumps({"success": False, "error": blocked}, ensure_ascii=False)
+    cancel_event = get_interrupt_event()
     try:
-        edited = ops.edit_file(path, old_block, new_block)
+        cancellation_checkpoint(cancel_event)
+        edited = ops.edit_file(path, old_block, new_block, cancel_event=cancel_event)
         return json.dumps({"path": edited}, ensure_ascii=False)
+    except InterruptedError as exc:
+        return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
     except (OSError, ValueError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -300,9 +314,13 @@ def delete_file_tool(path: str) -> str:
     blocked = _skill_store_mutation_error(path, "delete_file")
     if blocked:
         return json.dumps({"success": False, "error": blocked}, ensure_ascii=False)
+    cancel_event = get_interrupt_event()
     try:
-        deleted = ops.delete_file(path)
+        cancellation_checkpoint(cancel_event)
+        deleted = ops.delete_file(path, cancel_event=cancel_event)
         return json.dumps({"path": deleted, "deleted": True}, ensure_ascii=False)
+    except InterruptedError as exc:
+        return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
     except OSError as e:
         return json.dumps({"error": str(e), "success": False}, ensure_ascii=False)
 
@@ -326,10 +344,35 @@ def search_files_tool(
     Returns:
         Search results as formatted string (grep-style: path:lineno:content).
     """
+    cancel_event = get_interrupt_event()
     try:
-        results = ops.search_files(directory, pattern, file_pattern=file_pattern, limit=limit)
+        cancellation_checkpoint(cancel_event)
+        results = ops.search_files(
+            directory,
+            pattern,
+            file_pattern=file_pattern,
+            limit=limit,
+            cancel_event=cancel_event,
+        )
+        cancellation_checkpoint(cancel_event)
         return json.dumps({"results": results}, ensure_ascii=False)
+    except InterruptedError as exc:
+        return tool_error(
+            str(exc),
+            success=False,
+            status="cancelled",
+            interrupted=True,
+        )
     except OSError as e:
+        try:
+            cancellation_checkpoint(cancel_event)
+        except InterruptedError as cancel_exc:
+            return tool_error(
+                str(cancel_exc),
+                success=False,
+                status="cancelled",
+                interrupted=True,
+            )
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 

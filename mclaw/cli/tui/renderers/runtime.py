@@ -56,9 +56,6 @@ class RuntimeRenderer:
         prefix = "\n" if leading_newline else ""
         self._printer(f"{prefix}  {DIM}{message}{RST}")
 
-    def interrupted(self, symbol: str, *, leading_newline: bool = False) -> None:
-        self.warning(f"{symbol} 已中断", leading_newline=leading_newline)
-
     def no_subagents(self) -> None:
         self._printer("\n  (无子代理任务)")
 

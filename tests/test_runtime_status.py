@@ -76,6 +76,28 @@ def test_finish_turn_preserves_terminal_outcomes() -> None:
     state.finish_turn({"pending_skill_import_confirmation": True})
     assert state.status == RuntimeStatus.WAITING_FOR_USER
 
+    state.begin_turn()
+    state.finish_turn(
+        {
+            "interrupted": True,
+            "abort_reason": "tool_timeout",
+            "abort_message": "deadline",
+        }
+    )
+    assert state.status == RuntimeStatus.ERROR
+    assert state.detail == "Tool execution timed out"
+
+    state.begin_turn()
+    state.finish_turn(
+        {
+            "interrupted": True,
+            "abort_reason": "tool_completion_unknown",
+            "abort_message": "restart required",
+        }
+    )
+    assert state.status == RuntimeStatus.ERROR
+    assert state.detail == "restart required"
+
 
 def test_every_runtime_status_has_one_pet_mapping() -> None:
     assert set(_STATUS_STYLES) == set(RuntimeStatus)

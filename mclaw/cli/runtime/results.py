@@ -18,13 +18,13 @@ class RuntimeTurnResultHooks:
     stream_text: Callable[[], str]
     stream_started: Callable[[], bool]
     render_response: Callable[[str], None]
-    render_interrupted: Callable[[], None]
     emit_waiting_for_skill_confirmation: Callable[[], None]
     remember_pending_skill_confirmation: Callable[[dict[str, Any]], None]
     render_skill_confirmation: Callable[[dict[str, Any]], None]
     handle_pending_delegate: Callable[[dict[str, Any]], bool]
     log_skill_confirmation_pending: Callable[[dict[str, Any]], None]
     invalidate_skill_registry: Callable[[], None] = lambda: None
+    render_abort: Callable[[str], None] = lambda _message: None
 
 
 class RuntimeTurnResultCoordinator:
@@ -36,7 +36,10 @@ class RuntimeTurnResultCoordinator:
     def handle_result(self, result: dict[str, Any]) -> None:
         """Render terminal output and dispatch post-turn continuation intents."""
         if result.get("interrupted"):
-            self.hooks.render_interrupted()
+            abort_reason = str(result.get("abort_reason") or "")
+            abort_message = str(result.get("abort_message") or "")
+            if abort_reason in {"tool_timeout", "tool_completion_unknown"} and abort_message:
+                self.hooks.render_abort(abort_message)
             return
 
         display_text = self.select_display_text(

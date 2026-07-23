@@ -6,16 +6,19 @@
 
 from __future__ import annotations
 
+import asyncio
 import shutil
 import tempfile
+import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import quote, urlparse
 
-import requests
+import httpx
 
 from mclaw.skills_hub.search import CLAW_HUB_API_BASE, ClawHubSearcher, ClawHubSearchError
+from mclaw.tools.cancellation import cancellation_checkpoint
 
 
 @dataclass(frozen=True)
@@ -36,38 +39,92 @@ class SourceResolutionError(ValueError):
     """Raised when install_prepare cannot resolve or copy a source."""
 
 
-def resolve_source(source: str) -> ResolvedSource:
+def _run_http(coro, *, parent_agent, timeout: float, operation: str):
+    from mclaw.tools.dispatch import _run_async
+
+    return _run_async(
+        coro,
+        parent_agent=parent_agent,
+        diagnostic_name=f"skill_manage_{operation}_http",
+        timeout_seconds=timeout,
+        raise_on_stop=True,
+    )
+
+
+async def _get_json_async(url: str, *, timeout: float) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with asyncio.timeout(max(0.001, timeout)):
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("Remote source returned a non-object response.")
+    return data
+
+
+def resolve_source(
+    source: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> ResolvedSource:
     """Resolve a user-provided Skill source into a trusted fetch/copy plan."""
+    cancellation_checkpoint(cancel_event)
     value = str(source or "").strip().strip('"')
     if not value:
         raise SourceResolutionError("source is required.")
 
     local = Path(value).expanduser()
     if local.exists():
+        cancellation_checkpoint(cancel_event)
         if local.is_symlink():
             raise SourceResolutionError("Symlinks are not allowed in Skill source packages.")
         if not local.is_dir():
             raise SourceResolutionError("local source must be a directory.")
-        return ResolvedSource(type="local", original=value, fetch_url=str(local), local_path=local)
+        result = ResolvedSource(type="local", original=value, fetch_url=str(local), local_path=local)
+        cancellation_checkpoint(cancel_event)
+        return result
 
     parsed = urlparse(value)
     host = parsed.netloc.lower()
     if host in {"github.com", "www.github.com"}:
-        return _resolve_github(value, parsed)
+        return _resolve_github(
+            value,
+            parsed,
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
+        )
     if host in {"clawhub.ai", "www.clawhub.ai"}:
-        return _resolve_clawhub(value, parsed)
+        return _resolve_clawhub(
+            value,
+            parsed,
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
+        )
     raise SourceResolutionError("Unsupported skill source. Use GitHub, ClawHub, or a local directory.")
 
 
-def _resolve_clawhub(original: str, parsed) -> ResolvedSource:
+def _resolve_clawhub(
+    original: str,
+    parsed,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> ResolvedSource:
     """Resolve ClawHub URLs through the API so owner and slug are canonical."""
+    cancellation_checkpoint(cancel_event)
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
         raise SourceResolutionError("ClawHub URL must be https://clawhub.ai/<owner>/<slug>.")
     owner_hint, slug_hint = parts[0], parts[1]
 
     try:
-        detail = ClawHubSearcher().get_skill_detail(slug_hint, raise_on_error=True)
+        detail = ClawHubSearcher().get_skill_detail(
+            slug_hint,
+            raise_on_error=True,
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
+        )
     except ClawHubSearchError as exc:
         raise SourceResolutionError(f"ClawHub detail lookup failed for slug '{slug_hint}'.") from exc
     skill = detail.get("skill") if isinstance(detail, dict) else {}
@@ -89,6 +146,7 @@ def _resolve_clawhub(original: str, parsed) -> ResolvedSource:
         )
 
     fetch_url = f"{CLAW_HUB_API_BASE}/download?slug={quote(slug)}"
+    cancellation_checkpoint(cancel_event)
     return ResolvedSource(
         type="clawhub",
         original=original,
@@ -98,8 +156,15 @@ def _resolve_clawhub(original: str, parsed) -> ResolvedSource:
     )
 
 
-def _resolve_github(original: str, parsed) -> ResolvedSource:
+def _resolve_github(
+    original: str,
+    parsed,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> ResolvedSource:
     """Resolve GitHub repo/tree/blob URLs into codeload archive metadata."""
+    cancellation_checkpoint(cancel_event)
     parts = [part for part in parsed.path.split("/") if part]
     if len(parts) < 2:
         raise SourceResolutionError("GitHub URL must include owner and repo.")
@@ -119,7 +184,13 @@ def _resolve_github(original: str, parsed) -> ResolvedSource:
             blob_path = blob_path[:-1]
         package_root = "/".join(blob_path)
     if not branch:
-        branch = _github_default_branch(owner, repo) or "main"
+        branch = _github_default_branch(
+            owner,
+            repo,
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
+        ) or "main"
+    cancellation_checkpoint(cancel_event)
     fetch_url = f"https://codeload.github.com/{owner}/{repo}/zip/{quote(branch, safe='')}"
     return ResolvedSource(
         type="github",
@@ -131,34 +202,69 @@ def _resolve_github(original: str, parsed) -> ResolvedSource:
     )
 
 
-def _github_default_branch(owner: str, repo: str) -> str:
+def _github_default_branch(
+    owner: str,
+    repo: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> str:
     """Best-effort default-branch lookup; callers fall back when unavailable."""
+    cancellation_checkpoint(cancel_event)
     try:
-        response = requests.get(f"https://api.github.com/repos/{owner}/{repo}", timeout=15)
-        if response.ok:
-            data = response.json()
-            return str(data.get("default_branch") or "").strip()
-    except (requests.RequestException, ValueError):
+        data = _run_http(
+            _get_json_async(
+                f"https://api.github.com/repos/{owner}/{repo}",
+                timeout=15,
+            ),
+            parent_agent=parent_agent,
+            timeout=15,
+            operation="github_resolve",
+        )
+        cancellation_checkpoint(cancel_event)
+        return str(data.get("default_branch") or "").strip()
+    except (httpx.HTTPError, TimeoutError, ValueError):
+        cancellation_checkpoint(cancel_event)
         return ""
     return ""
 
 
-def materialize_source(resolved: ResolvedSource, target_dir: Path) -> None:
+def materialize_source(
+    resolved: ResolvedSource,
+    target_dir: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> None:
     """Copy/download a resolved source into target_dir, preserving its package layout."""
+    cancellation_checkpoint(cancel_event)
     target_dir.mkdir(parents=True, exist_ok=True)
+    cancellation_checkpoint(cancel_event)
     if resolved.type == "local":
         if resolved.local_path is None:
             raise SourceResolutionError("local_path is missing.")
-        _copy_dir_contents(resolved.local_path, target_dir)
+        _copy_dir_contents(resolved.local_path, target_dir, cancel_event=cancel_event)
+        cancellation_checkpoint(cancel_event)
         return
-    archive_path = _download_archive(resolved.fetch_url)
+    download_kwargs = {"cancel_event": cancel_event}
+    if parent_agent is not None:
+        download_kwargs["parent_agent"] = parent_agent
+    archive_path = _download_archive(resolved.fetch_url, **download_kwargs)
     try:
+        cancellation_checkpoint(cancel_event)
         with tempfile.TemporaryDirectory(prefix="mclaw_skill_src_") as tmp_name:
             tmp = Path(tmp_name)
             with zipfile.ZipFile(archive_path) as zf:
-                _safe_extract_archive(zf, tmp)
-            package = _find_archive_package_root(tmp, resolved.package_root)
-            _copy_dir_contents(package, target_dir)
+                _safe_extract_archive(zf, tmp, cancel_event=cancel_event)
+            cancellation_checkpoint(cancel_event)
+            package = _find_archive_package_root(
+                tmp,
+                resolved.package_root,
+                cancel_event=cancel_event,
+            )
+            cancellation_checkpoint(cancel_event)
+            _copy_dir_contents(package, target_dir, cancel_event=cancel_event)
+            cancellation_checkpoint(cancel_event)
     finally:
         try:
             archive_path.unlink()
@@ -166,16 +272,27 @@ def materialize_source(resolved: ResolvedSource, target_dir: Path) -> None:
             pass
 
 
-def _find_archive_package_root(extracted_root: Path, package_root: str = "") -> Path:
+def _find_archive_package_root(
+    extracted_root: Path,
+    package_root: str = "",
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Path:
     """Find the Skill package root in either GitHub-style or flat archives."""
+    cancellation_checkpoint(cancel_event)
     package_root = str(package_root or "").strip("/")
-    roots = [p for p in extracted_root.iterdir() if p.is_dir()]
+    roots = []
+    for path in extracted_root.iterdir():
+        cancellation_checkpoint(cancel_event)
+        if path.is_dir():
+            roots.append(path)
 
     if package_root:
         direct = extracted_root / package_root
         if direct.is_dir():
             return direct
         for root in roots:
+            cancellation_checkpoint(cancel_event)
             nested = root / package_root
             if nested.is_dir():
                 return nested
@@ -190,8 +307,46 @@ def _find_archive_package_root(extracted_root: Path, package_root: str = "") -> 
     raise SourceResolutionError("Downloaded archive contains multiple package directories; provide a package root.")
 
 
-def _download_archive(url: str) -> Path:
+async def _download_archive_async(
+    url: str,
+    path: Path,
+    *,
+    cancel_event: threading.Event | None,
+    timeout: float,
+) -> Path:
+    completed = False
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with asyncio.timeout(max(0.001, timeout)):
+                async with client.stream("GET", url) as response:
+                    if not response.is_success:
+                        raise SourceResolutionError(
+                            f"Download failed: HTTP {response.status_code}"
+                        )
+                    with path.open("wb") as handle:
+                        async for chunk in response.aiter_bytes(chunk_size=1024 * 128):
+                            cancellation_checkpoint(cancel_event)
+                            if chunk:
+                                handle.write(chunk)
+                        cancellation_checkpoint(cancel_event)
+        completed = True
+        return path
+    finally:
+        if not completed:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+
+
+def _download_archive(
+    url: str,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> Path:
     """Download an archive to a temporary file and delete partial files on errors."""
+    cancellation_checkpoint(cancel_event)
     fd, tmp_path = tempfile.mkstemp(prefix="mclaw_skill_download_", suffix=".zip")
     try:
         import os
@@ -200,14 +355,17 @@ def _download_archive(url: str) -> Path:
         pass
     path = Path(tmp_path)
     try:
-        with requests.get(url, timeout=60, stream=True) as response:
-            if not response.ok:
-                raise SourceResolutionError(f"Download failed: HTTP {response.status_code}")
-            with open(path, "wb") as handle:
-                for chunk in response.iter_content(chunk_size=1024 * 128):
-                    if chunk:
-                        handle.write(chunk)
-        return path
+        return _run_http(
+            _download_archive_async(
+                url,
+                path,
+                cancel_event=cancel_event,
+                timeout=60,
+            ),
+            parent_agent=parent_agent,
+            timeout=60,
+            operation="archive_download",
+        )
     except BaseException:
         try:
             path.unlink()
@@ -216,10 +374,16 @@ def _download_archive(url: str) -> Path:
         raise
 
 
-def _safe_extract_archive(zf: zipfile.ZipFile, target_root: Path) -> None:
+def _safe_extract_archive(
+    zf: zipfile.ZipFile,
+    target_root: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Extract zip members while rejecting absolute paths and traversal."""
     root = target_root.resolve()
     for member in zf.infolist():
+        cancellation_checkpoint(cancel_event)
         raw_name = str(member.filename or "").replace("\\", "/")
         parts = PurePosixPath(raw_name).parts
         if (
@@ -237,13 +401,25 @@ def _safe_extract_archive(zf: zipfile.ZipFile, target_root: Path) -> None:
             continue
         target.parent.mkdir(parents=True, exist_ok=True)
         with zf.open(member, "r") as src, target.open("wb") as dst:
-            shutil.copyfileobj(src, dst)
+            while True:
+                cancellation_checkpoint(cancel_event)
+                chunk = src.read(1024 * 128)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        cancellation_checkpoint(cancel_event)
 
 
-def _copy_dir_contents(src: Path, dst: Path) -> None:
+def _copy_dir_contents(
+    src: Path,
+    dst: Path,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> None:
     """Copy package contents while rejecting symlinks and local cache artifacts."""
     ignore_names = {".git", "__pycache__", ".DS_Store"}
     for item in src.iterdir():
+        cancellation_checkpoint(cancel_event)
         if item.name in ignore_names:
             continue
         target = dst / item.name
@@ -251,7 +427,8 @@ def _copy_dir_contents(src: Path, dst: Path) -> None:
             raise SourceResolutionError("Symlinks are not allowed in Skill source packages.")
         if item.is_dir():
             target.mkdir(parents=True, exist_ok=True)
-            _copy_dir_contents(item, target)
+            _copy_dir_contents(item, target, cancel_event=cancel_event)
         elif item.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
+        cancellation_checkpoint(cancel_event)

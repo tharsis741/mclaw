@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import shutil
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +38,7 @@ from mclaw.skills_hub.skill_yaml_store import (
     touch_skill_yaml,
     write_skill_yaml,
 )
+from mclaw.tools.cancellation import cancellation_checkpoint
 
 
 class SkillStoreError(ValueError):
@@ -518,15 +520,27 @@ def write_skill_file(
     }
 
 
-def validate_skill(*, name: str) -> dict[str, Any]:
+def validate_skill(
+    *,
+    name: str,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
     """Run the full enabled Skill contract and security review checks."""
 
+    cancellation_checkpoint(cancel_event)
     name = validate_skill_name(name)
     skill_dir = get_enabled_skills_dir() / name
     if not skill_dir.is_dir():
         raise SkillStoreError(f"Skill '{name}' not found.")
+    cancellation_checkpoint(cancel_event)
     yaml_data = _validate_package(skill_dir, expected_status="enabled", allow_placeholder=False)
-    review = review_skill_package(skill_dir, source="agent_created")
+    cancellation_checkpoint(cancel_event)
+    review = review_skill_package(
+        skill_dir,
+        source="agent_created",
+        cancel_event=cancel_event,
+    )
+    cancellation_checkpoint(cancel_event)
     if review.get("verdict") == "dangerous":
         raise SkillStoreError(f"Security scan blocked this skill: {review.get('summary')}")
     return {

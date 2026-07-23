@@ -18,8 +18,9 @@ import threading
 import time
 import uuid
 
-from mclaw.tools.browser_backend import BrowserBackend
+from mclaw.tools.browser_backend import BrowserBackend, BrowserOperationCancelled
 from mclaw.tools.browser_requirements import check_browser_requirements, diagnose_browser_requirements
+from mclaw.tools.interrupt import get_cancel_id, safe_cancel_trace
 from mclaw.tools.registry import registry, tool_error
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,65 @@ def _output_path_error(path: str | None, tool_name: str, parent_agent=None) -> s
     return None
 
 
+def _register_browser_fence(parent_agent, fence) -> None:
+    if parent_agent is None or fence is None:
+        return
+    register = getattr(parent_agent, "_register_turn_worker", None)
+    unregister = getattr(parent_agent, "_unregister_turn_worker", None)
+    if not callable(register):
+        return
+    register(fence)
+    cancel_event = getattr(fence, "_mclaw_cancel_event", None)
+    future = getattr(fence, "future", None)
+    if future is not None and callable(unregister):
+        def _release_fence(_future) -> None:
+            unregister(fence)
+            safe_cancel_trace(
+                lambda: logger.info(
+                    "[CANCEL_TRACE] browser_fence_release cancel_id=%s session=%s "
+                    "task_id=%x elapsed_ms=%d",
+                    get_cancel_id(cancel_event),
+                    getattr(parent_agent, "session_id", "?"),
+                    id(fence),
+                    int(
+                        (
+                            time.monotonic()
+                            - getattr(fence, "created_at", time.monotonic())
+                        )
+                        * 1000
+                    ),
+                )
+            )
+
+        future.add_done_callback(_release_fence)
+    safe_cancel_trace(
+        lambda: logger.warning(
+            "[CANCEL_TRACE] browser_fence_register cancel_id=%s session=%s "
+            "task_id=%x operation=%s phase=%s",
+            get_cancel_id(cancel_event),
+            getattr(parent_agent, "session_id", "?"),
+            id(fence),
+            getattr(fence, "diagnostic_name", type(fence).__name__),
+            getattr(fence, "phase", "unknown"),
+        )
+    )
+
+
+def _browser_exception_result(tool_name: str, exc: Exception, parent_agent=None) -> str:
+    if isinstance(exc, BrowserOperationCancelled):
+        _register_browser_fence(parent_agent, exc.fence)
+        details = {
+            "success": False,
+            "interrupted": True,
+            "status": "cancel_requested" if exc.completion_unknown else "cancelled",
+        }
+        if exc.completion_unknown:
+            details["completion_unknown"] = True
+        return tool_error(str(exc), **details)
+    logger.exception("%s error: %s", tool_name, exc)
+    return tool_error(str(exc), success=False)
+
+
 # ── 1. browser_navigate ─────────────────────────────────────────────────────
 
 def browser_navigate(url: str, parent_agent=None) -> str:
@@ -188,8 +248,7 @@ def browser_navigate(url: str, parent_agent=None) -> str:
     sess = _get_or_create_session(session_id)
 
     try:
-        nav = sess.backend.navigate(session_id, url)
-        snap = sess.backend.snapshot(session_id)
+        nav, snap = sess.backend.navigate_and_snapshot(session_id, url)
         result = {
             "success": not bool(nav.get("error")),
             "url": snap.get("url", nav.get("url", "")),
@@ -200,8 +259,7 @@ def browser_navigate(url: str, parent_agent=None) -> str:
             result["error"] = nav.get("error")
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_navigate error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_navigate", e, parent_agent)
 
 
 # ── 2. browser_snapshot ─────────────────────────────────────────────────────
@@ -221,8 +279,7 @@ def browser_snapshot(parent_agent=None) -> str:
             "snapshot": snap["snapshot"],
         }, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_snapshot error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_snapshot", e, parent_agent)
 
 
 # ── 3. browser_screenshot ───────────────────────────────────────────────────
@@ -241,8 +298,7 @@ def browser_screenshot(path: str | None = None, parent_agent=None) -> str:
         result = sess.backend.screenshot(session_id, path=path)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_screenshot error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_screenshot", e, parent_agent)
 
 
 # ── 4. browser_click ────────────────────────────────────────────────────────
@@ -261,8 +317,7 @@ def browser_click(ref: str, parent_agent=None) -> str:
         result = sess.backend.click(session_id, clean_ref)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_click error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_click", e, parent_agent)
 
 
 # ── 5. browser_type ─────────────────────────────────────────────────────────
@@ -283,8 +338,7 @@ def browser_type(ref: str, text: str, parent_agent=None) -> str:
         result = sess.backend.type_text(session_id, clean_ref, text)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_type error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_type", e, parent_agent)
 
 
 # ── 6. browser_scroll ───────────────────────────────────────────────────────
@@ -299,8 +353,7 @@ def browser_scroll(direction: str = "down", parent_agent=None) -> str:
         result = sess.backend.scroll(session_id, direction=direction)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_scroll error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_scroll", e, parent_agent)
 
 
 # ── 7. browser_press ────────────────────────────────────────────────────────
@@ -318,8 +371,7 @@ def browser_press(key: str, parent_agent=None) -> str:
         result = sess.backend.press(session_id, key)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_press error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_press", e, parent_agent)
 
 
 # ── 8. browser_download ─────────────────────────────────────────────────────
@@ -348,8 +400,7 @@ def browser_download(
         result = sess.backend.download(session_id, url=url, path=path, ref=clean_ref)
         return json.dumps(result, ensure_ascii=False)
     except Exception as e:
-        logger.exception("browser_download error: %s", e)
-        return tool_error(str(e), success=False)
+        return _browser_exception_result("browser_download", e, parent_agent)
 
 
 # ── Registry ────────────────────────────────────────────────────────────────
