@@ -318,6 +318,23 @@ def test_image_download_blocks_unsafe_redirect_before_request(
             assert not destination.exists()
 
 
+def test_url_safety_ignores_disabled_ipv6_artifacts_but_blocks_private_ipv4(
+    monkeypatch,
+) -> None:
+    def getaddrinfo(hostname, *_args, **_kwargs):
+        ipv4 = "125.73.212.153" if hostname == "public.example" else "10.0.0.1"
+        return [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ipv4, 0)),
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", (10, b"invalid-ipv6")),
+        ]
+
+    monkeypatch.setattr(image_io.socket, "has_ipv6", False)
+    monkeypatch.setattr(image_io.socket, "getaddrinfo", getaddrinfo)
+
+    assert image_io._is_safe_url("https://public.example/")
+    assert not image_io._is_safe_url("https://private.example/")
+
+
 def test_image_download_stream_size_cap_removes_partial_file(
     tmp_path,
     monkeypatch,

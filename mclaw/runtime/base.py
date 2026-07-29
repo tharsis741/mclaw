@@ -437,15 +437,7 @@ class Runtime:
             "credential_files": "protected",
             "features": self.features.to_dict(),
         }
-        launch_domain = getattr(self, "launch_domain", None)
-        if launch_domain is not None:
-            to_dict = getattr(launch_domain, "to_dict", None)
-            data["launch_domain"] = to_dict() if callable(to_dict) else str(launch_domain)
         return data
-
-    def prompt_os_label(self, os_name: str, os_release: str) -> str:
-        """Return the OS label exposed to the model in the system prompt."""
-        return f"{os_name} {os_release}".strip()
 
     @staticmethod
     def _strip_cwd_marker(output: str) -> tuple[str, str]:

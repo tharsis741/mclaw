@@ -76,7 +76,7 @@ def _is_kaihong_runtime() -> bool:
     try:
         from mclaw.runtime.manager import RuntimeManager
 
-        return RuntimeManager.detect() == "kaihong"
+        return RuntimeManager.current().kind == "kaihong"
     except Exception:
         return False
 

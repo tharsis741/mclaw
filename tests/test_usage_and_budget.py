@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.safety.context_rollback import ContextRollbackManager
 from mclaw.state import SessionDB
 from mclaw.tools.file_tools import write_file_tool
+from mclaw.tools.registry import ToolEntry, registry
 
 
 def _context(
@@ -416,6 +418,129 @@ def _runtime_agent(
         skip_memory=True,
         config={"compression": {"enabled": False}},
     )
+
+
+def test_turn_disabled_tool_names_filter_model_and_dispatch_without_mutating_agent(
+    monkeypatch,
+    caplog,
+) -> None:
+    context = _context()
+    executed: list[dict] = []
+    callbacks: list[str] = []
+    monkeypatch.setitem(
+        registry._tools,
+        "ordinary_tool",
+        ToolEntry(
+            name="ordinary_tool",
+            toolset="test",
+            schema={},
+            handler=lambda args, **_kwargs: (
+                executed.append(args) or json.dumps({"success": True})
+            ),
+        ),
+    )
+    transport = _SequenceTransport(
+        ModelCallResult(
+            content="",
+            tool_calls=[
+                {
+                    "id": "blocked-delegate",
+                    "type": "function",
+                    "function": {"name": "delegate_task", "arguments": "{}"},
+                },
+                {
+                    "id": "ordinary-call",
+                    "type": "function",
+                    "function": {
+                        "name": "ordinary_tool",
+                        "arguments": '{"value": 1}',
+                    },
+                },
+            ],
+            finish_reason="tool_calls",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        ),
+        ModelCallResult(
+            content="done",
+            tool_calls=[],
+            finish_reason="stop",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        ),
+        ModelCallResult(
+            content="next",
+            tool_calls=[],
+            finish_reason="stop",
+            reasoning=None,
+            usage=None,
+            was_streamed=False,
+            provider=context.provider,
+            model=context.model,
+        ),
+    )
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent._tool_callback = lambda name, _args: callbacks.append(name)
+    original_tools = [
+        {"type": "function", "function": {"name": "ordinary_tool", "parameters": {}}},
+        {"type": "function", "function": {"name": "delegate_task", "parameters": {}}},
+    ]
+    original_names = {"ordinary_tool", "delegate_task"}
+    agent.tools = original_tools
+    agent.valid_tool_names = original_names
+    caplog.set_level(logging.WARNING, logger="mclaw.agent.core")
+
+    result = agent.run_conversation(
+        "synthesize",
+        advance_background_review=False,
+        disabled_tool_names={"delegate_task"},
+    )
+
+    assert result["final_response"] == "done"
+    assert [
+        tool["function"]["name"] for tool in transport.calls[0]["tools"]
+    ] == ["ordinary_tool"]
+    assert [
+        tool["function"]["name"] for tool in transport.calls[1]["tools"]
+    ] == ["ordinary_tool"]
+    blocked_result = next(
+        message["content"]
+        for message in result["messages"]
+        if message.get("tool_call_id") == "blocked-delegate"
+    )
+    assert "not available" in json.loads(blocked_result)["error"]
+    ordinary_result = next(
+        message["content"]
+        for message in result["messages"]
+        if message.get("tool_call_id") == "ordinary-call"
+    )
+    assert json.loads(ordinary_result)["success"] is True
+    assert executed == [{"value": 1}]
+    assert callbacks == ["ordinary_tool"]
+    assert any(
+        "[TURN TOOL FILTER] rejected_model_calls=['delegate_task']"
+        in record.getMessage()
+        for record in caplog.records
+    )
+    assert agent._outstanding_turn_workers == set()
+    assert agent.tools is original_tools
+    assert agent.valid_tool_names is original_names
+
+    next_result = agent.run_conversation(
+        "next turn",
+        advance_background_review=False,
+    )
+
+    assert next_result["final_response"] == "next"
+    assert {
+        tool["function"]["name"] for tool in transport.calls[2]["tools"]
+    } == {"ordinary_tool", "delegate_task"}
 
 
 def test_configured_iteration_limit_returns_incomplete_stop_reason(monkeypatch) -> None:

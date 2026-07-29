@@ -104,7 +104,7 @@ TOOLSETS: dict[str, dict[str, Any]] = {
     },
     "vision": {
         "description": "Vision analysis for images via URL or local path",
-        "display": {"emoji": "👁️", "summary_zh": "图片理解与识别"},
+        "display": {"emoji": "👓", "summary_zh": "图片理解与识别"},
         "tools": VISION_TOOLS,
         "kind": "optional",
     },

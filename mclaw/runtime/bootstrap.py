@@ -16,43 +16,62 @@ import sys
 from pathlib import Path
 
 
+_OHOS_PARAMETER_FILES = (
+    Path("/etc/param/ohos.para"),
+    Path("/system/etc/param/ohos.para"),
+)
+_KAIHONG_RUN = Path("/bin/run")
+_KAIHONG_RELEASE_ROOT = Path("/data/local/release")
+OHOS_IDENTITY_KEYS = (
+    "const.ohos.fullname",
+    "const.ohos.version",
+    "const.product.software.version",
+    "const.product.brand",
+    "const.product.name",
+    "const.product.model",
+)
+
+
 class BootstrapPathResolver:
     """Resolve process-wide MCLAW_HOME before user config is loaded."""
 
     @staticmethod
+    def read_ohos_parameters() -> dict[str, str]:
+        """Read stable OpenHarmony identity parameters without spawning commands."""
+        parameters: dict[str, str] = {}
+        for param_path in _OHOS_PARAMETER_FILES:
+            try:
+                text = param_path.read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                continue
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip()
+                if key in OHOS_IDENTITY_KEYS:
+                    parameters.setdefault(key, value.strip().strip("\"'"))
+        return parameters
+
+    @staticmethod
     def is_kaihong_host() -> bool:
-        """Detect Kaihong/OpenHarmony-style hosts using low-level markers only."""
+        """Detect Kaihong identity or a compatible OpenHarmony release runtime."""
         if not sys.platform.startswith("linux"):
             return False
         machine = platform.machine().lower()
         if machine not in {"aarch64", "arm64"}:
             return False
 
-        score = 0
-        for path in (
-            "/bin/run",
-            "/data/local/release",
-            "/data/local/release/bin/python3",
-            "/data/acs/acs/file_sharing",
-        ):
-            if Path(path).exists():
-                score += 1
-
-        for param_path in (
-            "/etc/param/ohos.para",
-            "/system/etc/param/ohos.para",
-            "/data/service/el1/public/startup/parameters",
-        ):
-            try:
-                text = Path(param_path).read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                continue
-            lowered = text.lower()
-            if "ohos" in lowered or "openharmony" in lowered or "kaihong" in lowered:
-                score += 1
-                break
-
-        return score >= 3
+        parameters = BootstrapPathResolver.read_ohos_parameters()
+        brand = parameters.get("const.product.brand", "").casefold()
+        ohos_version = parameters.get("const.ohos.version", "").casefold()
+        kaihong_identity = brand == "kaihong" or ohos_version.startswith("kaihongos")
+        openharmony_family = any(key.startswith("const.ohos.") for key in parameters)
+        if not openharmony_family:
+            openharmony_family = any(path.exists() for path in _OHOS_PARAMETER_FILES)
+        release_runtime = _KAIHONG_RUN.is_file() and _KAIHONG_RELEASE_ROOT.is_dir()
+        return kaihong_identity or (openharmony_family and release_runtime)
 
     @staticmethod
     def resolve_mclaw_home() -> Path:

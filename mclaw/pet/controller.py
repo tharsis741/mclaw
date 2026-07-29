@@ -66,6 +66,15 @@ class PetController:
         with self._lock:
             if self.running:
                 return True
+            try:
+                from mclaw.runtime.manager import RuntimeManager
+
+                feature = RuntimeManager.current().features.get("pet")
+            except Exception:
+                feature = None
+            if feature is not None and not feature.enabled:
+                self._last_error = feature.reason or "Desktop pet is unavailable in the active runtime."
+                return False
             if self.config.backend.lower() != "pyside6":
                 self._last_error = f"Unsupported pet backend: {self.config.backend}"
                 return False

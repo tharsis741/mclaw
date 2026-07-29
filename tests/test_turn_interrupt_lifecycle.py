@@ -102,7 +102,7 @@ def test_user_interrupt_stays_the_turn_outcome_while_late_worker_remains_fenced(
     assert agent._turn_abort_reason == "user_cancelled"
     result = {"interrupted": turn_event.is_set(), **agent.current_turn_abort_details()}
     assert result == {"interrupted": True}
-    assert "工具仍在收尾" in agent._turn_worker_block_reason()
+    assert "仍在收尾" in agent._turn_worker_block_reason()
 
     state = RuntimeSessionState()
     state.begin_turn()
@@ -174,7 +174,7 @@ def test_cancellation_survives_faulty_worker_diagnostics_and_logging(trigger: st
     assert turn_event.is_set() is True
     assert agent._interrupted is True
     assert agent._persistent_turn_worker_reason() is None
-    assert "工具仍在收尾" in agent._turn_worker_block_reason()
+    assert "仍在收尾" in agent._turn_worker_block_reason()
 
     agent._unregister_turn_worker(worker)
     agent.end_turn(turn_event)
@@ -265,7 +265,7 @@ def test_next_turn_is_fenced_until_late_worker_exits() -> None:
     assert worker_started.wait(1)
     agent.end_turn(old_event)
 
-    with pytest.raises(RuntimeError, match="工具仍在收尾"):
+    with pytest.raises(RuntimeError, match="仍在收尾"):
         agent.begin_turn()
 
     release.set()
@@ -273,6 +273,127 @@ def test_next_turn_is_fenced_until_late_worker_exits() -> None:
     assert not worker.is_alive()
     new_event = agent.begin_turn()
     agent.end_turn(new_event)
+
+
+def test_registered_worker_can_begin_the_turn_it_owns() -> None:
+    agent = _bare_agent("registered-turn-owner")
+    entered = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+    owned: list[threading.Event] = []
+
+    def _worker() -> None:
+        try:
+            event = agent.begin_turn()
+            owned.append(event)
+            entered.set()
+            release.wait(2)
+            agent.end_turn(event)
+        except BaseException as exc:
+            errors.append(exc)
+            entered.set()
+        finally:
+            agent._unregister_turn_worker(threading.current_thread())
+
+    worker = threading.Thread(target=_worker, name="registered-turn-owner")
+    worker._mclaw_turn_owner = agent
+    agent._register_turn_worker(worker)
+    worker.start()
+
+    assert entered.wait(1)
+    assert errors == []
+    assert len(owned) == 1
+    assert worker in agent._outstanding_turn_workers
+
+    release.set()
+    worker.join(1)
+    assert not worker.is_alive()
+    assert agent._outstanding_turn_workers == set()
+
+
+def test_registered_non_owner_worker_cannot_begin_a_turn() -> None:
+    agent = _bare_agent("registered-non-owner")
+    errors: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            agent.begin_turn()
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            agent._unregister_turn_worker(threading.current_thread())
+
+    worker = threading.Thread(target=_worker, name="registered-non-owner")
+    agent._register_turn_worker(worker)
+    worker.start()
+    worker.join(1)
+
+    assert not worker.is_alive()
+    assert len(errors) == 1
+    assert "仍在收尾" in str(errors[0])
+
+
+def test_registered_not_yet_started_worker_keeps_the_fence() -> None:
+    agent = _bare_agent("registered-before-start")
+    worker = threading.Thread(target=lambda: None, name="not-yet-started")
+    agent._register_turn_worker(worker)
+
+    with pytest.raises(RuntimeError, match="仍在收尾"):
+        agent.begin_turn()
+
+    agent._unregister_turn_worker(worker)
+
+
+def test_turn_blocked_log_uses_the_live_worker_event(caplog) -> None:
+    class LateWorker:
+        def is_alive(self) -> bool:
+            return True
+
+    agent = _bare_agent("live-worker-log")
+    turn_event = agent.begin_turn()
+    worker = LateWorker()
+    agent._register_turn_worker(worker)
+    agent.end_turn(turn_event)
+    stale_event = threading.Event()
+    stale_id = get_cancel_id(stale_event)
+    agent._workspace_abort_event = stale_event
+
+    with caplog.at_level(logging.WARNING, logger="mclaw.agent.core"):
+        with pytest.raises(RuntimeError, match="仍在收尾"):
+            agent.begin_turn()
+
+    blocked_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if "turn_blocked" in record.getMessage()
+    )
+    assert get_cancel_id(turn_event) in blocked_log
+    assert stale_id not in blocked_log
+    agent._unregister_turn_worker(worker)
+
+
+def test_turn_blocked_log_does_not_invent_a_worker_cancel_id(caplog) -> None:
+    class OpaqueWorker:
+        __slots__ = ()
+
+        def is_alive(self) -> bool:
+            return True
+
+    agent = _bare_agent("opaque-worker-log")
+    worker = OpaqueWorker()
+    agent._register_turn_worker(worker)
+
+    with caplog.at_level(logging.WARNING, logger="mclaw.agent.core"):
+        with pytest.raises(RuntimeError, match="仍在收尾"):
+            agent.begin_turn()
+
+    blocked_log = next(
+        record.getMessage()
+        for record in caplog.records
+        if "turn_blocked" in record.getMessage()
+    )
+    assert "cancel_id=none" in blocked_log
+    agent._unregister_turn_worker(worker)
 
 
 def test_child_late_worker_transitively_fences_parent_turn() -> None:
@@ -293,7 +414,7 @@ def test_child_late_worker_transitively_fences_parent_turn() -> None:
     worker.start()
     parent.end_turn(parent_event)
 
-    with pytest.raises(RuntimeError, match="工具仍在收尾"):
+    with pytest.raises(RuntimeError, match="仍在收尾"):
         parent.begin_turn()
 
     release.set()
@@ -352,7 +473,7 @@ def test_cancelled_turn_fence_survives_agent_replacement() -> None:
     old_agent.interrupt()
     old_agent.end_turn(old_event)
 
-    with pytest.raises(RuntimeError, match="工具仍在收尾"):
+    with pytest.raises(RuntimeError, match="仍在收尾"):
         replacement.begin_turn()
 
     release.set()

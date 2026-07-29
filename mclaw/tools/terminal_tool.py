@@ -519,6 +519,7 @@ def terminal_tool(
         "output": output,
         "returncode": returncode,
         "error": redact_secret_values(error, scoped_env),
+        "cwd": session.cwd,
     }
     termination_confirmed = bool(getattr(result, "termination_confirmed", False))
     if not termination_confirmed:

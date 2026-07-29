@@ -13,7 +13,6 @@ are loaded only when the model needs a specific Skill.
 import logging
 import threading
 from collections import OrderedDict
-from datetime import datetime
 from typing import List, Optional, Set
 
 from mclaw.constants import get_mclaw_home, get_skills_dir
@@ -372,29 +371,25 @@ def load_soul_md() -> Optional[str]:
 
 def _build_platform_block(model: str = "", config: "dict | None" = None) -> str:
     """Build platform/environment context for the system prompt."""
-    from mclaw.runtime.manager import RuntimeManager
-
-    runtime = RuntimeManager.current(config)
     info = get_platform_info(config=config)
-    lines = []
-    if model:
-        lines.append(f"Model: {model}")
-    now = datetime.now()
-    lines.append(f"Current date: {now.strftime('%Y-%m-%d %H:%M %Z').strip()}")
-    os_text = runtime.prompt_os_label(info.os_name, info.os_release)
+    os_text = info.os_label()
     if info.is_wsl:
         os_text += " (WSL)"
-    lines.append(f"OS: {os_text}")
-    lines.append(f"Python: {info.python_version}")
-    lines.append(f"Working directory: {info.cwd}")
-    lines.append(f"Shell: {info.shell_name}")
-    if info.command_hint:
-        lines.append(f"Command execution: {info.command_hint}")
-    if info.is_linux and info.runtime_mode != "kaihong":
-        lines.append(
-            "Linux note: desktop GUI, audio input, and browser automation depend on the local display/audio/browser runtime; "
-            "use /doctor to verify optional capabilities before relying on them."
-        )
+    lines = [f"OS: {os_text}"]
+    distribution = info.distinct_distribution()
+    if distribution:
+        lines.append(f"Distribution: {distribution}")
+    if info.runtime_mode == "kaihong":
+        device = info.device_label()
+        if device:
+            lines.append(f"Device: {device}")
+        kernel = f"Linux {info.os_release}".strip()
+        if info.architecture:
+            kernel += f" ({info.architecture})"
+        lines.append(f"Kernel: {kernel}")
+    lines.append(f"Shell: {info.shell_label()}")
+    lines.append(f"M-Claw Python: {info.python_version} ({info.python_executable})")
+    lines.append(f"Initial working directory: {info.cwd}")
     return "\n".join(lines)
 
 

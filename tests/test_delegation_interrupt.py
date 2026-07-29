@@ -6,6 +6,7 @@ import time
 from types import SimpleNamespace
 
 from mclaw.cli.runtime.delegation import RuntimeDelegationCoordinator, RuntimeDelegationHooks
+from mclaw.cli.runtime.session import RuntimeSessionState
 from mclaw.cli.app import InteractiveChat
 from mclaw.tools import delegate_tool
 from mclaw.tools.interrupt import reset_interrupt_event, set_interrupt_event
@@ -36,6 +37,7 @@ def _hooks(events: list, **overrides) -> RuntimeDelegationHooks:
         "render_synthesis_response": lambda result: events.append(("response", result)),
         "render_synthesis_error": lambda error: events.append(("synthesis_error", error)),
         "render_synthesis_timeout": lambda: events.append(("synthesis_timeout", None)),
+        "render_synthesis_incomplete": lambda: events.append(("synthesis_incomplete", None)),
         "log_info": lambda _message, _args: None,
         "log_warning": lambda _message, _args: None,
     }
@@ -51,7 +53,6 @@ def _pending_result() -> dict:
             "num_tasks": 1,
             "task_info": {"goals": ["investigate"]},
         },
-        "completed": True,
     }
 
 
@@ -113,6 +114,59 @@ def test_pending_delegation_preserves_child_tool_abort_details() -> None:
     assert ("abort", "restart required") in events
 
 
+def test_missing_delegate_result_is_an_error_not_a_completed_turn() -> None:
+    events: list = []
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(events),
+        startup_delay_seconds=0,
+        poll_timeout_seconds=0,
+        render_settle_seconds=0,
+    )
+    result = _pending_result()
+
+    assert coordinator.handle_pending_delegate(result) is True
+
+    assert ("timeout", None) in events
+    assert result["pending_delegate"] is False
+    assert result["completed"] is False
+    assert result["stop_reason"] == "delegate_result_timeout"
+    assert result["error"] == "子代理结果获取超时"
+    state = RuntimeSessionState()
+    state.begin_turn()
+    state.finish_turn(result)
+    assert state.status.value == "error"
+
+
+def test_delegate_aggregation_failure_is_an_error_not_a_completed_turn() -> None:
+    events: list = []
+
+    def fail_aggregation(_result):
+        raise RuntimeError("render failed")
+
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(
+            events,
+            get_pending_result=lambda *_args: {"task_id": "task-1", "results": []},
+            render_aggregation=fail_aggregation,
+        ),
+        startup_delay_seconds=0,
+        render_settle_seconds=0,
+    )
+    result = _pending_result()
+
+    assert coordinator.handle_pending_delegate(result) is True
+
+    assert ("display_error", "render failed") in events
+    assert result["pending_delegate"] is False
+    assert result["completed"] is False
+    assert result["stop_reason"] == "delegate_aggregation_error"
+    assert result["error"] == "显示结果时出错: render failed"
+    state = RuntimeSessionState()
+    state.begin_turn()
+    state.finish_turn(result)
+    assert state.status.value == "error"
+
+
 def test_parent_synthesis_cancel_returns_without_rendering_stale_result() -> None:
     cancel_event = threading.Event()
     synthesis_release = threading.Event()
@@ -159,7 +213,248 @@ def test_parent_synthesis_cancel_returns_without_rendering_stale_result() -> Non
     assert unregistered_workers == registered_workers
     assert result["interrupted"] is True
     assert result["completed"] is False
+    assert result["pending_delegate"] is False
+    assert "pending_data" not in result
     assert all(kind != "response" for kind, _ in events)
+
+
+def test_parent_synthesis_completion_wins_a_late_cancel() -> None:
+    cancel_event = threading.Event()
+    events: list = []
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(
+            events,
+            get_pending_result=lambda *_args: {"task_id": "task-1", "results": []},
+            run_synthesis=lambda *_args: {"final_response": "done"},
+            unregister_synthesis_worker=lambda _worker: cancel_event.set(),
+        ),
+        startup_delay_seconds=0,
+        render_settle_seconds=0,
+    )
+    result = _pending_result()
+
+    assert coordinator.handle_pending_delegate(result, cancel_event=cancel_event) is True
+
+    assert ("response", {"final_response": "done"}) in events
+    assert result["interrupted"] is False
+    assert result["pending_delegate"] is False
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+
+
+def test_parent_synthesis_cooperative_cancel_stays_interrupted() -> None:
+    cancel_event = threading.Event()
+    events: list = []
+
+    def run_synthesis(*_args):
+        cancel_event.set()
+        return {
+            "final_response": None,
+            "interrupted": True,
+            "completed": False,
+        }
+
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(
+            events,
+            get_pending_result=lambda *_args: {"task_id": "task-1", "results": []},
+            run_synthesis=run_synthesis,
+        ),
+        startup_delay_seconds=0,
+        render_settle_seconds=0,
+    )
+    result = _pending_result()
+
+    assert coordinator.handle_pending_delegate(result, cancel_event=cancel_event) is True
+
+    assert result["interrupted"] is True
+    assert result["completed"] is False
+    assert result["pending_delegate"] is False
+    assert "pending_data" not in result
+    assert all(
+        kind not in {"response", "synthesis_error", "synthesis_incomplete"}
+        for kind, _ in events
+    )
+
+
+def test_parent_synthesis_error_takes_precedence_over_display_text() -> None:
+    events: list = []
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(
+            events,
+            get_pending_result=lambda *_args: {"task_id": "task-1", "results": []},
+            run_synthesis=lambda *_args: {
+                "final_response": "API Error: provider failed",
+                "error": "provider failed",
+                "completed": False,
+            },
+        ),
+        startup_delay_seconds=0,
+        render_settle_seconds=0,
+    )
+    result = _pending_result()
+
+    assert coordinator.handle_pending_delegate(result) is True
+
+    assert ("synthesis_error", "provider failed") in events
+    assert all(kind != "response" for kind, _ in events)
+    assert result["completed"] is False
+    assert result["stop_reason"] == "synthesis_error"
+    assert result["error"] == "综合结果时出错: provider failed"
+
+
+def test_parent_synthesis_pending_result_is_incomplete_not_timeout() -> None:
+    events: list = []
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(
+            events,
+            get_pending_result=lambda *_args: {"task_id": "task-1", "results": []},
+            run_synthesis=lambda *_args: {
+                "final_response": "partial",
+                "completed": False,
+                "stop_reason": "max_iterations",
+                "pending_delegate": True,
+                "pending_data": {"task_id": "unexpected-nested"},
+            },
+        ),
+        startup_delay_seconds=0,
+        render_settle_seconds=0,
+    )
+
+    result = _pending_result()
+    assert coordinator.handle_pending_delegate(result) is True
+
+    assert ("synthesis_incomplete", None) in events
+    assert ("synthesis_timeout", None) not in events
+    assert result["completed"] is False
+    assert result["stop_reason"] == "synthesis_incomplete"
+    assert result["error"] == "综合结果未完成：模型没有返回最终内容"
+
+
+def test_parent_synthesis_timeout_requires_a_live_worker() -> None:
+    events: list = []
+    release = threading.Event()
+    workers: list[threading.Thread] = []
+
+    def run_synthesis(*_args):
+        release.wait(2)
+        return {"final_response": "late"}
+
+    coordinator = RuntimeDelegationCoordinator(
+        _hooks(
+            events,
+            get_pending_result=lambda *_args: {"task_id": "task-1", "results": []},
+            run_synthesis=run_synthesis,
+            register_synthesis_worker=workers.append,
+        ),
+        startup_delay_seconds=0,
+        render_settle_seconds=0,
+        synthesis_timeout_seconds=0.01,
+    )
+    result = _pending_result()
+    try:
+        assert coordinator.handle_pending_delegate(result) is True
+        assert ("synthesis_timeout", None) in events
+        assert ("synthesis_incomplete", None) not in events
+        assert len(workers) == 1
+        assert workers[0].is_alive()
+        assert result["completed"] is False
+        assert result["stop_reason"] == "synthesis_timeout"
+        assert result["error"] == "综合结果超时"
+
+        state = RuntimeSessionState()
+        state.begin_turn()
+        state.finish_turn(result)
+        assert state.status.value == "error"
+    finally:
+        release.set()
+        if workers:
+            workers[0].join(1)
+
+
+def test_interactive_synthesis_disables_redelegation(monkeypatch) -> None:
+    captured: dict = {}
+    rendered: list[dict] = []
+    turn_event = threading.Event()
+    registered: list[tuple[threading.Thread, object]] = []
+    unregistered: list[threading.Thread] = []
+
+    class Agent:
+        messages = []
+
+        def current_turn_cancel_event(self):
+            return turn_event
+
+        def _register_turn_worker(self, worker):
+            registered.append((worker, getattr(worker, "_mclaw_turn_owner", None)))
+
+        def _unregister_turn_worker(self, worker):
+            unregistered.append(worker)
+
+        def run_conversation(self, _prompt, **kwargs):
+            captured.update(kwargs)
+            return {
+                "final_response": "done",
+                "api_calls": 2,
+                "assistant_rounds": [{"iteration": 3}],
+                "token_usage": {"input_tokens": 5, "output_tokens": 2},
+            }
+
+    chat = InteractiveChat.__new__(InteractiveChat)
+    chat.agent = Agent()
+    chat._app = None
+    chat.subtask_manager = None
+    chat._pending_subagent_events = []
+    state = RuntimeSessionState()
+    chat._runtime_state = lambda: state
+    chat._emit_runtime_event = lambda *_args, **_kwargs: None
+    chat._pet_emit_for_runtime_status = lambda *_args, **_kwargs: None
+    chat._make_subtask_manager = lambda *_args: SimpleNamespace(
+        completion_event=threading.Event()
+    )
+    chat._replay_pending_delegate_events = lambda _manager: None
+    chat._update_subagent_status_detail = lambda: None
+    chat._render_aggregation = lambda _result: "synthesis prompt"
+    chat._reset_stream_accumulator = lambda: None
+    chat._get_turn_result_coordinator = lambda: SimpleNamespace(
+        handle_result=rendered.append
+    )
+    monkeypatch.setattr(
+        "mclaw.cli.app.get_pending_result_for_task",
+        lambda *_args: {"task_id": "task-1", "results": []},
+    )
+
+    result = _pending_result()
+    result.update(
+        api_calls=1,
+        assistant_rounds=[{"iteration": 1}, {"iteration": 2}],
+        token_usage={"input_tokens": 3, "output_tokens": 1},
+    )
+    assert chat._handle_pending_delegate(result) is True
+
+    assert captured["disable_tools"] is False
+    assert captured["disabled_tool_names"] == {"delegate_task"}
+    assert captured["cancel_event"] is turn_event
+    assert "不可再次调用 delegate_task" in captured["extra_system"]
+    assert rendered == [{
+        "final_response": "done",
+        "api_calls": 2,
+        "assistant_rounds": [{"iteration": 3}],
+        "token_usage": {"input_tokens": 5, "output_tokens": 2},
+    }]
+    assert result["pending_delegate"] is False
+    assert result["completed"] is True
+    assert result["final_response"] == "done"
+    assert result["api_calls"] == 3
+    assert result["assistant_rounds"] == [
+        {"iteration": 1},
+        {"iteration": 2},
+        {"iteration": 3},
+    ]
+    assert result["token_usage"] == {"input_tokens": 8, "output_tokens": 3}
+    assert len(registered) == 1
+    assert registered[0][1] is chat.agent
+    assert unregistered == [registered[0][0]]
 
 
 def test_delegate_child_receives_the_parent_turn_event(monkeypatch) -> None:

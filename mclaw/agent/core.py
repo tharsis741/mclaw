@@ -875,6 +875,12 @@ class MClaw:
         clear_trace = None
         publish_trace = None
         event = None
+        current_worker = threading.current_thread()
+        turn_owner = (
+            current_worker
+            if self._turn_worker_attr(current_worker, "_mclaw_turn_owner") is self
+            else None
+        )
         with _WORKSPACE_ABORT_QUARANTINE_LOCK:
             with self._interrupt_lock:
                 if self._turn_active:
@@ -890,7 +896,9 @@ class MClaw:
                     exclude=self,
                 )
                 if workspace_block_reason is None:
-                    worker_block_reason = self._turn_worker_block_reason()
+                    worker_block_reason = self._turn_worker_block_reason(
+                        exclude=turn_owner,
+                    )
                 if workspace_block_reason is None and worker_block_reason is None:
                     clear_trace = _clear_workspace_abort_fence(self)
                     event = cancel_event or self._turn_cancel_event
@@ -920,11 +928,23 @@ class MClaw:
             )
             raise RuntimeError(workspace_block_reason)
         if worker_block_reason is not None:
+            worker_event = None
+            with self._turn_workers_lock:
+                for worker in self._outstanding_turn_workers:
+                    if worker is turn_owner:
+                        continue
+                    if self._turn_worker_is_alive(worker):
+                        worker_event = self._turn_worker_attr(
+                            worker,
+                            "_mclaw_cancel_event",
+                        )
+                        if worker_event is not None:
+                            break
             _safe_cancel_trace(
                 logger.warning,
                 "[CANCEL_TRACE] turn_blocked cancel_id=%s scope=agent session=%s "
                 "reason=%s workers=%s",
-                get_cancel_id(getattr(self, "_workspace_abort_event", None)),
+                get_cancel_id(worker_event) if worker_event is not None else "none",
                 self.session_id or "?",
                 worker_block_reason,
                 self._turn_worker_log_snapshot(),
@@ -1068,6 +1088,8 @@ class MClaw:
     @staticmethod
     def _turn_worker_is_alive(worker: Any) -> bool:
         try:
+            if isinstance(worker, threading.Thread) and worker.ident is None:
+                return True
             return bool(worker.is_alive())
         except BaseException:
             return True
@@ -1109,7 +1131,7 @@ class MClaw:
             workers = list(self._outstanding_turn_workers)
         return "[" + ",".join(self._turn_worker_log_label(worker) for worker in workers) + "]"
 
-    def _turn_worker_block_reason(self) -> str | None:
+    def _turn_worker_block_reason(self, *, exclude: Any = None) -> str | None:
         with self._turn_workers_lock:
             finished = {
                 worker
@@ -1121,8 +1143,13 @@ class MClaw:
                 self._turn_workers_drained.set()
                 block_reason = None
             else:
+                candidates = [
+                    worker
+                    for worker in self._outstanding_turn_workers
+                    if worker is not exclude
+                ]
                 block_reason = None
-                for worker in self._outstanding_turn_workers:
+                for worker in candidates:
                     reason = self._turn_worker_attr(worker, "blocking_reason")
                     if self._turn_worker_truthy(reason):
                         try:
@@ -1131,9 +1158,9 @@ class MClaw:
                             pass
                         if block_reason:
                             break
-                if block_reason is None:
+                if candidates and block_reason is None:
                     block_reason = (
-                        "上一轮已停止，但工具仍在收尾；为避免旧结果混入新一轮，"
+                        "上一轮的工具或子代理仍在收尾；为避免旧结果混入新一轮，"
                         "请稍后再试。"
                     )
         return block_reason
@@ -1422,11 +1449,13 @@ class MClaw:
         dynamic_system_context: str,
         reason: str,
         force_one: bool = False,
+        tools: List[Dict[str, Any]] | None = None,
     ) -> tuple[List[Dict[str, Any]], int]:
         """Prune confirmed tool results when summary compaction cannot help."""
         compressor = self.context_compressor
         if not compressor:
             return messages, 0
+        request_tools = self.tools if tools is None else tools
         if not self._tool_visibility_state_reliable:
             logger.warning(
                 "[CONTEXT FALLBACK SKIP] reason=%s outcome=visibility_unknown pending=%d",
@@ -1437,7 +1466,7 @@ class MClaw:
 
         before = estimate_request_budget(
             messages=messages,
-            tools=self.tools,
+            tools=request_tools,
             dynamic_system_context=dynamic_system_context,
             context=self.provider_runtime,
             context_window=compressor.context_length,
@@ -1479,7 +1508,7 @@ class MClaw:
         )
         after = estimate_request_budget(
             messages=pruned_messages,
-            tools=self.tools,
+            tools=request_tools,
             dynamic_system_context=dynamic_system_context,
             context=self.provider_runtime,
             context_window=compressor.context_length,
@@ -1520,6 +1549,7 @@ class MClaw:
         call_source: str = "turn",
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
+        disabled_tool_names: set[str] | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn and discard stale estimates on failure."""
         turn_cancel_event, owns_turn = self._acquire_turn_cancel_event(cancel_event)
@@ -1533,6 +1563,7 @@ class MClaw:
                 call_source=call_source,
                 deadline_monotonic=deadline_monotonic,
                 cancel_event=turn_cancel_event,
+                disabled_tool_names=disabled_tool_names,
             )
         except Exception:
             self._clear_unconfirmed_context_display()
@@ -1552,6 +1583,7 @@ class MClaw:
         call_source: str = "turn",
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event,
+        disabled_tool_names: set[str] | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -1654,10 +1686,28 @@ class MClaw:
                 and time.monotonic() >= deadline_monotonic
             )
 
-        # Temporarily disable tools when disable_tools=True (e.g. synthesis turn)
-        original_tools = self.tools
+        disabled_names = set(disabled_tool_names or ())
         if disable_tools:
-            self.tools = []
+            active_tools: List[Dict[str, Any]] = []
+            active_tool_names: set[str] = set()
+        elif disabled_names:
+            active_tool_names = set(self.valid_tool_names) - disabled_names
+            active_tools = [
+                tool
+                for tool in self.tools
+                if str((tool.get("function") or {}).get("name") or "") in active_tool_names
+            ]
+        else:
+            active_tools = self.tools
+            active_tool_names = set(self.valid_tool_names)
+        if disable_tools or disabled_names:
+            logger.info(
+                "[TURN TOOL FILTER] source=%s disable_all=%s disabled=%s active=%d",
+                call_source,
+                disable_tools,
+                sorted(disabled_names),
+                len(active_tool_names),
+            )
 
         while (
             (self.max_iterations is None or assistant_iteration_count < self.max_iterations)
@@ -1709,7 +1759,7 @@ class MClaw:
                     logger.info("[LOOP] estimating tokens for preventive compression")
                     budget = estimate_request_budget(
                         messages=messages,
-                        tools=self.tools,
+                        tools=active_tools,
                         dynamic_system_context=dynamic_system_context,
                         context=self.provider_runtime,
                         context_window=cc.context_length,
@@ -1747,7 +1797,7 @@ class MClaw:
                             logger.info("[LOOP] compression done")
                             post_summary_budget = estimate_request_budget(
                                 messages=messages,
-                                tools=self.tools,
+                                tools=active_tools,
                                 dynamic_system_context=dynamic_system_context,
                                 context=self.provider_runtime,
                                 context_window=cc.context_length,
@@ -1765,6 +1815,7 @@ class MClaw:
                                         messages,
                                         dynamic_system_context=dynamic_system_context,
                                         reason="preventive_summary_insufficient",
+                                        tools=active_tools,
                                     )
                                 )
                                 if fallback_pruned:
@@ -1783,6 +1834,7 @@ class MClaw:
                                     messages,
                                     dynamic_system_context=dynamic_system_context,
                                     reason=f"preventive_{outcome}",
+                                    tools=active_tools,
                                 )
                             )
                             if fallback_pruned:
@@ -1828,7 +1880,7 @@ class MClaw:
                     ):
                         display_budget = estimate_request_budget(
                             messages=messages,
-                            tools=self.tools,
+                            tools=active_tools,
                             dynamic_system_context=dynamic_system_context,
                             context=self.provider_runtime,
                             context_window=self.context_compressor.context_length,
@@ -1877,7 +1929,7 @@ class MClaw:
                     self._record_api_attempt()
                     result = self.transport.call(
                         messages=messages,
-                        tools=self.tools,
+                        tools=active_tools,
                         options=ModelCallOptions(
                             stream=bool(self._stream_callback),
                             timeout=30.0,
@@ -1888,7 +1940,7 @@ class MClaw:
                             ),
                             cache_plan=build_prompt_cache_plan(
                                 messages=messages,
-                                tools=self.tools,
+                                tools=active_tools,
                                 context=self.provider_runtime,
                                 session_id=self.session_id,
                                 enabled=cache_enabled,
@@ -1914,7 +1966,7 @@ class MClaw:
                             self._refresh_prompt_epoch(messages)
                             before_budget = estimate_request_budget(
                                 messages=messages,
-                                tools=self.tools,
+                                tools=active_tools,
                                 dynamic_system_context=dynamic_system_context,
                                 context=self.provider_runtime,
                                 context_window=self.context_compressor.context_length,
@@ -1927,7 +1979,7 @@ class MClaw:
                             )
                             after_budget = estimate_request_budget(
                                 messages=compressed_messages,
-                                tools=self.tools,
+                                tools=active_tools,
                                 dynamic_system_context=dynamic_system_context,
                                 context=self.provider_runtime,
                                 context_window=self.context_compressor.context_length,
@@ -1972,6 +2024,7 @@ class MClaw:
                                         dynamic_system_context=dynamic_system_context,
                                         reason=f"context_overflow_{outcome}",
                                         force_one=True,
+                                        tools=active_tools,
                                     )
                                 )
                             if summary_reduced or fallback_pruned:
@@ -1991,6 +2044,7 @@ class MClaw:
                                     dynamic_system_context=dynamic_system_context,
                                     reason="context_overflow_after_compacted_retry",
                                     force_one=True,
+                                    tools=active_tools,
                                 )
                             )
                             if fallback_pruned:
@@ -2027,8 +2081,6 @@ class MClaw:
                     self._clear_unconfirmed_context_display()
                     final_response = f"API Error: {error}"
                     self.messages = messages
-                    if disable_tools:
-                        self.tools = original_tools
                     return {
                         "final_response": final_response,
                         "messages": messages,
@@ -2135,12 +2187,17 @@ class MClaw:
                 # _execute_tool_calls appends the assistant message internally, so
                 # do not append it again here. Non-blocking delegate_task returns
                 # pending metadata that is checked below to avoid unnecessary work.
+                execute_kwargs: Dict[str, Any] = {
+                    "assistant_content": assistant_content,
+                    "reasoning": result.reasoning,
+                    "cancel_event": cancel_event,
+                }
+                if disable_tools or disabled_names:
+                    execute_kwargs["allowed_tool_names"] = active_tool_names
                 pending_result = self._execute_tool_calls(
                     tool_calls,
                     messages,
-                    assistant_content=assistant_content,
-                    reasoning=result.reasoning,
-                    cancel_event=cancel_event,
+                    **execute_kwargs,
                 )
                 logger.info("[POST-TOOL] _execute_tool_calls returned, pending=%s", pending_result is not None)
                 if self._is_interrupted(cancel_event):
@@ -2148,9 +2205,6 @@ class MClaw:
                     break
                 if pending_result is not None:
                     # delegate_task started in non-blocking mode; return for TUI polling.
-                    # Restore tools before returning so they are not left disabled.
-                    if disable_tools:
-                        self.tools = original_tools
                     pending_result["assistant_rounds"] = assistant_rounds
                     pending_result["api_calls"] = api_call_count
                     pending_result["token_usage"] = self._finish_turn_usage()
@@ -2262,10 +2316,6 @@ class MClaw:
             except Exception as exc:
                 logger.debug("Background review scheduling failed: %s", exc)
 
-        # Restore tools if this turn temporarily disabled them.
-        if disable_tools:
-            self.tools = original_tools
-
         return {
             "final_response": final_response,
             "messages": messages,
@@ -2304,6 +2354,7 @@ class MClaw:
         assistant_content: str = "",
         reasoning: ReasoningTrace | None = None,
         cancel_event: threading.Event | None = None,
+        allowed_tool_names: set[str] | None = None,
     ):
         """Dispatch tool calls and append normalized results to the conversation.
 
@@ -2334,17 +2385,6 @@ class MClaw:
 
         checkpoint_mgr = self._get_checkpoint_manager()
         checkpoint_mgr.new_turn()
-
-        # Batch dispatch: write tools take the serialized CheckpointManager path.
-        # Read-only batches choose the concurrent path inside handle_function_calls.
-        if self._tool_callback:
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                try:
-                    args = json.loads(fn.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
-                self._tool_callback(fn.get("name", ""), args)
 
         # Filter disabled tools.
         disabled = set(getattr(self, "config", {}).get("tools", {}).get("disabled", []))
@@ -2385,6 +2425,32 @@ class MClaw:
             filtered_calls.append(tc)
         tool_calls = filtered_calls
 
+        # Only advertise calls that this turn can actually dispatch.
+        rejected_names = [
+            tc.get("function", {}).get("name", "")
+            for tc in tool_calls
+            if allowed_tool_names is not None
+            and tc.get("function", {}).get("name", "") not in allowed_tool_names
+        ]
+        if rejected_names:
+            logger.warning(
+                "[TURN TOOL FILTER] rejected_model_calls=%s",
+                rejected_names,
+            )
+        if self._tool_callback:
+            for tc in tool_calls:
+                fn = tc.get("function", {})
+                name = fn.get("name", "")
+                if allowed_tool_names is not None and name not in allowed_tool_names:
+                    continue
+                try:
+                    args = json.loads(fn.get("arguments", "{}"))
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                self._tool_callback(name, args)
+
+        # Batch dispatch: write tools take the serialized CheckpointManager path.
+        # Read-only batches choose the concurrent path inside handle_function_calls.
         tool_names = [tc.get("function", {}).get("name", "?") for tc in tool_calls]
         logger.info("[TOOL DISPATCH START] tools=%s count=%d", tool_names, len(tool_calls))
         self._emit_status(f"Running {len(tool_calls)} tool(s)...")
@@ -2398,10 +2464,15 @@ class MClaw:
             session_id=self.session_id,
             cancel_event=cancel_event,
         )
+        dispatch_tool_names = (
+            set(self.valid_tool_names)
+            if allowed_tool_names is None
+            else set(allowed_tool_names)
+        )
         try:
             results = handle_function_calls(
                 calls=tool_calls,
-                tool_names=set(self.valid_tool_names),
+                tool_names=dispatch_tool_names,
                 memory_manager=self._memory_manager,
                 checkpoint_manager=checkpoint_mgr,
                 parent_agent=self,

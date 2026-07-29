@@ -1250,6 +1250,9 @@ class InteractiveChat:
         )
 
     def _handle_pending_delegate(self, result: dict) -> bool:
+        current_cancel_event = getattr(self.agent, "current_turn_cancel_event", None)
+        cancel_event = current_cancel_event() if callable(current_cancel_event) else None
+
         def _invalidate() -> None:
             if self._app:
                 self._app.invalidate()
@@ -1292,9 +1295,17 @@ class InteractiveChat:
                 synthesis_prompt,
                 conversation_history=self.agent.messages,
                 disable_tools=False,
+                disabled_tool_names={"delegate_task"},
                 advance_background_review=False,
                 extra_system=extra_system,
+                cancel_event=cancel_event,
             )
+
+        def _register_synthesis_worker(worker: threading.Thread) -> None:
+            register = getattr(self.agent, "_register_turn_worker", None)
+            if callable(register):
+                worker._mclaw_turn_owner = self.agent
+                register(worker)
 
         def _render_synthesis_response(synth_result: dict) -> None:
             self._get_turn_result_coordinator().handle_result(synth_result)
@@ -1337,16 +1348,16 @@ class InteractiveChat:
                     leading_newline=True,
                 ),
                 render_synthesis_timeout=lambda: self._get_runtime_renderer().warning(
-                    f"{self._sym('⚠')} 综合结果超时或未完成",
+                    f"{self._sym('⚠')} 综合结果超时",
+                    leading_newline=True,
+                ),
+                render_synthesis_incomplete=lambda: self._get_runtime_renderer().warning(
+                    f"{self._sym('⚠')} 综合结果未完成：模型没有返回最终内容",
                     leading_newline=True,
                 ),
                 log_info=lambda message, args: logger.info(message, *args),
                 log_warning=lambda message, args: logger.warning(message, *args),
-                register_synthesis_worker=getattr(
-                    self.agent,
-                    "_register_turn_worker",
-                    None,
-                ),
+                register_synthesis_worker=_register_synthesis_worker,
                 unregister_synthesis_worker=getattr(
                     self.agent,
                     "_unregister_turn_worker",
@@ -1363,8 +1374,6 @@ class InteractiveChat:
                 ),
             )
         )
-        current_cancel_event = getattr(self.agent, "current_turn_cancel_event", None)
-        cancel_event = current_cancel_event() if callable(current_cancel_event) else None
         return coordinator.handle_pending_delegate(result, cancel_event=cancel_event)
 
     def _render_skill_import_confirmation(self, confirmation: dict):

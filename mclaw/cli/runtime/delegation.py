@@ -43,6 +43,7 @@ class RuntimeDelegationHooks:
     render_synthesis_response: Callable[[dict[str, Any]], None]
     render_synthesis_error: Callable[[str], None]
     render_synthesis_timeout: Callable[[], None]
+    render_synthesis_incomplete: Callable[[], None]
     log_info: Callable[[str, tuple[Any, ...]], None]
     log_warning: Callable[[str, tuple[Any, ...]], None]
     register_synthesis_worker: Callable[[threading.Thread], None] | None = None
@@ -121,22 +122,68 @@ class RuntimeDelegationCoordinator:
             self.hooks.sleep(self.render_settle_seconds)
 
         self.hooks.set_aggregating_status()
-        synthesis_prompt = self._render_result(pending_result)
+        synthesis_prompt, aggregation_error = self._render_result(pending_result)
         self.hooks.clear_subagent_state()
         self.hooks.emit_delegation_completed(pending_result or {})
 
         if synthesis_prompt:
-            self._run_synthesis(synthesis_prompt, cancel_event)
-            if cancel_event is not None and cancel_event.is_set():
+            synthesis_result = self._run_synthesis(synthesis_prompt, cancel_event)
+            if synthesis_result is None:
                 result["interrupted"] = True
                 result["completed"] = False
+                result["pending_delegate"] = False
+                result.pop("pending_data", None)
                 self._apply_abort_details(result)
+            else:
+                previous_api_calls = int(result.get("api_calls") or 0)
+                previous_rounds = result.get("assistant_rounds")
+                previous_usage = result.get("token_usage")
+                previous_skills_changed = bool(result.get("skills_changed"))
+                result.update(synthesis_result)
+                result["pending_delegate"] = False
+                result.pop("pending_data", None)
+                result["interrupted"] = False
+                if "api_calls" in synthesis_result:
+                    result["api_calls"] = previous_api_calls + int(
+                        synthesis_result.get("api_calls") or 0
+                    )
+                synthesis_rounds = synthesis_result.get("assistant_rounds")
+                if isinstance(synthesis_rounds, list):
+                    result["assistant_rounds"] = (
+                        previous_rounds if isinstance(previous_rounds, list) else []
+                    ) + synthesis_rounds
+                synthesis_usage = synthesis_result.get("token_usage")
+                if isinstance(previous_usage, dict) and isinstance(synthesis_usage, dict):
+                    result["token_usage"] = {
+                        key: int(previous_usage.get(key) or 0)
+                        + int(synthesis_usage.get(key) or 0)
+                        for key in previous_usage.keys() | synthesis_usage.keys()
+                    }
+                result["skills_changed"] = previous_skills_changed or bool(
+                    synthesis_result.get("skills_changed")
+                )
+        elif aggregation_error:
+            result["pending_delegate"] = False
+            result.pop("pending_data", None)
+            result["interrupted"] = False
+            result["completed"] = False
+            result["stop_reason"] = "delegate_aggregation_error"
+            result["error"] = f"显示结果时出错: {aggregation_error}"
+        elif pending_result is None:
+            result["pending_delegate"] = False
+            result.pop("pending_data", None)
+            result["interrupted"] = False
+            result["completed"] = False
+            result["stop_reason"] = "delegate_result_timeout"
+            result["error"] = "子代理结果获取超时"
         return True
 
     def _finish_cancelled(self, result: dict[str, Any], task_id: str) -> bool:
         """Close the parent-side delegation UI without waiting for stale children."""
         result["interrupted"] = True
         result["completed"] = False
+        result["pending_delegate"] = False
+        result.pop("pending_data", None)
         self._apply_abort_details(result)
         self.hooks.clear_subagent_state()
         self.hooks.emit_delegation_completed({"task_id": task_id, "interrupted": True})
@@ -199,22 +246,25 @@ class RuntimeDelegationCoordinator:
                     return pending_result
         return None
 
-    def _render_result(self, pending_result: dict[str, Any] | None) -> str:
+    def _render_result(
+        self,
+        pending_result: dict[str, Any] | None,
+    ) -> tuple[str, str | None]:
         """Render aggregation output and return the prompt used for synthesis."""
         try:
             if pending_result:
-                return self.hooks.render_aggregation(pending_result)
+                return self.hooks.render_aggregation(pending_result), None
             self.hooks.render_result_timeout()
-            return ""
+            return "", None
         except Exception as exc:
             self.hooks.render_display_error(str(exc))
-            return ""
+            return "", str(exc)
 
     def _run_synthesis(
         self,
         synthesis_prompt: str,
         cancel_event: threading.Event | None = None,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Run parent synthesis in a worker so UI timeout policy stays local."""
         if cancel_event is not None and cancel_event.is_set():
             return
@@ -222,17 +272,37 @@ class RuntimeDelegationCoordinator:
         self.hooks.invalidate()
         self.hooks.clear_stream_state()
         result_container: list[dict[str, Any] | None] = [None]
+        decision = ["pending"]
+        decision_lock = threading.Lock()
         extra_system = build_delegate_synthesis_extra_system()
 
         def _target() -> None:
+            synthesis_result: dict[str, Any] | None = None
             try:
-                result_container[0] = self.hooks.run_synthesis(synthesis_prompt, extra_system)
+                synthesis_result = self.hooks.run_synthesis(
+                    synthesis_prompt,
+                    extra_system,
+                )
             except Exception as exc:
                 self.hooks.log_warning("Synthesis error: %s", (exc,))
-                result_container[0] = {"final_response": None, "error": str(exc)}
+                synthesis_result = {"final_response": None, "error": str(exc)}
             finally:
+                with decision_lock:
+                    if decision[0] == "pending":
+                        result_container[0] = synthesis_result
+                        decision[0] = "completed"
                 if self.hooks.unregister_synthesis_worker is not None:
                     self.hooks.unregister_synthesis_worker(threading.current_thread())
+
+        def _commit_stop(reason: str) -> str:
+            with decision_lock:
+                if decision[0] == "pending":
+                    decision[0] = reason
+                return decision[0]
+
+        def _snapshot() -> tuple[str, dict[str, Any] | None]:
+            with decision_lock:
+                return decision[0], result_container[0]
 
         thread = threading.Thread(target=_target, daemon=True)
         if self.hooks.register_synthesis_worker is not None:
@@ -250,8 +320,10 @@ class RuntimeDelegationCoordinator:
         )
         while thread.is_alive():
             if cancel_event is not None and cancel_event.wait(0.05):
-                thread.join(_SYNTHESIS_CANCEL_UNWIND_GRACE_SECONDS)
-                return
+                if _commit_stop("cancelled") == "cancelled":
+                    thread.join(_SYNTHESIS_CANCEL_UNWIND_GRACE_SECONDS)
+                    return
+                break
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -260,15 +332,63 @@ class RuntimeDelegationCoordinator:
             else:
                 thread.join(timeout=0.05)
 
-        if cancel_event is not None and cancel_event.is_set():
-            return
-        synth_result = result_container[0] or {"final_response": None}
-        if synth_result.get("final_response"):
+        state, synth_result = _snapshot()
+        if state != "completed" and cancel_event is not None and cancel_event.is_set():
+            state = _commit_stop("cancelled")
+            if state == "cancelled":
+                thread.join(_SYNTHESIS_CANCEL_UNWIND_GRACE_SECONDS)
+                return
+            state, synth_result = _snapshot()
+        if state != "completed" and thread.is_alive():
+            if _commit_stop("timed_out") == "completed":
+                state, synth_result = _snapshot()
+            else:
+                self.hooks.log_warning(
+                    "[DELEGATE TUI] synthesis deadline exceeded; worker still alive",
+                    (),
+                )
+                self.hooks.render_synthesis_timeout()
+                return {
+                    "completed": False,
+                    "stop_reason": "synthesis_timeout",
+                    "error": "综合结果超时",
+                }
+
+        synth_result = synth_result or {"final_response": None}
+        if synth_result.get("interrupted"):
+            return None
+        if synth_result.get("error"):
+            message = str(synth_result["error"])
+            self.hooks.render_synthesis_error(message)
+            return {
+                **synth_result,
+                "completed": False,
+                "stop_reason": "synthesis_error",
+                "error": f"综合结果时出错: {message}",
+            }
+        if synth_result.get("final_response") and synth_result.get("completed") is not False:
             self.hooks.render_synthesis_response(synth_result)
-        elif synth_result.get("error"):
-            self.hooks.render_synthesis_error(str(synth_result["error"]))
-        else:
-            self.hooks.render_synthesis_timeout()
+            return {
+                **synth_result,
+                "completed": True,
+                "stop_reason": synth_result.get("stop_reason") or "synthesis_completed",
+            }
+
+        pending_data = synth_result.get("pending_data", {}) or {}
+        self.hooks.log_warning(
+            "[DELEGATE TUI] synthesis incomplete stop_reason=%s nested_task_id=%s",
+            (
+                str(synth_result.get("stop_reason") or ""),
+                str(pending_data.get("task_id") or ""),
+            ),
+        )
+        self.hooks.render_synthesis_incomplete()
+        return {
+            **synth_result,
+            "completed": False,
+            "stop_reason": "synthesis_incomplete",
+            "error": "综合结果未完成：模型没有返回最终内容",
+        }
 
 
 def _completion_event_is_set(manager: Any) -> bool:

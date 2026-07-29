@@ -536,26 +536,27 @@ def run_doctor() -> list[CheckResult]:
                 "runtime",
                 True,
                 (
-                    f"kind={info['kind']}; shell={info['shell']}; "
+                    f"kind={info['kind']}; shell={info['shell_executable']} ({info['shell']}); "
                     f"search={info['search_provider']}; filesystem={info['filesystem_access']}; "
                     f"credential_files={info['credential_files']}"
                 ),
             )
         )
-        launch_domain = info.get("launch_domain")
-        if isinstance(launch_domain, dict):
+        release_root = str(info.get("release_root") or "")
+        if release_root:
+            duplicates = info.get("environment_duplicates")
+            duplicate_names = ", ".join(sorted(duplicates)) if isinstance(duplicates, dict) else ""
+            active = bool(info.get("release_environment_active"))
+            detail = f"root={release_root}; active={'yes' if active else 'no'}"
+            if duplicate_names:
+                detail += f"; duplicate entries in {duplicate_names}"
             results.append(
                 CheckResult(
-                    "runtime launch domain",
-                    True,
-                    (
-                        f"name={launch_domain.get('name')}; "
-                        f"stdin_tty={launch_domain.get('stdin_tty')}; "
-                        f"stdout_tty={launch_domain.get('stdout_tty')}; "
-                        f"size={launch_domain.get('terminal_columns')}x{launch_domain.get('terminal_rows')}; "
-                        f"uid={launch_domain.get('uid')}; "
-                        f"context={launch_domain.get('selinux_context') or 'unknown'}"
-                    ),
+                    "Kaihong release environment",
+                    active and not duplicate_names,
+                    detail,
+                    "Start M-Claw with /data/local/release/bin/mclaw so /bin/run initializes the environment once.",
+                    severity="warn",
                 )
             )
         for name, feature in sorted(info.get("features", {}).items()):
@@ -577,7 +578,12 @@ def run_doctor() -> list[CheckResult]:
         from mclaw.platform import get_platform_info
 
         platform_info = get_platform_info(config=cfg)
-        detail = f"{platform_info.os_name} {platform_info.os_release}; shell={platform_info.shell_name}"
+        detail = f"{platform_info.os_label()}; shell={platform_info.shell_label()}"
+        device = platform_info.device_label()
+        if device:
+            detail += f"; device={device}"
+        if platform_info.architecture:
+            detail += f"; architecture={platform_info.architecture}"
         if platform_info.is_wsl:
             detail += "; wsl=yes"
         results.append(CheckResult("platform", True, detail))

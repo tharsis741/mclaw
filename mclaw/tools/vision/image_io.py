@@ -52,11 +52,15 @@ def _resolve_host_ips(hostname: str) -> list[ipaddress.IPv4Address | ipaddress.I
     infos = socket.getaddrinfo(hostname, None, type=socket.SOCK_STREAM)
     ips: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
     for info in infos:
+        if info[0] == socket.AF_INET6 and not socket.has_ipv6:
+            continue
         address = info[4][0]
+        if not isinstance(address, str):
+            return []
         try:
             ip = ipaddress.ip_address(address)
         except ValueError:
-            continue
+            return []
         if ip not in ips:
             ips.append(ip)
     return ips
