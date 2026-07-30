@@ -248,7 +248,7 @@ git clone https://gitcode.com/m-robots/mclaw.git
 cd mclaw
 ```
 
-如果本机尚未安装 Git，可使用以下方式安装：
+如果本机尚未安装 Git，以下方式安装：
 
 - 官方下载：[git-scm.com/download/win](https://git-scm.com/download/win)
 - 国内镜像：[华为云 Git for Windows 镜像](https://mirrors.huaweicloud.com/git-for-windows/)
@@ -268,7 +268,13 @@ pip install -e .
 安装浏览器自动化运行时：
 
 ```powershell
+# Windows
 python -m playwright install chromium
+```
+
+```bash
+# Linux
+python -m playwright install --with-deps chromium
 ```
 
 首次配置：
@@ -283,11 +289,10 @@ mclaw setup
 mclaw
 ```
 
-更新 M-Claw：
-
-退出正在运行的 M-Claw
+后续 M-Claw 更新：
 
 ```powershell
+# 首先退出正在运行的 M-Claw
 git status --porcelain
 git pull --ff-only
 pip install -e .
