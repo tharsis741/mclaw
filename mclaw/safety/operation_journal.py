@@ -247,6 +247,19 @@ class OperationJournal:
         self._append_session(record)
         return record
 
+    def update_rollback_context(
+        self,
+        rollback_record: dict[str, Any],
+        context_rollback_id: str,
+    ) -> dict[str, Any]:
+        """Attach the durable turn-level context transaction to a rollback record."""
+        if not rollback_record or not context_rollback_id:
+            return rollback_record or {}
+        rollback_record.setdefault("rollback", {})["context_rollback_id"] = context_rollback_id
+        rollback_record["updated_at"] = _now_iso()
+        self._write_record(rollback_record)
+        return rollback_record
+
     def list_operations(
         self,
         *,

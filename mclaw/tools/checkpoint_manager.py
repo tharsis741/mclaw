@@ -20,7 +20,8 @@ Storage layout (single shared store, git objects deduplicated across projects)
     M-Claw home checkpoints/
         store/                          — single bare-ish git repo
             HEAD, config, objects/      — standard git internals (shared)
-            refs/mclaw/<hash16>         — per-project branch tip
+            refs/mclaw/<hash16>         — per-project latest snapshot
+            refs/mclaw-snapshots/       — immutable per-snapshot refs
             indexes/<hash16>            — per-project git index
             projects/<hash16>.json      — {workdir, created_at, last_touch}
             meta/<commit>.json          — optional session/tool metadata
@@ -55,11 +56,14 @@ import shutil
 import subprocess
 import threading
 import time
+import uuid
 from pathlib import Path
 from mclaw.constants import get_mclaw_home
+from mclaw.runtime.manager import RuntimeManager
 from mclaw.runtime.process import run_captured_process
 from mclaw.tools.cancellation import cancellation_checkpoint
 from mclaw.tools.interrupt import get_interrupt_event
+from mclaw.utils import atomic_json_write
 from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
@@ -73,9 +77,14 @@ CHECKPOINT_BASE = get_mclaw_home() / "checkpoints"
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
 _REFS_PREFIX = "refs/mclaw"
+_SNAPSHOT_REFS_PREFIX = "refs/mclaw-snapshots"
 _INDEXES_DIRNAME = "indexes"
 _PROJECTS_DIRNAME = "projects"
 _META_DIRNAME = "meta"
+_RECOVERY_DIRNAME = "recovery"
+# Bump when PathPolicy's credential matching expands so existing stores are
+# scanned once under the new rules.
+_CREDENTIAL_SANITIZE_MARKER_NAME = ".credentials-sanitized-v1"
 DEFAULT_EXCLUDES = [
     # Dependency / build output
     "node_modules/",
@@ -132,19 +141,23 @@ DEFAULT_EXCLUDES = [
     ".env.*",
     ".env.local",
     ".env.*.local",
+    "**/.ssh/id_rsa",
+    "**/.ssh/id_dsa",
+    "**/.ssh/id_ecdsa",
+    "**/.ssh/id_ed25519",
+    "**/.aws/credentials",
+    "**/.kube/config",
+    "**/.docker/config.json",
+    ".git-credentials",
+    ".netrc",
+    ".npmrc",
+    ".pypirc",
     # OS junk
     ".DS_Store",
     "Thumbs.db",
     # Logs
     "*.log",
 ]
-
-_MCLAW_RUNTIME_CHECKPOINT_SKIP_DIRS = (
-    "temp",
-    "tmp",
-    "snapshots",
-    "logs",
-)
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -183,21 +196,54 @@ def _validate_commit_hash(commit_hash: str) -> Optional[str]:
     return None
 
 
-def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
-    """Validate a file path to prevent path traversal outside the working directory.
-
-    Returns an error string if invalid, None if valid.
-    """
-    if not file_path or not file_path.strip():
-        return "Empty file path"
-    if os.path.isabs(file_path):
-        return f"File path must be relative, got absolute path: {file_path!r}"
-    abs_workdir = _normalize_path(working_dir)
-    resolved = (abs_workdir / file_path).resolve()
+def _normalize_restore_targets(working_dir: str, target_paths: List[str]) -> Tuple[List[str], Optional[str]]:
+    """Return literal, relative restore targets that stay inside working_dir."""
     try:
-        resolved.relative_to(abs_workdir)
-    except ValueError:
-        return f"File path escapes the working directory via traversal: {file_path!r}"
+        root = _normalize_path(working_dir)
+    except (OSError, RuntimeError) as exc:
+        return [], f"Could not resolve restore workspace: {exc}"
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    restores_all = False
+    for item in target_paths:
+        raw = str(item or "").strip()
+        if not raw:
+            return [], "Empty restore target"
+        path = Path(raw).expanduser()
+        try:
+            resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+            relative = resolved.relative_to(root)
+        except (OSError, RuntimeError, ValueError):
+            return [], f"Restore target escapes the working directory: {raw!r}"
+        value = relative.as_posix() or "."
+        if value == ".":
+            restores_all = True
+            continue
+        if value not in seen:
+            normalized.append(value)
+            seen.add(value)
+    if restores_all:
+        return ["."], None
+    if not normalized:
+        return [], "No restore targets were provided"
+    return normalized, None
+
+
+def _restore_target_contains(target: str, relative_path: str) -> bool:
+    target = target.rstrip("/")
+    return target == "." or relative_path == target or relative_path.startswith(f"{target}/")
+
+
+def _restore_policy_error(checks: List[Tuple[str, str]]) -> Optional[str]:
+    """Fail closed when Runtime PathPolicy rejects or cannot validate a restore."""
+    try:
+        policy = RuntimeManager.current().paths
+        for action, path_value in checks:
+            decision = policy.check(action, path_value)
+            if not decision.allowed:
+                return decision.error_message()
+    except Exception as exc:
+        return f"PathPolicy could not validate restore targets: {exc}"
     return None
 
 
@@ -228,12 +274,8 @@ def _checkpoint_skip_reason(path_value: str) -> Optional[str]:
 
     roots: List[Tuple[Path, str]] = [
         (CHECKPOINT_BASE, "M-Claw checkpoint store"),
+        (get_mclaw_home(), "M-Claw runtime directory"),
     ]
-    mclaw_home = get_mclaw_home()
-    roots.extend(
-        (mclaw_home / name, f"M-Claw runtime directory: {name}")
-        for name in _MCLAW_RUNTIME_CHECKPOINT_SKIP_DIRS
-    )
 
     for root, reason in roots:
         try:
@@ -242,6 +284,8 @@ def _checkpoint_skip_reason(path_value: str) -> Optional[str]:
             normalized_root = root.expanduser()
         if _path_is_relative_to(path, normalized_root):
             return reason
+        if _path_is_relative_to(normalized_root, path):
+            return f"workspace contains {reason}"
     return None
 
 
@@ -264,6 +308,14 @@ def _ref_name(dir_hash: str) -> str:
     return f"{_REFS_PREFIX}/{dir_hash}"
 
 
+def _snapshot_ref_prefix(dir_hash: str) -> str:
+    return f"{_SNAPSHOT_REFS_PREFIX}/{dir_hash}"
+
+
+def _snapshot_ref_name(dir_hash: str, commit_hash: str) -> str:
+    return f"{_snapshot_ref_prefix(dir_hash)}/{commit_hash}"
+
+
 def _project_meta_path(store: Path, dir_hash: str) -> Path:
     return store / _PROJECTS_DIRNAME / f"{dir_hash}.json"
 
@@ -274,15 +326,13 @@ def _checkpoint_meta_path(store: Path, commit_hash: str) -> Path:
 
 def _write_checkpoint_meta(store: Path, commit_hash: str, metadata: Optional[Dict]) -> None:
     """Persist optional runtime metadata beside the shadow commit."""
-    if not metadata:
-        return
     try:
         meta_path = _checkpoint_meta_path(store, commit_hash)
         meta_path.parent.mkdir(parents=True, exist_ok=True)
-        meta = dict(metadata)
+        meta = dict(metadata or {})
         meta.setdefault("commit", commit_hash)
         meta.setdefault("created_at", time.time())
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        atomic_json_write(meta_path, meta)
     except Exception as exc:
         logger.debug("Could not write checkpoint metadata for %s: %s", commit_hash, exc)
 
@@ -422,16 +472,229 @@ def _run_git(
         return False, "", str(exc)
 
 
-def _commit_belongs_to_project(store: Path, working_dir: str, commit_hash: str) -> bool:
-    """Return True only when commit_hash is reachable from this workdir's ref."""
-    ref = _ref_name(_project_hash(working_dir))
-    ok, _, _ = _run_git(
-        ["merge-base", "--is-ancestor", commit_hash, ref],
+def _ensure_snapshot_refs(
+    store: Path,
+    working_dir: str,
+    dir_hash: str,
+) -> Optional[str]:
+    """Add immutable refs for checkpoints created by the legacy linear format."""
+    head_ref = _ref_name(dir_hash)
+    ok, stdout, error = _run_git(
+        ["rev-list", "--reverse", head_ref],
+        store,
+        working_dir,
+        allowed_returncodes={128},
+    )
+    if not ok:
+        exists, _, _ = _run_git(
+            ["show-ref", "--verify", "--quiet", head_ref],
+            store,
+            working_dir,
+            allowed_returncodes={1, 128},
+        )
+        return (error or "could not list legacy checkpoints") if exists else None
+    if not stdout:
+        return None
+    for commit_hash in stdout.splitlines():
+        snapshot_ref = _snapshot_ref_name(dir_hash, commit_hash)
+        exists, _, _ = _run_git(
+            ["show-ref", "--verify", "--quiet", snapshot_ref],
+            store,
+            working_dir,
+            allowed_returncodes={1, 128},
+        )
+        if not exists:
+            created, _, error = _run_git(
+                ["update-ref", snapshot_ref, commit_hash],
+                store,
+                working_dir,
+            )
+            if not created:
+                return error or f"could not preserve legacy checkpoint {commit_hash}"
+    return None
+
+
+def _list_snapshot_records(
+    store: Path,
+    working_dir: str,
+    dir_hash: str,
+) -> List[Dict]:
+    _ensure_snapshot_refs(store, working_dir, dir_hash)
+    ok, stdout, _ = _run_git(
+        ["for-each-ref", "--format=%(objectname)", _snapshot_ref_prefix(dir_hash)],
+        store,
+        working_dir,
+        allowed_returncodes={128},
+    )
+    if not ok or not stdout:
+        return []
+    records: List[Dict] = []
+    for commit_hash in dict.fromkeys(stdout.splitlines()):
+        metadata = _read_checkpoint_meta(store, commit_hash) or {}
+        try:
+            created_at = float(metadata.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created_at = 0.0
+        if created_at <= 0:
+            time_ok, commit_time, _ = _run_git(
+                ["show", "-s", "--format=%ct", commit_hash],
+                store,
+                working_dir,
+            )
+            try:
+                created_at = float(commit_time) if time_ok else 0.0
+            except ValueError:
+                created_at = 0.0
+        records.append({
+            "hash": commit_hash,
+            "created_at": created_at,
+            "pinned": bool(metadata.get("recovery_pins")),
+            "metadata": metadata,
+        })
+    return sorted(records, key=lambda record: (record["created_at"], record["hash"]))
+
+
+def _publish_checkpoint(
+    store: Path,
+    working_dir: str,
+    dir_hash: str,
+    commit_hash: str,
+    previous_head: str | None,
+) -> Optional[str]:
+    snapshot_ref = _snapshot_ref_name(dir_hash, commit_hash)
+    existed, _, _ = _run_git(
+        ["show-ref", "--verify", "--quiet", snapshot_ref],
         store,
         working_dir,
         allowed_returncodes={1, 128},
     )
-    return ok
+    ok_snapshot, _, error = _run_git(
+        ["update-ref", snapshot_ref, commit_hash],
+        store,
+        working_dir,
+    )
+    if not ok_snapshot:
+        return error or "snapshot ref update failed"
+    update_args = ["update-ref", _ref_name(dir_hash), commit_hash]
+    if previous_head:
+        update_args.append(previous_head)
+    ok_head, _, error = _run_git(update_args, store, working_dir)
+    if not ok_head:
+        if not existed:
+            _run_git(["update-ref", "-d", snapshot_ref], store, working_dir)
+        return error or "project head update failed"
+    return None
+
+
+def _pin_checkpoint(store: Path, commit_hash: str, pin_id: str) -> bool:
+    metadata = _read_checkpoint_meta(store, commit_hash) or {}
+    pins = {str(value) for value in metadata.get("recovery_pins") or [] if value}
+    pins.add(str(pin_id))
+    metadata["recovery_pins"] = sorted(pins)
+    try:
+        metadata.setdefault("commit", commit_hash)
+        metadata.setdefault("created_at", time.time())
+        atomic_json_write(_checkpoint_meta_path(store, commit_hash), metadata)
+        return True
+    except OSError as exc:
+        logger.error("Could not pin recovery checkpoint %s: %s", commit_hash, exc)
+        return False
+
+
+def _unpin_checkpoint(store: Path, commit_hash: str, pin_id: str) -> bool:
+    metadata = _read_checkpoint_meta(store, commit_hash) or {}
+    pins = {str(value) for value in metadata.get("recovery_pins") or [] if value}
+    pins.discard(str(pin_id))
+    if pins:
+        metadata["recovery_pins"] = sorted(pins)
+    else:
+        metadata.pop("recovery_pins", None)
+    try:
+        atomic_json_write(_checkpoint_meta_path(store, commit_hash), metadata)
+        return True
+    except OSError as exc:
+        logger.error("Could not unpin recovery checkpoint %s: %s", commit_hash, exc)
+        return False
+
+
+def _restore_intent_path(store: Path, intent_id: str) -> Path:
+    return store / _RECOVERY_DIRNAME / f"{intent_id}.json"
+
+
+def _write_restore_intent(store: Path, intent: Dict) -> None:
+    intent["updated_at"] = time.time()
+    atomic_json_write(_restore_intent_path(store, str(intent["id"])), intent)
+
+
+def _read_restore_intents(store: Path) -> List[Dict]:
+    recovery_dir = store / _RECOVERY_DIRNAME
+    if not recovery_dir.exists():
+        return []
+    intents: List[Dict] = []
+    for path in recovery_dir.glob("*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict) and payload.get("id"):
+                intents.append(payload)
+        except (OSError, json.JSONDecodeError):
+            logger.warning("Ignoring unreadable restore intent: %s", path)
+    return sorted(
+        intents,
+        key=lambda item: float(item.get("updated_at") or item.get("created_at") or 0),
+        reverse=True,
+    )
+
+
+def _set_restore_intent_status(store: Path, intent: Optional[Dict], status: str, **extra) -> bool:
+    if not intent:
+        return True
+    intent.update(extra)
+    intent["status"] = status
+    try:
+        _write_restore_intent(store, intent)
+        return True
+    except OSError as exc:
+        logger.error("Could not update restore intent %s: %s", intent.get("id"), exc)
+        return False
+
+
+def _resolve_project_commit(
+    store: Path,
+    working_dir: str,
+    commit_hash: str,
+) -> Optional[str]:
+    """Resolve an abbreviated hash only when it belongs to this workdir."""
+    dir_hash = _project_hash(working_dir)
+    _ensure_snapshot_refs(store, working_dir, dir_hash)
+    resolved, full_hash, _ = _run_git(
+        ["rev-parse", "--verify", f"{commit_hash}^{{commit}}"],
+        store,
+        working_dir,
+        allowed_returncodes={128},
+    )
+    if not resolved or not full_hash:
+        return None
+    snapshot_ref = _snapshot_ref_name(dir_hash, full_hash)
+    registered, _, _ = _run_git(
+        ["show-ref", "--verify", "--quiet", snapshot_ref],
+        store,
+        working_dir,
+        allowed_returncodes={1, 128},
+    )
+    if registered:
+        return full_hash
+    ok, _, _ = _run_git(
+        ["merge-base", "--is-ancestor", full_hash, _ref_name(dir_hash)],
+        store,
+        working_dir,
+        allowed_returncodes={1, 128},
+    )
+    return full_hash if ok else None
+
+
+def _commit_belongs_to_project(store: Path, working_dir: str, commit_hash: str) -> bool:
+    """Return True only when commit_hash is registered for this workdir."""
+    return _resolve_project_commit(store, working_dir, commit_hash) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -449,7 +712,7 @@ def _init_store(store: Path) -> Optional[str]:
             return f"Could not create checkpoint base: {exc}"
 
     if (store / "HEAD").exists():
-        return None
+        return _sync_default_excludes(store)
 
     store.mkdir(parents=True, exist_ok=True)
     (store / _INDEXES_DIRNAME).mkdir(exist_ok=True)
@@ -492,14 +755,25 @@ def _init_store(store: Path) -> Optional[str]:
     _run_git(["config", "tag.gpgSign", "false"], store, cfg_wd)
     _run_git(["config", "gc.auto", "0"], store, cfg_wd)
 
-    info_dir = store / "info"
-    info_dir.mkdir(exist_ok=True)
-    (info_dir / "exclude").write_text(
-        "\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8"
-    )
+    exclude_error = _sync_default_excludes(store)
+    if exclude_error:
+        return exclude_error
 
     logger.debug("Initialised checkpoint store at %s", store)
     return None
+
+
+def _sync_default_excludes(store: Path) -> Optional[str]:
+    """Keep credential and bulk-file exclusions current for existing stores."""
+    content = "\n".join(DEFAULT_EXCLUDES) + "\n"
+    path = store / "info" / "exclude"
+    try:
+        path.parent.mkdir(exist_ok=True)
+        if not path.exists() or path.read_text(encoding="utf-8") != content:
+            path.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return f"Could not update checkpoint exclusions: {exc}"
+    return _sanitize_existing_credential_storage(store)
 
 
 def _register_project(store: Path, working_dir: str) -> None:
@@ -562,6 +836,123 @@ def _list_projects(store: Path) -> List[Dict]:
         meta["_hash"] = dir_hash
         out.append(meta)
     return out
+
+
+def _sanitize_existing_credential_storage(store: Path) -> Optional[str]:
+    """Remove credentials already tracked by indexes or retained snapshot refs."""
+    marker = store / _CREDENTIAL_SANITIZE_MARKER_NAME
+    if marker.exists():
+        return None
+    try:
+        policy = RuntimeManager.current().paths
+    except Exception as exc:
+        return f"Could not load PathPolicy while sanitizing checkpoints: {exc}"
+
+    refs_changed = False
+    for project in _list_projects(store):
+        dir_hash = str(project.get("_hash") or "")
+        workdir = str(project.get("workdir") or "")
+        if not dir_hash or not workdir:
+            continue
+        root = _normalize_path(workdir)
+        git_cwd = str(root) if root.is_dir() else str(store.parent)
+        index_file = _index_path(store, dir_hash)
+        if index_file.exists():
+            ok, stdout, error = _run_git(
+                ["ls-files", "--cached", "-z"],
+                store,
+                git_cwd,
+                index_file=index_file,
+            )
+            if not ok:
+                return error or f"Could not inspect checkpoint index {dir_hash}"
+            credentials = [
+                rel
+                for rel in stdout.split("\x00")
+                if rel and policy.is_credential_path(root / rel)
+            ]
+            for offset in range(0, len(credentials), 200):
+                removed, _, error = _run_git(
+                    [
+                        "--literal-pathspecs",
+                        "update-index",
+                        "--force-remove",
+                        "--",
+                        *credentials[offset:offset + 200],
+                    ],
+                    store,
+                    git_cwd,
+                    index_file=index_file,
+                )
+                if not removed:
+                    return error or f"Could not sanitize checkpoint index {dir_hash}"
+
+        migration_error = _ensure_snapshot_refs(store, git_cwd, dir_hash)
+        if migration_error:
+            return f"Could not inspect checkpoint history {dir_hash}: {migration_error}"
+        records = _list_snapshot_records(store, git_cwd, dir_hash)
+        contaminated: Set[str] = set()
+        legacy: Set[str] = set()
+        for record in records:
+            commit_hash = record["hash"]
+            if (record.get("metadata") or {}).get("snapshot_format") != "root-v1":
+                legacy.add(commit_hash)
+            ok, stdout, error = _run_git(
+                ["ls-tree", "-r", "-z", "--name-only", commit_hash],
+                store,
+                git_cwd,
+            )
+            if not ok:
+                return error or f"Could not inspect checkpoint {commit_hash}"
+            if any(
+                policy.is_credential_path(root / rel)
+                for rel in stdout.split("\x00")
+                if rel
+            ):
+                contaminated.add(commit_hash)
+
+        legacy_contaminated = bool(contaminated & legacy)
+        drop_hashes = contaminated | (legacy if legacy_contaminated else set())
+        if not drop_hashes:
+            continue
+        ok, head, _ = _run_git(
+            ["rev-parse", "--verify", _ref_name(dir_hash) + "^{commit}"],
+            store,
+            git_cwd,
+            allowed_returncodes={128},
+        )
+        if ok and head in drop_hashes and not _delete_ref(store, _ref_name(dir_hash)):
+            return f"Could not remove credential-bearing project head {dir_hash}"
+        for commit_hash in drop_hashes:
+            if not _delete_snapshot_ref(
+                store,
+                _snapshot_ref_name(dir_hash, commit_hash),
+                commit_hash,
+            ):
+                return f"Could not remove credential-bearing checkpoint {commit_hash}"
+        refs_changed = True
+
+    if refs_changed:
+        expired, _, error = _run_git(
+            ["reflog", "expire", "--expire=now", "--all"],
+            store,
+            str(store.parent),
+        )
+        if not expired:
+            return error or "Could not expire credential-bearing checkpoint reflogs"
+        collected, _, error = _run_git(
+            ["gc", "--prune=now", "--quiet"],
+            store,
+            str(store.parent),
+            timeout=_GIT_TIMEOUT * 3,
+        )
+        if not collected:
+            return error or "Could not prune credential-bearing checkpoint objects"
+    try:
+        marker.write_text("1\n", encoding="utf-8")
+    except OSError as exc:
+        return f"Could not record checkpoint credential migration: {exc}"
+    return None
 
 
 def _dir_file_count(
@@ -744,6 +1135,7 @@ class CheckpointManager:
         target_paths: Optional[List[str]] = None,
     ) -> bool:
         """Force a checkpoint without per-turn deduplication."""
+        self.last_attempt = {}
         if not self.enabled:
             self._record_attempt("disabled", working_dir, reason)
             return False
@@ -760,7 +1152,10 @@ class CheckpointManager:
             return False
 
         try:
-            return self._take(abs_dir, reason, metadata=metadata, target_paths=target_paths)
+            taken = self._take(abs_dir, reason, metadata=metadata, target_paths=target_paths)
+            if not taken and not self.last_attempt:
+                self._record_attempt("failed", abs_dir, reason, detail="checkpoint creation failed")
+            return taken
         except InterruptedError:
             raise
         except Exception as e:
@@ -781,32 +1176,34 @@ class CheckpointManager:
         if not (store / "HEAD").exists():
             return []
 
-        ref = _ref_name(_project_hash(abs_dir))
-        ok, stdout, _ = _run_git(
-            ["log", ref, "--format=%H|%h|%aI|%s", "-n", str(self.max_snapshots)],
-            store, abs_dir,
-            allowed_returncodes={128, 129},
-        )
-
-        if not ok or not stdout:
-            return []
-
         results: List[Dict] = []
-        for line in stdout.splitlines():
+        records = _list_snapshot_records(store, abs_dir, _project_hash(abs_dir))
+        for record in reversed(records[-self.max_snapshots:]):
+            commit_hash = record["hash"]
+            ok, line, _ = _run_git(
+                ["show", "-s", "--format=%H|%h|%aI|%s", commit_hash],
+                store,
+                abs_dir,
+            )
+            if not ok:
+                continue
             parts = line.split("|", 3)
             if len(parts) == 4:
+                metadata = record.get("metadata") or {}
                 entry = {
                     "hash": parts[0],
                     "short_hash": parts[1],
                     "timestamp": parts[2],
                     "reason": parts[3],
-                    "metadata": _read_checkpoint_meta(store, parts[0]) or {},
+                    "metadata": metadata,
                     "files_changed": 0,
                     "insertions": 0,
                     "deletions": 0,
                 }
+                previous = metadata.get("previous_commit")
+                diff_base = previous if previous else f"{parts[0]}~1"
                 stat_ok, stat_out, _ = _run_git(
-                    ["diff", "--shortstat", f"{parts[0]}~1", parts[0]],
+                    ["diff", "--shortstat", diff_base, parts[0]],
                     store, abs_dir,
                     allowed_returncodes={128, 129},
                 )
@@ -814,6 +1211,17 @@ class CheckpointManager:
                     self._parse_shortstat(stat_out, entry)
                 results.append(entry)
         return results
+
+    def has_checkpoint(self, working_dir: str, commit_hash: str) -> bool:
+        """Return whether a checkpoint is still available for this directory."""
+        if _validate_commit_hash(commit_hash):
+            return False
+        abs_dir = str(_normalize_path(working_dir))
+        store = _store_path(CHECKPOINT_BASE)
+        return bool(
+            (store / "HEAD").exists()
+            and _resolve_project_commit(store, abs_dir, commit_hash)
+        )
 
     @staticmethod
     def _parse_shortstat(stat_line: str, entry: Dict) -> None:
@@ -828,7 +1236,12 @@ class CheckpointManager:
         if m:
             entry["deletions"] = int(m.group(1))
 
-    def diff(self, working_dir: str, commit_hash: str) -> Dict:
+    def diff(
+        self,
+        working_dir: str,
+        commit_hash: str,
+        target_paths: Optional[List[str]] = None,
+    ) -> Dict:
         """Show diff between a checkpoint and the current working tree.
 
         Targeted checkpoints compare only the paths captured in metadata so
@@ -853,23 +1266,40 @@ class CheckpointManager:
         )
         if not ok:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found"}
-        if not _commit_belongs_to_project(store, abs_dir, commit_hash):
+        resolved_commit = _resolve_project_commit(store, abs_dir, commit_hash)
+        if not resolved_commit:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' does not belong to this directory"}
+        commit_hash = resolved_commit
         metadata = _read_checkpoint_meta(store, commit_hash) or {}
+        requested_targets = (
+            list(target_paths)
+            if target_paths is not None
+            else list(metadata.get("target_paths_rel") or [])
+            if metadata.get("targeted")
+            else ["."]
+        )
+        diff_targets, target_error = _normalize_restore_targets(abs_dir, requested_targets)
+        if target_error:
+            return {"success": False, "error": target_error}
 
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 
         # Stage current state into the per-project index to compare.
-        if metadata.get("targeted") and metadata.get("target_paths_rel"):
+        if diff_targets != ["."]:
             _run_git(["read-tree", commit_hash], store, abs_dir, index_file=index_file, allowed_returncodes={128})
-            for rel in metadata.get("target_paths_rel") or []:
+            for rel in diff_targets:
                 path = Path(abs_dir) / rel
                 if path.exists():
-                    _run_git(["add", "-f", "--", rel], store, abs_dir,
+                    _run_git(["--literal-pathspecs", "add", "-f", "--", rel], store, abs_dir,
                              timeout=_GIT_TIMEOUT * 2, index_file=index_file)
                 else:
-                    _run_git(["rm", "--cached", "--ignore-unmatch", "--", rel], store, abs_dir, index_file=index_file)
+                    _run_git(
+                        ["--literal-pathspecs", "rm", "--cached", "--ignore-unmatch", "--", rel],
+                        store,
+                        abs_dir,
+                        index_file=index_file,
+                    )
         else:
             _run_git(["add", "-A"], store, abs_dir,
                      timeout=_GIT_TIMEOUT * 2, index_file=index_file)
@@ -899,14 +1329,489 @@ class CheckpointManager:
             "diff": diff_out if ok_diff else "",
         }
 
+    def list_restore_intents(
+        self,
+        working_dir: Optional[str] = None,
+        *,
+        unresolved_only: bool = True,
+    ) -> List[Dict]:
+        """Return durable restore attempts, newest first."""
+        store = _store_path(CHECKPOINT_BASE)
+        if not (store / "HEAD").exists():
+            return []
+        workspace = str(_normalize_path(working_dir)) if working_dir else None
+        unresolved = {"applying", "interrupted", "failed"}
+        return [
+            intent
+            for intent in _read_restore_intents(store)
+            if (not workspace or intent.get("workspace") == workspace)
+            and (not unresolved_only or intent.get("status") in unresolved)
+        ]
+
+    def recover_restore(
+        self,
+        intent_id: Optional[str] = None,
+        *,
+        working_dir: Optional[str] = None,
+        defer_completion: bool = False,
+    ) -> Dict:
+        """Restore the pre-operation snapshot recorded by an interrupted restore."""
+        cancellation_checkpoint(get_interrupt_event())
+        intents = self.list_restore_intents(working_dir)
+        if intent_id:
+            matches = [
+                item
+                for item in intents
+                if item.get("id") == intent_id or str(item.get("id") or "").startswith(intent_id)
+            ]
+            if len(matches) != 1:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Restore recovery intent '{intent_id}' was not found"
+                        if not matches
+                        else f"Restore recovery intent '{intent_id}' is ambiguous"
+                    ),
+                }
+            intent = matches[0]
+        elif intents:
+            intent = intents[0]
+        else:
+            return {"success": False, "error": "No interrupted restore needs recovery"}
+
+        recovery_commit = str(intent.get("recovery_commit") or "")
+        workspace = str(intent.get("workspace") or "")
+        target_paths = list(intent.get("target_paths") or [])
+        if not recovery_commit or not workspace or not target_paths:
+            return {"success": False, "error": "Restore recovery intent is incomplete", "intent": intent}
+        if "target_commits" in intent and "context_recovery" not in intent:
+            return {
+                "success": False,
+                "error": "Restore recovery intent predates coordinated context recovery; refusing file-only recovery",
+                "intent": intent,
+            }
+        context_recovery = intent.get("context_recovery")
+        if context_recovery and (
+            not isinstance(context_recovery, dict)
+            or context_recovery.get("action") not in {"restore", "reapply"}
+            or not isinstance(context_recovery.get("rollback_ids"), list)
+            or not context_recovery.get("rollback_ids")
+            or not all(
+                isinstance(value, str) and value
+                for value in context_recovery.get("rollback_ids") or []
+            )
+        ):
+            return {
+                "success": False,
+                "error": "Restore recovery context metadata is invalid",
+                "intent": intent,
+            }
+        if context_recovery and not defer_completion:
+            return {
+                "success": False,
+                "error": "Restore recovery also requires chat context recovery",
+                "intent": intent,
+            }
+
+        result = self.restore(
+            workspace,
+            recovery_commit,
+            target_paths=target_paths,
+            create_pre_snapshot=True,
+        )
+        if defer_completion and result.get("success"):
+            return {
+                "success": True,
+                "error": None,
+                "intent_id": intent.get("id"),
+                "intent": intent,
+                "restore": result,
+            }
+        store = _store_path(CHECKPOINT_BASE)
+        status_saved = _set_restore_intent_status(
+            store,
+            intent,
+            "recovered" if result.get("success") else "failed",
+            recovery_result={
+                "success": bool(result.get("success")),
+                "error": result.get("error"),
+                "restored_hash": result.get("restored_hash"),
+            },
+        )
+        status_error = None if status_saved else "Recovery completed but its intent status could not be persisted"
+        return {
+            "success": bool(result.get("success") and status_saved),
+            "error": result.get("error") or status_error,
+            "intent_id": intent.get("id"),
+            "intent": intent,
+            "restore": result,
+        }
+
+    def begin_restore_intent(
+        self,
+        working_dir: str,
+        *,
+        target_commits: List[str],
+        recovery_commit: Optional[str] = None,
+        target_paths: List[str],
+        kind: str = "restore-group",
+        context_recovery: Optional[Dict] = None,
+    ) -> Dict:
+        """Persist and pin one recovery boundary owned by a higher-level operation."""
+        abs_dir = str(_normalize_path(working_dir))
+        store = _store_path(CHECKPOINT_BASE)
+        if not (store / "HEAD").exists():
+            return {"success": False, "error": "No checkpoints exist for this directory"}
+
+        normalized_targets, target_error = _normalize_restore_targets(abs_dir, target_paths)
+        if target_error:
+            return {"success": False, "error": target_error}
+        policy_error = _restore_policy_error([
+            (action, str((Path(abs_dir) / target).resolve()))
+            for target in normalized_targets
+            for action in ("overwrite", "delete")
+        ])
+        if policy_error:
+            return {"success": False, "error": policy_error}
+
+        resolved_targets: List[str] = []
+        for commit_hash in target_commits:
+            if not commit_hash:
+                continue
+            hash_error = _validate_commit_hash(commit_hash)
+            resolved = (
+                None
+                if hash_error
+                else _resolve_project_commit(store, abs_dir, commit_hash)
+            )
+            if hash_error or not resolved:
+                return {
+                    "success": False,
+                    "error": hash_error or (
+                        f"Checkpoint '{commit_hash}' does not belong to this directory"
+                    ),
+                }
+            if resolved not in resolved_targets:
+                resolved_targets.append(resolved)
+
+        intent_id = uuid.uuid4().hex
+        pinned: List[str] = []
+
+        def release_pins() -> None:
+            for pinned_hash in pinned:
+                _unpin_checkpoint(store, pinned_hash, intent_id)
+
+        for commit_hash in resolved_targets:
+            if commit_hash in pinned:
+                continue
+            if not _pin_checkpoint(store, commit_hash, intent_id):
+                release_pins()
+                return {"success": False, "error": "Could not pin every restore checkpoint"}
+            pinned.append(commit_hash)
+
+        if recovery_commit:
+            recovery_error = _validate_commit_hash(recovery_commit)
+            resolved_recovery = (
+                None
+                if recovery_error
+                else _resolve_project_commit(store, abs_dir, recovery_commit)
+            )
+            if recovery_error or not resolved_recovery:
+                release_pins()
+                return {
+                    "success": False,
+                    "error": recovery_error or (
+                        f"Recovery checkpoint '{recovery_commit}' does not belong to this directory"
+                    ),
+                }
+        else:
+            try:
+                created = self.create_checkpoint(
+                    abs_dir,
+                    f"pre-{kind} snapshot",
+                    metadata={"restore_intent_id": intent_id, "restore_kind": kind},
+                    target_paths=[
+                        str((Path(abs_dir) / target).resolve())
+                        for target in normalized_targets
+                    ],
+                )
+            except BaseException:
+                release_pins()
+                raise
+            attempt = self.last_attempt or {}
+            resolved_recovery = attempt.get("commit") if created else None
+            if resolved_recovery:
+                resolved_recovery = _resolve_project_commit(store, abs_dir, resolved_recovery)
+            if not resolved_recovery:
+                release_pins()
+                detail = attempt.get("detail") or attempt.get("status") or "unknown error"
+                return {
+                    "success": False,
+                    "error": f"Could not create restore recovery checkpoint: {detail}",
+                }
+
+        if resolved_recovery not in pinned:
+            if not _pin_checkpoint(store, resolved_recovery, intent_id):
+                release_pins()
+                return {"success": False, "error": "Could not pin every restore checkpoint"}
+            pinned.append(resolved_recovery)
+
+        intent = {
+            "id": intent_id,
+            "kind": kind,
+            "status": "applying",
+            "created_at": time.time(),
+            "workspace": abs_dir,
+            "target_commit": resolved_targets[0] if resolved_targets else "",
+            "target_commits": resolved_targets,
+            "recovery_commit": resolved_recovery,
+            "target_paths": normalized_targets,
+            "context_recovery": dict(context_recovery) if context_recovery else None,
+        }
+        try:
+            _write_restore_intent(store, intent)
+        except Exception as exc:
+            release_pins()
+            return {
+                "success": False,
+                "error": f"Could not persist restore recovery intent: {exc}",
+            }
+        return {
+            "success": True,
+            "intent_id": intent_id,
+            "recovery_commit": resolved_recovery,
+            "target_commits": resolved_targets,
+            "target_paths": normalized_targets,
+        }
+
+    def finish_restore_intent(
+        self,
+        intent_id: str,
+        status: str,
+        *,
+        error: Optional[str] = None,
+    ) -> bool:
+        """Finish a deferred batch intent after its context transaction."""
+        if status not in {"completed", "recovered", "failed", "interrupted"}:
+            return False
+        store = _store_path(CHECKPOINT_BASE)
+        intent = next(
+            (item for item in _read_restore_intents(store) if item.get("id") == intent_id),
+            None,
+        )
+        if not intent:
+            return False
+        return _set_restore_intent_status(store, intent, status, error=error)
+
+    def restore_batch(
+        self,
+        working_dir: str,
+        restores: List[Dict],
+        *,
+        defer_completion: bool = False,
+        context_recovery: Optional[Dict] = None,
+    ) -> Dict:
+        """Apply several targeted checkpoints with one durable recovery snapshot."""
+        if not restores:
+            return {"success": False, "error": "No restores were provided"}
+        abs_dir = str(_normalize_path(working_dir))
+        store = _store_path(CHECKPOINT_BASE)
+        if not (store / "HEAD").exists():
+            return {"success": False, "error": "No checkpoints exist for this directory"}
+
+        prepared: List[Dict] = []
+        union_targets: List[str] = []
+        for item in restores:
+            commit_hash = str(item.get("commit_hash") or "")
+            hash_error = _validate_commit_hash(commit_hash)
+            if hash_error:
+                return {"success": False, "error": hash_error}
+            resolved_commit = _resolve_project_commit(store, abs_dir, commit_hash)
+            if not resolved_commit:
+                return {
+                    "success": False,
+                    "error": f"Checkpoint '{commit_hash}' does not belong to this directory",
+                }
+            targets, target_error = _normalize_restore_targets(
+                abs_dir,
+                list(item.get("target_paths") or []),
+            )
+            if target_error:
+                return {"success": False, "error": target_error}
+            prepared.append({"commit_hash": resolved_commit, "target_paths": targets})
+            union_targets.extend(target for target in targets if target not in union_targets)
+
+        policy_error = _restore_policy_error([
+            (action, str((Path(abs_dir) / target).resolve()))
+            for target in union_targets
+            for action in ("overwrite", "delete")
+        ])
+        if policy_error:
+            return {"success": False, "error": policy_error}
+
+        intent_id = uuid.uuid4().hex
+        pinned_commits: Set[str] = set()
+
+        def pin(commit_hash: str) -> bool:
+            if commit_hash in pinned_commits:
+                return True
+            if not _pin_checkpoint(store, commit_hash, intent_id):
+                return False
+            pinned_commits.add(commit_hash)
+            return True
+
+        def release_pins() -> None:
+            for commit_hash in pinned_commits:
+                _unpin_checkpoint(store, commit_hash, intent_id)
+
+        for item in prepared:
+            if not pin(item["commit_hash"]):
+                release_pins()
+                return {"success": False, "error": "Could not pin every batch restore target"}
+
+        try:
+            created = self.create_checkpoint(
+                abs_dir,
+                "pre-batch-restore snapshot",
+                metadata={"restore_intent_id": intent_id, "restore_batch": True},
+                target_paths=[
+                    str((Path(abs_dir) / target).resolve())
+                    for target in union_targets
+                ],
+            )
+        except BaseException:
+            release_pins()
+            raise
+        attempt = self.last_attempt or {}
+        recovery_commit = attempt.get("commit") if created else None
+        if not recovery_commit or not pin(recovery_commit):
+            release_pins()
+            return {
+                "success": False,
+                "error": (
+                    "Could not create the batch recovery checkpoint"
+                    if not recovery_commit
+                    else "Could not pin the batch recovery checkpoint"
+                ),
+            }
+
+        intent = {
+            "id": intent_id,
+            "kind": "restore-batch",
+            "status": "applying",
+            "created_at": time.time(),
+            "workspace": abs_dir,
+            "target_commit": prepared[0]["commit_hash"],
+            "target_commits": [item["commit_hash"] for item in prepared],
+            "recovery_commit": recovery_commit,
+            "target_paths": union_targets,
+            "context_recovery": dict(context_recovery) if context_recovery else None,
+        }
+        try:
+            _write_restore_intent(store, intent)
+        except Exception as exc:
+            release_pins()
+            return {
+                "success": False,
+                "error": f"Could not persist batch restore recovery intent: {exc}",
+            }
+
+        results: List[Dict] = []
+        try:
+            for item in prepared:
+                result = self.restore(
+                    abs_dir,
+                    item["commit_hash"],
+                    target_paths=item["target_paths"],
+                    create_pre_snapshot=False,
+                )
+                results.append(result)
+                if result.get("success"):
+                    continue
+                compensation = self.restore(
+                    abs_dir,
+                    recovery_commit,
+                    target_paths=union_targets,
+                    create_pre_snapshot=False,
+                )
+                recovered = bool(compensation.get("success"))
+                _set_restore_intent_status(
+                    store,
+                    intent,
+                    "recovered" if recovered else "failed",
+                    error=result.get("error"),
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        f"{result.get('error') or 'Batch restore failed'}; "
+                        + (
+                            f"restored the pre-batch state from checkpoint {recovery_commit[:8]}"
+                            if recovered
+                            else f"batch recovery also failed: {compensation.get('error') or 'unknown error'}"
+                        )
+                    ),
+                    "results": results,
+                    "recovery_commit": recovery_commit,
+                    "restore_intent_id": intent_id,
+                    "compensation": compensation,
+                }
+        except InterruptedError as exc:
+            _set_restore_intent_status(store, intent, "interrupted", error=str(exc))
+            raise
+        except Exception as exc:
+            _set_restore_intent_status(
+                store,
+                intent,
+                "interrupted" if getattr(exc, "termination_fence", None) is not None else "failed",
+                error=str(exc),
+            )
+            raise
+
+        if not defer_completion:
+            if not _set_restore_intent_status(store, intent, "completed"):
+                compensation = self.restore(
+                    abs_dir,
+                    recovery_commit,
+                    target_paths=union_targets,
+                    create_pre_snapshot=False,
+                )
+                return {
+                    "success": False,
+                    "error": (
+                        "Batch restore intent could not be finalized; "
+                        + (
+                            f"restored the pre-batch state from checkpoint {recovery_commit[:8]}"
+                            if compensation.get("success")
+                            else "automatic recovery also failed: "
+                            f"{compensation.get('error') or 'unknown error'}"
+                        )
+                    ),
+                    "results": results,
+                    "recovery_commit": recovery_commit,
+                    "restore_intent_id": intent_id,
+                    "compensation": compensation,
+                }
+        return {
+            "success": True,
+            "results": results,
+            "recovery_commit": recovery_commit,
+            "restore_intent_id": intent_id,
+            "target_paths": union_targets,
+        }
+
     def restore(
         self,
         working_dir: str,
         commit_hash: str,
-        file_path: str = None,
+        file_path: Optional[str] = None,
         create_pre_snapshot: bool = True,
+        target_paths: Optional[List[str]] = None,
+        recovery_commit: Optional[str] = None,
+        recovery_target_paths: Optional[List[str]] = None,
+        recovery_intent_id: Optional[str] = None,
     ) -> Dict:
-        """Restore files to a checkpoint state, optionally limited to one file.
+        """Restore files to a checkpoint state, optionally limited to explicit targets.
 
         Targeted checkpoints may record paths that were absent at snapshot time;
         restoring those paths means deleting files created after the checkpoint.
@@ -920,10 +1825,11 @@ class CheckpointManager:
         if skip_reason:
             return {"success": False, "error": f"Checkpoints are skipped for {skip_reason}"}
 
-        if file_path:
-            path_err = _validate_file_path(file_path, abs_dir)
-            if path_err:
-                return {"success": False, "error": path_err}
+        policy_error = _restore_policy_error([("overwrite", abs_dir)])
+        if policy_error:
+            return {"success": False, "error": policy_error}
+        if file_path and target_paths is not None:
+            return {"success": False, "error": "Use file_path or target_paths, not both"}
 
         store = _store_path(CHECKPOINT_BASE)
 
@@ -936,68 +1842,325 @@ class CheckpointManager:
         if not ok:
             return {"success": False, "error": f"Checkpoint '{commit_hash}' not found",
                     "debug": err or None}
-        if not _commit_belongs_to_project(store, abs_dir, commit_hash):
+        resolved_commit = _resolve_project_commit(store, abs_dir, commit_hash)
+        if not resolved_commit:
             return {
                 "success": False,
                 "error": f"Checkpoint '{commit_hash}' does not belong to this directory",
             }
+        commit_hash = resolved_commit
+        if recovery_commit:
+            recovery_hash_error = _validate_commit_hash(recovery_commit)
+            resolved_recovery = (
+                None
+                if recovery_hash_error
+                else _resolve_project_commit(store, abs_dir, recovery_commit)
+            )
+            if recovery_hash_error or not resolved_recovery:
+                return {
+                    "success": False,
+                    "error": recovery_hash_error or (
+                        f"Recovery checkpoint '{recovery_commit}' does not belong to this directory"
+                    ),
+                }
+            recovery_commit = resolved_recovery
         metadata = _read_checkpoint_meta(store, commit_hash) or {}
+        ok_reason, reason_out, _ = _run_git(
+            ["log", "--format=%s", "-1", commit_hash], store, abs_dir,
+        )
+        reason = reason_out if ok_reason else "unknown"
 
+        requested_targets = (
+            [file_path]
+            if file_path
+            else list(target_paths)
+            if target_paths is not None
+            else list(metadata.get("target_paths_rel") or [])
+            if metadata.get("targeted")
+            else ["."]
+        )
+        restore_targets, target_error = _normalize_restore_targets(abs_dir, requested_targets)
+        if target_error:
+            return {"success": False, "error": target_error}
+        intent_targets = restore_targets
+        if recovery_target_paths is not None:
+            intent_targets, target_error = _normalize_restore_targets(abs_dir, recovery_target_paths)
+            if target_error:
+                return {"success": False, "error": target_error}
+            policy_error = _restore_policy_error([
+                ("overwrite", str((Path(abs_dir) / target).resolve()))
+                for target in intent_targets
+            ])
+            if policy_error:
+                return {"success": False, "error": policy_error}
+
+        missing_at_checkpoint = set(metadata.get("missing_at_checkpoint") or [])
+        ok_tree, tree_output, tree_error = _run_git(
+            ["ls-tree", "-r", "-z", "--name-only", commit_hash],
+            store,
+            abs_dir,
+        )
+        if not ok_tree:
+            return {
+                "success": False,
+                "error": f"Could not inspect checkpoint restore targets: {tree_error}",
+                "debug": tree_error or None,
+            }
+        tree_paths = [path for path in tree_output.split("\0") if path]
+        stored_targets = tree_paths + list(missing_at_checkpoint)
+        if stored_targets:
+            _, stored_target_error = _normalize_restore_targets(abs_dir, stored_targets)
+            if stored_target_error:
+                return {
+                    "success": False,
+                    "error": f"Checkpoint contains an unsafe restore target: {stored_target_error}",
+                }
+        selected_tree_paths = [
+            path
+            for path in tree_paths
+            if any(_restore_target_contains(target, path) for target in restore_targets)
+        ]
+        cleanup_targets = sorted(
+            path
+            for path in missing_at_checkpoint
+            if any(_restore_target_contains(target, path) for target in restore_targets)
+        )
+        policy_checks = [
+            (
+                "delete" if target in missing_at_checkpoint else "overwrite",
+                str((Path(abs_dir) / target).resolve()),
+            )
+            for target in restore_targets
+        ]
+        policy_checks.extend(
+            ("overwrite", str((Path(abs_dir) / path).resolve()))
+            for path in selected_tree_paths
+        )
+        policy_checks.extend(
+            ("delete", str((Path(abs_dir) / path).resolve()))
+            for path in cleanup_targets
+        )
+        policy_error = _restore_policy_error(policy_checks)
+        if policy_error:
+            return {"success": False, "error": policy_error}
+
+        pre_restore_commit = recovery_commit
+        intent_id = uuid.uuid4().hex
+        intent: Optional[Dict] = None
+        pinned_commits: Set[str] = set()
+        needs_intent = bool((create_pre_snapshot or recovery_commit) and not recovery_intent_id)
+
+        def pin(commit: str) -> bool:
+            if commit in pinned_commits:
+                return True
+            if not _pin_checkpoint(store, commit, intent_id):
+                return False
+            pinned_commits.add(commit)
+            return True
+
+        def release_pins() -> None:
+            for pinned_commit in pinned_commits:
+                _unpin_checkpoint(store, pinned_commit, intent_id)
+
+        if needs_intent and not pin(commit_hash):
+            return {
+                "success": False,
+                "error": "Could not pin the restore target before starting",
+            }
         if create_pre_snapshot:
             # Take a pre-rollback snapshot so the rollback can be reversed.
-            pre_target_paths = metadata.get("target_paths") if metadata.get("targeted") else None
-            self._take(
-                abs_dir,
-                f"pre-rollback snapshot (restoring to {commit_hash[:8]})",
-                metadata={"rollback_target": commit_hash},
-                target_paths=pre_target_paths,
+            pre_target_paths = (
+                None
+                if restore_targets == ["."]
+                else [str((Path(abs_dir) / target).resolve()) for target in restore_targets]
             )
+            try:
+                snapshot_created = self.create_checkpoint(
+                    abs_dir,
+                    f"pre-rollback snapshot (restoring to {commit_hash[:8]})",
+                    metadata={"rollback_target": commit_hash, "restore_intent_id": intent_id},
+                    target_paths=pre_target_paths,
+                )
+            except BaseException:
+                release_pins()
+                raise
+            attempt = self.last_attempt or {}
+            pre_restore_commit = attempt.get("commit") if snapshot_created else None
+            if not pre_restore_commit and attempt.get("status") == "skipped" and attempt.get("detail") == "no changes":
+                ref = _ref_name(_project_hash(abs_dir))
+                try:
+                    ref_ok, ref_commit, _ = _run_git(
+                        ["rev-parse", "--verify", ref + "^{commit}"],
+                        store,
+                        abs_dir,
+                        allowed_returncodes={128},
+                    )
+                except BaseException:
+                    release_pins()
+                    raise
+                if ref_ok:
+                    pre_restore_commit = ref_commit
+            if not pre_restore_commit:
+                detail = attempt.get("detail") or attempt.get("status") or "unknown error"
+                release_pins()
+                return {
+                    "success": False,
+                    "error": f"Could not create pre-restore checkpoint: {detail}",
+                }
+            try:
+                retained = _commit_belongs_to_project(store, abs_dir, pre_restore_commit)
+            except BaseException:
+                release_pins()
+                raise
+            if not retained:
+                release_pins()
+                return {
+                    "success": False,
+                    "error": "Pre-restore checkpoint was not retained by checkpoint pruning",
+                }
+            if not pin(pre_restore_commit):
+                release_pins()
+                return {
+                    "success": False,
+                    "error": "Could not pin the pre-restore checkpoint before starting",
+                }
+            try:
+                target_ok, _, target_error = _run_git(
+                    ["cat-file", "-t", commit_hash],
+                    store,
+                    abs_dir,
+                )
+            except BaseException:
+                release_pins()
+                raise
+            if not target_ok:
+                release_pins()
+                return {
+                    "success": False,
+                    "error": f"Restore checkpoint became unavailable while preparing recovery: {target_error}",
+                }
+        elif needs_intent and recovery_commit and not pin(recovery_commit):
+            release_pins()
+            return {
+                "success": False,
+                "error": "Could not pin the supplied recovery checkpoint before starting",
+            }
 
         dir_hash = _project_hash(abs_dir)
         index_file = _index_path(store, dir_hash)
 
-        missing_at_checkpoint = set(metadata.get("missing_at_checkpoint") or [])
-        targeted_paths = list(metadata.get("target_paths_rel") or [])
-        restore_targets = [file_path] if file_path else (targeted_paths if metadata.get("targeted") else ["."])
+        policy_error = _restore_policy_error(policy_checks)
+        if policy_error:
+            release_pins()
+            return {"success": False, "error": policy_error}
+
+        if needs_intent:
+            intent = {
+                "id": intent_id,
+                "status": "applying",
+                "created_at": time.time(),
+                "workspace": abs_dir,
+                "target_commit": commit_hash,
+                "recovery_commit": pre_restore_commit,
+                "target_paths": intent_targets,
+            }
+            try:
+                _write_restore_intent(store, intent)
+            except Exception as exc:
+                release_pins()
+                return {
+                    "success": False,
+                    "error": f"Could not persist restore recovery intent: {exc}",
+                }
+
         ok = True
         stdout = ""
         err = ""
-        for restore_target in restore_targets:
-            if restore_target == "." and missing_at_checkpoint:
-                ok_tree, tree_files, _ = _run_git(
-                    ["ls-tree", "-r", "--name-only", commit_hash],
-                    store,
-                    abs_dir,
-                )
-                if ok_tree and not tree_files.strip():
-                    continue
-            if restore_target in missing_at_checkpoint:
-                target = (Path(abs_dir) / restore_target).resolve()
-                try:
-                    if target.is_file() or target.is_symlink():
-                        target.unlink()
-                    elif target.is_dir():
-                        shutil.rmtree(target)
-                except FileNotFoundError:
-                    pass
-                except OSError as exc:
-                    ok = False
-                    err = str(exc)
-                    break
-                continue
-            ok, stdout, err = _run_git(
-                ["checkout", commit_hash, "--", restore_target],
-                store, abs_dir, timeout=_GIT_TIMEOUT * 2,
-                index_file=index_file,
-            )
-            if not ok:
-                break
+        restored_targets: List[str] = []
 
-        if not ok:
-            return {"success": False, "error": f"Restore failed: {err}",
-                    "debug": err or None}
-        if not metadata.get("targeted") and not file_path:
-            for rel in missing_at_checkpoint:
+        def restore_failure(message: str, failed_target: str, debug: str = "") -> Dict:
+            result = {
+                "success": False,
+                "error": message,
+                "debug": debug or None,
+                "failed_target": failed_target,
+                "restored_targets": list(restored_targets),
+                "pre_restore_commit": pre_restore_commit,
+                "restore_intent_id": intent_id if intent else None,
+            }
+            if not pre_restore_commit:
+                _set_restore_intent_status(store, intent, "failed", error=message)
+                return result
+            compensation = self.restore(
+                abs_dir,
+                pre_restore_commit,
+                target_paths=restore_targets,
+                create_pre_snapshot=False,
+            )
+            result["compensation"] = compensation
+            result["recovered"] = bool(compensation.get("success"))
+            _set_restore_intent_status(
+                store,
+                intent,
+                "recovered" if result["recovered"] else "failed",
+                error=message,
+                compensation={
+                    "success": result["recovered"],
+                    "error": compensation.get("error"),
+                },
+            )
+            if result["recovered"]:
+                result["error"] = (
+                    f"{message}; restored the pre-restore state from checkpoint "
+                    f"{pre_restore_commit[:8]}"
+                )
+            else:
+                recovery_error = compensation.get("error") or "unknown error"
+                result["error"] = (
+                    f"{message}; automatic recovery from checkpoint "
+                    f"{pre_restore_commit[:8]} also failed: {recovery_error}"
+                )
+            return result
+
+        try:
+            for restore_target in restore_targets:
+                cancellation_checkpoint(get_interrupt_event())
+                if restore_target == "." and not tree_paths:
+                    continue
+                if restore_target in missing_at_checkpoint:
+                    target = (Path(abs_dir) / restore_target).resolve()
+                    try:
+                        if target.is_file() or target.is_symlink():
+                            target.unlink()
+                        elif target.is_dir():
+                            shutil.rmtree(target)
+                    except FileNotFoundError:
+                        pass
+                    except OSError as exc:
+                        ok = False
+                        err = str(exc)
+                        break
+                    restored_targets.append(restore_target)
+                    continue
+                ok, stdout, err = _run_git(
+                    ["--literal-pathspecs", "checkout", commit_hash, "--", restore_target],
+                    store, abs_dir, timeout=_GIT_TIMEOUT * 2,
+                    index_file=index_file,
+                )
+                if not ok:
+                    break
+                restored_targets.append(restore_target)
+
+            if not ok:
+                return restore_failure(
+                    f"Restore failed at {restore_target!r}: {err}",
+                    restore_target,
+                    err,
+                )
+            for rel in cleanup_targets:
+                if rel in restore_targets:
+                    continue
+                cancellation_checkpoint(get_interrupt_event())
                 target = (Path(abs_dir) / rel).resolve()
                 try:
                     if target.is_file() or target.is_symlink():
@@ -1007,12 +2170,47 @@ class CheckpointManager:
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
-                    return {"success": False, "error": f"Restore cleanup failed: {exc}", "debug": str(exc)}
+                    return restore_failure(
+                        f"Restore cleanup failed at {rel!r}: {exc}",
+                        rel,
+                        str(exc),
+                    )
+                restored_targets.append(rel)
+        except InterruptedError as exc:
+            _set_restore_intent_status(store, intent, "interrupted", error=str(exc))
+            raise
+        except Exception as exc:
+            _set_restore_intent_status(
+                store,
+                intent,
+                "interrupted" if getattr(exc, "termination_fence", None) is not None else "failed",
+                error=str(exc),
+            )
+            raise
 
-        ok2, reason_out, _ = _run_git(
-            ["log", "--format=%s", "-1", commit_hash], store, abs_dir,
-        )
-        reason = reason_out if ok2 else "unknown"
+        if not _set_restore_intent_status(store, intent, "completed"):
+            compensation = self.restore(
+                abs_dir,
+                pre_restore_commit,
+                target_paths=intent_targets,
+                create_pre_snapshot=False,
+            )
+            return {
+                "success": False,
+                "error": (
+                    "Restore intent could not be finalized; "
+                    + (
+                        f"restored the pre-restore state from checkpoint {pre_restore_commit[:8]}"
+                        if compensation.get("success")
+                        else "automatic recovery also failed: "
+                        f"{compensation.get('error') or 'unknown error'}"
+                    )
+                ),
+                "pre_restore_commit": pre_restore_commit,
+                "restore_intent_id": intent_id if intent else None,
+                "compensation": compensation,
+                "recovered": bool(compensation.get("success")),
+            }
 
         result = {
             "success": True,
@@ -1021,6 +2219,8 @@ class CheckpointManager:
             "reason": reason,
             "directory": abs_dir,
             "metadata": metadata,
+            "pre_restore_commit": pre_restore_commit,
+            "restore_intent_id": intent_id if intent else None,
         }
         if file_path:
             result["file"] = file_path
@@ -1068,6 +2268,12 @@ class CheckpointManager:
             if not item:
                 continue
             path = _normalize_path(str(item))
+            try:
+                path_policy = RuntimeManager.current().paths
+                if path_policy.is_runtime_internal_path(path) or not path_policy.check("read", path).allowed:
+                    continue
+            except Exception:
+                continue
             try:
                 rel = path.relative_to(abs_dir)
             except ValueError:
@@ -1203,6 +2409,14 @@ class CheckpointManager:
             self._drop_oversize_from_index(store, working_dir, index_file)
         if target_info.get("rel"):
             self._stage_explicit_targets(store, working_dir, index_file, target_info)
+        if not self._drop_credentials_from_index(store, working_dir, index_file):
+            self._record_attempt(
+                "failed",
+                working_dir,
+                reason,
+                detail="could not remove credential paths from checkpoint index",
+            )
+            return False
 
         # Compare against the current ref tip (not HEAD — HEAD points to a
         # branch that doesn't exist on a bare store, so ``diff --cached``
@@ -1247,10 +2461,26 @@ class CheckpointManager:
             self._record_attempt("failed", working_dir, reason, detail=err or "write-tree failed")
             return False
 
-        # Build commit (parent = current ref tip, if any).
-        commit_args = ["commit-tree", tree_sha, "-m", reason, "--no-gpg-sign"]
-        if has_ref:
-            commit_args = ["commit-tree", tree_sha, "-p", ref_commit, "-m", reason, "--no-gpg-sign"]
+        # Preserve legacy checkpoints before switching the project head to the
+        # immutable, independent snapshot format.
+        migration_error = _ensure_snapshot_refs(store, working_dir, dir_hash)
+        if migration_error:
+            self._record_attempt(
+                "failed",
+                working_dir,
+                reason,
+                detail=f"could not preserve legacy checkpoints: {migration_error}",
+            )
+            return False
+        commit_args = [
+            "commit-tree",
+            tree_sha,
+            "-m",
+            reason,
+            "-m",
+            f"mclaw-checkpoint: {time.time_ns()}",
+            "--no-gpg-sign",
+        ]
         ok_commit, new_sha, err = _run_git(
             commit_args, store, working_dir,
             index_file=index_file,
@@ -1260,18 +2490,21 @@ class CheckpointManager:
             self._record_attempt("failed", working_dir, reason, detail=err or "commit-tree failed")
             return False
 
-        # Update the per-project ref.
-        update_args = ["update-ref", ref, new_sha]
-        if has_ref:
-            update_args = ["update-ref", ref, new_sha, ref_commit]
-        ok_update, _, err = _run_git(
-            update_args, store, working_dir,
+        publish_error = _publish_checkpoint(
+            store,
+            working_dir,
+            dir_hash,
+            new_sha,
+            ref_commit if has_ref else None,
         )
-        if not ok_update:
+        if publish_error:
+            err = publish_error
             logger.debug("Checkpoint update-ref failed: %s", err)
             self._record_attempt("failed", working_dir, reason, detail=err or "update-ref failed")
             return False
 
+        metadata["previous_commit"] = ref_commit if has_ref else None
+        metadata["snapshot_format"] = "root-v1"
         _write_checkpoint_meta(store, new_sha, metadata)
         self._record_attempt(
             "taken",
@@ -1345,6 +2578,14 @@ class CheckpointManager:
                 pass
 
         self._stage_explicit_targets(store, working_dir, index_file, target_info)
+        if not self._drop_credentials_from_index(store, working_dir, index_file):
+            self._record_attempt(
+                "failed",
+                working_dir,
+                reason,
+                detail="could not remove credential paths from checkpoint index",
+            )
+            return False
 
         if has_ref:
             ok_diff, _, _ = _run_git(
@@ -1363,22 +2604,43 @@ class CheckpointManager:
             self._record_attempt("failed", working_dir, reason, detail=err or "write-tree failed")
             return False
 
-        commit_args = ["commit-tree", tree_sha, "-m", reason, "--no-gpg-sign"]
-        if has_ref:
-            commit_args = ["commit-tree", tree_sha, "-p", ref_commit, "-m", reason, "--no-gpg-sign"]
+        migration_error = _ensure_snapshot_refs(store, working_dir, dir_hash)
+        if migration_error:
+            self._record_attempt(
+                "failed",
+                working_dir,
+                reason,
+                detail=f"could not preserve legacy checkpoints: {migration_error}",
+            )
+            return False
+        commit_args = [
+            "commit-tree",
+            tree_sha,
+            "-m",
+            reason,
+            "-m",
+            f"mclaw-checkpoint: {time.time_ns()}",
+            "--no-gpg-sign",
+        ]
         ok_commit, new_sha, err = _run_git(commit_args, store, working_dir, index_file=index_file)
         if not ok_commit or not new_sha:
             self._record_attempt("failed", working_dir, reason, detail=err or "commit-tree failed")
             return False
 
-        update_args = ["update-ref", ref, new_sha]
-        if has_ref:
-            update_args = ["update-ref", ref, new_sha, ref_commit]
-        ok_update, _, err = _run_git(update_args, store, working_dir)
-        if not ok_update:
+        publish_error = _publish_checkpoint(
+            store,
+            working_dir,
+            dir_hash,
+            new_sha,
+            ref_commit if has_ref else None,
+        )
+        if publish_error:
+            err = publish_error
             self._record_attempt("failed", working_dir, reason, detail=err or "update-ref failed")
             return False
 
+        metadata["previous_commit"] = ref_commit if has_ref else None
+        metadata["snapshot_format"] = "root-v1"
         _write_checkpoint_meta(store, new_sha, metadata)
         self._record_attempt(
             "taken",
@@ -1440,60 +2702,64 @@ class CheckpointManager:
                 allowed_returncodes={128},
             )
 
-    def _prune(self, store: Path, working_dir: str, ref: str) -> None:
-        """Keep only the last ``max_snapshots`` commits on the per-project ref.
-
-        The ref is rewritten to drop commits older than ``max_snapshots`` and
-        then ``git gc`` reclaims unreachable objects.
-        """
+    def _drop_credentials_from_index(
+        self,
+        store: Path,
+        working_dir: str,
+        index_file: Path,
+    ) -> bool:
+        """Remove credentials that an older per-project index already tracked."""
+        try:
+            policy = RuntimeManager.current().paths
+        except Exception as exc:
+            logger.error("Could not load PathPolicy while sanitizing checkpoint index: %s", exc)
+            return False
         ok, stdout, _ = _run_git(
-            ["rev-list", "--count", ref], store, working_dir,
-            allowed_returncodes={128},
+            ["ls-files", "--cached", "-z"],
+            store,
+            working_dir,
+            index_file=index_file,
         )
         if not ok:
-            return
-        try:
-            count = int(stdout)
-        except ValueError:
-            return
-        if count <= self.max_snapshots:
-            return
-
-        # Collect commits oldest → newest, take last N.
-        ok_list, list_out, _ = _run_git(
-            ["rev-list", "--reverse", ref], store, working_dir,
-        )
-        if not ok_list or not list_out:
-            return
-        commits = list_out.splitlines()
-        keep = commits[-self.max_snapshots:]
-
-        # Rebuild a linear chain off keep[0]'s tree.
-        new_parent: Optional[str] = None
-        for sha in keep:
-            ok_tree, tree_sha, _ = _run_git(
-                ["rev-parse", f"{sha}^{{tree}}"], store, working_dir,
+            return False
+        root = _normalize_path(working_dir)
+        credentials = [
+            rel
+            for rel in stdout.split("\x00")
+            if rel and policy.is_credential_path(root / rel)
+        ]
+        for offset in range(0, len(credentials), 200):
+            removed, _, _ = _run_git(
+                [
+                    "--literal-pathspecs",
+                    "rm",
+                    "--cached",
+                    "--quiet",
+                    "--ignore-unmatch",
+                    "--",
+                    *credentials[offset:offset + 200],
+                ],
+                store,
+                working_dir,
+                index_file=index_file,
             )
-            if not ok_tree or not tree_sha:
-                return
-            ok_msg, msg, _ = _run_git(
-                ["log", "--format=%s", "-1", sha], store, working_dir,
-            )
-            commit_msg = msg if ok_msg and msg else "checkpoint"
-            args = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
-            if new_parent is not None:
-                args = ["commit-tree", tree_sha, "-p", new_parent,
-                        "-m", commit_msg, "--no-gpg-sign"]
-            ok_commit, new_sha, _ = _run_git(args, store, working_dir)
-            if not ok_commit or not new_sha:
-                return
-            new_parent = new_sha
+            if not removed:
+                return False
+        return True
 
-        if new_parent is None:
+    def _prune(self, store: Path, working_dir: str, ref: str) -> None:
+        """Drop old unpinned snapshot refs without rewriting commit hashes."""
+        records = _list_snapshot_records(store, working_dir, _project_hash(working_dir))
+        unpinned = [record for record in records if not record["pinned"]]
+        drop = unpinned[:-self.max_snapshots]
+        if not drop:
             return
-        _run_git(["update-ref", ref, new_parent], store, working_dir)
-
-        # Reclaim objects from the dropped commits.
+        for record in drop:
+            _delete_snapshot_ref(
+                store,
+                _snapshot_ref_name(_project_hash(working_dir), record["hash"]),
+                record["hash"],
+            )
         _run_git(
             ["reflog", "expire", "--expire=now", "--all"],
             store, working_dir,
@@ -1504,91 +2770,10 @@ class CheckpointManager:
         )
 
     def _enforce_size_cap(self, store: Path) -> None:
-        """If total store size exceeds ``max_total_size_mb``, drop oldest
-        checkpoints across ALL projects until under the cap.
-        """
+        """Drop oldest unpinned snapshots until the shared store fits."""
         if self.max_total_size_mb <= 0:
             return
-        cap_bytes = self.max_total_size_mb * 1024 * 1024
-        size = _dir_size_bytes(store)
-        if size <= cap_bytes:
-            return
-        logger.info(
-            "Checkpoint store exceeded %d MB (actual %d MB) — pruning oldest",
-            self.max_total_size_mb, size // (1024 * 1024),
-        )
-
-        # Collect (commit_time, ref, sha) across all per-project refs.
-        ok, stdout, _ = _run_git(
-            ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
-            store, str(store.parent),
-            allowed_returncodes={128},
-        )
-        if not ok or not stdout:
-            return
-        refs = [r for r in stdout.splitlines() if r.strip()]
-
-        any_dropped = False
-        # Round-robin-drop oldest commit per ref until under cap.
-        for _ in range(20):  # hard upper bound to avoid pathological loops
-            size = _dir_size_bytes(store)
-            if size <= cap_bytes:
-                break
-            for ref in refs:
-                ok_count, count_out, _ = _run_git(
-                    ["rev-list", "--count", ref], store, str(store.parent),
-                    allowed_returncodes={128},
-                )
-                try:
-                    count = int(count_out) if ok_count else 0
-                except ValueError:
-                    count = 0
-                if count <= 1:
-                    continue  # keep at least one snapshot per project
-                ok_list, list_out, _ = _run_git(
-                    ["rev-list", "--reverse", ref], store, str(store.parent),
-                )
-                if not ok_list or not list_out:
-                    continue
-                commits = list_out.splitlines()
-                keep = commits[1:]  # drop oldest
-                new_parent: Optional[str] = None
-                fail = False
-                for sha in keep:
-                    ok_tree, tree_sha, _ = _run_git(
-                        ["rev-parse", f"{sha}^{{tree}}"], store, str(store.parent),
-                    )
-                    if not ok_tree or not tree_sha:
-                        fail = True
-                        break
-                    ok_msg, msg, _ = _run_git(
-                        ["log", "--format=%s", "-1", sha], store, str(store.parent),
-                    )
-                    commit_msg = msg if ok_msg and msg else "checkpoint"
-                    args = ["commit-tree", tree_sha, "-m", commit_msg, "--no-gpg-sign"]
-                    if new_parent is not None:
-                        args = ["commit-tree", tree_sha, "-p", new_parent,
-                                "-m", commit_msg, "--no-gpg-sign"]
-                    ok_commit, new_sha, _ = _run_git(args, store, str(store.parent))
-                    if not ok_commit or not new_sha:
-                        fail = True
-                        break
-                    new_parent = new_sha
-                if fail or new_parent is None:
-                    continue
-                _run_git(["update-ref", ref, new_parent], store, str(store.parent))
-                any_dropped = True
-            if not any_dropped:
-                break
-
-        _run_git(
-            ["reflog", "expire", "--expire=now", "--all"],
-            store, str(store.parent),
-        )
-        _run_git(
-            ["gc", "--prune=now", "--quiet"],
-            store, str(store.parent), timeout=_GIT_TIMEOUT * 3,
-        )
+        _prune_store_to_size(store, self.max_total_size_mb * 1024 * 1024)
 
 
 # ---------------------------------------------------------------------------
@@ -1605,6 +2790,108 @@ def _delete_ref(store: Path, ref: str) -> bool:
         allowed_returncodes={128},
     )
     return ok
+
+
+def _delete_snapshot_ref(store: Path, ref: str, commit_hash: str) -> bool:
+    if not _delete_ref(store, ref):
+        return False
+    ok, stdout, _ = _run_git(
+        ["for-each-ref", "--format=%(refname)", "--points-at", commit_hash, _SNAPSHOT_REFS_PREFIX],
+        store,
+        str(store.parent),
+        allowed_returncodes={128},
+    )
+    if ok and not stdout:
+        try:
+            _checkpoint_meta_path(store, commit_hash).unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True
+
+
+def _prune_store_to_size(store: Path, cap_bytes: int) -> None:
+    if cap_bytes <= 0 or _dir_size_bytes(store) <= cap_bytes:
+        return
+
+    candidates: List[Tuple[float, str, str]] = []
+    for project in _list_projects(store):
+        dir_hash = project.get("_hash") or ""
+        if not dir_hash:
+            continue
+        project_workdir = str(project.get("workdir") or "")
+        git_cwd = project_workdir if project_workdir and Path(project_workdir).exists() else str(store.parent)
+        records = _list_snapshot_records(store, git_cwd, dir_hash)
+        ok, head, _ = _run_git(
+            ["rev-parse", "--verify", _ref_name(dir_hash) + "^{commit}"],
+            store,
+            git_cwd,
+            allowed_returncodes={128},
+        )
+        current = head if ok else ""
+        for record in records:
+            if not record["pinned"] and record["hash"] != current:
+                candidates.append((
+                    record["created_at"],
+                    _snapshot_ref_name(dir_hash, record["hash"]),
+                    record["hash"],
+                ))
+
+    for _, ref, commit_hash in sorted(candidates):
+        if not _delete_snapshot_ref(store, ref, commit_hash):
+            continue
+        _run_git(["reflog", "expire", "--expire=now", "--all"], store, str(store.parent))
+        _run_git(
+            ["gc", "--prune=now", "--quiet"],
+            store,
+            str(store.parent),
+            timeout=_GIT_TIMEOUT * 3,
+        )
+        if _dir_size_bytes(store) <= cap_bytes:
+            break
+
+
+def _delete_project_refs(store: Path, dir_hash: str, working_dir: str) -> bool:
+    git_cwd = working_dir if working_dir and Path(working_dir).exists() else str(store.parent)
+    records = _list_snapshot_records(store, git_cwd, dir_hash)
+    if any(record["pinned"] for record in records):
+        return False
+    _delete_ref(store, _ref_name(dir_hash))
+    for record in records:
+        _delete_snapshot_ref(
+            store,
+            _snapshot_ref_name(dir_hash, record["hash"]),
+            record["hash"],
+        )
+    return True
+
+
+def _expire_restore_intents(store: Path, cutoff: float) -> None:
+    if cutoff <= 0:
+        return
+    for intent in _read_restore_intents(store):
+        if intent.get("status") not in {"completed", "recovered"}:
+            continue
+        if float(intent.get("updated_at") or intent.get("created_at") or 0) >= cutoff:
+            continue
+        intent_id = str(intent.get("id") or "")
+        commits = {
+            str(intent.get("target_commit") or ""),
+            str(intent.get("recovery_commit") or ""),
+            *(
+                str(commit_hash)
+                for commit_hash in intent.get("target_commits") or []
+                if commit_hash
+            ),
+        }
+        released = True
+        for commit_hash in commits:
+            if commit_hash and not _unpin_checkpoint(store, commit_hash, intent_id):
+                released = False
+        if released:
+            try:
+                _restore_intent_path(store, intent_id).unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def prune_checkpoints(
@@ -1649,6 +2936,7 @@ def prune_checkpoints(
 
     store = _store_path(base)
     if (store / "HEAD").exists():
+        _expire_restore_intents(store, cutoff)
         for meta in _list_projects(store):
             dir_hash = meta.get("_hash") or ""
             workdir = meta.get("workdir") or ""
@@ -1664,8 +2952,8 @@ def prune_checkpoints(
                     reason = "stale"
             if reason is None:
                 continue
-            ref = _ref_name(dir_hash)
-            _delete_ref(store, ref)
+            if not _delete_project_refs(store, dir_hash, workdir):
+                continue
             # Drop per-project index and metadata.
             try:
                 idx = _index_path(store, dir_hash)
@@ -1694,76 +2982,8 @@ def prune_checkpoints(
             store, str(base), timeout=_GIT_TIMEOUT * 3,
         )
 
-        # Size-cap pass across remaining projects.
         if max_total_size_mb > 0:
-            cap_bytes = max_total_size_mb * 1024 * 1024
-            for _i in range(20):
-                size = _dir_size_bytes(store)
-                if size <= cap_bytes:
-                    break
-                ok, stdout, _ = _run_git(
-                    ["for-each-ref", "--format=%(refname)", _REFS_PREFIX],
-                    store, str(base),
-                    allowed_returncodes={128},
-                )
-                refs = [r for r in stdout.splitlines() if r.strip()] if ok else []
-                if not refs:
-                    break
-                any_drop = False
-                for ref in refs:
-                    ok_c, count_out, _ = _run_git(
-                        ["rev-list", "--count", ref], store, str(base),
-                        allowed_returncodes={128},
-                    )
-                    try:
-                        count = int(count_out) if ok_c else 0
-                    except ValueError:
-                        count = 0
-                    if count <= 1:
-                        continue
-                    ok_l, lo, _ = _run_git(
-                        ["rev-list", "--reverse", ref], store, str(base),
-                    )
-                    if not ok_l or not lo:
-                        continue
-                    commits = lo.splitlines()
-                    keep = commits[1:]
-                    new_parent: Optional[str] = None
-                    fail = False
-                    for sha in keep:
-                        ok_t, tsha, _ = _run_git(
-                            ["rev-parse", f"{sha}^{{tree}}"], store, str(base),
-                        )
-                        if not ok_t or not tsha:
-                            fail = True
-                            break
-                        ok_m, m, _ = _run_git(
-                            ["log", "--format=%s", "-1", sha], store, str(base),
-                        )
-                        msg = m if ok_m and m else "checkpoint"
-                        args = ["commit-tree", tsha, "-m", msg, "--no-gpg-sign"]
-                        if new_parent is not None:
-                            args = ["commit-tree", tsha, "-p", new_parent,
-                                    "-m", msg, "--no-gpg-sign"]
-                        ok_cm, new_sha, _ = _run_git(args, store, str(base))
-                        if not ok_cm or not new_sha:
-                            fail = True
-                            break
-                        new_parent = new_sha
-                    if fail or new_parent is None:
-                        continue
-                    _run_git(["update-ref", ref, new_parent], store, str(base))
-                    any_drop = True
-                if not any_drop:
-                    break
-            _run_git(
-                ["reflog", "expire", "--expire=now", "--all"],
-                store, str(base),
-            )
-            _run_git(
-                ["gc", "--prune=now", "--quiet"],
-                store, str(base), timeout=_GIT_TIMEOUT * 3,
-            )
+            _prune_store_to_size(store, max_total_size_mb * 1024 * 1024)
 
     size_after = _dir_size_bytes(base)
     delta = size_before - size_after
@@ -1867,15 +3087,14 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
             for meta in _list_projects(store):
                 dir_hash = meta.get("_hash") or ""
                 workdir = meta.get("workdir") or ""
-                ref = _ref_name(dir_hash)
+                git_cwd = workdir if workdir and Path(workdir).exists() else str(base)
+                _ensure_snapshot_refs(store, git_cwd, dir_hash)
                 ok, count_out, _ = _run_git(
-                    ["rev-list", "--count", ref], store, str(base),
+                    ["for-each-ref", "--count=999999", "--format=%(refname)", _snapshot_ref_prefix(dir_hash)],
+                    store, git_cwd,
                     allowed_returncodes={128},
                 )
-                try:
-                    commits = int(count_out) if ok else 0
-                except ValueError:
-                    commits = 0
+                commits = len(count_out.splitlines()) if ok and count_out else 0
                 out["projects"].append({
                     "hash": dir_hash,
                     "workdir": workdir,

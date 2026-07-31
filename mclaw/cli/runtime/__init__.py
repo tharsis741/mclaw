@@ -21,7 +21,6 @@ from .asr_commands import RuntimeAsrCommandCoordinator, RuntimeAsrCommandHooks
 from .background import RuntimeBackgroundCoordinator, RuntimeBackgroundHooks
 from .events import EventBus, EventType, MClawEvent, RuntimeStatus
 from .file_safety_commands import RuntimeFileSafetyCommandCoordinator, RuntimeFileSafetyCommandHooks
-from .controller import RuntimeController, get_runtime_controller
 from .delegation import RuntimeDelegationCoordinator, RuntimeDelegationHooks
 from .interactive import InteractiveRuntime
 from .info_commands import RuntimeInfoCommandCoordinator, RuntimeInfoCommandHooks
@@ -74,7 +73,6 @@ __all__ = [
     "RuntimeAsrCommandHooks",
     "RuntimeSessionState",
     "RuntimeStatus",
-    "RuntimeController",
     "RuntimeDelegationCoordinator",
     "RuntimeDelegationHooks",
     "RuntimeFileSafetyCommandCoordinator",
@@ -109,7 +107,6 @@ __all__ = [
     "RuntimeWorkerSupervisor",
     "RuntimeTurnCoordinator",
     "RuntimeTurnHooks",
-    "get_runtime_controller",
     "CommandDispatchResult",
     "CommandRouter",
     "ParsedSlashCommand",

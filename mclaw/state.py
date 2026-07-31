@@ -875,31 +875,92 @@ class SessionDB:
 
     def restore_context_rollback(self, rollback_id: str) -> int:
         """Undo a soft context rollback by reactivating its invalidated messages."""
+        return self.restore_context_rollbacks([rollback_id])
+
+    def restore_context_rollbacks(self, rollback_ids: List[str]) -> int:
+        """Restore several context rollbacks in one database transaction."""
+        rollback_ids = list(dict.fromkeys(str(value) for value in rollback_ids if value))
+        if not rollback_ids:
+            return 0
+
         def _do(conn):
-            row = conn.execute(
-                "SELECT session_id, invalidated_message_ids FROM context_rollbacks WHERE id = ? AND restored_at IS NULL",
-                (rollback_id,),
-            ).fetchone()
-            if not row:
-                return 0
-            session_id = row["session_id"] if isinstance(row, sqlite3.Row) else row[0]
-            raw_ids = row["invalidated_message_ids"] if isinstance(row, sqlite3.Row) else row[1]
-            try:
-                message_ids = [int(v) for v in json.loads(raw_ids or "[]")]
-            except (json.JSONDecodeError, TypeError, ValueError):
-                message_ids = []
-            if not message_ids:
-                conn.execute("UPDATE context_rollbacks SET restored_at = ? WHERE id = ?", (time.time(), rollback_id))
-                return 0
-            placeholders = ",".join("?" for _ in message_ids)
-            cursor = conn.execute(
-                f"UPDATE messages SET invalidated_at = NULL, invalidated_by = NULL, "
-                f"invalidation_reason = NULL WHERE id IN ({placeholders}) AND invalidated_by = ?",
-                (*message_ids, rollback_id),
-            )
-            conn.execute("UPDATE context_rollbacks SET restored_at = ? WHERE id = ?", (time.time(), rollback_id))
-            self._recompute_session_counts_in_tx(conn, session_id)
-            return cursor.rowcount
+            restored = 0
+            session_ids = set()
+            now = time.time()
+            for rollback_id in rollback_ids:
+                row = conn.execute(
+                    "SELECT session_id, invalidated_message_ids FROM context_rollbacks "
+                    "WHERE id = ? AND restored_at IS NULL",
+                    (rollback_id,),
+                ).fetchone()
+                if not row:
+                    continue
+                session_id = row["session_id"] if isinstance(row, sqlite3.Row) else row[0]
+                raw_ids = row["invalidated_message_ids"] if isinstance(row, sqlite3.Row) else row[1]
+                try:
+                    message_ids = [int(v) for v in json.loads(raw_ids or "[]")]
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    message_ids = []
+                if message_ids:
+                    placeholders = ",".join("?" for _ in message_ids)
+                    cursor = conn.execute(
+                        f"UPDATE messages SET invalidated_at = NULL, invalidated_by = NULL, "
+                        f"invalidation_reason = NULL WHERE id IN ({placeholders}) AND invalidated_by = ?",
+                        (*message_ids, rollback_id),
+                    )
+                    restored += cursor.rowcount
+                conn.execute(
+                    "UPDATE context_rollbacks SET restored_at = ? WHERE id = ?",
+                    (now, rollback_id),
+                )
+                session_ids.add(session_id)
+            for session_id in session_ids:
+                self._recompute_session_counts_in_tx(conn, session_id)
+            return restored
+
+        return self._execute_write(_do)
+
+    def reapply_context_rollbacks(self, rollback_ids: List[str]) -> int:
+        """Re-invalidate messages when an interrupted context restore is reversed."""
+        rollback_ids = list(dict.fromkeys(str(value) for value in rollback_ids if value))
+        if not rollback_ids:
+            return 0
+
+        def _do(conn):
+            reapplied = 0
+            session_ids = set()
+            now = time.time()
+            for rollback_id in rollback_ids:
+                row = conn.execute(
+                    "SELECT session_id, invalidated_message_ids FROM context_rollbacks "
+                    "WHERE id = ? AND restored_at IS NOT NULL",
+                    (rollback_id,),
+                ).fetchone()
+                if not row:
+                    continue
+                session_id = row["session_id"] if isinstance(row, sqlite3.Row) else row[0]
+                raw_ids = row["invalidated_message_ids"] if isinstance(row, sqlite3.Row) else row[1]
+                try:
+                    message_ids = [int(v) for v in json.loads(raw_ids or "[]")]
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    message_ids = []
+                if message_ids:
+                    placeholders = ",".join("?" for _ in message_ids)
+                    cursor = conn.execute(
+                        f"UPDATE messages SET invalidated_at = ?, invalidated_by = ?, "
+                        f"invalidation_reason = ? WHERE id IN ({placeholders}) "
+                        f"AND invalidated_at IS NULL",
+                        (now, rollback_id, "filesystem rollback", *message_ids),
+                    )
+                    reapplied += cursor.rowcount
+                conn.execute(
+                    "UPDATE context_rollbacks SET restored_at = NULL WHERE id = ?",
+                    (rollback_id,),
+                )
+                session_ids.add(session_id)
+            for session_id in session_ids:
+                self._recompute_session_counts_in_tx(conn, session_id)
+            return reapplied
 
         return self._execute_write(_do)
 

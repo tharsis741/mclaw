@@ -55,6 +55,7 @@ class ContextRollbackManager:
         checkpoint_hash: str | None = None,
         operation_id: str | None = None,
         turn_id: str | None = None,
+        rollback_id: str | None = None,
         metadata: dict | None = None,
         scope: str = "operation",
     ) -> dict[str, Any]:
@@ -77,6 +78,7 @@ class ContextRollbackManager:
                 marker_message_id,
                 turn_id=turn_id,
                 operation_id=operation_id,
+                rollback_id=rollback_id,
                 reason="filesystem rollback",
                 mode=mode,
                 checkpoint_hash=checkpoint_hash,
@@ -86,6 +88,7 @@ class ContextRollbackManager:
             result = self.session_db.invalidate_messages_after(
                 session_id,
                 marker_message_id,
+                rollback_id=rollback_id,
                 reason="filesystem rollback",
                 mode=mode,
                 checkpoint_hash=checkpoint_hash,
@@ -93,19 +96,64 @@ class ContextRollbackManager:
                 metadata=metadata or {},
             )
         if self.agent_matches_session(session_id):
-            self.reload_agent_messages(session_id)
-            self.reset_runtime_context()
+            try:
+                self.reload_agent_messages(session_id)
+                self.reset_runtime_context()
+            except Exception as exc:
+                logger.warning("Context was rolled back but the live agent could not be refreshed: %s", exc)
+                return {"skipped": False, **result, "refresh_error": str(exc)}
         return {"skipped": False, **result}
 
     def restore(self, rollback_id: str, session_id: str | None = None) -> dict[str, Any]:
         """Re-enable messages invalidated by an earlier context rollback transaction."""
-        if not rollback_id or not self.session_db:
+        return self.restore_many([rollback_id], session_id=session_id)
+
+    def restore_many(self, rollback_ids: list[str], session_id: str | None = None) -> dict[str, Any]:
+        """Re-enable several rollback records atomically and refresh the agent once."""
+        rollback_ids = list(dict.fromkeys(value for value in rollback_ids if value))
+        if not rollback_ids or not self.session_db:
             return {"restored": 0}
-        restored = self.session_db.restore_context_rollback(rollback_id)
+        restore_many = getattr(self.session_db, "restore_context_rollbacks", None)
+        if callable(restore_many):
+            restored = restore_many(rollback_ids)
+        elif len(rollback_ids) == 1:
+            restored = self.session_db.restore_context_rollback(rollback_ids[0])
+        else:
+            raise RuntimeError("Session database does not support atomic context restore")
+        refresh_error = None
         if session_id and self.agent_matches_session(session_id):
-            self.reload_agent_messages(session_id)
-            self.reset_runtime_context()
-        return {"restored": restored}
+            try:
+                self.reload_agent_messages(session_id)
+                self.reset_runtime_context()
+            except Exception as exc:
+                refresh_error = str(exc)
+                logger.warning("Context was restored but the live agent could not be refreshed: %s", exc)
+        result = {"restored": restored}
+        if refresh_error:
+            result["refresh_error"] = refresh_error
+        return result
+
+    def reapply_many(self, rollback_ids: list[str], session_id: str | None = None) -> dict[str, Any]:
+        """Re-apply restored rollback records atomically during recovery."""
+        rollback_ids = list(dict.fromkeys(value for value in rollback_ids if value))
+        if not rollback_ids or not self.session_db:
+            return {"reapplied": 0}
+        reapply_many = getattr(self.session_db, "reapply_context_rollbacks", None)
+        if not callable(reapply_many):
+            raise RuntimeError("Session database does not support atomic context reapply")
+        reapplied = reapply_many(rollback_ids)
+        refresh_error = None
+        if session_id and self.agent_matches_session(session_id):
+            try:
+                self.reload_agent_messages(session_id)
+                self.reset_runtime_context()
+            except Exception as exc:
+                refresh_error = str(exc)
+                logger.warning("Context was re-applied but the live agent could not be refreshed: %s", exc)
+        result = {"reapplied": reapplied}
+        if refresh_error:
+            result["refresh_error"] = refresh_error
+        return result
 
     def agent_matches_session(self, session_id: str) -> bool:
         """Return whether the live agent should be refreshed for a session change."""

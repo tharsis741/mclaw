@@ -229,28 +229,34 @@ def _parse_secret_batch_values(text: str, env_vars: list[str]) -> tuple[dict[str
     raw = str(text or "").strip()
     if not raw:
         return {}, ""
-    if len(env_vars) == 1 and "=" not in raw and not raw.startswith("{"):
-        return {env_vars[0]: raw}, ""
-
     values: dict[str, str] = {}
-    if raw.startswith("{"):
+    if len(env_vars) == 1:
+        key, separator, value = raw.partition("=")
+        if not separator or key.strip().upper() != env_vars[0]:
+            return {env_vars[0]: raw}, ""
+        values[env_vars[0]] = value.strip().strip('"\'')
+    elif raw.startswith("{"):
         try:
             parsed = _json.loads(raw)
         except Exception:
             return {}, "JSON 格式无效。请使用 KEY=value; KEY2=value 或 JSON 对象。"
         if not isinstance(parsed, dict):
             return {}, "JSON 格式无效。顶层必须是对象。"
-        values = {str(k).strip().upper(): str(v).strip() for k, v in parsed.items() if str(k).strip()}
+        for key, value in parsed.items():
+            normalized_key = str(key).strip().upper()
+            if not normalized_key:
+                continue
+            if not isinstance(value, str) or not value.strip():
+                return {}, "JSON 中的凭据值必须是非空字符串。"
+            values[normalized_key] = value.strip()
     else:
         parts = [part.strip() for part in _re.split(r"[\n;]+", raw) if part.strip()]
         if all("=" in part for part in parts):
             for part in parts:
                 key, _, value = part.partition("=")
                 values[key.strip().upper()] = value.strip().strip('"\'')
-        elif len(parts) == len(env_vars):
-            values = {env_var: value for env_var, value in zip(env_vars, parts)}
         else:
-            return {}, "多个凭据请使用 KEY=value; KEY2=value、JSON，或按顺序用分号分隔。"
+            return {}, "多个凭据请使用 KEY=value; KEY2=value 或 JSON 对象。"
 
     unknown = sorted(set(values) - set(env_vars))
     if unknown:
@@ -268,7 +274,7 @@ def _prompt_secret_batch(env_vars: list[str], *, prompt: str, print_plain, color
         return {}
     if len(requested) > 1:
         print_plain(color("  请在一个加密输入中填写所有凭据。", Colors.DIM))
-        print_plain(color("  格式：KEY=value; KEY2=value，JSON 对象，或按顺序用分号分隔。", Colors.DIM))
+        print_plain(color("  格式：KEY=value; KEY2=value，或 JSON 对象。", Colors.DIM))
         print_plain(color(f"  需要填写：{', '.join(requested)}", Colors.DIM))
     while True:
         try:

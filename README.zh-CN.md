@@ -253,6 +253,13 @@ cd mclaw
 - 官方下载：[git-scm.com/download/win](https://git-scm.com/download/win)
 - 国内镜像：[华为云 Git for Windows 镜像](https://mirrors.huaweicloud.com/git-for-windows/)
 
+
+```bash
+# Ubuntu / Debian
+sudo apt update
+sudo apt install -y git
+```
+
 安装完成后确认 Git 可用：
 
 ```powershell

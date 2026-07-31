@@ -11,6 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from mclaw.safety.path_resolver import is_mclaw_runtime_path
 from mclaw.utils import is_truthy_value
 
 
@@ -60,15 +61,52 @@ class RuntimeFileSafetyCommandCoordinator:
         options, rollback_args = self.parse_rollback_options(raw_args)
         context_mode = options.get("context") or "soft"
         cwd, option_file_path = self.hooks.resolve_rollback_workspace(options)
+        if not cwd or is_mclaw_runtime_path(cwd):
+            self.hooks.render_notice(
+                "Rollback",
+                "未找到安全的项目工作区。请使用 --dir 指定项目目录。",
+                "",
+                "danger",
+            )
+            return
         command, rest = self.split_ref_and_rest(rollback_args)
-        coordinator = self.hooks.create_rollback_coordinator(mgr)
 
         if not command:
+            list_intents = getattr(mgr, "list_restore_intents", None)
+            pending = list_intents(cwd) if callable(list_intents) else []
+            if pending:
+                self.hooks.render_notice(
+                    "Rollback",
+                    f"检测到 {len(pending)} 个未完成的文件恢复，可运行 /rollback recover。",
+                    "",
+                    "warning",
+                )
+            coordinator = self.hooks.create_rollback_coordinator(mgr)
             groups = coordinator.list_groups(session_id=None, workspace=cwd)
             self.hooks.render_rollback_groups(groups, cwd)
             return
 
         lower = command.lower()
+        if lower == "recover":
+            coordinator = self.hooks.create_rollback_coordinator(mgr)
+            recover = getattr(coordinator, "recover_restore", None)
+            if not callable(recover):
+                self.hooks.render_notice("Rollback", "当前 rollback 协调器不支持恢复中断操作。", "", "danger")
+                return
+            target_id, _ = self.split_ref_and_rest(rest)
+            result = recover(target_id or None, workspace=cwd)
+            if not result.get("success"):
+                self.hooks.render_notice("Rollback", str(result.get("error") or "恢复失败"), "", "danger")
+                return
+            self.hooks.render_notice(
+                "Rollback",
+                f"已从恢复点撤销中断操作（{str(result.get('intent_id') or '')[:8]}）。",
+                "",
+                "success",
+            )
+            return
+
+        coordinator = self.hooks.create_rollback_coordinator(mgr)
         if lower == "project":
             self._handle_project_rollback(
                 mgr,

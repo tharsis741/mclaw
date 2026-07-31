@@ -20,7 +20,7 @@ import json
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from prompt_toolkit import Application
 from prompt_toolkit.application import run_in_terminal
@@ -98,8 +98,9 @@ from mclaw.cli.tui.renderers.safety import SafetyRenderer
 from mclaw.cli.tui.renderers.skills import SkillsRenderer
 from mclaw.cli.tui.renderers.status import STATUS_ANIM_FRAME_COUNT, StatusRenderer, format_duration, fmt_tokens
 from mclaw.cli.tui.selection_prompt import prompt_workspace_risk_confirmation
-from mclaw.cli.tui.theme import ACCENT_COLOR, select_box
+from mclaw.cli.tui.theme import select_box
 from mclaw.constants import display_mclaw_path, get_mclaw_home
+from mclaw.safety.path_resolver import is_mclaw_runtime_path
 from mclaw.tools.delegate_tool import SubtaskEvent, get_pending_result_for_task
 from mclaw.tools.terminal_tool import set_current_session
 from mclaw.utils import is_truthy_value
@@ -210,28 +211,6 @@ def _compact_status_detail(message: str, *, has_active_tools: bool = False) -> s
 def _format_subagent_status(total: int, done: int, running: int) -> str:
     noun = "subagent" if running == 1 else "subagents"
     return f"{running} {noun} running · {done}/{total} done"
-
-
-def _strip_markdown(text: str) -> str:
-    """Strip common Markdown syntax for compact one-line display."""
-    import re
-    if not text:
-        return ""
-    # Remove headers (# ## ###)
-    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-    # Remove bold/italic
-    text = re.sub(r"\*\*|__", "", text)
-    text = re.sub(r"\*|_", "", text)
-    # Remove inline code backticks
-    text = re.sub(r"`", "", text)
-    # Remove list bullets
-    text = re.sub(r"^\s*[-*+]\s+", "", text, flags=re.MULTILINE)
-    # Remove table pipes
-    text = re.sub(r"\|", " ", text)
-    # Remove links [text](url) -> text
-    text = re.sub(r"\[(.*?)\]\(.*?\)", r"\1", text)
-    # Collapse whitespace
-    return " ".join(text.split())
 
 
 # ── Main TUI class ──
@@ -683,12 +662,6 @@ class InteractiveChat:
         if self._app:
             self._app.invalidate()
 
-    def _build_subagent_compact_progress(self) -> list:
-        return self._get_status_renderer().build_subagent_compact_progress(self)
-
-    def _format_subagent_goal(self, goal: str, max_len: int = 72) -> str:
-        return self._get_status_renderer().format_subagent_goal(goal, max_len=max_len)
-
     def _create_agent(self, provider_runtime: ProviderRuntimeContext, session_id: str):
         """Construct one agent without mutating the active interactive state."""
         from mclaw.agent.core import MClaw
@@ -962,9 +935,6 @@ class InteractiveChat:
             self._safety_renderer = renderer
         return renderer
 
-    def _render_safety_panel(self, title: str, *items, border_style: str = ACCENT_COLOR) -> None:
-        self._get_safety_renderer().render_panel(title, *items, border_style=border_style)
-
     def _emit_status_snapshot(self) -> None:
         agent = getattr(self, "agent", None)
         total_tokens = 0
@@ -1105,8 +1075,7 @@ class InteractiveChat:
 
         def __init__(self, num_tasks: int, goals: list):
             self.num_tasks = num_tasks
-            self.goals = goals
-            self.tasks: List[dict] = [
+            self.tasks: list[dict] = [
                 {
                     "index": i,
                     "status": "pending",
@@ -1153,21 +1122,6 @@ class InteractiveChat:
                     for t in self.tasks
                 ):
                     self.completion_event.set()
-
-        def render_overview(self) -> str:
-            lines = ["", "─── Subagent Overview ───"]
-            icons = {"pending": "⏳", "running": "🔄", "completed": "✅", "error": "❌"}
-            for t in self.tasks:
-                icon = icons.get(t["status"], "?")
-                if t["status"] in ("completed", "error"):
-                    status_str = f'{t["status"]} ({t["duration"]:.1f}s)'
-                else:
-                    status_str = t["status"]
-                lines.append(f"  {icon} Task {t['index']}: {status_str}")
-                if t["status"] == "running" and t["tool_calls"]:
-                    last_tool = t["tool_calls"][-1][0]
-                    lines.append(f"       └─ 🔧 {last_tool}")
-            return "\n".join(lines)
 
     # ── Aggregation ──
 
@@ -1538,28 +1492,34 @@ class InteractiveChat:
         if not raw:
             return {}, "请输入密钥，或使用 /skip 跳过。"
 
-        if len(env_vars) == 1 and "=" not in raw and not raw.startswith("{"):
-            return {env_vars[0]: raw}, ""
-
         values: dict[str, str] = {}
-        if raw.startswith("{"):
+        if len(env_vars) == 1:
+            key, separator, value = raw.partition("=")
+            if not separator or key.strip().upper() != env_vars[0]:
+                return {env_vars[0]: raw}, ""
+            values[env_vars[0]] = value.strip().strip('"\'')
+        elif raw.startswith("{"):
             try:
                 parsed = _json.loads(raw)
             except Exception:
                 return {}, "批量密钥格式错误：请输入 JSON 对象，或使用 KEY=value; KEY2=value。"
             if not isinstance(parsed, dict):
                 return {}, "批量密钥格式错误：JSON 顶层必须是对象。"
-            values = {str(k).strip().upper(): str(v).strip() for k, v in parsed.items() if str(k).strip()}
+            for key, value in parsed.items():
+                normalized_key = str(key).strip().upper()
+                if not normalized_key:
+                    continue
+                if not isinstance(value, str) or not value.strip():
+                    return {}, "批量密钥格式错误：JSON 中的值必须是非空字符串。"
+                values[normalized_key] = value.strip()
         else:
             parts = [part.strip() for part in re.split(r"[\n;]+", raw) if part.strip()]
             if all("=" in part for part in parts):
                 for part in parts:
                     key, _, value = part.partition("=")
                     values[key.strip().upper()] = value.strip().strip('"\'')
-            elif len(parts) == len(env_vars):
-                values = {env_var: value for env_var, value in zip(env_vars, parts)}
             else:
-                return {}, "批量密钥格式错误：多个 key 请使用 KEY=value; KEY2=value，或按顺序用分号/换行分隔。"
+                return {}, "批量密钥格式错误：多个 key 请使用 KEY=value; KEY2=value 或 JSON 对象。"
 
         unknown = sorted(set(values) - set(env_vars))
         if unknown:
@@ -2130,10 +2090,6 @@ class InteractiveChat:
             )
         ).invoke_skill(skill, user_intent)
 
-    def _inject_skill_context(self, skill_text: str) -> None:
-        """Append skill guidance to the existing system message."""
-        RuntimeSkillCommandCoordinator.inject_skill_context(self.agent.messages, skill_text)
-
     # ── Model switching ──
 
     def _handle_model_update(self, raw_args: str = ""):
@@ -2638,37 +2594,23 @@ class InteractiveChat:
     def _checkpoint_cwd(self) -> str:
         """Resolve the workspace used by checkpoint and rollback commands."""
         recent = getattr(self.agent, "_last_checkpoint_work_dir", None) if self.agent else None
-        if recent:
-            return str(recent)
         terminal_cfg = self.config.get("terminal", {}) if isinstance(self.config, dict) else {}
-        if isinstance(terminal_cfg, dict) and terminal_cfg.get("cwd") and str(terminal_cfg.get("cwd")) != ".":
-            return str(terminal_cfg.get("cwd"))
+        configured_cwd = terminal_cfg.get("cwd") if isinstance(terminal_cfg, dict) else None
         launch_cfg = str(self.config.get("_launch_cwd") or "").strip() if isinstance(self.config, dict) else ""
-        if launch_cfg and not self._is_mclaw_runtime_path(launch_cfg):
-            return launch_cfg
+        terminal_cwd = None
         try:
             from mclaw.tools import terminal_tool
 
             sid = getattr(terminal_tool, "_current_session_id", None)
             env = getattr(terminal_tool, "_env_registry", {}).get(sid) if sid else None
-            cwd = getattr(env, "cwd", None)
-            if cwd and not self._is_mclaw_runtime_path(cwd):
-                return str(cwd)
+            terminal_cwd = getattr(env, "cwd", None)
         except Exception:
             pass
         launch_cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
-        if launch_cwd and not self._is_mclaw_runtime_path(launch_cwd):
-            return str(launch_cwd)
-        return launch_cwd
-
-    @staticmethod
-    def _is_mclaw_runtime_path(path_value) -> bool:
-        try:
-            from mclaw.runtime.manager import RuntimeManager
-
-            return RuntimeManager.current().paths.is_runtime_internal_path(path_value)
-        except Exception:
-            return False
+        for candidate in (recent, configured_cwd, launch_cfg, terminal_cwd, launch_cwd):
+            if candidate and str(candidate) != "." and not is_mclaw_runtime_path(candidate):
+                return str(candidate)
+        return ""
 
     def _resolve_checkpoint_ref(self, ref: str, checkpoints: list) -> str | None:
         try:
@@ -2679,14 +2621,6 @@ class InteractiveChat:
             return None
         except ValueError:
             return ref
-
-    @staticmethod
-    def _split_checkpoint_ref_and_rest(raw_args: str) -> tuple[str, str]:
-        parts = (raw_args or "").strip().split(maxsplit=1)
-        if not parts:
-            return "", ""
-        rest = parts[1].strip().strip("'\"") if len(parts) > 1 else ""
-        return parts[0].strip("'\""), rest
 
     def _rollback_cwd_from_options(self, options: dict) -> tuple[str, str | None]:
         if options.get("dir"):
@@ -3362,14 +3296,17 @@ class InteractiveChat:
         )
         self._app = app
 
-        from mclaw.cli.runtime.controller import get_runtime_controller
+        from mclaw.cli.runtime.workers import RuntimeWorkerSupervisor
 
-        controller = get_runtime_controller(self)
-        process_thread, anim_thread = controller.start_runtime_threads(
-            invalidate=lambda: getattr(app, "invalidate", lambda: None)(),
-            exit_ui=lambda: app.exit() if getattr(app, "is_running", False) else None,
-            is_ui_running=lambda: bool(getattr(app, "is_running", False)),
+        supervisor = RuntimeWorkerSupervisor(
+            self._runtime(),
+            self.build_runtime_worker_hooks(
+                invalidate=lambda: getattr(app, "invalidate", lambda: None)(),
+                exit_ui=lambda: app.exit() if getattr(app, "is_running", False) else None,
+                is_ui_running=lambda: bool(getattr(app, "is_running", False)),
+            ),
         )
+        process_thread, anim_thread = supervisor.start()
 
         set_current_session(self.session_id)
 
@@ -3380,7 +3317,7 @@ class InteractiveChat:
             pass
         finally:
             try:
-                controller.shutdown_runtime_threads(process_thread, anim_thread)
+                self._shutdown_runtime_threads(process_thread, anim_thread)
             finally:
                 self._release_session_lock()
 
