@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import subprocess
 import sys
 from dataclasses import FrozenInstanceError
@@ -375,6 +376,46 @@ def test_models_dev_lists_recently_released_models_first(monkeypatch: pytest.Mon
         "older",
         "undated",
     ]
+
+
+def test_models_dev_disk_cache_does_not_wait_for_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = {"cached": {"models": {}}}
+    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
+    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
+    monkeypatch.setattr(models_dev, "_load_disk_cache", lambda: registry)
+    monkeypatch.setattr(
+        models_dev.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("network should not be used when disk cache exists"),
+    )
+
+    assert models_dev.fetch_models_dev() == registry
+
+
+def test_models_dev_falls_back_to_official_npm_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    providers = {"fallback": {"models": {"model-a": {"id": "model-a"}}}}
+    payload = json.dumps(json.dumps({"providers": providers, "models": {}}))
+
+    class SnapshotResponse:
+        status_code = 200
+        text = f"const data = JSON.parse({payload})\nexport default data\n"
+
+    requested: list[str] = []
+
+    def get(url, **_kwargs):
+        requested.append(url)
+        if url == models_dev.MODELS_DEV_URL:
+            raise models_dev.requests.ConnectTimeout("blocked")
+        return SnapshotResponse()
+
+    monkeypatch.setattr(models_dev, "_models_dev_cache", {})
+    monkeypatch.setattr(models_dev, "_models_dev_cache_time", 0)
+    monkeypatch.setattr(models_dev, "_load_disk_cache", lambda: {})
+    monkeypatch.setattr(models_dev, "_save_disk_cache", lambda _data: None)
+    monkeypatch.setattr(models_dev.requests, "get", get)
+
+    assert models_dev.fetch_models_dev(force_refresh=True) == providers
+    assert requested == [models_dev.MODELS_DEV_URL, models_dev.MODELS_DEV_SNAPSHOT_URL]
 
 
 @pytest.mark.parametrize(

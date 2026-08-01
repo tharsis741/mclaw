@@ -26,6 +26,9 @@ from mclaw.providers.registry import PROVIDER_REGISTRY
 logger = logging.getLogger(__name__)
 
 MODELS_DEV_URL = "https://models.dev/api.json"
+MODELS_DEV_SNAPSHOT_URL = (
+    "https://cdn.jsdelivr.net/npm/@opencode-ai/models@latest/dist/snapshot.js"
+)
 _MODELS_DEV_CACHE_TTL = 3600  # one-hour in-memory cache
 
 # In-memory cache.
@@ -82,6 +85,42 @@ def _response_json_object(resp: requests.Response) -> dict[str, Any]:
     return data
 
 
+def _response_snapshot_object(resp: requests.Response) -> dict[str, Any]:
+    """Extract the provider registry from the official npm snapshot module."""
+    marker = "JSON.parse("
+    start = resp.text.find(marker)
+    if start < 0:
+        raise ValueError("models.dev npm snapshot is missing JSON.parse payload")
+    try:
+        encoded, _ = json.JSONDecoder().raw_decode(resp.text[start + len(marker):])
+        data = json.loads(encoded)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("models.dev npm snapshot contains invalid JSON") from exc
+    providers = data.get("providers") if isinstance(data, dict) else None
+    if not isinstance(providers, dict):
+        raise ValueError("models.dev npm snapshot is missing provider data")
+    return providers
+
+
+def _fetch_network_registry(timeout: int) -> dict[str, Any]:
+    """Fetch the registry from the API, then its official npm snapshot."""
+    errors: list[str] = []
+    connect_timeout = min(3, timeout)
+    for url, decoder in (
+        (MODELS_DEV_URL, _response_json_object),
+        (MODELS_DEV_SNAPSHOT_URL, _response_snapshot_object),
+    ):
+        try:
+            response = requests.get(url, timeout=(connect_timeout, timeout))
+            if response.status_code != 200:
+                errors.append(f"{url}: HTTP {response.status_code}")
+                continue
+            return decoder(response)
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"{url}: {exc}")
+    raise ValueError("; ".join(errors))
+
+
 def _get_cache_path() -> Path:
     """Return the user-scoped models.dev cache path."""
     return get_mclaw_home() / "models_dev_cache.json"
@@ -128,17 +167,17 @@ def fetch_models_dev(force_refresh: bool = False) -> dict[str, Any]:
         _models_dev_cache = disk
         _models_dev_cache_time = time.time()
         logger.debug("models.dev loaded from disk cache")
+        if not force_refresh:
+            return disk
 
     # Then try a short network fetch.
     try:
-        resp = requests.get(MODELS_DEV_URL, timeout=5)
-        if resp.status_code == 200:
-            data = _response_json_object(resp)
-            _models_dev_cache = data
-            _models_dev_cache_time = time.time()
-            _save_disk_cache(data)
-            logger.debug("models.dev fetched from network, cached")
-            return data
+        data = _fetch_network_registry(timeout=5)
+        _models_dev_cache = data
+        _models_dev_cache_time = time.time()
+        _save_disk_cache(data)
+        logger.debug("models.dev fetched from network, cached")
+        return data
     except (requests.RequestException, ValueError) as exc:
         logger.debug("models.dev network fetch failed: %s", exc)
 
@@ -155,15 +194,7 @@ def refresh_models_dev_cache(*, timeout: int = 10) -> dict[str, Any]:
 
     path = _get_cache_path()
     try:
-        resp = requests.get(MODELS_DEV_URL, timeout=timeout)
-        if resp.status_code != 200:
-            return {
-                "ok": False,
-                "error": f"HTTP {resp.status_code}",
-                "cache_path": str(path),
-                **_registry_stats(_models_dev_cache or _load_disk_cache()),
-            }
-        data = _response_json_object(resp)
+        data = _fetch_network_registry(timeout=timeout)
         _models_dev_cache = data
         _models_dev_cache_time = time.time()
         _save_disk_cache(data)
