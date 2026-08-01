@@ -583,7 +583,49 @@ def test_setup_web_extract_configures_multiple_selected_backends(monkeypatch) ->
         ("tool:web_extract", ["FIRECRAWL_API_KEY"]),
     ]
     assert config["auxiliary"]["web_extract"]["backend"] == "trafilatura"
+    assert config["auxiliary"]["web_extract"]["backends"] == [
+        "trafilatura",
+        "tavily",
+        "firecrawl",
+    ]
     assert any("已配置 Trafilatura、Tavily、Firecrawl" in line for line in output)
+
+
+def test_setup_web_extract_migrates_previous_backend_selection(monkeypatch) -> None:
+    from mclaw.cli import config as cli_config
+    from mclaw.cli import main as cli_main
+    from mclaw.runtime import secrets
+
+    menu: dict[str, object] = {}
+
+    def choose(_title, _items, **kwargs):
+        menu.update(kwargs)
+        return kwargs["default_selected"]
+
+    monkeypatch.setattr("mclaw.cli.tui.selection_prompt.prompt_multi_select", choose)
+    monkeypatch.setattr(cli_config, "get_env_value", lambda _name: "configured")
+    monkeypatch.setattr(
+        secrets,
+        "authorized_env_vars",
+        lambda scope: ["TAVILY_API_KEY", "FIRECRAWL_API_KEY"] if scope == "tool:web_extract" else [],
+    )
+    monkeypatch.setattr(secrets, "authorize", lambda *_args, **_kwargs: None)
+
+    config = {
+        "toolsets": ["mclaw-required", "web"],
+        "tools": {"disabled": []},
+        "auxiliary": {"web_extract": {"backend": "trafilatura"}},
+    }
+    assert cli_main._setup_configure_web_extract(
+        config,
+        print_plain=lambda *_args, **_kwargs: None,
+        color=lambda text, *_styles: text,
+        Colors=SimpleNamespace(DIM="", YELLOW=""),
+    )
+
+    expected = ["trafilatura", "tavily", "firecrawl"]
+    assert menu["default_selected"] == expected
+    assert config["auxiliary"]["web_extract"]["backends"] == expected
 
 
 def test_setup_web_search_does_not_skip_tavily_when_qwen_key_exists(monkeypatch) -> None:

@@ -1560,7 +1560,7 @@ def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) ->
     """Select and configure one or more extraction backends."""
     from mclaw.cli import config as cli_config
     from mclaw.cli.tui.selection_prompt import prompt_multi_select
-    from mclaw.runtime.secrets import authorize
+    from mclaw.runtime.secrets import authorize, authorized_env_vars
 
     extract_cfg = _ensure_web_extract_config(config)
     current = str(extract_cfg.get("backend") or "trafilatura").strip().lower()
@@ -1598,13 +1598,36 @@ def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) ->
         current = "trafilatura"
     next(item for item in backend_items if item["id"] == current)["category"] = "当前"
 
+    saved_backends = extract_cfg.get("backends")
+    if isinstance(saved_backends, list):
+        previously_selected = {str(item).strip().lower() for item in saved_backends}
+    else:
+        toolsets = {str(item) for item in config.get("toolsets", [])}
+        tools_cfg = config.get("tools", {})
+        disabled = {
+            str(item)
+            for item in (tools_cfg.get("disabled", []) if isinstance(tools_cfg, dict) else [])
+        }
+        previously_selected = set()
+        if "web" in toolsets and "web_extract" not in disabled:
+            previously_selected.add(current)
+            authorized = set(authorized_env_vars("tool:web_extract"))
+            previously_selected.update(
+                backend
+                for backend, (env_var, _label, _url) in backend_config.items()
+                if env_var in authorized
+            )
+
     selected = prompt_multi_select(
         "M-Claw 网页提取后端",
         backend_items,
         hint="可选择多个后端；之后可用 /extract-backend 切换当前后端。",
-        default_selected=[],
+        default_selected=[
+            item["id"] for item in backend_items if item["id"] in previously_selected
+        ],
     )
     if not selected:
+        extract_cfg["backends"] = []
         print_plain(color("  已跳过网页提取，不会启用。", Colors.DIM))
         return False
 
@@ -1649,6 +1672,7 @@ def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) ->
         configured.append(backend)
         print_plain(color(f"  网页提取: {backend_label} 凭据已保存。", Colors.DIM))
 
+    extract_cfg["backends"] = configured
     if not configured:
         print_plain(color("  网页提取没有可用后端，不会启用。", Colors.DIM))
         return False
@@ -1920,6 +1944,7 @@ def _run_setup_builtin_skill_selection() -> None:
         list_builtin_skills,
         sync_selected_skills,
     )
+    from mclaw.skills_hub.skill_store import list_skills as list_enabled_skills
 
     skills = list_builtin_skills()
     if not skills:
@@ -1935,8 +1960,27 @@ def _run_setup_builtin_skill_selection() -> None:
         )
         return
 
+    installed_builtins = {
+        (str(item.get("name") or ""), str(source.get("original") or ""))
+        for item in list_enabled_skills()
+        if isinstance(item, dict)
+        and isinstance((source := item.get("source")), dict)
+        and source.get("type") == "bundled"
+    }
+    default_selected = [
+        str(item.get("name") or "")
+        for item in skills
+        if (
+            str(item.get("name") or ""),
+            str(item.get("source_key") or ""),
+        ) in installed_builtins
+    ]
+
     try:
-        selected = prompt_builtin_skill_selection(skills)
+        selected = prompt_builtin_skill_selection(
+            skills,
+            default_selected=default_selected,
+        )
     except (EOFError, KeyboardInterrupt):
         print_plain()
         raise _SetupCancelled
@@ -2009,8 +2053,23 @@ def _select_setup_profile(provider_key: str, config: dict):
         None,
     )
     if previous_profile is None:
+        saved_profiles = config.get("setup_provider_profiles")
+        saved_profile_id = (
+            str(saved_profiles.get(provider_key) or "").strip()
+            if isinstance(saved_profiles, dict)
+            else ""
+        )
+        previous_profile = next(
+            (
+                profile
+                for profile in profiles
+                if profile.callable and profile.id == saved_profile_id
+            ),
+            None,
+        )
+    if previous_profile is None:
         fallback_entries = config.get("fallback_providers")
-        for entry in fallback_entries if isinstance(fallback_entries, list) else []:
+        for entry in reversed(fallback_entries) if isinstance(fallback_entries, list) else []:
             if not isinstance(entry, dict) or not str(entry.get("model") or "").strip():
                 continue
             runtime_provider = str(entry.get("provider") or "").strip()
@@ -2406,6 +2465,11 @@ def _setup_api_key_provider(
     config["model"] = model_name
     config["active_provider"] = runtime_provider
     config["active_provider_profile"] = ""
+    saved_profiles = config.setdefault("setup_provider_profiles", {})
+    if not isinstance(saved_profiles, dict):
+        saved_profiles = {}
+        config["setup_provider_profiles"] = saved_profiles
+    saved_profiles[provider_key] = profile.id
     save_config(config)
     print_plain(_setup_label("模型") + color(model_name, Colors.GREEN))
     print_plain()

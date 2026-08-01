@@ -118,7 +118,11 @@ def _multi_select_item_fragments(item: dict, *, checked: bool, current: bool) ->
     ]
 
 
-def prompt_builtin_skill_selection(skills: list[dict]) -> list[str]:
+def prompt_builtin_skill_selection(
+    skills: list[dict],
+    *,
+    default_selected: list[str] | None = None,
+) -> list[str]:
     """Let the user choose setup-time built-in Skills with keyboard navigation."""
     return prompt_multi_select(
         "M-Claw 内置技能",
@@ -135,6 +139,8 @@ def prompt_builtin_skill_selection(skills: list[dict]) -> list[str]:
             if str(item.get("name") or "").strip()
         ],
         hint="选择这次初始化要启用的内置技能。",
+        default_selected=default_selected,
+        allow_select_all=True,
     )
 
 
@@ -165,6 +171,7 @@ def prompt_multi_select(
     hint: str = "",
     default_selected: list[str] | None = None,
     max_visible_items: int = 20,
+    allow_select_all: bool = False,
     _single: bool = False,
 ) -> list[str]:
     """Run a compact keyboard-driven multi-select prompt and return selected ids."""
@@ -217,7 +224,11 @@ def prompt_multi_select(
                 "class:hint",
                 "↑/↓ 移动，Tab/Space 选择，Enter 确认，Esc 返回\n"
                 if _single
-                else "↑/↓ 移动，Tab/Space 勾选，Enter 确认，Esc 跳过\n",
+                else (
+                    "↑/↓ 移动，Tab/Space 勾选，Ctrl+A 全选/取消全选，Enter 确认，Esc 跳过\n"
+                    if allow_select_all
+                    else "↑/↓ 移动，Tab/Space 勾选，Enter 确认，Esc 跳过\n"
+                ),
             ),
         ])
         return result
@@ -248,6 +259,13 @@ def prompt_multi_select(
         else:
             selected["ids"].add(item_id)
         event.app.invalidate()
+
+    if allow_select_all:
+        @kb.add("c-a")
+        def _(event):
+            all_ids = {item["id"] for item in normalized}
+            selected["ids"] = set() if all_ids <= selected["ids"] else all_ids
+            event.app.invalidate()
 
     @kb.add("enter")
     def _(event):

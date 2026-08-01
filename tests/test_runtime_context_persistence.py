@@ -253,6 +253,7 @@ def test_setup_persists_canonical_runtime_provider_without_selector(
     assert result["profile"] == ""
     assert config["active_provider"] == runtime_provider
     assert config["active_provider_profile"] == ""
+    assert config["setup_provider_profiles"] == {selector: profile_id}
     assert saved_env == [(credential_env, "test-secret")]
     assert prompts == [f"  {runtime_profile.display_name} API 密钥: "]
     assert any(runtime_profile.display_name in line for line in output)

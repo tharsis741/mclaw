@@ -336,6 +336,23 @@ def test_setup_profile_stars_only_previous_selection(
     assert prompts == [f"  输入接口编号或名称 [{expected_profile}]: "]
 
 
+def test_setup_profile_migrates_latest_minimax_region(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mclaw.cli import main as cli_main
+
+    monkeypatch.setattr(cli_main, "print_plain", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli_main, "_setup_input", lambda *_args, **_kwargs: "")
+    config = {
+        "active_provider": "moonshot",
+        "model": "kimi-model",
+        "fallback_providers": [
+            {"provider": "minimax", "model": "intl-model"},
+            {"provider": "minimax-cn", "model": "cn-model"},
+        ],
+    }
+
+    assert cli_main._select_setup_profile("minimax", config).id == "api-cn"
+
+
 def test_models_dev_lists_recently_released_models_first(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = {
         "test-provider": {
@@ -424,6 +441,54 @@ def test_setup_single_select_scrolls_and_waits_for_enter() -> None:
         pipe.send_text("\x1b[B" * 21 + "\t\x1b[B\t\r")
         with create_app_session(input=pipe, output=DummyOutput()):
             assert prompt_single_select("Models", items, max_visible_items=20) == "model-22"
+
+
+def test_setup_skill_selection_ctrl_a_toggles_all() -> None:
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from mclaw.cli.tui.selection_prompt import prompt_builtin_skill_selection
+
+    skills = [
+        {"name": f"skill-{index}", "short_description": "", "category": ""}
+        for index in range(3)
+    ]
+    with create_pipe_input() as pipe:
+        pipe.send_text("\x01\r")
+        with create_app_session(input=pipe, output=DummyOutput()):
+            assert prompt_builtin_skill_selection(skills) == ["skill-0", "skill-1", "skill-2"]
+
+
+def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mclaw.cli import main as cli_main
+    from mclaw.cli.tui import console, selection_prompt
+    from mclaw.skills_hub import builtin_sync, skill_store
+
+    skills = [
+        {"name": "skill-a", "source_key": "group/skill-a"},
+        {"name": "skill-b", "source_key": "group/skill-b"},
+    ]
+    defaults: list[list[str]] = []
+    enabled: list[dict] = []
+
+    monkeypatch.setattr(builtin_sync, "list_builtin_skills", lambda: skills)
+    monkeypatch.setattr(skill_store, "list_skills", lambda: enabled)
+    monkeypatch.setattr(
+        selection_prompt,
+        "prompt_builtin_skill_selection",
+        lambda _skills, **kwargs: defaults.append(kwargs["default_selected"]) or [],
+    )
+    monkeypatch.setattr(console, "print_plain", lambda *_args, **_kwargs: None)
+
+    cli_main._run_setup_builtin_skill_selection()
+    enabled.append({
+        "name": "skill-a",
+        "source": {"type": "bundled", "original": "group/skill-a"},
+    })
+    cli_main._run_setup_builtin_skill_selection()
+
+    assert defaults == [[], ["skill-a"]]
 
 
 def test_provider_import_boundary_is_cli_and_sdk_independent() -> None:
