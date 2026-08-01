@@ -16,7 +16,7 @@ EVOLUTION_SECTIONS = (
     "known_failures",
     "runtime_notes",
 )
-SOURCE_TYPES = {"agent_created", "github", "clawhub", "local", "bundled"}
+SOURCE_TYPES = {"agent_created", "github", "skills_sh", "clawhub", "local", "bundled"}
 ACTORS = {"install", "main_agent", "background_review", "bundled"}
 SKILL_YAML_FIELDS = frozenset(
     {

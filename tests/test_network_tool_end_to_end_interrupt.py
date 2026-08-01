@@ -325,9 +325,9 @@ def test_web_extract_cancel_closes_backend_socket(backend, monkeypatch) -> None:
         _end_and_restart(agent, turn)
 
 
-def test_skill_search_cancel_closes_clawhub_socket(monkeypatch) -> None:
-    with _half_response(b'{"results":[{"slug":"PARTIAL') as server:
-        monkeypatch.setattr(skill_search_module, "CLAW_HUB_API_BASE", server.url)
+def test_skill_search_cancel_closes_skills_sh_socket(monkeypatch) -> None:
+    with _half_response(b'{"skills":[{"id":"PARTIAL') as server:
+        monkeypatch.setattr(skill_search_module, "SKILLS_SH_BASE_URL", server.url)
         agent = _agent("skill-search")
         cancel_event = threading.Event()
         turn = agent.begin_turn(cancel_event)

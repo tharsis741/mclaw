@@ -20,7 +20,7 @@ def search(
     cancel_event: threading.Event | None = None,
     parent_agent=None,
 ) -> list[ExternalSkill]:
-    """Search ClawHub for Skills."""
+    """Search skills.sh for external Skills."""
     return search_all(
         query,
         limit=limit,

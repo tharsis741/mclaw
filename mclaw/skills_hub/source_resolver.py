@@ -7,16 +7,18 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import shutil
 import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 import httpx
 
+from mclaw.agent.skill_utils import parse_frontmatter
 from mclaw.skills_hub.search import CLAW_HUB_API_BASE, ClawHubSearcher, ClawHubSearchError
 from mclaw.tools.cancellation import cancellation_checkpoint
 
@@ -32,6 +34,7 @@ class ResolvedSource:
     owner: str = ""
     repo: str = ""
     slug: str = ""
+    catalog_id: str = ""
     local_path: Path | None = None
 
 
@@ -101,7 +104,59 @@ def resolve_source(
             cancel_event=cancel_event,
             parent_agent=parent_agent,
         )
-    raise SourceResolutionError("Unsupported skill source. Use GitHub, ClawHub, or a local directory.")
+    if host in {"skills.sh", "www.skills.sh"}:
+        return _resolve_skills_sh(
+            value,
+            parsed,
+            cancel_event=cancel_event,
+            parent_agent=parent_agent,
+        )
+    raise SourceResolutionError(
+        "Unsupported skill source. Use skills.sh, GitHub, ClawHub, or a local directory."
+    )
+
+
+_GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_SKILL_SLUG_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$")
+
+
+def _resolve_skills_sh(
+    original: str,
+    parsed,
+    *,
+    cancel_event: threading.Event | None = None,
+    parent_agent=None,
+) -> ResolvedSource:
+    """Resolve a skills.sh catalog page to its public GitHub repository."""
+
+    cancellation_checkpoint(cancel_event)
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) != 3:
+        raise SourceResolutionError(
+            "skills.sh URL must be https://skills.sh/<owner>/<repo>/<skill>."
+        )
+    owner, repo, slug = parts
+    if not _GITHUB_OWNER_RE.fullmatch(owner):
+        raise SourceResolutionError("skills.sh URL contains an invalid GitHub owner.")
+    if repo in {".", ".."} or not _GITHUB_REPO_RE.fullmatch(repo):
+        raise SourceResolutionError("skills.sh URL contains an invalid GitHub repository.")
+    if slug in {".", ".."} or not _SKILL_SLUG_RE.fullmatch(slug):
+        raise SourceResolutionError("skills.sh URL contains an invalid Skill slug.")
+
+    cancellation_checkpoint(cancel_event)
+    return ResolvedSource(
+        type="skills_sh",
+        original=original,
+        # GitHub resolves HEAD to the repository's default branch.  This avoids
+        # consuming the unauthenticated GitHub API rate limit merely to learn a
+        # branch name, while keeping public installs credential-free.
+        fetch_url=f"https://github.com/{owner}/{repo}/archive/HEAD.zip",
+        owner=owner,
+        repo=repo,
+        slug=slug,
+        catalog_id=f"{owner}/{repo}/{slug}",
+    )
 
 
 def _resolve_clawhub(
@@ -111,16 +166,28 @@ def _resolve_clawhub(
     cancel_event: threading.Event | None = None,
     parent_agent=None,
 ) -> ResolvedSource:
-    """Resolve ClawHub URLs through the API so owner and slug are canonical."""
+    """Resolve legacy and current ClawHub URLs through owner-qualified APIs."""
     cancellation_checkpoint(cancel_event)
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) < 2:
-        raise SourceResolutionError("ClawHub URL must be https://clawhub.ai/<owner>/<slug>.")
-    owner_hint, slug_hint = parts[0], parts[1]
+    parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) == 2:
+        owner_hint, slug_hint = parts
+    elif len(parts) == 3 and parts[1].lower() == "skills":
+        owner_hint, slug_hint = parts[0], parts[2]
+    else:
+        raise SourceResolutionError(
+            "ClawHub URL must be https://clawhub.ai/<owner>/skills/<slug> "
+            "or the legacy https://clawhub.ai/<owner>/<slug> form."
+        )
+    if any(
+        not value or value in {".", ".."} or "/" in value or "\\" in value
+        for value in (owner_hint, slug_hint)
+    ):
+        raise SourceResolutionError("ClawHub URL contains an invalid owner or Skill slug.")
 
     try:
         detail = ClawHubSearcher().get_skill_detail(
             slug_hint,
+            owner_handle=owner_hint,
             raise_on_error=True,
             cancel_event=cancel_event,
             parent_agent=parent_agent,
@@ -145,7 +212,10 @@ def _resolve_clawhub(
             f"ClawHub URL owner mismatch: URL owner '{owner_hint}' does not match API owner '{owner}'."
         )
 
-    fetch_url = f"{CLAW_HUB_API_BASE}/download?slug={quote(slug)}"
+    fetch_url = (
+        f"{CLAW_HUB_API_BASE}/download?slug={quote(slug)}"
+        f"&ownerHandle={quote(owner or owner_hint)}"
+    )
     cancellation_checkpoint(cancel_event)
     return ResolvedSource(
         type="clawhub",
@@ -257,11 +327,18 @@ def materialize_source(
             with zipfile.ZipFile(archive_path) as zf:
                 _safe_extract_archive(zf, tmp, cancel_event=cancel_event)
             cancellation_checkpoint(cancel_event)
-            package = _find_archive_package_root(
-                tmp,
-                resolved.package_root,
-                cancel_event=cancel_event,
-            )
+            if resolved.type == "skills_sh":
+                package = _find_skill_package_root(
+                    tmp,
+                    resolved.slug,
+                    cancel_event=cancel_event,
+                )
+            else:
+                package = _find_archive_package_root(
+                    tmp,
+                    resolved.package_root,
+                    cancel_event=cancel_event,
+                )
             cancellation_checkpoint(cancel_event)
             _copy_dir_contents(package, target_dir, cancel_event=cancel_event)
             cancellation_checkpoint(cancel_event)
@@ -307,6 +384,71 @@ def _find_archive_package_root(
     raise SourceResolutionError("Downloaded archive contains multiple package directories; provide a package root.")
 
 
+def _normalize_skill_selector(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[\s_]+", "-", text)
+    return re.sub(r"-+", "-", text).strip("-")
+
+
+def _skill_frontmatter_name(skill_md: Path) -> str:
+    """Read only the YAML frontmatter name needed for package selection."""
+
+    try:
+        text = skill_md.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    frontmatter, _ = parse_frontmatter(text)
+    return str(frontmatter.get("name") or "").strip()
+
+
+def _find_skill_package_root(
+    extracted_root: Path,
+    skill_slug: str,
+    *,
+    cancel_event: threading.Event | None = None,
+) -> Path:
+    """Find one unambiguous SKILL.md package selected by a skills.sh slug."""
+
+    cancellation_checkpoint(cancel_event)
+    selector = _normalize_skill_selector(skill_slug)
+    if not selector:
+        raise SourceResolutionError("skills.sh Skill slug is missing.")
+
+    name_matches: list[Path] = []
+    directory_matches: list[Path] = []
+    for skill_md in sorted(extracted_root.rglob("SKILL.md")):
+        cancellation_checkpoint(cancel_event)
+        if not skill_md.is_file():
+            continue
+        package = skill_md.parent
+        frontmatter_name = _normalize_skill_selector(_skill_frontmatter_name(skill_md))
+        directory_name = _normalize_skill_selector(package.name)
+        if frontmatter_name == selector:
+            name_matches.append(package)
+        elif directory_name == selector:
+            directory_matches.append(package)
+
+    matches = name_matches or directory_matches
+    unique_matches = list(dict.fromkeys(path.resolve() for path in matches))
+    cancellation_checkpoint(cancel_event)
+    if not unique_matches:
+        raise SourceResolutionError(
+            f"Skill '{skill_slug}' was not found in the skills.sh source repository."
+        )
+    if len(unique_matches) > 1:
+        relative = []
+        root = extracted_root.resolve()
+        for path in unique_matches[:5]:
+            try:
+                relative.append(path.relative_to(root).as_posix())
+            except ValueError:
+                relative.append(path.as_posix())
+        raise SourceResolutionError(
+            f"Skill '{skill_slug}' is ambiguous in the source repository: {', '.join(relative)}"
+        )
+    return unique_matches[0]
+
+
 async def _download_archive_async(
     url: str,
     path: Path,
@@ -316,7 +458,7 @@ async def _download_archive_async(
 ) -> Path:
     completed = False
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             async with asyncio.timeout(max(0.001, timeout)):
                 async with client.stream("GET", url) as response:
                     if not response.is_success:

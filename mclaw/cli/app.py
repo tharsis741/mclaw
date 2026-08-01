@@ -2011,7 +2011,7 @@ class InteractiveChat:
             if not rest:
                 self._get_commands_renderer().render_notice(
                     "M-Claw Skill",
-                    "Usage: /skill install <github-url|clawhub-url|local-path>",
+                    "Usage: /skill install <skills.sh-url|github-url|clawhub-url|local-path>",
                     kind="warning",
                 )
                 return True

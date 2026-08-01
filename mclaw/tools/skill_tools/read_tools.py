@@ -33,7 +33,7 @@ def _normalize_skill_key(value: str) -> str:
 
 
 def _infer_search_intent(query: str, results: list[ExternalSkill]) -> str:
-    """Classify whether a ClawHub query names a Skill or describes a capability."""
+    """Classify whether a catalog query names a Skill or describes a capability."""
     key = _normalize_skill_key(query)
     if not key:
         return "capability"
@@ -50,9 +50,11 @@ def _serialize_external_skill(skill: ExternalSkill) -> dict[str, Any]:
     """Convert external search results into the tool display contract."""
     description = str(skill.description or "").strip()
     description_zh = description if _contains_cjk(description) else ""
-    source_ref = str(skill.url or "").strip()
+    source_ref = str(skill.install_source or skill.url or "").strip()
+    if not source_ref and skill.source == "skills_sh" and skill.catalog_id:
+        source_ref = f"https://skills.sh/{skill.catalog_id.strip('/')}"
     if not source_ref and skill.source == "clawhub" and skill.author and skill.slug:
-        source_ref = f"https://clawhub.ai/{skill.author}/{skill.slug}"
+        source_ref = f"https://clawhub.ai/{skill.author}/skills/{skill.slug}"
     if not source_ref:
         source_ref = skill.slug
     return {
@@ -60,11 +62,14 @@ def _serialize_external_skill(skill: ExternalSkill) -> dict[str, Any]:
         "slug": skill.slug,
         "description": description,
         "description_zh": description_zh,
-        "description_needs_translation": not bool(description_zh),
+        "description_needs_translation": bool(description) and not bool(description_zh),
         "source": skill.source,
+        "catalog_id": skill.catalog_id,
+        "repository": skill.repository,
         "url": skill.url,
         "downloads": skill.downloads,
         "stars": skill.stars,
+        "installs": skill.installs,
         "platforms": skill.platforms,
         "install_command": (
             f"skill_manage(action='install_prepare', source='{source_ref}')"
@@ -132,7 +137,7 @@ def skill_search(
     *,
     parent_agent=None,
 ) -> str:
-    """Search ClawHub and return install suggestions that still require consent."""
+    """Search skills.sh and return install suggestions that still require consent."""
     cancel_event = get_interrupt_event()
     try:
         cancellation_checkpoint(cancel_event)
@@ -245,7 +250,7 @@ SKILL_SEARCH_SCHEMA = {
     "type": "function",
     "function": {
         "name": "skill_search",
-        "description": "Search ClawHub for external skills. This does not search the general web.",
+        "description": "Search skills.sh for external skills. This does not search the general web.",
         "parameters": {
             "type": "object",
             "properties": {"query": {"type": "string"}},
@@ -297,6 +302,6 @@ registry.register(
         task_id=kw.get("task_id"),
         parent_agent=kw.get("parent_agent"),
     ),
-    description="Search ClawHub Skills",
+    description="Search skills.sh Skills",
     emoji="🔎",
 )

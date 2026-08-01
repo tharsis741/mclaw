@@ -307,7 +307,7 @@ def build_skills_system_prompt(
     if has_skill_manage:
         tool_lines.extend(
             [
-                "- skill_manage(install_prepare: source, user_intent)：准备安装 GitHub、ClawHub 或本地目录 Skill，并返回 dependency_hints；不收集密钥。",
+                "- skill_manage(install_prepare: source, user_intent)：准备安装 skills.sh、GitHub、ClawHub 或本地目录 Skill，并返回 dependency_hints；不收集密钥。",
                 "- skill_manage(security_review: drafting_id)：重新审查 drafting Skill；正常 /skill install 流程不要单独调用。",
                 "- skill_manage(enable_drafting/cancel_drafting: drafting_id)：只用于 runtime confirmation flow，不要在普通对话中主动调用。",
                 "- skill_manage(create_scaffold: name, short_description, user_intent)：用中文 short_description 初始化最小 enabled Skill 壳，后续必须用 edit/write_file/validate 完成。",

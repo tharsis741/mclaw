@@ -2,13 +2,19 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""ClawHub-backed search layer for external Skills."""
+"""External Skill catalog adapters.
+
+skills.sh is the default discovery provider.  The ClawHub adapter remains in
+this module because existing ClawHub URLs still use its detail endpoint during
+manual installation.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import threading
 from typing import List
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +23,7 @@ from mclaw.tools.cancellation import cancellation_checkpoint
 
 logger = logging.getLogger(__name__)
 
+SKILLS_SH_BASE_URL = "https://skills.sh"
 CLAW_HUB_API_BASE = "https://clawhub.ai/api/v1"
 CLAW_HUB_DETAIL_STATS_LIMIT = 3
 
@@ -33,17 +40,23 @@ async def _get_json_async(
             response.raise_for_status()
             data = response.json()
     if not isinstance(data, dict):
-        raise ValueError("ClawHub returned a non-object response.")
+        raise ValueError("Skill catalog returned a non-object response.")
     return data
 
 
-def _run_request(coro, *, parent_agent, timeout: float = 10.0):
+def _run_request(
+    coro,
+    *,
+    parent_agent,
+    diagnostic_name: str,
+    timeout: float = 10.0,
+):
     from mclaw.tools.dispatch import _run_async
 
     return _run_async(
         coro,
         parent_agent=parent_agent,
-        diagnostic_name="clawhub_http",
+        diagnostic_name=diagnostic_name,
         timeout_seconds=timeout,
         raise_on_stop=True,
     )
@@ -83,6 +96,104 @@ def _extract_stats(item: dict) -> tuple[int, int]:
     return _as_int(downloads), _as_int(stars)
 
 
+def _skills_sh_catalog_parts(item: dict) -> tuple[str, str, str]:
+    """Return (catalog_id, repository, skill_slug) for a GitHub-backed result."""
+
+    catalog_id = str(item.get("id") or "").strip().strip("/")
+    repository = str(item.get("source") or "").strip().strip("/")
+    skill_slug = str(item.get("skillId") or "").strip()
+    if not repository and catalog_id.count("/") >= 2:
+        repository = "/".join(catalog_id.split("/")[:2])
+    if not skill_slug and catalog_id:
+        skill_slug = catalog_id.rsplit("/", 1)[-1]
+    if not skill_slug:
+        skill_slug = str(item.get("name") or "").strip()
+    if not catalog_id and repository and skill_slug:
+        catalog_id = f"{repository}/{skill_slug}"
+    return catalog_id, repository, skill_slug
+
+
+def _skills_sh_url(catalog_id: str) -> str:
+    parts = [quote(part, safe="") for part in catalog_id.split("/") if part]
+    return f"{SKILLS_SH_BASE_URL}/{'/'.join(parts)}" if parts else ""
+
+
+class SkillsShSearcher:
+    """Adapter for the unauthenticated search endpoint used by skills.sh CLI."""
+
+    def search(
+        self,
+        query: str,
+        limit: int = 10,
+        *,
+        cancel_event: threading.Event | None = None,
+        parent_agent=None,
+    ) -> List[ExternalSkill]:
+        """Search skills.sh and return installable GitHub-backed records."""
+
+        cancellation_checkpoint(cancel_event)
+        query = str(query or "").strip()
+        if not query:
+            return []
+        bounded_limit = max(1, min(_as_int(limit, 10), 50))
+        try:
+            data = _run_request(
+                _get_json_async(
+                    f"{SKILLS_SH_BASE_URL}/api/search",
+                    params={"q": query, "limit": str(bounded_limit)},
+                    timeout=10.0,
+                ),
+                parent_agent=parent_agent,
+                diagnostic_name="skills_sh_http",
+            )
+            cancellation_checkpoint(cancel_event)
+        except (httpx.HTTPError, TimeoutError, ValueError):
+            cancellation_checkpoint(cancel_event)
+            logger.debug("skills.sh search failed", exc_info=True)
+            return []
+
+        items = data.get("skills", []) if isinstance(data, dict) else []
+        if not isinstance(items, list):
+            return []
+
+        results: List[ExternalSkill] = []
+        for item in items:
+            cancellation_checkpoint(cancel_event)
+            if not isinstance(item, dict):
+                continue
+            catalog_id, repository, skill_slug = _skills_sh_catalog_parts(item)
+            repo_parts = [part for part in repository.split("/") if part]
+            # The no-key install path downloads a public GitHub repository.  A
+            # well-known/non-GitHub source cannot be materialized by that path.
+            if len(repo_parts) != 2 or not catalog_id or not skill_slug:
+                continue
+            # Build the canonical ID from the independently returned source and
+            # selector so an inconsistent upstream id cannot redirect install.
+            catalog_id = f"{repository}/{skill_slug}"
+            url = _skills_sh_url(catalog_id)
+            installs = _as_int(item.get("installs"))
+            results.append(
+                ExternalSkill(
+                    source="skills_sh",
+                    name=str(item.get("name") or skill_slug).strip(),
+                    description=str(item.get("description") or "").strip(),
+                    slug=skill_slug,
+                    url=url,
+                    author=repo_parts[0],
+                    installs=installs,
+                    catalog_id=catalog_id,
+                    repository=repository,
+                    install_source=url,
+                    platforms=None,
+                    frontmatter={},
+                )
+            )
+            if len(results) >= bounded_limit:
+                break
+        cancellation_checkpoint(cancel_event)
+        return results
+
+
 class ClawHubSearcher:
     """Small adapter around ClawHub search and detail endpoints."""
 
@@ -90,6 +201,7 @@ class ClawHubSearcher:
         self,
         slug: str,
         *,
+        owner_handle: str = "",
         raise_on_error: bool = False,
         cancel_event: threading.Event | None = None,
         parent_agent=None,
@@ -102,10 +214,12 @@ class ClawHubSearcher:
         try:
             data = _run_request(
                 _get_json_async(
-                f"{CLAW_HUB_API_BASE}/skills/{slug}",
-                timeout=10.0,
+                    f"{CLAW_HUB_API_BASE}/skills/{slug}",
+                    params={"owner": owner_handle} if owner_handle else None,
+                    timeout=10.0,
                 ),
                 parent_agent=parent_agent,
+                diagnostic_name="clawhub_http",
             )
             cancellation_checkpoint(cancel_event)
             return data
@@ -135,6 +249,7 @@ class ClawHubSearcher:
                     timeout=10.0,
                 ),
                 parent_agent=parent_agent,
+                diagnostic_name="clawhub_http",
             )
             cancellation_checkpoint(cancel_event)
         except (httpx.HTTPError, TimeoutError, ValueError):
@@ -165,6 +280,7 @@ class ClawHubSearcher:
                 # detail calls to keep interactive search latency bounded.
                 detail = self.get_skill_detail(
                     slug,
+                    owner_handle=owner_handle,
                     cancel_event=cancel_event,
                     parent_agent=parent_agent,
                 )
@@ -176,7 +292,15 @@ class ClawHubSearcher:
                 owner_detail = detail.get("owner") if isinstance(detail, dict) else {}
                 if not owner_handle and isinstance(owner_detail, dict):
                     owner_handle = str(owner_detail.get("handle") or "").strip()
-            url = f"https://clawhub.ai/{owner_handle}/{slug}" if owner_handle and slug else ""
+            canonical_path = str(item.get("canonicalUrl") or "").strip()
+            if canonical_path.startswith("/"):
+                url = f"https://clawhub.ai{canonical_path}"
+            else:
+                url = (
+                    f"https://clawhub.ai/{owner_handle}/skills/{slug}"
+                    if owner_handle and slug
+                    else ""
+                )
             results.append(
                 ExternalSkill(
                     source="clawhub",
@@ -204,7 +328,7 @@ def search_all(
 ) -> List[ExternalSkill]:
     """Convenience entry point used by tools and slash commands."""
 
-    return ClawHubSearcher().search(
+    return SkillsShSearcher().search(
         query,
         limit=limit,
         cancel_event=cancel_event,
