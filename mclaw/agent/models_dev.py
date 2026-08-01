@@ -131,7 +131,7 @@ def fetch_models_dev(force_refresh: bool = False) -> dict[str, Any]:
 
     # Then try a short network fetch.
     try:
-        resp = requests.get(MODELS_DEV_URL, timeout=3)
+        resp = requests.get(MODELS_DEV_URL, timeout=5)
         if resp.status_code == 200:
             data = _response_json_object(resp)
             _models_dev_cache = data
@@ -227,7 +227,7 @@ def resolve_models_dev_provider(provider: str, profile_id: str = "") -> str:
     return profile.models_dev_provider
 
 
-def list_models_dev_provider(provider_id: str, *, limit: int = 20) -> list[str]:
+def list_models_dev_provider(provider_id: str, *, limit: int | None = 20) -> list[str]:
     """Return model IDs for one raw models.dev provider ID."""
     registry = fetch_models_dev()
     providers_data = _providers_data(registry)
@@ -237,7 +237,11 @@ def list_models_dev_provider(provider_id: str, *, limit: int = 20) -> list[str]:
 
     models: list[str] = []
     seen = set()
-    for m in _iter_models(provider_data):
+    for m in sorted(
+        _iter_models(provider_data),
+        key=lambda item: str(item.get("release_date") or ""),
+        reverse=True,
+    ):
         model_id = str(m.get("id") or "").strip()
         if not model_id:
             continue
@@ -246,12 +250,12 @@ def list_models_dev_provider(provider_id: str, *, limit: int = 20) -> list[str]:
             continue
         seen.add(key)
         models.append(model_id)
-        if len(models) >= limit:
+        if limit is not None and len(models) >= limit:
             break
     return models
 
 
-def list_provider_models(provider: str, *, limit: int = 20, profile_id: str = "") -> list[str]:
+def list_provider_models(provider: str, *, limit: int | None = 20, profile_id: str = "") -> list[str]:
     """Return model IDs for one provider from the current models.dev registry.
 
     ``provider`` may be an M-Claw provider key or a raw models.dev provider ID.

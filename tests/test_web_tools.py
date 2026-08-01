@@ -532,7 +532,7 @@ def test_setup_reuses_tavily_key_from_extract_for_search(monkeypatch) -> None:
     ]
     extract_items = menus[0][1]
     assert [item["id"] for item in extract_items] == ["trafilatura", "tavily", "firecrawl"]
-    assert menus[0][2]["default_selected"] == ["trafilatura", "tavily", "firecrawl"]
+    assert menus[0][2]["default_selected"] == []
     assert [item["description"] for item in extract_items] == [
         "无需 API Key",
         "需要 TAVILY_API_KEY",

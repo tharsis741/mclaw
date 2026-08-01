@@ -11,7 +11,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from mclaw.agent import context_metadata
+from mclaw.agent import context_metadata, models_dev
 from mclaw.agent.models_dev import resolve_models_dev_provider
 from mclaw.cli import auth, provider_profiles
 from mclaw.cli.config import DEFAULT_CONFIG
@@ -278,6 +278,152 @@ def test_models_dev_mapping_reads_runtime_registry_directly() -> None:
     assert resolve_models_dev_provider("qwen", "api-cn") == "alibaba-cn"
     assert resolve_models_dev_provider("moonshot") == "moonshotai-cn"
     assert resolve_models_dev_provider("unknown") == "unknown"
+
+
+@pytest.mark.parametrize(
+    ("config", "expected_profile", "starred_profile"),
+    [
+        ({}, "api", ""),
+        (
+            {
+                "active_provider": "qwen-intl",
+                "model": "qwen-current",
+                "fallback_providers": [{"provider": "qwen", "model": "qwen-cn"}],
+            },
+            "api",
+            "api",
+        ),
+        ({"active_provider": "qwen", "model": "qwen-cn"}, "api-cn", "api-cn"),
+        (
+            {
+                "active_provider": "openai",
+                "model": "gpt-current",
+                "fallback_providers": [{"provider": "qwen", "model": "qwen-cn"}],
+            },
+            "api-cn",
+            "api-cn",
+        ),
+    ],
+)
+def test_setup_profile_stars_only_previous_selection(
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict,
+    expected_profile: str,
+    starred_profile: str,
+) -> None:
+    from mclaw.cli import colors
+    from mclaw.cli import main as cli_main
+
+    output: list[str] = []
+    prompts: list[str] = []
+    monkeypatch.setattr(colors, "color", lambda text, *_styles: str(text))
+    monkeypatch.setattr(cli_main, "print_plain", lambda line="": output.append(str(line)))
+    monkeypatch.setattr(
+        cli_main,
+        "_setup_input",
+        lambda prompt, **_kwargs: prompts.append(prompt) or "",
+    )
+
+    selected = cli_main._select_setup_profile("qwen", config)
+
+    assert selected.id == expected_profile
+    starred_lines = [line for line in output if " *" in line]
+    if starred_profile:
+        assert len(starred_lines) == 1
+        assert f"({starred_profile})" in starred_lines[0]
+    else:
+        assert starred_lines == []
+    assert prompts == [f"  输入接口编号或名称 [{expected_profile}]: "]
+
+
+def test_models_dev_lists_recently_released_models_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = {
+        "test-provider": {
+            "models": {
+                "older": {
+                    "id": "older",
+                    "release_date": "2025-01-01",
+                    "last_updated": "2026-08-01",
+                },
+                "undated": {"id": "undated"},
+                "newest": {"id": "newest", "release_date": "2026-07-30"},
+            }
+        }
+    }
+    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda: registry)
+
+    assert models_dev.list_models_dev_provider("test-provider", limit=2) == ["newest", "older"]
+    assert models_dev.list_models_dev_provider("test-provider", limit=None) == [
+        "newest",
+        "older",
+        "undated",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("config", "profile_id", "expected"),
+    [
+        ({}, "api-cn", "qwen3.7-plus"),
+        ({"active_provider": "qwen", "model": "older"}, "api-cn", "older"),
+        ({"active_provider": "qwen-intl", "model": "older"}, "api", "older"),
+    ],
+)
+def test_setup_model_pins_current_or_recommended_first(
+    monkeypatch: pytest.MonkeyPatch,
+    config: dict,
+    profile_id: str,
+    expected: str,
+) -> None:
+    from mclaw.cli import main as cli_main
+    from mclaw.cli.tui import selection_prompt
+
+    candidates = ["newest", "qwen3.7-plus", "older", *(f"model-{index}" for index in range(22))]
+    menu: dict[str, object] = {}
+
+    def list_models(*_args, **kwargs):
+        assert kwargs["limit"] is None
+        return candidates
+
+    def choose(title, items, **kwargs):
+        menu.update(title=title, items=items, kwargs=kwargs)
+        return items[0]["id"]
+
+    monkeypatch.setattr(models_dev, "list_provider_models", list_models)
+    monkeypatch.setattr(selection_prompt, "prompt_single_select", choose)
+
+    assert cli_main._select_setup_model("qwen", config, profile_id) == expected
+    assert menu["title"] == "M-Claw 模型选择"
+    assert menu["items"][0]["id"] == expected
+    assert {item["id"] for item in menu["items"][:-1]} == set(candidates)
+    assert menu["items"][-1]["label"] == "其他模型名称"
+    assert menu["kwargs"]["default_selected"] == expected
+    assert menu["kwargs"]["max_visible_items"] == 20
+
+
+def test_setup_multi_select_uses_checkmark_for_selected_item() -> None:
+    from mclaw.cli.tui.selection_prompt import _multi_select_item_fragments
+
+    fragments = _multi_select_item_fragments(
+        {"label": "Item", "category": "", "description": ""},
+        checked=True,
+        current=False,
+    )
+
+    assert "[✓]" in "".join(text for _style, text in fragments)
+
+
+def test_setup_single_select_scrolls_and_waits_for_enter() -> None:
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from mclaw.cli.tui.selection_prompt import prompt_single_select
+
+    items = [{"id": f"model-{index}", "label": f"model-{index}"} for index in range(30)]
+    with create_pipe_input() as pipe:
+        pipe.send_text("\x1b[B" * 21 + "\t\x1b[B\t\r")
+        with create_app_session(input=pipe, output=DummyOutput()):
+            assert prompt_single_select("Models", items, max_visible_items=20) == "model-22"
 
 
 def test_provider_import_boundary_is_cli_and_sdk_independent() -> None:
@@ -725,7 +871,11 @@ def test_setup_selects_multiple_providers_before_configuring_each_model(monkeypa
     monkeypatch.setattr(selection_prompt, "prompt_multi_select", choose)
     monkeypatch.setattr(cli_main, "_print_setup_intro", lambda: False)
     monkeypatch.setattr(cli_main, "_print_setup_step", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(cli_main, "_select_setup_profile", lambda _provider: type("Profile", (), {"id": "api"})())
+    monkeypatch.setattr(
+        cli_main,
+        "_select_setup_profile",
+        lambda _provider, _config: type("Profile", (), {"id": "api"})(),
+    )
     monkeypatch.setattr(cli_main, "_setup_api_key_provider", configure)
     monkeypatch.setattr(cli_main, "_setup_input", setup_input)
     monkeypatch.setattr(cli_main, "_run_setup_capability_selection", lambda _config: None)

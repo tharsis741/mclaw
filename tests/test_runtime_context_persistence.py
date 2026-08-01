@@ -11,6 +11,7 @@ from mclaw.agent.token_budget import TokenBudgetEstimate
 from mclaw.agent.transports.base import ModelCallOptions, ReasoningTrace
 from mclaw.agent.usage import UsageRecord
 from mclaw.providers.base import RuntimeProviderProfile
+from mclaw.providers.registry import PROVIDER_REGISTRY
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
 
@@ -230,26 +231,29 @@ def test_setup_persists_canonical_runtime_provider_without_selector(
     from mclaw.cli import config as cli_config
 
     saved_env: list[tuple[str, str]] = []
+    prompts: list[str] = []
+    output: list[str] = []
     monkeypatch.setattr(cli_config, "get_env_value", lambda _name: "")
     monkeypatch.setattr(cli_config, "save_env_value", lambda name, value: saved_env.append((name, value)))
     monkeypatch.setattr(cli_config, "save_config", lambda _config: None)
-    monkeypatch.setattr(main, "_setup_secret", lambda _prompt: "test-secret")
+    monkeypatch.setattr(main, "_setup_secret", lambda prompt: prompts.append(prompt) or "test-secret")
     monkeypatch.setattr(main, "_select_setup_model", lambda *_args, **_kwargs: "test-model")
-    monkeypatch.setattr(main, "print_plain", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main, "print_plain", lambda text="", **_kwargs: output.append(str(text)))
 
     config: dict[str, object] = {"active_provider_profile": "stale-selector"}
     result = main._setup_api_key_provider(
         config,
         selector,
-        "WRONG_PARENT_ENV",
-        selector,
-        "https://example.invalid/keys",
         profile_id=profile_id,
     )
 
+    runtime_profile = PROVIDER_REGISTRY[runtime_provider]
     assert result is not None
     assert result["provider"] == runtime_provider
     assert result["profile"] == ""
     assert config["active_provider"] == runtime_provider
     assert config["active_provider_profile"] == ""
     assert saved_env == [(credential_env, "test-secret")]
+    assert prompts == [f"  {runtime_profile.display_name} API 密钥: "]
+    assert any(runtime_profile.display_name in line for line in output)
+    assert any(runtime_profile.key_url in line for line in output)

@@ -1216,16 +1216,12 @@ def _run_setup_impl(args):
                 continue
 
         if result is None:
-            pcfg = PROVIDER_REGISTRY[provider_key]
-            profile = _select_setup_profile(provider_key)
+            profile = _select_setup_profile(provider_key, config)
             if profile is None:
                 continue
             result = _setup_api_key_provider(
                 config,
                 provider_key,
-                pcfg.api_key_env_vars[0],
-                pcfg.display_name,
-                pcfg.key_url,
                 profile_id=profile.id,
             )
 
@@ -1605,8 +1601,8 @@ def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) ->
     selected = prompt_multi_select(
         "M-Claw 网页提取后端",
         backend_items,
-        hint="可选择多个后端；当前后端会继续使用，之后可用 /extract-backend 切换。",
-        default_selected=[item["id"] for item in backend_items],
+        hint="可选择多个后端；之后可用 /extract-backend 切换当前后端。",
+        default_selected=[],
     )
     if not selected:
         print_plain(color("  已跳过网页提取，不会启用。", Colors.DIM))
@@ -1992,7 +1988,7 @@ def _setup_configured_model(config: dict, provider_key: str) -> str:
     return ""
 
 
-def _select_setup_profile(provider_key: str):
+def _select_setup_profile(provider_key: str, config: dict):
     """Select a callable provider profile for setup."""
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.provider_profiles import find_provider_profile, get_default_provider_profile, get_provider_profiles
@@ -2001,10 +1997,38 @@ def _select_setup_profile(provider_key: str):
     if len(profiles) <= 1:
         return profiles[0]
 
-    default_profile = get_default_provider_profile(provider_key)
+    active_provider = str(config.get("active_provider") or "").strip()
+    previous_profile = next(
+        (
+            profile
+            for profile in profiles
+            if profile.callable
+            and profile.runtime_provider == active_provider
+            and _setup_configured_model(config, active_provider)
+        ),
+        None,
+    )
+    if previous_profile is None:
+        fallback_entries = config.get("fallback_providers")
+        for entry in fallback_entries if isinstance(fallback_entries, list) else []:
+            if not isinstance(entry, dict) or not str(entry.get("model") or "").strip():
+                continue
+            runtime_provider = str(entry.get("provider") or "").strip()
+            previous_profile = next(
+                (
+                    profile
+                    for profile in profiles
+                    if profile.callable and profile.runtime_provider == runtime_provider
+                ),
+                None,
+            )
+            if previous_profile is not None:
+                break
+
+    default_profile = previous_profile or get_default_provider_profile(provider_key)
     print_plain(color("\n  选择接口类型", Colors.BOLD, Colors.BLUE))
     for idx, profile in enumerate(profiles, 1):
-        marker = color(" *", Colors.BOLD, Colors.CYAN) if profile.id == default_profile.id else ""
+        marker = color(" *", Colors.BOLD, Colors.CYAN) if profile == previous_profile else ""
         status_color = Colors.GREEN if profile.callable else Colors.YELLOW
         status = color(profile.status_label, status_color)
         print_plain(
@@ -2055,43 +2079,54 @@ def _select_setup_model(
     """Select a model for setup from models.dev/cache, with manual fallback."""
     from mclaw.agent import models_dev
     from mclaw.cli.auth import DEFAULT_PROVIDER_MODELS
-    from mclaw.cli.colors import Colors, color
     from mclaw.cli.provider_profiles import get_provider_profile
+    from mclaw.cli.tui.selection_prompt import prompt_single_select
 
-    fallback_model = _setup_configured_model(config, provider_key)
     profile = get_provider_profile(provider_key, profile_id)
-    models = models_dev.list_provider_models(provider_key, limit=20, profile_id=profile.id)
+    runtime_provider = profile.runtime_provider or provider_key
+    current_model = _setup_configured_model(config, runtime_provider)
+    recommended_models = DEFAULT_PROVIDER_MODELS.get(runtime_provider, [])
+    models = models_dev.list_provider_models(provider_key, limit=None, profile_id=profile.id)
     source = f"models.dev 模型库 / {profile.models_dev_provider}"
     if not models:
-        models = DEFAULT_PROVIDER_MODELS.get(provider_key, [])[:20]
+        models = recommended_models[:20]
         source = "本地默认候选"
 
-    if fallback_model and fallback_model not in models:
-        models = [fallback_model, *models]
-    models = list(dict.fromkeys(models))[:20]
+    recommended_model = recommended_models[0] if recommended_models else ""
+    preferred_model = current_model or recommended_model
+    if preferred_model:
+        preferred_key = preferred_model.casefold()
+        models = [preferred_model, *(model for model in models if model.casefold() != preferred_key)]
+    models = list(dict.fromkeys(models))
 
     if models:
-        print_plain(color("  可选模型", Colors.BOLD, Colors.BLUE) + color(f"  来自 {source}", Colors.DIM))
-        for idx, model in enumerate(models, 1):
-            marker = color(" *", Colors.BOLD, Colors.CYAN) if fallback_model and model == fallback_model else ""
-            print_plain(f"    {_setup_index(idx)}. {model}{marker}")
-        other_idx = len(models) + 1
-        print_plain(f"    {_setup_index(other_idx)}. {color('其他模型名称', Colors.CYAN)}")
-        print_plain()
-        default_prompt = fallback_model or models[0]
-        model_input = _setup_input(f"  输入模型编号或名称 [{default_prompt}]: ")
-        if not model_input:
-            return default_prompt
-        if model_input.isdigit():
-            idx = int(model_input)
-            if 1 <= idx <= len(models):
-                return models[idx - 1]
-            if idx == other_idx:
-                return _setup_input("  输入其他模型名称: ")
-        return model_input
+        current_key = current_model.casefold()
+        recommended_key = recommended_model.casefold()
+        items = [
+            {
+                "id": model,
+                "label": model,
+                "category": (
+                    "当前"
+                    if current_key and model.casefold() == current_key
+                    else "推荐" if recommended_key and model.casefold() == recommended_key else ""
+                ),
+            }
+            for model in models
+        ]
+        manual_id = "__manual_model__"
+        items.append({"id": manual_id, "label": "其他模型名称", "category": "手动输入"})
+        selected = prompt_single_select(
+            "M-Claw 模型选择",
+            items,
+            hint=f"来自 {source}；使用 ↑/↓ 浏览全部模型。",
+            default_selected=models[0],
+            max_visible_items=20,
+        )
+        return _setup_input("  输入其他模型名称: ") if selected == manual_id else selected
 
-    prompt = f"  模型名称 [{fallback_model}]: " if fallback_model else "  模型名称: "
-    return _setup_input(prompt) or fallback_model
+    prompt = f"  模型名称 [{current_model}]: " if current_model else "  模型名称: "
+    return _setup_input(prompt) or current_model
 
 
 def _select_models_dev_provider_from_query(query: str) -> str:
@@ -2199,15 +2234,12 @@ def _setup_custom_endpoint(
         print_plain(color("  建议使用预置接入方，这样 /provider、/model 和模型库识别会保持一致。", Colors.DIM))
         use_builtin = _setup_input(f"  改用 {pcfg.display_name} 接入方? [Y/n]: ").lower()
         if use_builtin not in {"n", "no"}:
-            profile = _select_setup_profile(matched_provider)
+            profile = _select_setup_profile(matched_provider, config)
             if profile is None:
                 return None
             return _setup_api_key_provider(
                 config,
                 matched_provider,
-                pcfg.api_key_env_vars[0],
-                pcfg.display_name,
-                pcfg.key_url,
                 profile_id=profile.id,
             )
         print_plain(color("  继续按自定义接口保存。", Colors.DIM))
@@ -2330,9 +2362,6 @@ def _match_builtin_provider_by_base_url(base_url: str, *, is_anthropic: bool) ->
 def _setup_api_key_provider(
     config: dict,
     provider_key: str,
-    env_var: str,
-    display_name: str,
-    url: str,
     profile_id: str = "",
 ):
     """Setup flow for a named provider (key only)."""
@@ -2349,9 +2378,10 @@ def _setup_api_key_provider(
             f"Setup profile {provider_key}/{profile.id} has no runtime provider: "
             f"{runtime_provider}"
         )
-    # A setup profile is only a presentation selector. Persist and hydrate the
-    # canonical runtime target so a later startup never has to reinterpret it.
-    env_var = runtime_config.api_key_env_vars[0] if runtime_config.api_key_env_vars else env_var
+    # Persist and display the canonical runtime target selected by the profile.
+    env_var = runtime_config.api_key_env_vars[0]
+    display_name = runtime_config.display_name
+    url = runtime_config.key_url
     current_key = get_env_value(env_var) or ""
 
     print_plain()

@@ -104,7 +104,7 @@ def _multi_select_item_fragments(item: dict, *, checked: bool, current: bool) ->
     prefix = ">" if current else " "
     category = f" [{item['category']}]" if item["category"] else ""
     desc = f" - {item['description']}" if item["description"] else ""
-    check = "x" if checked else " "
+    check = "✓" if checked else " "
     name_style = "class:item-name-current" if current else "class:item-name"
     return [
         ("class:cursor", f"{prefix} "),
@@ -138,6 +138,26 @@ def prompt_builtin_skill_selection(skills: list[dict]) -> list[str]:
     )
 
 
+def prompt_single_select(
+    title: str,
+    items: list[dict],
+    *,
+    hint: str = "",
+    default_selected: str = "",
+    max_visible_items: int = 20,
+) -> str:
+    """Run the shared selection prompt in single-choice mode."""
+    selected = prompt_multi_select(
+        title,
+        items,
+        hint=hint,
+        default_selected=[default_selected] if default_selected else None,
+        max_visible_items=max_visible_items,
+        _single=True,
+    )
+    return selected[0] if selected else ""
+
+
 def prompt_multi_select(
     title: str,
     items: list[dict],
@@ -145,6 +165,7 @@ def prompt_multi_select(
     hint: str = "",
     default_selected: list[str] | None = None,
     max_visible_items: int = 20,
+    _single: bool = False,
 ) -> list[str]:
     """Run a compact keyboard-driven multi-select prompt and return selected ids."""
     normalized = [
@@ -160,7 +181,13 @@ def prompt_multi_select(
     if not normalized:
         return []
 
-    selected = {"index": 0, "ids": set(default_selected or [])}
+    default_ids = set(default_selected or [])
+    initial_index = (
+        next((index for index, item in enumerate(normalized) if item["id"] in default_ids), 0)
+        if _single
+        else 0
+    )
+    selected = {"index": initial_index, "ids": default_ids}
 
     def fragments() -> StyleAndTextTuples:
         result: StyleAndTextTuples = [("class:title", f"{title}\n")]
@@ -186,7 +213,12 @@ def prompt_multi_select(
             ))
         result.extend([
             ("", "\n"),
-            ("class:hint", "↑/↓ 移动，Tab/Space 勾选，Enter 确认，Esc 跳过\n"),
+            (
+                "class:hint",
+                "↑/↓ 移动，Tab/Space 选择，Enter 确认，Esc 返回\n"
+                if _single
+                else "↑/↓ 移动，Tab/Space 勾选，Enter 确认，Esc 跳过\n",
+            ),
         ])
         return result
 
@@ -207,6 +239,10 @@ def prompt_multi_select(
     @kb.add("space")
     def _(event):
         item_id = normalized[selected["index"]]["id"]
+        if _single:
+            selected["ids"] = {item_id}
+            event.app.invalidate()
+            return
         if item_id in selected["ids"]:
             selected["ids"].remove(item_id)
         else:
@@ -215,6 +251,13 @@ def prompt_multi_select(
 
     @kb.add("enter")
     def _(event):
+        if _single:
+            item_id = next(
+                (item["id"] for item in normalized if item["id"] in selected["ids"]),
+                normalized[selected["index"]]["id"],
+            )
+            event.app.exit(result=[item_id])
+            return
         event.app.exit(result=[item["id"] for item in normalized if item["id"] in selected["ids"]])
 
     @kb.add("escape")
