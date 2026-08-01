@@ -7,6 +7,7 @@
 <p align="center">
   <a href="#安装与启动">快速开始</a> ·
   <a href="#能力概览">功能</a> ·
+  <a href="docs/manual/README.md">操作手册</a> ·
   <a href="#智能体循环">架构</a> ·
   <a href="#开发者生态">开发</a>
 </p>
@@ -23,6 +24,8 @@
 > 当前版本：1.0.0  
 > 开源协议：Apache-2.0  
 > 当前安装方式：源码安装
+
+> 📖 **完整使用指南：** [M-Claw 操作手册](docs/manual/README.md) — 按功能查看设计说明、操作步骤、Slash Command、示例提示词和平台限制。
 
 ## Roadmap
 
