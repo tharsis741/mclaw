@@ -278,6 +278,27 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "push_to_talk_behavior": "tap_once",
         },
     },
+    "capabilities": {
+        "inbound_audio": {
+            "enabled": "auto",
+            "auto_transcribe_voice_messages": True,
+            "provider": "qwen",
+            "model": "qwen3-asr-flash",
+            "base_url": "",
+            "language": "auto",
+            "enable_itn": False,
+            "max_audio_bytes": 7340032,
+            "max_duration_seconds": 120,
+            "transcription_timeout_seconds": 60.0,
+            "decode_timeout_seconds": 15.0,
+            "max_concurrency": 2,
+            "max_retries": 1,
+            "retry_backoff_seconds": 0.5,
+            "retain_source_seconds": 0,
+            "retain_decoded_seconds": 0,
+            "silk_sample_rate": 24000,
+        },
+    },
     "channels": {
         "weixin": {
             "enabled": False,

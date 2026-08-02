@@ -14,9 +14,10 @@ from __future__ import annotations
 import base64
 import hashlib
 import mimetypes
+import os
 import re
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ ITEM_IMAGE = 2
 ITEM_VOICE = 3
 ITEM_FILE = 4
 ITEM_VIDEO = 5
+_VOICE_MEDIA_MAX_BYTES = 7 * 1024 * 1024
 
 DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 WEIXIN_CDN_ALLOWLIST: frozenset[str] = frozenset(
@@ -54,6 +56,7 @@ class WeixinMediaAttachment:
     filename: str = ""
     size_bytes: int = 0
     error: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -62,6 +65,11 @@ class WeixinMediaAttachment:
 def has_media_items(item_list: list[dict[str, Any]]) -> bool:
     """Return whether an item list contains direct or referenced media payloads."""
     return any(item.get("type") in {ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO} for item in _iter_media_items(item_list))
+
+
+def has_voice_items(item_list: list[dict[str, Any]]) -> bool:
+    """Return whether an inbound payload contains a native voice message."""
+    return any(item.get("type") == ITEM_VOICE for item in _iter_media_items(item_list))
 
 
 def media_dedup_key(sender_id: str, item_list: list[dict[str, Any]]) -> str:
@@ -86,11 +94,14 @@ def media_dedup_key(sender_id: str, item_list: list[dict[str, Any]]) -> str:
 
 def format_media_for_agent(attachments: list[WeixinMediaAttachment]) -> str:
     """Render cached attachments as prompt context with suggested follow-up tools."""
-    if not attachments:
+    # Voice attachments are consumed by the shared inbound-audio pipeline. Do
+    # not leak their local cache paths into the LLM prompt as media guidance.
+    prompt_attachments = [attachment for attachment in attachments if attachment.kind != "voice"]
+    if not prompt_attachments:
         return ""
 
     lines = ["## Weixin Attachments"]
-    for idx, attachment in enumerate(attachments, 1):
+    for idx, attachment in enumerate(prompt_attachments, 1):
         label = f"{idx}. {attachment.kind}"
         if attachment.filename:
             label += f" ({attachment.filename})"
@@ -110,10 +121,6 @@ def format_media_for_agent(attachments: list[WeixinMediaAttachment]) -> str:
             lines.append(
                 f"   Use read_file(path={attachment.path!r}) or other file tools if the file type is readable."
             )
-        elif attachment.kind == "voice":
-            lines.append(
-                "   Audio is cached locally. Use the file path if a later audio/transcription tool is available."
-            )
         elif attachment.kind == "video":
             lines.append("   Video is cached locally as a file attachment.")
     return "\n".join(lines)
@@ -132,34 +139,56 @@ class WeixinMediaCache:
         if not self.config.media_cache_enabled:
             return []
         attachments: list[WeixinMediaAttachment] = []
-        for index, item in enumerate(_iter_media_items(item_list), 1):
-            attachments.append(await self._download_item(item, message_id=message_id, index=index))
-        return attachments
+        try:
+            for index, item in enumerate(_iter_media_items(item_list), 1):
+                attachments.append(await self._download_item(item, message_id=message_id, index=index))
+            return attachments
+        except BaseException:
+            _cleanup_cached_attachments(attachments)
+            raise
 
     async def _download_item(self, item: dict[str, Any], *, message_id: str, index: int) -> WeixinMediaAttachment:
         """Fetch, optionally decrypt, size-check, and cache one Weixin media item."""
         kind = _kind_for_type(item.get("type"))
         filename = _filename_for_item(item)
         mime_type = _mime_for_item(item, filename)
+        metadata = _metadata_for_item(item)
         media = _media_reference_for_item(item)
         if not media:
-            return WeixinMediaAttachment(kind=kind, mime_type=mime_type, filename=filename, error="missing media reference")
+            return WeixinMediaAttachment(
+                kind=kind,
+                mime_type=mime_type,
+                filename=filename,
+                error="missing media reference",
+                metadata=metadata,
+            )
 
         try:
+            payload_limit = (
+                min(self.config.media_max_bytes, _VOICE_MEDIA_MAX_BYTES)
+                if kind == "voice"
+                else self.config.media_max_bytes
+            )
             url = _download_url(
                 cdn_base_url=self.config.media_cdn_base_url,
                 encrypted_query_param=media.get("encrypt_query_param") or media.get("encrypted_query_param"),
                 full_url=media.get("full_url") or media.get("url"),
             )
-            raw = await self.client.download_bytes(url, timeout_ms=int(self.config.media_download_timeout_seconds * 1000))
-            if len(raw) > self.config.media_max_bytes:
-                raise RuntimeError(
-                    f"media exceeds max size ({len(raw)} > {self.config.media_max_bytes} bytes)"
-                )
+            raw = await self.client.download_bytes(
+                url,
+                timeout_ms=int(self.config.media_download_timeout_seconds * 1000),
+                # AES padding can add one block to the encrypted form. The
+                # plaintext limit is enforced immediately after decryption.
+                max_bytes=payload_limit + 16,
+            )
             aes_key = _aes_key_for_item(item, media)
             if aes_key:
                 # Weixin may provide encrypted CDN bytes; decrypt after the size guard.
                 raw = _aes128_ecb_decrypt(raw, _parse_aes_key(aes_key))
+            if len(raw) > payload_limit:
+                raise RuntimeError(
+                    f"media exceeds max size ({len(raw)} > {payload_limit} bytes)"
+                )
             path = self._write_cache(raw, kind=kind, filename=filename, mime_type=mime_type, message_id=message_id, index=index)
             return WeixinMediaAttachment(
                 kind=kind,
@@ -167,9 +196,16 @@ class WeixinMediaCache:
                 path=str(path),
                 filename=filename,
                 size_bytes=len(raw),
+                metadata=metadata,
             )
         except Exception as exc:
-            return WeixinMediaAttachment(kind=kind, mime_type=mime_type, filename=filename, error=str(exc))
+            return WeixinMediaAttachment(
+                kind=kind,
+                mime_type=mime_type,
+                filename=filename,
+                error=str(exc),
+                metadata=metadata,
+            )
 
     def _write_cache(
         self,
@@ -183,12 +219,13 @@ class WeixinMediaCache:
     ) -> Path:
         day = datetime.now().strftime("%Y%m%d")
         cache_dir = self.root / self.config.account_id / day
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix":
+            os.chmod(cache_dir, 0o700)
         stem = _safe_stem(message_id or uuid.uuid4().hex)
         extension = _extension(filename, mime_type, kind)
         path = cache_dir / f"{stem}-{index}-{kind}{extension}"
-        path.write_bytes(data)
-        return path
+        return _write_private_bytes(path, data)
 
 
 def _cache_root(config: WeixinConfig) -> Path:
@@ -254,6 +291,22 @@ def _mime_for_item(item: dict[str, Any], filename: str) -> str:
     return mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
 
+def _metadata_for_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Preserve protocol metadata needed by downstream attachment processors."""
+    item_type = item.get("type")
+    metadata: dict[str, Any] = {
+        "channel": "weixin",
+        "item_type": item_type,
+    }
+    if item_type == ITEM_VOICE:
+        voice = item.get("voice_item") or {}
+        for key in ("encode_type", "sample_rate", "playtime", "bits_per_sample"):
+            value = voice.get(key)
+            if value is not None:
+                metadata[key] = value
+    return metadata
+
+
 def _download_url(*, cdn_base_url: str, encrypted_query_param: str | None, full_url: str | None) -> str:
     """Resolve Weixin's encrypted-query or full-URL media reference into a safe CDN URL."""
     if encrypted_query_param:
@@ -271,8 +324,8 @@ def _assert_weixin_cdn_url(url: str) -> None:
     parsed = urlparse(url)
     scheme = parsed.scheme.lower()
     host = parsed.hostname or ""
-    if scheme not in {"http", "https"}:
-        raise ValueError(f"media URL has disallowed scheme {scheme!r}")
+    if scheme != "https":
+        raise ValueError("Weixin media download URL must use https")
     if host not in WEIXIN_CDN_ALLOWLIST:
         raise ValueError(f"media URL host {host!r} is not in the WeChat CDN allowlist")
 
@@ -322,6 +375,43 @@ def _aes128_ecb_decrypt(ciphertext: bytes, key: bytes) -> bytes:
 def _safe_stem(value: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip(".-")
     return stem[:64] or uuid.uuid4().hex
+
+
+def _write_private_bytes(path: Path, data: bytes) -> Path:
+    """Create a cache artifact atomically with owner-only POSIX permissions."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    candidate = path
+    for _attempt in range(3):
+        try:
+            descriptor = os.open(candidate, flags, 0o600)
+            break
+        except FileExistsError:
+            candidate = path.with_name(f"{path.stem}-{uuid.uuid4().hex[:8]}{path.suffix}")
+    else:
+        raise FileExistsError(f"could not allocate private cache path for {path.name}")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        if os.name == "posix":
+            os.chmod(candidate, 0o600)
+        return candidate
+    except BaseException:
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _cleanup_cached_attachments(attachments: list[WeixinMediaAttachment]) -> None:
+    for attachment in attachments:
+        if not attachment.path:
+            continue
+        try:
+            Path(attachment.path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _extension(filename: str, mime_type: str, kind: str) -> str:

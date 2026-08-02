@@ -20,6 +20,7 @@ from mclaw.channels.dingtalk.dedup import MessageDeduplicator
 from mclaw.channels.dingtalk.runtime_lock import DingTalkRuntimeLock
 from mclaw.channels.dingtalk.session_router import DingTalkSessionRouter
 from mclaw.channels.dingtalk.stream_client import DingTalkClient
+from mclaw.channels.audio_transcription import build_inbound_pipeline
 from mclaw.channels.runner import AgentRunner
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
@@ -51,6 +52,7 @@ class DingTalkRuntime:
             enabled_toolsets=self.dingtalk_config.toolsets,
             session_db=self.session_db,
             platform="dingtalk",
+            inbound_pipeline=build_inbound_pipeline(config),
         )
         self.session_router = session_router or DingTalkSessionRouter(
             account_id=self.dingtalk_config.client_id,

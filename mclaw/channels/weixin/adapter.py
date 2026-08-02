@@ -17,8 +17,16 @@ import time
 import uuid
 from typing import Any
 
-from mclaw.channels.base import AgentTurnResult, ChannelMessage, ChannelSource, SendResult
-from mclaw.channels.runner import AgentRunner
+from mclaw.channels.base import (
+    AgentTurnResult,
+    AttachmentKind,
+    AttachmentOrigin,
+    ChannelAttachment,
+    ChannelMessage,
+    ChannelSource,
+    SendResult,
+)
+from mclaw.channels.runner import AgentRunner, IngressQueueFullError
 from mclaw.channels.weixin.command_router import WeixinCommandRouter
 from mclaw.channels.weixin.config import WeixinConfig
 from mclaw.channels.weixin.context_token_store import ContextTokenStore
@@ -30,9 +38,11 @@ from mclaw.channels.weixin.media import (
     ITEM_IMAGE,
     ITEM_VIDEO,
     ITEM_VOICE,
+    WeixinMediaAttachment,
     WeixinMediaCache,
     format_media_for_agent,
     has_media_items,
+    has_voice_items,
     media_dedup_key,
 )
 from mclaw.channels.weixin.outbound_media import (
@@ -93,7 +103,7 @@ class TypingTicketCache:
 
 
 def _extract_text(item_list: list[dict[str, Any]]) -> str:
-    """Extract text or voice transcript text from Weixin item payloads."""
+    """Extract only user-authored text items from a Weixin payload."""
     parts: list[str] = []
     for item in item_list:
         if item.get("type") == ITEM_TEXT:
@@ -107,14 +117,70 @@ def _extract_text(item_list: list[dict[str, Any]]) -> str:
                 text = f"{prefix}{text}".strip()
             if text:
                 parts.append(text)
-    if parts:
-        return "\n".join(parts).strip()
+    return "\n".join(parts).strip()
+
+
+def _extract_platform_transcript(item_list: list[dict[str, Any]]) -> str:
+    """Parse the optional iLink transcript without admitting it as input.
+
+    This compatibility parser makes the exclusion behavior testable.  The
+    runtime deliberately does not call it or retain the platform value; the
+    shared pipeline transcribes the downloaded audio itself.
+    """
+    parts: list[str] = []
     for item in item_list:
         if item.get("type") == ITEM_VOICE:
             text = str((item.get("voice_item") or {}).get("text") or "")
             if text:
-                return text.strip()
+                parts.append(text.strip())
     return "\n".join(parts).strip()
+
+
+def _to_channel_attachment(attachment: WeixinMediaAttachment) -> ChannelAttachment:
+    """Normalize one cached Weixin media item for the inbound pipeline."""
+    kind_by_media = {
+        "image": AttachmentKind.IMAGE,
+        "video": AttachmentKind.VIDEO,
+        "file": AttachmentKind.FILE,
+    }
+    is_voice = attachment.kind == "voice"
+    metadata = dict(attachment.metadata)
+    metadata.setdefault("channel", "weixin")
+    if attachment.path and not attachment.error:
+        metadata.setdefault("managed_cache", True)
+    duration_ms = 0
+    if is_voice:
+        try:
+            duration_ms = max(0, int(metadata.get("playtime") or 0))
+        except (TypeError, ValueError):
+            duration_ms = 0
+    return ChannelAttachment(
+        kind=AttachmentKind.AUDIO if is_voice else kind_by_media.get(attachment.kind, AttachmentKind.FILE),
+        origin=AttachmentOrigin.VOICE_MESSAGE if is_voice else AttachmentOrigin.FILE_UPLOAD,
+        path=attachment.path,
+        filename=attachment.filename,
+        mime_type=attachment.mime_type,
+        size_bytes=attachment.size_bytes,
+        duration_ms=duration_ms,
+        codec="silk" if is_voice else "",
+        error=attachment.error,
+        metadata=metadata,
+    )
+
+
+def _discard_unowned_channel_message(message: ChannelMessage | None) -> None:
+    """Delete adapter-owned cache if the runner never takes message ownership."""
+
+    if message is None:
+        return
+    for attachment in message.attachments:
+        metadata = attachment.metadata if isinstance(attachment.metadata, dict) else {}
+        if metadata.get("managed_cache") is not True or not attachment.path:
+            continue
+        try:
+            Path(attachment.path).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _guess_chat_type(message: dict[str, Any], account_id: str) -> tuple[str, str]:
@@ -171,6 +237,7 @@ class WeixinAdapter:
             item_list = []
         text = _extract_text(item_list)
         contains_media = has_media_items(item_list)
+        contains_voice = has_voice_items(item_list)
         if not text and not contains_media:
             return None
 
@@ -213,7 +280,6 @@ class WeixinAdapter:
         if context_token:
             # Persist the latest token so future replies stay in the same iLink context.
             self.token_store.set(self.config.account_id, sender_id, context_token)
-        await self._maybe_fetch_typing_ticket(sender_id, context_token or None)
 
         bind_result = await self._maybe_handle_schedule_bind(
             text=text,
@@ -284,24 +350,91 @@ class WeixinAdapter:
                 await self.send(chat_id, command.text)
             return AgentTurnResult(session_id=routed.session_id)
 
-        register_weixin_outbound_target(
-            session_id=routed.session_id,
-            adapter=self,
-            chat_id=chat_id,
-            loop=asyncio.get_running_loop(),
-        )
-        attachments = await self.media_cache.collect(item_list, message_id=message_id) if contains_media else []
-        media_context = format_media_for_agent(attachments)
-        if contains_media and not media_context and not self.config.media_cache_enabled:
-            media_context = "## Weixin Attachments\nMedia attachment(s) were present, but media caching is disabled."
-        if media_context:
-            text = f"{text}\n\n{media_context}".strip() if text else f"User sent Weixin attachment(s).\n\n{media_context}"
-        if attachments:
-            message = {**message, "_mclaw_media": [attachment.to_dict() for attachment in attachments]}
-        channel_message = ChannelMessage(text=text, source=source, raw_message=message)
-
-        await self.send_typing(chat_id)
+        reserve_ingress = getattr(self.runner, "reserve_ingress", None)
         try:
+            reservation = (
+                reserve_ingress(routed.session_id) if callable(reserve_ingress) else None
+            )
+        except IngressQueueFullError:
+            safe_text = "当前会话消息积压过多，请稍后重试。"
+            await self.send(chat_id, safe_text)
+            return AgentTurnResult(
+                session_id=routed.session_id,
+                final_response=safe_text,
+                error="CHANNEL_QUEUE_FULL",
+                raw_result={"queue_full": True},
+            )
+        release_ingress = getattr(self.runner, "release_ingress", None)
+        channel_message: ChannelMessage | None = None
+        try:
+            # Reserve arrival order before either of these network requests.
+            # A later small voice message must not overtake an earlier large one.
+            await_ingress = getattr(self.runner, "await_ingress", None)
+            if (
+                reservation is not None
+                and callable(await_ingress)
+                and not await await_ingress(reservation)
+            ):
+                if callable(release_ingress):
+                    release_ingress(reservation)
+                return AgentTurnResult(session_id=routed.session_id, interrupted=True)
+            await self._maybe_fetch_typing_ticket(sender_id, context_token or None)
+            register_weixin_outbound_target(
+                session_id=routed.session_id,
+                adapter=self,
+                chat_id=chat_id,
+                loop=asyncio.get_running_loop(),
+            )
+            if contains_media:
+                bounded_download = getattr(self.runner, "run_bounded_media_download", None)
+                operation = lambda: self.media_cache.collect(item_list, message_id=message_id)
+                attachments = (
+                    await bounded_download(operation)
+                    if callable(bounded_download)
+                    else await operation()
+                )
+            else:
+                attachments = []
+            channel_attachments = tuple(_to_channel_attachment(attachment) for attachment in attachments)
+            if contains_voice and not getattr(self.config, "media_cache_enabled", True):
+                channel_attachments += (ChannelAttachment(
+                    kind=AttachmentKind.AUDIO,
+                    origin=AttachmentOrigin.VOICE_MESSAGE,
+                    mime_type="audio/silk",
+                    codec="silk",
+                    error="media caching is disabled",
+                    metadata={"channel": "weixin", "managed_cache": False},
+                ),)
+            media_context = format_media_for_agent(attachments)
+            if contains_media and not media_context and not getattr(self.config, "media_cache_enabled", True):
+                media_context = "## Weixin Attachments\nMedia attachment(s) were present, but media caching is disabled."
+            if media_context:
+                text = f"{text}\n\n{media_context}".strip() if text else f"User sent Weixin attachment(s).\n\n{media_context}"
+            # Keep only fields needed after admission.  The original payload
+            # may contain a context token, CDN URL and AES key and must not be
+            # retained in the channel-neutral message.
+            raw_message = {
+                "message_id": message_id,
+                "chat_id": chat_id,
+                "chat_type": chat_type,
+                "sender_id": sender_id,
+                "weixin_media": [attachment.to_dict() for attachment in attachments],
+            }
+            channel_message = ChannelMessage(
+                text=text,
+                source=source,
+                raw_message=raw_message,
+                attachments=channel_attachments,
+            )
+        except BaseException:
+            _discard_unowned_channel_message(channel_message)
+            if reservation is not None and callable(release_ingress):
+                release_ingress(reservation)
+            raise
+
+        runner_accepted = False
+        try:
+            await self.send_typing(chat_id)
             history = self.runner.session_db.get_messages_as_conversation(routed.session_id)
             logger.info("weixin: agent turn start session=%s history=%d", routed.session_id, len(history))
             bind_events = getattr(self.runner, "bind_session_events", None)
@@ -311,13 +444,17 @@ class WeixinAdapter:
                     loop=asyncio.get_running_loop(),
                     callback=self._agent_event_callback(chat_id),
                 )
-            result = await self.runner.handle_message(
+            handle_kwargs = dict(
                 message=channel_message,
                 session_id=routed.session_id,
                 conversation_history=history,
                 reply_callback=self._reply_callback,
                 extra_system=self._session_context_text(source),
             )
+            if reservation is not None:
+                handle_kwargs["ingress_reservation"] = reservation
+            result = await self.runner.handle_message(**handle_kwargs)
+            runner_accepted = True
             if result.queued:
                 await self.send(chat_id, "Previous request is still running; queued the latest message.")
                 logger.info("weixin: message queued session=%s", routed.session_id)
@@ -329,7 +466,13 @@ class WeixinAdapter:
                     len(result.final_response or ""),
                 )
             return result
+        except BaseException:
+            if not runner_accepted:
+                _discard_unowned_channel_message(channel_message)
+            raise
         finally:
+            if reservation is not None and callable(release_ingress):
+                release_ingress(reservation)
             await self.stop_typing(chat_id)
 
     async def _maybe_handle_schedule_bind(
@@ -371,7 +514,8 @@ class WeixinAdapter:
     async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> None:
         """Send the final agent result or error back to the originating chat."""
         if result.error:
-            await self.send(message.source.chat_id, f"Error: {result.error}")
+            safe_text = result.final_response.strip() or f"Error: {result.error}"
+            await self.send(message.source.chat_id, safe_text)
             return
         text = result.final_response.strip()
         if text:

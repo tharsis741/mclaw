@@ -102,6 +102,21 @@ def _truthy_enabled(value: object) -> bool:
 
 def _feature_enabled(config: dict | None, spec: object) -> bool:
     cfg = config if isinstance(config, dict) else {}
+    feature_name = str(getattr(spec, "name", "") or "")
+    if feature_name == "asr":
+        microphone_enabled = _truthy_enabled(
+            _config_path_value(cfg, "auxiliary.asr.enabled")
+        )
+        inbound_mode = _config_path_value(
+            cfg,
+            "capabilities.inbound_audio.enabled",
+        )
+        inbound_enabled = not (
+            isinstance(inbound_mode, str)
+            and inbound_mode.strip().lower() == "auto"
+        ) and _truthy_enabled(inbound_mode)
+        return microphone_enabled or inbound_enabled
+
     config_path = str(getattr(spec, "config_path", "") or "")
     if config_path:
         return _truthy_enabled(_config_path_value(cfg, config_path))
@@ -156,6 +171,25 @@ def _append_feature_checks(results: list[CheckResult], cfg: dict | None) -> None
         required_for = getattr(spec, "required_for", "")
         enabled = _feature_enabled(cfg, spec)
         configured = configured_env_vars(spec, get_env_value)
+        if not enabled and getattr(spec, "name", "") == "asr" and configured:
+            inbound_mode = _config_path_value(
+                cfg,
+                "capabilities.inbound_audio.enabled",
+            )
+            channels = cfg.get("channels", {}) if isinstance(cfg, dict) else {}
+            gateway_enabled = any(
+                _truthy_enabled(section.get("enabled"))
+                for section in (
+                    channels.get("weixin", {}) if isinstance(channels, dict) else {},
+                    channels.get("dingtalk", {}) if isinstance(channels, dict) else {},
+                )
+                if isinstance(section, dict)
+            )
+            enabled = (
+                isinstance(inbound_mode, str)
+                and inbound_mode.strip().lower() == "auto"
+                and gateway_enabled
+            )
         authorized = [env_var for env_var in configured if is_authorized(required_for, env_var)]
         name = f"feature {display}"
         if enabled and not configured:
@@ -186,6 +220,56 @@ def _append_feature_checks(results: list[CheckResult], cfg: dict | None) -> None
             results.append(CheckResult(name, True, f"not enabled; credentials present ({auth_detail}); optional"))
         else:
             results.append(CheckResult(name, True, "not enabled; optional"))
+
+
+def _append_inbound_audio_checks(results: list[CheckResult], cfg: dict | None) -> None:
+    """Check the codec needed for Weixin voice messages when that path is enabled."""
+    config = cfg if isinstance(cfg, dict) else {}
+    inbound_mode = _config_path_value(config, "capabilities.inbound_audio.enabled")
+    if inbound_mode is None:
+        return
+    inbound_requested = not (
+        isinstance(inbound_mode, str)
+        and inbound_mode.strip().lower() in {"off", "false", "disabled"}
+    ) and inbound_mode is not False
+    if not inbound_requested:
+        return
+
+    try:
+        from mclaw.voice.config import resolve_inbound_audio_config
+
+        resolved = resolve_inbound_audio_config(config=config)
+        configuration_error = str(resolved.get("configuration_error") or "")
+    except Exception as exc:
+        configuration_error = f"resolution failed: {type(exc).__name__}: {exc}"
+    results.append(
+        CheckResult(
+            "inbound audio configuration",
+            not configuration_error,
+            configuration_error or "provider and endpoint validation passed",
+            "Use provider qwen/qwen-intl and an HTTPS endpoint (HTTP is allowed only on loopback).",
+        )
+    )
+
+    weixin_enabled = _truthy_enabled(
+        _config_path_value(config, "channels.weixin.enabled")
+    )
+    if not weixin_enabled:
+        return
+    try:
+        from mclaw.voice.codecs import SilkDecoder
+
+        available = SilkDecoder.available()
+    except Exception:
+        available = False
+    results.append(
+        CheckResult(
+            "inbound audio SILK decoder",
+            available,
+            "ready" if available else "silk-python/pysilk import unavailable",
+            "Install M-Claw dependencies again with: pip install -e .",
+        )
+    )
 
 
 def _append_provider_checks(results: list[CheckResult], cfg: dict | None) -> None:
@@ -572,6 +656,7 @@ def run_doctor() -> list[CheckResult]:
         results.append(CheckResult("runtime", False, f"failed: {type(exc).__name__}: {exc}", "Check mclaw.runtime imports."))
     _append_secret_allowlist_check(results)
     _append_feature_checks(results, cfg)
+    _append_inbound_audio_checks(results, cfg)
     _append_provider_checks(results, cfg)
 
     try:

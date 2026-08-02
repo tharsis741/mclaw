@@ -763,7 +763,7 @@ def test_setup_configures_selected_capabilities_in_order_with_qwen_intl(monkeypa
     selections = iter([
         ["web_extract", "web_search", "vision", "browser"],
         ["weixin", "dingtalk"],
-        ["asr"],
+        ["inbound_audio", "asr"],
     ])
     prompt_titles: list[str] = []
     actions: list[str] = []
@@ -852,6 +852,10 @@ def test_setup_configures_selected_capabilities_in_order_with_qwen_intl(monkeypa
         "websocket_url": "",
         "enabled": True,
         "region": "intl",
+    }
+    assert config["capabilities"]["inbound_audio"] == {
+        "enabled": True,
+        "provider": "qwen-intl",
     }
 
 

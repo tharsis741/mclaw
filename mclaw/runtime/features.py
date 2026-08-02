@@ -191,7 +191,7 @@ FEATURES: dict[str, FeatureSpec] = {
         name="asr",
         kind="runtime",
         display_name="语音输入",
-        description="通过 DashScope/Qwen 实时语音识别启用麦克风输入。",
+        description="通过 DashScope/Qwen 识别麦克风音频或微信、钉钉原生语音消息。",
         config_path="auxiliary.asr.enabled",
         requires_any=_QWEN_CREDENTIAL_GROUPS,
     ),

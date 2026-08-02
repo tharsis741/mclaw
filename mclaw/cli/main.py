@@ -1331,7 +1331,6 @@ def _run_setup_capability_selection(config: dict) -> None:
     runtime = RuntimeManager.current(config)
 
     vision_feature = get_feature("vision_analyze")
-    asr_feature = get_feature("asr")
     web_tools = ("web_extract", "web_search")
     capability_items = [
         {
@@ -1396,17 +1395,38 @@ def _run_setup_capability_selection(config: dict) -> None:
             hint="选择需要接入的消息渠道；选中后进入对应登录流程。",
             default_selected=default_channels,
         )
+        inbound_audio = config.get("capabilities", {}).get("inbound_audio", {})
+        inbound_mode = (
+            inbound_audio.get("enabled", "auto")
+            if isinstance(inbound_audio, dict)
+            else "auto"
+        )
+        inbound_default = inbound_mode is True or (
+            isinstance(inbound_mode, str)
+            and inbound_mode.strip().lower() == "auto"
+            and bool(channels)
+        )
+        asr_defaults = []
+        if inbound_default:
+            asr_defaults.append("inbound_audio")
+        if config.get("auxiliary", {}).get("asr", {}).get("enabled") is True:
+            asr_defaults.append("asr")
         asr_choice = prompt_multi_select(
             "M-Claw 语音输入",
             [
                 {
+                    "id": "inbound_audio",
+                    "label": "IM 语音消息识别",
+                    "description": "下载微信/钉钉原始语音，由 M-Claw 独立转写后交给 Agent。",
+                },
+                {
                     "id": "asr",
-                    "label": asr_feature.display_name if asr_feature else "语音输入",
-                    "description": asr_feature.description if asr_feature else "需要语音识别凭据。",
+                    "label": "麦克风实时语音",
+                    "description": "在本机通过唤醒词或按键说话输入。",
                 }
             ],
-            hint="仅在需要麦克风语音输入时启用。",
-            default_selected=["asr"] if config.get("auxiliary", {}).get("asr", {}).get("enabled") is True else [],
+            hint="两项共用 Qwen ASR 凭据，可分别启用。",
+            default_selected=asr_defaults,
         )
     except (EOFError, KeyboardInterrupt):
         print_plain()
@@ -1465,9 +1485,17 @@ def _run_setup_capability_selection(config: dict) -> None:
         if name not in enabled_channels:
             enabled_channels.append(name)
 
-    asr_enabled = False
-    if "asr" in asr_choice:
-        asr_enabled = _setup_configure_feature_keys("asr", print_plain=print_plain, color=color, Colors=Colors)
+    asr_authorized = False
+    if {"asr", "inbound_audio"} & set(asr_choice):
+        asr_authorized = _setup_configure_feature_keys(
+            "asr",
+            print_plain=print_plain,
+            color=color,
+            Colors=Colors,
+        )
+    asr_enabled = asr_authorized and "asr" in asr_choice
+    inbound_audio_enabled = asr_authorized and "inbound_audio" in asr_choice
+    asr_provider = _setup_qwen_provider() if asr_authorized else ""
 
     selected_toolsets = ["mclaw-required"]
     for name in [*enabled_optional, *enabled_channels]:
@@ -1493,13 +1521,27 @@ def _run_setup_capability_selection(config: dict) -> None:
             asr["enabled"] = bool(asr_enabled)
             if (
                 asr_enabled
-                and _setup_qwen_provider() == "qwen-intl"
+                and asr_provider == "qwen-intl"
                 and str(asr.get("provider") or "qwen").strip().lower() in {"", "auto", "dashscope", "qwen"}
                 and not str(asr.get("websocket_url") or "").strip()
                 and str(asr.get("region") or "").strip().lower() not in {"cn", "china"}
             ):
                 asr["provider"] = "qwen-intl"
                 asr["region"] = "intl"
+
+    capabilities = config.setdefault("capabilities", {})
+    if isinstance(capabilities, dict):
+        inbound = capabilities.setdefault("inbound_audio", {})
+        if isinstance(inbound, dict):
+            inbound["enabled"] = bool(inbound_audio_enabled)
+            if (
+                inbound_audio_enabled
+                and asr_provider == "qwen-intl"
+                and str(inbound.get("provider") or "qwen").strip().lower()
+                in {"", "auto", "dashscope", "qwen"}
+                and not str(inbound.get("base_url") or "").strip()
+            ):
+                inbound["provider"] = "qwen-intl"
 
     enabled_names = [
         *enabled_web_tools,

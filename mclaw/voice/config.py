@@ -11,6 +11,8 @@ from typing import Any, Dict
 from mclaw.cli.config import get_env_value, load_config, mask_api_key
 from mclaw.providers.normalization import normalize_provider_key
 from mclaw.providers.registry import get_runtime_profile
+from mclaw.voice.codecs import SILK_SAMPLE_RATES
+from mclaw.voice.transcription import validate_audio_service_url
 
 CN_REALTIME_URL = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 INTL_REALTIME_URL = "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime"
@@ -42,6 +44,27 @@ DEFAULT_ASR_CONFIG: Dict[str, Any] = {
     "min_voice_chunks": 1,
     "push_to_talk_key": "f8",
     "push_to_talk_behavior": "tap_once",
+}
+DEFAULT_INBOUND_AUDIO_CONFIG: Dict[str, Any] = {
+    "enabled": "auto",
+    "auto_transcribe_voice_messages": True,
+    "provider": "qwen",
+    "model": "qwen3-asr-flash",
+    "base_url": "",
+    "language": "auto",
+    "enable_itn": False,
+    # Qwen's OpenAI-compatible endpoint applies its 10 MiB limit after
+    # Base64 expansion.  Seven MiB leaves safe room for the data-URI wrapper.
+    "max_audio_bytes": 7 * 1024 * 1024,
+    "max_duration_seconds": 120,
+    "transcription_timeout_seconds": 60.0,
+    "decode_timeout_seconds": 15.0,
+    "max_concurrency": 2,
+    "max_retries": 1,
+    "retry_backoff_seconds": 0.5,
+    "retain_source_seconds": 0,
+    "retain_decoded_seconds": 0,
+    "silk_sample_rate": 24000,
 }
 _ASR_REQUIRED_FOR = "runtime:asr"
 _QWEN_PROVIDER_KEYS = {"qwen", "qwen-intl"}
@@ -176,6 +199,130 @@ def resolve_asr_config(parent_agent=None, config: dict | None = None) -> Dict[st
         result["wake_words"] = list(DEFAULT_ASR_CONFIG["wake_words"])
 
     return result
+
+
+def resolve_inbound_audio_config(parent_agent=None, config: dict | None = None) -> Dict[str, Any]:
+    """Resolve complete-file ASR without probing microphone hardware.
+
+    Gateway voice messages have already been recorded by the remote user, so
+    their availability must not depend on a local sound card or PortAudio.
+    Credentials still pass through the existing ``runtime:asr`` secret gate.
+    """
+
+    cfg = effective_config(parent_agent=parent_agent, config=config)
+    capabilities = cfg.get("capabilities", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(capabilities, dict):
+        capabilities = {}
+    raw = capabilities.get("inbound_audio", {})
+    inbound_cfg = raw if isinstance(raw, dict) else {}
+    result = _deep_merge(DEFAULT_INBOUND_AUDIO_CONFIG, inbound_cfg)
+
+    provider = normalize_provider_key(str(result.get("provider") or "qwen"))
+    result["provider"] = provider
+    result["credential_provider"] = provider
+    result["configuration_error"] = ""
+    result["key_source"] = ""
+    result["api_key"] = ""
+
+    if provider not in _QWEN_PROVIDER_KEYS:
+        # Never reinterpret an unknown/local provider as a cloud provider.  A
+        # typo must not cause private audio to be sent using an unrelated key.
+        result["base_url"] = ""
+        result["configuration_error"] = f"unsupported inbound ASR provider: {provider or '<empty>'}"
+    else:
+        profile = get_runtime_profile(provider)
+        result["provider"] = profile.name
+        result["credential_provider"] = profile.name
+        result["key_source"], result["api_key"] = next(
+            ((name, value) for name in profile.env_vars if (value := _authorized_env_value(name))),
+            ("", ""),
+        )
+
+        configured_base_url = str(result.get("base_url") or "").strip()
+        env_base_url = get_env_value(profile.base_url_env_var) if profile.base_url_env_var else ""
+        candidate_base_url = configured_base_url or env_base_url or profile.base_url
+        try:
+            result["base_url"] = validate_audio_service_url(candidate_base_url)
+        except ValueError as exc:
+            result["base_url"] = str(candidate_base_url or "").strip().rstrip("/")
+            result["configuration_error"] = f"invalid inbound ASR base URL: {exc}"
+            # Do not leave a usable credential beside an unsafe endpoint.
+            result["key_source"] = ""
+            result["api_key"] = ""
+
+    language = str(result.get("language") or "auto").strip().casefold()
+    result["language"] = language or "auto"
+
+    for key, minimum in (
+        ("max_audio_bytes", 1),
+        ("max_duration_seconds", 1),
+        ("max_concurrency", 1),
+    ):
+        try:
+            value = int(result.get(key) or 0)
+        except (TypeError, ValueError):
+            value = int(DEFAULT_INBOUND_AUDIO_CONFIG[key])
+        result[key] = max(minimum, value)
+    try:
+        silk_sample_rate = int(result.get("silk_sample_rate") or 0)
+    except (TypeError, ValueError):
+        silk_sample_rate = int(DEFAULT_INBOUND_AUDIO_CONFIG["silk_sample_rate"])
+    result["silk_sample_rate"] = silk_sample_rate
+    if silk_sample_rate not in SILK_SAMPLE_RATES:
+        supported = ", ".join(str(rate) for rate in sorted(SILK_SAMPLE_RATES))
+        rate_error = (
+            f"unsupported SILK sample rate: {silk_sample_rate}; "
+            f"expected one of {supported}"
+        )
+        existing_error = str(result.get("configuration_error") or "")
+        result["configuration_error"] = (
+            f"{existing_error}; {rate_error}" if existing_error else rate_error
+        )
+    for key in ("retain_source_seconds", "retain_decoded_seconds"):
+        try:
+            value = int(result.get(key) or 0)
+        except (TypeError, ValueError):
+            value = int(DEFAULT_INBOUND_AUDIO_CONFIG[key])
+        result[key] = max(0, value)
+    for key, minimum in (
+        ("transcription_timeout_seconds", 1.0),
+        ("decode_timeout_seconds", 1.0),
+        ("retry_backoff_seconds", 0.0),
+    ):
+        try:
+            value = float(result.get(key) or 0)
+        except (TypeError, ValueError):
+            value = float(DEFAULT_INBOUND_AUDIO_CONFIG[key])
+        result[key] = max(minimum, value)
+    try:
+        result["max_retries"] = max(0, int(result.get("max_retries") or 0))
+    except (TypeError, ValueError):
+        result["max_retries"] = int(DEFAULT_INBOUND_AUDIO_CONFIG["max_retries"])
+    for key in (
+        "auto_transcribe_voice_messages",
+        "enable_itn",
+    ):
+        result[key] = _coerce_enabled(result.get(key))
+
+    enabled_raw = result.get("enabled")
+    if isinstance(enabled_raw, str) and enabled_raw.strip().casefold() == "auto":
+        result["enabled"] = bool(result["api_key"]) and not result["configuration_error"]
+        result["enabled_mode"] = "auto"
+    else:
+        requested_enabled = _coerce_enabled(enabled_raw)
+        result["enabled"] = requested_enabled and not result["configuration_error"]
+        result["enabled_mode"] = "on" if requested_enabled else "off"
+    return result
+
+
+def _coerce_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().casefold() in {"1", "true", "yes", "on", "y"}
+    return False
 
 
 def mask_asr_status(config: dict) -> dict:

@@ -135,13 +135,36 @@ class ILinkClient:
         response.raise_for_status()
         return response.json()
 
-    async def download_bytes(self, url: str, *, timeout_ms: int | None = None) -> bytes:
-        """Download raw media bytes from a previously validated CDN URL."""
+    async def download_bytes(
+        self,
+        url: str,
+        *,
+        timeout_ms: int | None = None,
+        max_bytes: int | None = None,
+    ) -> bytes:
+        """Stream bounded media bytes from a previously validated CDN URL."""
         await self.open()
         assert self._client is not None
-        response = await self._client.get(url, timeout=(timeout_ms or self.timeout_ms) / 1000)
-        response.raise_for_status()
-        return response.content
+        limit = max(1, int(max_bytes)) if max_bytes is not None else None
+        chunks = bytearray()
+        async with self._client.stream(
+            "GET",
+            url,
+            timeout=(timeout_ms or self.timeout_ms) / 1000,
+        ) as response:
+            response.raise_for_status()
+            content_length = response.headers.get("content-length")
+            if limit is not None and content_length:
+                try:
+                    if int(content_length) > limit:
+                        raise RuntimeError(f"media exceeds max size ({content_length} > {limit} bytes)")
+                except ValueError:
+                    pass
+            async for chunk in response.aiter_bytes():
+                if limit is not None and len(chunks) + len(chunk) > limit:
+                    raise RuntimeError(f"media exceeds max size (> {limit} bytes)")
+                chunks.extend(chunk)
+        return bytes(chunks)
 
     async def upload_bytes(self, url: str, data: bytes, *, timeout_ms: int | None = None) -> str:
         """Upload encrypted media bytes and return the CDN encrypted parameter."""

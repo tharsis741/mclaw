@@ -19,11 +19,16 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
+from urllib.parse import urljoin
 
 import httpx
 
 from mclaw.channels.base import SendResult
 from mclaw.channels.dingtalk.config import DingTalkConfig
+from mclaw.channels.dingtalk.download_security import (
+    dingtalk_media_url_origin,
+    normalize_dingtalk_media_url,
+)
 from mclaw.channels.dingtalk.formatter import normalize_markdown_for_dingtalk
 
 logger = logging.getLogger(__name__)
@@ -305,13 +310,94 @@ class DingTalkClient:
         except Exception as exc:
             return SendResult(success=False, error=str(exc))
 
-    async def download_bytes(self, url: str, *, timeout_seconds: float = 60.0) -> bytes:
-        """Download bytes from a DingTalk-provided media URL."""
+    async def download_bytes(
+        self,
+        url: str,
+        *,
+        timeout_seconds: float = 60.0,
+        max_bytes: int | None = None,
+        max_redirects: int = 3,
+    ) -> bytes:
+        """Stream bounded bytes while validating every DingTalk redirect hop."""
         if not self.http:
             raise RuntimeError("HTTP client not initialized")
-        response = await self.http.get(url, timeout=timeout_seconds)
-        response.raise_for_status()
-        return response.content
+        limit = max(1, int(max_bytes)) if max_bytes is not None else None
+        redirect_limit = max(0, int(max_redirects))
+        current_url = normalize_dingtalk_media_url(url, upgrade_trusted_http=True)
+        visited: set[str] = set()
+        redirect_statuses = {301, 302, 303, 307, 308}
+        for redirect_count in range(redirect_limit + 1):
+            if current_url in visited:
+                raise RuntimeError("DingTalk media redirect loop detected")
+            visited.add(current_url)
+            async with self.http.stream(
+                "GET",
+                current_url,
+                timeout=timeout_seconds,
+                follow_redirects=False,
+            ) as response:
+                if response.status_code in redirect_statuses:
+                    if redirect_count >= redirect_limit:
+                        raise RuntimeError("DingTalk media redirect limit exceeded")
+                    location = response.headers.get("location")
+                    if not location:
+                        raise RuntimeError("DingTalk media redirect is missing Location")
+                    candidate_url = urljoin(current_url, location)
+                    try:
+                        next_url = normalize_dingtalk_media_url(
+                            candidate_url,
+                            upgrade_trusted_http=False,
+                        )
+                    except ValueError as exc:
+                        target_scheme, target_host = dingtalk_media_url_origin(candidate_url)
+                        logger.warning(
+                            "dingtalk media redirect rejected hop=%d target=%s://%s reason=%s",
+                            redirect_count + 1,
+                            target_scheme,
+                            target_host or "unknown",
+                            type(exc).__name__,
+                        )
+                        raise
+                    from_scheme, from_host = dingtalk_media_url_origin(current_url)
+                    to_scheme, to_host = dingtalk_media_url_origin(next_url)
+                    logger.debug(
+                        "dingtalk media redirect hop=%d from=%s://%s to=%s://%s",
+                        redirect_count + 1,
+                        from_scheme,
+                        from_host,
+                        to_scheme,
+                        to_host,
+                    )
+                    current_url = next_url
+                    continue
+
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError:
+                    scheme, hostname = dingtalk_media_url_origin(current_url)
+                    logger.warning(
+                        "dingtalk media HTTP failure origin=%s://%s status=%d",
+                        scheme,
+                        hostname or "unknown",
+                        response.status_code,
+                    )
+                    raise
+                chunks = bytearray()
+                content_length = response.headers.get("content-length")
+                if limit is not None and content_length:
+                    try:
+                        if int(content_length) > limit:
+                            raise RuntimeError(
+                                f"media exceeds max size ({content_length} > {limit} bytes)"
+                            )
+                    except ValueError:
+                        pass
+                async for chunk in response.aiter_bytes():
+                    if limit is not None and len(chunks) + len(chunk) > limit:
+                        raise RuntimeError(f"media exceeds max size (> {limit} bytes)")
+                    chunks.extend(chunk)
+                return bytes(chunks)
+        raise RuntimeError("DingTalk media redirect limit exceeded")
 
     async def get_access_token(self) -> str | None:
         """Return the SDK access token, isolating the blocking SDK call in a thread."""
@@ -343,7 +429,16 @@ class DingTalkClient:
             body = response.body if response else None
             return getattr(body, "download_url", None) if body else None
         except Exception as exc:
-            logger.warning("dingtalk downloadCode resolve failed: %s", exc)
+            response = getattr(exc, "response", None)
+            status = getattr(response, "status_code", None) or getattr(exc, "status_code", None)
+            code = str(getattr(exc, "code", "") or "")
+            safe_code = code if code.replace(".", "").replace("_", "").isalnum() else ""
+            logger.warning(
+                "dingtalk downloadCode resolve failed type=%s status=%s code=%s",
+                type(exc).__name__,
+                status if isinstance(status, int) else "unknown",
+                safe_code or "unknown",
+            )
             return None
 
     def spawn_bg(self, coro) -> None:

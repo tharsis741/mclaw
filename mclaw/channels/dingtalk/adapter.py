@@ -18,15 +18,26 @@ import tempfile
 import time
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
-from mclaw.channels.base import AgentTurnResult, ChannelMessage, ChannelSource, SendResult
+from mclaw.channels.base import (
+    AgentTurnResult,
+    AttachmentKind,
+    AttachmentOrigin,
+    ChannelAttachment,
+    ChannelMessage,
+    ChannelSource,
+    SendResult,
+)
 from mclaw.channels.dingtalk.command_router import DingTalkCommandRouter
 from mclaw.channels.dingtalk.config import DingTalkConfig
 from mclaw.channels.dingtalk.dedup import MessageDeduplicator
 from mclaw.channels.dingtalk.formatter import split_text_for_dingtalk
 from mclaw.channels.dingtalk.media import (
+    DingTalkMediaAttachment,
     DingTalkMediaCache,
+    extract_audio_duration_ms,
     extract_media_refs,
     extract_text,
     format_media_for_agent,
@@ -37,7 +48,7 @@ from mclaw.channels.dingtalk.outbound_registry import (
 )
 from mclaw.channels.dingtalk.session_router import DingTalkSessionRouter
 from mclaw.channels.dingtalk.stream_client import DingTalkClient
-from mclaw.channels.runner import AgentRunner
+from mclaw.channels.runner import AgentRunner, IngressQueueFullError
 from mclaw.prompts.channels import build_channel_context
 from mclaw.scheduler.store import SchedulerStore
 from mclaw.scheduler.targets import bind_pairing_from_channel, parse_schedule_bind_command
@@ -117,6 +128,73 @@ def _log_unhandled_inbound_payload(message: Any, *, message_type: str, conversat
     )
 
 
+def _to_channel_attachment(
+    attachment: DingTalkMediaAttachment,
+    *,
+    duration_ms: int = 0,
+) -> ChannelAttachment:
+    """Normalize one cached DingTalk artifact for shared inbound capabilities."""
+    kind_by_media = {
+        "image": AttachmentKind.IMAGE,
+        "video": AttachmentKind.VIDEO,
+        "file": AttachmentKind.FILE,
+    }
+    is_audio = attachment.kind in {"voice", "audio"}
+    if is_audio:
+        kind = AttachmentKind.AUDIO
+        origin = AttachmentOrigin.VOICE_MESSAGE
+    else:
+        kind = kind_by_media.get(attachment.kind, AttachmentKind.UNKNOWN)
+        origin = (
+            AttachmentOrigin.FILE_UPLOAD
+            if attachment.kind == "file"
+            else AttachmentOrigin.DINGTALK
+        )
+    return ChannelAttachment(
+        kind=kind,
+        origin=origin,
+        path=attachment.path,
+        filename=attachment.filename,
+        mime_type=attachment.mime_type,
+        size_bytes=attachment.size_bytes,
+        duration_ms=max(0, duration_ms) if is_audio else 0,
+        codec=attachment.codec,
+        error=attachment.error,
+        metadata={
+            "channel": "dingtalk",
+            "dingtalk_kind": attachment.kind,
+            "managed_cache": bool(attachment.path and not attachment.error),
+        },
+    )
+
+
+def _minimal_message_context(message: Any) -> SimpleNamespace:
+    """Retain only routing/display fields, never the inbound content payload."""
+
+    return SimpleNamespace(
+        message_id=str(getattr(message, "message_id", "") or ""),
+        conversation_id=str(getattr(message, "conversation_id", "") or ""),
+        conversation_type=str(getattr(message, "conversation_type", "1") or "1"),
+        conversation_title=str(getattr(message, "conversation_title", "") or ""),
+        sender_staff_id=str(getattr(message, "sender_staff_id", "") or ""),
+    )
+
+
+def _discard_unowned_channel_message(message: ChannelMessage | None) -> None:
+    """Delete adapter-owned cache if the runner never takes message ownership."""
+
+    if message is None:
+        return
+    for attachment in message.attachments:
+        metadata = attachment.metadata if isinstance(attachment.metadata, dict) else {}
+        if metadata.get("managed_cache") is not True or not attachment.path:
+            continue
+        try:
+            Path(attachment.path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 class DingTalkAdapter:
     """Normalize DingTalk callbacks and route them through M-Claw agent sessions."""
 
@@ -183,6 +261,7 @@ class DingTalkAdapter:
         chat_type = "group" if is_group else "dm"
         text = extract_text(message)
         media_refs = extract_media_refs(message)
+        contains_voice = any(ref.kind in {"voice", "audio"} for ref in media_refs)
 
         if not sender_id and not chat_id:
             return None
@@ -206,8 +285,9 @@ class DingTalkAdapter:
 
         reply_route: tuple[str, int] | None = None
         if chat_id:
-            # Cache the SDK message so later tool calls can recover reply routes.
-            self._message_contexts[chat_id] = message
+            # Later tool calls need a few routing/display fields, not the SDK
+            # payload containing recognition text and media download handles.
+            self._message_contexts[chat_id] = _minimal_message_context(message)
             self._done_reaction_fired.discard(chat_id)
             reply_route = self._remember_session_webhook(chat_id, message)
 
@@ -309,14 +389,68 @@ class DingTalkAdapter:
                 await self.send(chat_id, command.text, reply_to=message_id, route=reply_route, done_message=message)
             return AgentTurnResult(session_id=routed.session_id)
 
-        attachments = await self.media_cache.collect(message, message_id=message_id) if media_refs else []
-        media_context = format_media_for_agent(attachments)
-        if media_context:
-            text = f"{text}\n\n{media_context}".strip() if text else f"User sent DingTalk attachment(s).\n\n{media_context}"
-        channel_message = ChannelMessage(
-            text=text,
-            source=source,
-            raw_message={
+        reserve_ingress = getattr(self.runner, "reserve_ingress", None)
+        try:
+            reservation = (
+                reserve_ingress(routed.session_id) if callable(reserve_ingress) else None
+            )
+        except IngressQueueFullError:
+            safe_text = "当前会话消息积压过多，请稍后重试。"
+            await self.send(
+                chat_id,
+                safe_text,
+                reply_to=message_id,
+                route=reply_route,
+                done_message=message,
+            )
+            return AgentTurnResult(
+                session_id=routed.session_id,
+                final_response=safe_text,
+                error="CHANNEL_QUEUE_FULL",
+                raw_result={"queue_full": True},
+            )
+        release_ingress = getattr(self.runner, "release_ingress", None)
+        channel_message: ChannelMessage | None = None
+        try:
+            # Download may finish out of order; the runner reservation retains
+            # the original callback order when each message is admitted.
+            await_ingress = getattr(self.runner, "await_ingress", None)
+            if (
+                reservation is not None
+                and callable(await_ingress)
+                and not await await_ingress(reservation)
+            ):
+                if callable(release_ingress):
+                    release_ingress(reservation)
+                return AgentTurnResult(session_id=routed.session_id, interrupted=True)
+            if media_refs:
+                bounded_download = getattr(self.runner, "run_bounded_media_download", None)
+                operation = lambda: self.media_cache.collect(message, message_id=message_id)
+                attachments = (
+                    await bounded_download(operation)
+                    if callable(bounded_download)
+                    else await operation()
+                )
+            else:
+                attachments = []
+            duration_ms = extract_audio_duration_ms(message)
+            channel_attachments = tuple(
+                _to_channel_attachment(attachment, duration_ms=duration_ms)
+                for attachment in attachments
+            )
+            if contains_voice and not getattr(self.config, "media_cache_enabled", True):
+                channel_attachments += (ChannelAttachment(
+                    kind=AttachmentKind.AUDIO,
+                    origin=AttachmentOrigin.VOICE_MESSAGE,
+                    mime_type="application/octet-stream",
+                    duration_ms=duration_ms,
+                    error="media caching is disabled",
+                    metadata={"channel": "dingtalk", "managed_cache": False},
+                ),)
+            media_context = format_media_for_agent(attachments)
+            if media_context:
+                text = f"{text}\n\n{media_context}".strip() if text else f"User sent DingTalk attachment(s).\n\n{media_context}"
+            raw_message = {
                 "message_id": message_id,
                 "chat_id": chat_id,
                 "chat_type": chat_type,
@@ -327,31 +461,54 @@ class DingTalkAdapter:
                 "reaction_open_msg_id": message_id,
                 "reaction_open_conversation_id": conversation_id,
                 "dingtalk_media": [attachment.to_dict() for attachment in attachments],
-            },
-        )
-
-        bind_events = getattr(self.runner, "bind_session_events", None)
-        if bind_events:
-            bind_events(
-                session_id=routed.session_id,
-                loop=asyncio.get_running_loop(),
-                callback=self._agent_event_callback(chat_id),
+            }
+            channel_message = ChannelMessage(
+                text=text,
+                source=source,
+                raw_message=raw_message,
+                attachments=channel_attachments,
             )
-        register_dingtalk_outbound_target(
-            session_id=routed.session_id,
-            adapter=self,
-            chat_id=chat_id,
-            loop=asyncio.get_running_loop(),
-        )
-        history = self.runner.session_db.get_messages_as_conversation(routed.session_id)
-        logger.info("dingtalk: agent turn start session=%s history=%d", routed.session_id, len(history))
-        result = await self.runner.handle_message(
-            message=channel_message,
-            session_id=routed.session_id,
-            conversation_history=history,
-            reply_callback=self._reply_callback,
-            extra_system=self._session_context_text(source),
-        )
+        except BaseException:
+            _discard_unowned_channel_message(channel_message)
+            if reservation is not None and callable(release_ingress):
+                release_ingress(reservation)
+            raise
+
+        runner_accepted = False
+        try:
+            bind_events = getattr(self.runner, "bind_session_events", None)
+            if bind_events:
+                bind_events(
+                    session_id=routed.session_id,
+                    loop=asyncio.get_running_loop(),
+                    callback=self._agent_event_callback(chat_id),
+                )
+            register_dingtalk_outbound_target(
+                session_id=routed.session_id,
+                adapter=self,
+                chat_id=chat_id,
+                loop=asyncio.get_running_loop(),
+            )
+            history = self.runner.session_db.get_messages_as_conversation(routed.session_id)
+            logger.info("dingtalk: agent turn start session=%s history=%d", routed.session_id, len(history))
+            handle_kwargs = dict(
+                message=channel_message,
+                session_id=routed.session_id,
+                conversation_history=history,
+                reply_callback=self._reply_callback,
+                extra_system=self._session_context_text(source),
+            )
+            if reservation is not None:
+                handle_kwargs["ingress_reservation"] = reservation
+            result = await self.runner.handle_message(**handle_kwargs)
+            runner_accepted = True
+        except BaseException:
+            if not runner_accepted:
+                _discard_unowned_channel_message(channel_message)
+            raise
+        finally:
+            if reservation is not None and callable(release_ingress):
+                release_ingress(reservation)
         if result.queued:
             await self.send(chat_id, "Previous request is still running; queued the latest message.", route=reply_route)
             logger.info("dingtalk: message queued session=%s", routed.session_id)
@@ -508,9 +665,10 @@ class DingTalkAdapter:
         """Send the final agent result through the route captured on the inbound message."""
         route = self._route_from_channel_message(message)
         if result.error:
+            safe_text = result.final_response.strip() or f"Error: {result.error}"
             await self.send(
                 message.source.chat_id,
-                f"Error: {result.error}",
+                safe_text,
                 reply_to=message.source.message_id,
                 route=route,
                 done_message=message,

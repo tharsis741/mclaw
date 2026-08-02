@@ -12,13 +12,20 @@ outbound handlers.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import threading
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from mclaw.channels.base import AgentTurnResult, ChannelMessage
+from mclaw.channels.inbound_pipeline import (
+    InboundCapabilityError,
+    InboundCapabilityPipeline,
+)
 from mclaw.providers.resolver import restore_session_runtime_context
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
@@ -27,12 +34,31 @@ from mclaw.tools.interrupt import get_cancel_id, safe_cancel_trace
 logger = logging.getLogger(__name__)
 
 _CANCEL_UNWIND_GRACE_SECONDS = 1.0
+_DEFAULT_MAX_PENDING_MESSAGES = 8
+_DEFAULT_MAX_INBOUND_DOWNLOADS = 4
+_PENDING_QUEUE_FULL_ERROR = "CHANNEL_QUEUE_FULL"
+_PENDING_QUEUE_FULL_MESSAGE = "当前会话消息积压过多，请稍后重试。"
 
 ReplyCallback = Callable[[ChannelMessage, AgentTurnResult], Awaitable[None]]
 AgentEventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 if TYPE_CHECKING:
     from mclaw.agent.core import MClaw
+
+
+@dataclass(slots=True)
+class IngressReservation:
+    """Preserve channel arrival order across concurrent media downloads."""
+
+    session_id: str
+    generation: int
+    ready: asyncio.Event
+    released: bool = False
+    cancelled: bool = False
+
+
+class IngressQueueFullError(RuntimeError):
+    """Raised before media download when a session has no ingress capacity."""
 
 
 def _consume_task_exception(task: asyncio.Task) -> None:
@@ -43,6 +69,13 @@ def _consume_task_exception(task: asyncio.Task) -> None:
         task.exception()
     except asyncio.CancelledError:
         pass
+
+
+def _current_task_or_none() -> asyncio.Task[Any] | None:
+    try:
+        return asyncio.current_task()
+    except RuntimeError:
+        return None
 
 
 class AgentRunner:
@@ -58,6 +91,9 @@ class AgentRunner:
         platform: str = "channel",
         max_cached_agents: int = 128,
         cache_idle_ttl_seconds: float = 3600.0,
+        inbound_pipeline: InboundCapabilityPipeline | None = None,
+        max_pending_messages: int = _DEFAULT_MAX_PENDING_MESSAGES,
+        max_inbound_downloads: int = _DEFAULT_MAX_INBOUND_DOWNLOADS,
     ) -> None:
         self.startup_provider_runtime = provider_runtime
         self.config = config or {}
@@ -66,64 +102,177 @@ class AgentRunner:
         self.platform = platform
         self.max_cached_agents = max_cached_agents
         self.cache_idle_ttl_seconds = cache_idle_ttl_seconds
+        self.inbound_pipeline = (
+            inbound_pipeline if inbound_pipeline is not None else InboundCapabilityPipeline()
+        )
+        self.max_pending_messages = max(1, int(max_pending_messages))
+        self.max_inbound_downloads = max(1, int(max_inbound_downloads))
 
         self._agents: OrderedDict[str, tuple["MClaw", float]] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
-        self._pending: dict[str, ChannelMessage] = {}
+        # Legacy tests and embedders may still assign a single ChannelMessage
+        # directly. Queue helpers below normalize that value on first use.
+        self._pending: dict[str, deque[ChannelMessage] | ChannelMessage] = {}
         self._active_agents: dict[str, "MClaw"] = {}
         self._closing_sessions: dict[str, asyncio.Event] = {}
         self._closing_agents: dict[str, "MClaw"] = {}
         self._cancelled_sessions: set[str] = set()
         self._event_callbacks: dict[str, tuple[asyncio.AbstractEventLoop, AgentEventCallback]] = {}
+        self._ingress_queues: dict[str, deque[IngressReservation]] = {}
+        self._ingress_generations: dict[str, int] = {}
+        self._session_tasks: dict[str, asyncio.Task[Any]] = {}
+        self._inbound_download_semaphore = asyncio.Semaphore(self.max_inbound_downloads)
+
+    def reserve_ingress(self, session_id: str) -> IngressReservation:
+        """Reserve bounded arrival order before an adapter downloads media."""
+        queues = getattr(self, "_ingress_queues", None)
+        if queues is None:
+            queues = {}
+            self._ingress_queues = queues
+        queue = queues.setdefault(session_id, deque())
+        pending = self._pending_count(session_id)
+        lock = self._locks.get(session_id)
+        # One additional reservation may occupy the currently free active slot.
+        limit = self._pending_capacity() if lock and lock.locked() else self._pending_capacity() + 1
+        if pending + len(queue) >= limit:
+            raise IngressQueueFullError(_PENDING_QUEUE_FULL_MESSAGE)
+
+        generations = getattr(self, "_ingress_generations", None)
+        if generations is None:
+            generations = {}
+            self._ingress_generations = generations
+        reservation = IngressReservation(
+            session_id=session_id,
+            generation=generations.get(session_id, 0),
+            ready=asyncio.Event(),
+        )
+        queue.append(reservation)
+        if len(queue) == 1:
+            reservation.ready.set()
+        return reservation
+
+    def release_ingress(self, reservation: IngressReservation | None) -> None:
+        """Release one reservation after it is admitted or abandoned."""
+        if reservation is None or reservation.released:
+            return
+        reservation.released = True
+        self._advance_ingress(reservation.session_id)
+
+    async def await_ingress(self, reservation: IngressReservation) -> bool:
+        """Wait until a reservation reaches the head, returning false if cancelled."""
+        await reservation.ready.wait()
+        generations = getattr(self, "_ingress_generations", {})
+        return (
+            not reservation.cancelled
+            and not reservation.released
+            and reservation.generation == generations.get(reservation.session_id, 0)
+        )
+
+    async def run_bounded_media_download(
+        self,
+        operation: Callable[[], Awaitable[Any]],
+    ) -> Any:
+        """Limit aggregate channel media downloads for this runtime."""
+        semaphore = getattr(self, "_inbound_download_semaphore", None)
+        if semaphore is None:
+            maximum = max(1, int(getattr(self, "max_inbound_downloads", _DEFAULT_MAX_INBOUND_DOWNLOADS)))
+            semaphore = asyncio.Semaphore(maximum)
+            self._inbound_download_semaphore = semaphore
+        async with semaphore:
+            return await operation()
+
+    def _advance_ingress(self, session_id: str) -> None:
+        queues = getattr(self, "_ingress_queues", {})
+        queue = queues.get(session_id)
+        if not queue:
+            queues.pop(session_id, None)
+            return
+        while queue and queue[0].released:
+            queue.popleft()
+        if queue:
+            queue[0].ready.set()
+        else:
+            queues.pop(session_id, None)
+
+    def _cancel_ingress(self, session_id: str) -> bool:
+        queues = getattr(self, "_ingress_queues", {})
+        queue = queues.pop(session_id, deque())
+        generations = getattr(self, "_ingress_generations", None)
+        if generations is None:
+            generations = {}
+            self._ingress_generations = generations
+        generations[session_id] = generations.get(session_id, 0) + 1
+        for reservation in queue:
+            reservation.cancelled = True
+            reservation.released = True
+            reservation.ready.set()
+        return bool(queue)
 
     def get_status(self, session_id: str) -> str:
         """Return the coarse execution state for a channel session."""
-        if session_id in self._active_agents:
+        if session_id in self._active_agents or session_id in getattr(self, "_session_tasks", {}):
             return "running"
         if session_id in self._closing_sessions:
             return "stopping"
-        if session_id in self._pending:
+        if session_id in self._pending or session_id in getattr(self, "_ingress_queues", {}):
             return "queued"
         return "idle"
 
     def interrupt(self, session_id: str) -> bool:
         """Cancel active work and discard queued input for one session."""
-        self._pending.pop(session_id, None)
+        had_pending = self._clear_pending(session_id)
+        had_ingress = self._cancel_ingress(session_id)
+        task = getattr(self, "_session_tasks", {}).get(session_id)
         agent = self._active_agents.get(session_id)
-        if not agent:
+        had_work = bool(had_pending or had_ingress or task or agent)
+        if not had_work:
             return False
-        self._cancelled_sessions.add(session_id)
-        event = getattr(agent, "current_turn_cancel_event", lambda: None)()
-        agent.interrupt()
-        safe_cancel_trace(
-            lambda: logger.warning(
-                "[CANCEL_TRACE] channel_cancel_request cancel_id=%s session=%s "
-                "trigger=channel_stop",
-                get_cancel_id(event),
-                session_id,
+        if task or agent:
+            self._cancelled_sessions.add(session_id)
+        if agent:
+            event = getattr(agent, "current_turn_cancel_event", lambda: None)()
+            agent.interrupt()
+            safe_cancel_trace(
+                lambda: logger.warning(
+                    "[CANCEL_TRACE] channel_cancel_request cancel_id=%s session=%s "
+                    "trigger=channel_stop",
+                    get_cancel_id(event),
+                    session_id,
+                )
             )
-        )
-        return True
+        current = _current_task_or_none()
+        if task is not None and task is not current and not task.done():
+            task.cancel()
+        return had_work
 
     def interrupt_all(self) -> int:
         """Interrupt all active or queued channel sessions."""
         interrupted = 0
-        for session_id in list(set(self._pending) | set(self._active_agents)):
+        sessions = (
+            set(self._pending)
+            | set(self._active_agents)
+            | set(getattr(self, "_ingress_queues", {}))
+            | set(getattr(self, "_session_tasks", {}))
+        )
+        for session_id in list(sessions):
             if self.interrupt(session_id):
                 interrupted += 1
-            else:
-                self._pending.pop(session_id, None)
         return interrupted
 
     def reset_session(self, session_id: str) -> bool:
         """Cancel active/pending work and evict cached agent for a superseded session."""
-        had_work = session_id in self._pending or session_id in self._active_agents
-        self._pending.pop(session_id, None)
+        had_pending = self._clear_pending(session_id)
+        had_ingress = self._cancel_ingress(session_id)
+        task = getattr(self, "_session_tasks", {}).get(session_id)
         agent = self._active_agents.get(session_id)
+        had_work = bool(had_pending or had_ingress or task or agent)
         if agent:
             self._cancelled_sessions.add(session_id)
             agent.interrupt()
-        else:
+        if task is not None and task is not _current_task_or_none() and not task.done():
+            self._cancelled_sessions.add(session_id)
+            task.cancel()
+        if not agent and not task:
             self._cancelled_sessions.discard(session_id)
             self._agents.pop(session_id, None)
         return had_work
@@ -160,6 +309,109 @@ class AgentRunner:
         """Attach an async event sink for agent streaming callbacks."""
         self._event_callbacks[session_id] = (loop, callback)
 
+    def _pending_capacity(self) -> int:
+        """Return a valid queue capacity for initialized and legacy runners."""
+        raw = getattr(self, "max_pending_messages", _DEFAULT_MAX_PENDING_MESSAGES)
+        try:
+            return max(1, int(raw))
+        except (TypeError, ValueError):
+            return _DEFAULT_MAX_PENDING_MESSAGES
+
+    def _pending_count(self, session_id: str) -> int:
+        current = self._pending.get(session_id)
+        if isinstance(current, ChannelMessage):
+            return 1
+        if isinstance(current, (deque, list, tuple)):
+            return sum(isinstance(item, ChannelMessage) for item in current)
+        return 0
+
+    def _clear_pending(self, session_id: str) -> bool:
+        """Discard a session FIFO and remove any M-Claw-owned cached files."""
+        current = self._pending.pop(session_id, None)
+        if isinstance(current, ChannelMessage):
+            messages = [current]
+        elif isinstance(current, (deque, list, tuple)):
+            messages = [item for item in current if isinstance(item, ChannelMessage)]
+        else:
+            messages = []
+        for message in messages:
+            self._discard_message_cache(message)
+        return bool(messages)
+
+    @staticmethod
+    def _discard_message_cache(message: ChannelMessage) -> None:
+        """Delete only files explicitly marked as M-Claw-managed channel cache."""
+        for attachment in message.attachments:
+            metadata = attachment.metadata if isinstance(attachment.metadata, dict) else {}
+            if metadata.get("managed_cache") is not True or not attachment.path:
+                continue
+            try:
+                Path(attachment.path).unlink(missing_ok=True)
+            except OSError:
+                logger.debug(
+                    "discarded channel attachment cleanup failed channel=%s",
+                    message.source.channel,
+                )
+
+    def _enqueue_pending(self, session_id: str, message: ChannelMessage) -> bool:
+        """Append one pending message without discarding older accepted work."""
+        current = self._pending.get(session_id)
+        if isinstance(current, deque):
+            queue = current
+        elif isinstance(current, ChannelMessage):
+            queue = deque([current])
+        elif isinstance(current, (list, tuple)):
+            queue = deque(item for item in current if isinstance(item, ChannelMessage))
+        else:
+            queue = deque()
+        if len(queue) >= self._pending_capacity():
+            return False
+        queue.append(message)
+        self._pending[session_id] = queue
+        return True
+
+    def _dequeue_pending(self, session_id: str) -> ChannelMessage | None:
+        """Remove the oldest pending message, accepting the legacy single-slot shape."""
+        current = self._pending.get(session_id)
+        if isinstance(current, ChannelMessage):
+            self._pending.pop(session_id, None)
+            return current
+        if isinstance(current, deque):
+            if not current:
+                self._pending.pop(session_id, None)
+                return None
+            message = current.popleft()
+            if not current:
+                self._pending.pop(session_id, None)
+            return message
+        if isinstance(current, list):
+            if not current:
+                self._pending.pop(session_id, None)
+                return None
+            message = current.pop(0)
+            if not current:
+                self._pending.pop(session_id, None)
+            return message if isinstance(message, ChannelMessage) else None
+        self._pending.pop(session_id, None)
+        return None
+
+    async def _process_inbound_message(self, message: ChannelMessage) -> ChannelMessage:
+        """Run the injected pipeline while retaining compatibility with simple fakes."""
+        pipeline = getattr(self, "inbound_pipeline", None)
+        if pipeline is None:
+            return message
+        processor = getattr(pipeline, "process", None)
+        if not callable(processor):
+            if not callable(pipeline):
+                raise TypeError("Inbound pipeline is not callable")
+            processor = pipeline
+        outcome = processor(message)
+        if inspect.isawaitable(outcome):
+            outcome = await outcome
+        if not isinstance(outcome, ChannelMessage):
+            raise TypeError("Inbound pipeline must return ChannelMessage")
+        return outcome
+
     async def handle_message(
         self,
         *,
@@ -168,31 +420,146 @@ class AgentRunner:
         conversation_history: list[dict] | None,
         reply_callback: ReplyCallback,
         extra_system: str = "",
+        ingress_reservation: IngressReservation | None = None,
     ) -> AgentTurnResult:
-        """Serialize turns per session while coalescing one pending message."""
+        """Serialize turns per session and drain its bounded pending FIFO."""
+        if ingress_reservation is not None:
+            if ingress_reservation.session_id != session_id:
+                self._discard_message_cache(message)
+                self.release_ingress(ingress_reservation)
+                raise ValueError("Ingress reservation belongs to a different session")
+            try:
+                admitted = await self.await_ingress(ingress_reservation)
+            except BaseException:
+                self._discard_message_cache(message)
+                self.release_ingress(ingress_reservation)
+                raise
+            if not admitted:
+                self._discard_message_cache(message)
+                self.release_ingress(ingress_reservation)
+                return AgentTurnResult(session_id=session_id, interrupted=True)
+
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         if lock.locked():
-            self._pending[session_id] = message
-            return AgentTurnResult(session_id=session_id, queued=True)
+            if self._enqueue_pending(session_id, message):
+                self.release_ingress(ingress_reservation)
+                return AgentTurnResult(session_id=session_id, queued=True)
+            result = AgentTurnResult(
+                session_id=session_id,
+                final_response=_PENDING_QUEUE_FULL_MESSAGE,
+                error=_PENDING_QUEUE_FULL_ERROR,
+                raw_result={"queue_full": True},
+            )
+            self.release_ingress(ingress_reservation)
+            self._discard_message_cache(message)
+            await reply_callback(message, result)
+            return result
 
         last_result = AgentTurnResult(session_id=session_id)
-        async with lock:
-            current: ChannelMessage | None = message
+        try:
+            await lock.acquire()
+        except BaseException:
+            self._discard_message_cache(message)
+            self.release_ingress(ingress_reservation)
+            raise
+        if ingress_reservation is not None:
+            try:
+                admitted = await self.await_ingress(ingress_reservation)
+            except BaseException:
+                self._discard_message_cache(message)
+                self.release_ingress(ingress_reservation)
+                lock.release()
+                raise
+            if not admitted:
+                self._discard_message_cache(message)
+                self.release_ingress(ingress_reservation)
+                lock.release()
+                return AgentTurnResult(session_id=session_id, interrupted=True)
+        self.release_ingress(ingress_reservation)
+        session_tasks = getattr(self, "_session_tasks", None)
+        if session_tasks is None:
+            session_tasks = {}
+            self._session_tasks = session_tasks
+        owner_task = _current_task_or_none()
+        if owner_task is not None:
+            session_tasks[session_id] = owner_task
+        current: ChannelMessage | None = message
+        try:
             history = conversation_history
             while current is not None:
+                try:
+                    processed = await self._process_inbound_message(current)
+                except asyncio.CancelledError:
+                    self._discard_message_cache(current)
+                    raise
+                except InboundCapabilityError as exc:
+                    logger.warning(
+                        "channel inbound capability failed session=%s capability=%s "
+                        "code=%s",
+                        session_id,
+                        exc.capability or "?",
+                        exc.code,
+                    )
+                    last_result = AgentTurnResult(
+                        session_id=session_id,
+                        final_response=exc.safe_message,
+                        error=exc.code,
+                        raw_result={
+                            "capability_error": {
+                                "code": exc.code,
+                                "capability": exc.capability,
+                            }
+                        },
+                    )
+                    self._discard_message_cache(current)
+                    await reply_callback(current, last_result)
+                    current = self._dequeue_pending(session_id)
+                    continue
+                except Exception as exc:
+                    capability_error = InboundCapabilityError(detail=str(exc))
+                    logger.exception(
+                        "channel inbound processing failed session=%s",
+                        session_id,
+                    )
+                    last_result = AgentTurnResult(
+                        session_id=session_id,
+                        final_response=capability_error.safe_message,
+                        error=capability_error.code,
+                        raw_result={
+                            "capability_error": {
+                                "code": capability_error.code,
+                                "capability": capability_error.capability,
+                            }
+                        },
+                    )
+                    self._discard_message_cache(current)
+                    await reply_callback(current, last_result)
+                    current = self._dequeue_pending(session_id)
+                    continue
                 last_result = await self._run_single_turn(
-                    message=current,
+                    message=processed,
                     session_id=session_id,
                     conversation_history=history,
                     extra_system=extra_system,
                 )
                 if session_id in self._cancelled_sessions:
                     self._cancelled_sessions.discard(session_id)
-                    self._pending.pop(session_id, None)
+                    self._discard_message_cache(current)
+                    self._clear_pending(session_id)
                     break
-                await reply_callback(current, last_result)
+                await reply_callback(processed, last_result)
                 history = last_result.raw_result.get("messages") or history
-                current = self._pending.pop(session_id, None)
+                current = self._dequeue_pending(session_id)
+        except BaseException:
+            if current is not None:
+                self._discard_message_cache(current)
+            self._clear_pending(session_id)
+            self._cancelled_sessions.discard(session_id)
+            raise
+        finally:
+            if owner_task is not None and session_tasks.get(session_id) is owner_task:
+                session_tasks.pop(session_id, None)
+            lock.release()
         return last_result
 
     async def _run_single_turn(
@@ -236,7 +603,7 @@ class AgentRunner:
                 result = await asyncio.shield(worker_task)
             except asyncio.CancelledError:
                 discard_agent = True
-                self._pending.pop(session_id, None)
+                self._clear_pending(session_id)
                 agent.interrupt()
                 safe_cancel_trace(
                     lambda: logger.warning(

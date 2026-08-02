@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from mclaw.channels.audio_transcription import build_inbound_pipeline
 from mclaw.channels.runner import AgentRunner
 from mclaw.channels.weixin.account_store import WeixinAccountStore
 from mclaw.channels.weixin.adapter import WeixinAdapter
@@ -62,6 +63,7 @@ class WeixinRuntime:
             enabled_toolsets=self.weixin_config.toolsets,
             session_db=self.session_db,
             platform="weixin",
+            inbound_pipeline=build_inbound_pipeline(config),
         )
         self.session_router = session_router or WeixinSessionRouter(
             account_id=self.weixin_config.account_id,

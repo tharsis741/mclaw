@@ -6,16 +6,23 @@
 
 from __future__ import annotations
 
+import logging
 import mimetypes
+import os
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
 
 from mclaw.channels.dingtalk.config import DingTalkConfig
+from mclaw.channels.dingtalk.download_security import (
+    dingtalk_media_url_origin,
+    normalize_dingtalk_media_url,
+)
 from mclaw.constants import get_mclaw_home
+
+logger = logging.getLogger(__name__)
 
 DINGTALK_TYPE_MAPPING = {
     "picture": "image",
@@ -44,10 +51,10 @@ _DOWNLOAD_CODE_KEYS = (
 _DOWNLOAD_URL_KEYS = (
     "downloadUrl",
     "download_url",
-    "url",
     "mediaUrl",
     "media_url",
 )
+_VOICE_MEDIA_MAX_BYTES = 7 * 1024 * 1024
 _FILENAME_KEYS = ("fileName", "file_name", "name", "title")
 _NESTED_MEDIA_KEYS = (
     "content",
@@ -89,6 +96,7 @@ class DingTalkMediaAttachment:
 
     kind: str
     mime_type: str
+    codec: str = ""
     path: str = ""
     filename: str = ""
     size_bytes: int = 0
@@ -99,9 +107,32 @@ class DingTalkMediaAttachment:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class DetectedMediaType:
+    """Media metadata derived from payload bytes instead of platform guesses."""
+
+    mime_type: str
+    extension: str
+    codec: str = ""
+
+
 def extract_text(message: Any) -> str:
-    """Extract user-visible text from DingTalk SDK and raw payload shapes."""
-    text = getattr(message, "text", None) or ""
+    """Extract only text the user explicitly typed.
+
+    DingTalk includes its own ASR result in ``content.recognition`` for voice
+    messages.  That value is platform-generated metadata and deliberately does
+    not enter the user text path; M-Claw transcribes the downloaded audio
+    independently.
+    """
+    raw_payload = _raw_payload(message)
+    message_type = str(
+        getattr(message, "message_type", None)
+        or getattr(message, "msgtype", "")
+        or raw_payload.get("msgtype")
+        or raw_payload.get("messageType")
+        or ""
+    ).strip().lower()
+    text = "" if message_type in {"audio", "voice"} else (getattr(message, "text", None) or "")
     if hasattr(text, "content"):
         content = str(text.content or "").strip()
     elif isinstance(text, dict):
@@ -119,9 +150,10 @@ def extract_text(message: Any) -> str:
             raw_parts = _rich_text_parts(raw_rich_text)
             if raw_parts:
                 return raw_parts
-        recognition = raw_content.get("recognition") or raw_content.get("text") or raw_content.get("content")
-        if recognition:
-            return str(recognition).strip()
+        if message_type == "text":
+            raw_text = raw_content.get("text") or raw_content.get("content")
+            if isinstance(raw_text, str) and raw_text.strip():
+                return raw_text.strip()
 
     rich_text = getattr(message, "rich_text_content", None) or getattr(message, "rich_text", None)
     if not rich_text:
@@ -130,6 +162,60 @@ def extract_text(message: Any) -> str:
     if not isinstance(rich_list, list):
         return ""
     return _rich_text_parts(rich_list)
+
+
+def extract_platform_transcript(message: Any) -> str:
+    """Parse DingTalk's ASR hint so its deliberate runtime exclusion is testable."""
+    candidates: list[Any] = []
+    raw_content = _raw_content(message)
+    if raw_content:
+        candidates.append(raw_content.get("recognition"))
+
+    raw_payload = _raw_payload(message)
+    payload_content = raw_payload.get("content") if raw_payload else None
+    if isinstance(payload_content, dict):
+        candidates.append(payload_content.get("recognition"))
+
+    for attr_name in ("audio_content", "audioContent", "voice_content", "voiceContent"):
+        value = getattr(message, attr_name, None)
+        if isinstance(value, dict):
+            candidates.append(value.get("recognition"))
+        elif value is not None:
+            candidates.append(getattr(value, "recognition", None))
+
+    for candidate in candidates:
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return ""
+
+
+def extract_audio_duration_ms(message: Any) -> int:
+    """Extract DingTalk's audio duration hint without trusting other content."""
+    candidates: list[Any] = []
+    raw_content = _raw_content(message)
+    if raw_content:
+        candidates.append(raw_content.get("duration"))
+
+    raw_payload = _raw_payload(message)
+    payload_content = raw_payload.get("content") if raw_payload else None
+    if isinstance(payload_content, dict):
+        candidates.append(payload_content.get("duration"))
+
+    for attr_name in ("audio_content", "audioContent", "voice_content", "voiceContent"):
+        value = getattr(message, attr_name, None)
+        if isinstance(value, dict):
+            candidates.append(value.get("duration"))
+        elif value is not None:
+            candidates.append(getattr(value, "duration", None))
+
+    for candidate in candidates:
+        if candidate in (None, "") or isinstance(candidate, bool):
+            continue
+        try:
+            return max(0, int(candidate))
+        except (TypeError, ValueError):
+            continue
+    return 0
 
 
 def extract_media_refs(message: Any) -> list[DingTalkMediaRef]:
@@ -221,7 +307,9 @@ def _extract_media_refs_from_mapping(data: dict[str, Any], *, fallback_msg_type:
     refs: list[DingTalkMediaRef] = []
     for candidate, path_hint in _iter_media_candidates(data):
         code = _first_mapping_value(candidate, _DOWNLOAD_CODE_KEYS)
-        url = _first_mapping_value(candidate, _DOWNLOAD_URL_KEYS)
+        # A downloadCode is resolved through authenticated DingTalk OpenAPI.
+        # Never let a sibling raw URL override that trusted route.
+        url = "" if code else _first_mapping_value(candidate, _DOWNLOAD_URL_KEYS)
         if not code and not url:
             continue
         candidate_type = str(candidate.get("type") or candidate.get("msgtype") or candidate.get("messageType") or "").strip()
@@ -307,10 +395,16 @@ def _raw_payload(message: Any) -> dict[str, Any]:
 
 def format_media_for_agent(attachments: list[DingTalkMediaAttachment]) -> str:
     """Render cached attachment paths as tool-ready guidance for the agent."""
-    if not attachments:
+    # Audio is consumed by the shared inbound-audio pipeline.  Keeping its
+    # private cache path out of the prompt also prevents a voice-only message
+    # from bypassing ASR as generic attachment text.
+    prompt_attachments = [
+        attachment for attachment in attachments if attachment.kind not in {"voice", "audio"}
+    ]
+    if not prompt_attachments:
         return ""
     lines = ["## DingTalk Attachments"]
-    for idx, attachment in enumerate(attachments, 1):
+    for idx, attachment in enumerate(prompt_attachments, 1):
         label = f"{idx}. {attachment.kind}"
         if attachment.filename:
             label += f" ({attachment.filename})"
@@ -328,8 +422,6 @@ def format_media_for_agent(attachments: list[DingTalkMediaAttachment]) -> str:
             )
         elif attachment.kind == "file":
             lines.append(f"   Use read_file(path={attachment.path!r}) or other file tools if readable.")
-        elif attachment.kind in {"voice", "audio"}:
-            lines.append("   Audio is cached locally. Use the file path if a transcription tool is available.")
         elif attachment.kind == "video":
             lines.append("   Video is cached locally as a file attachment.")
     return "\n".join(lines)
@@ -348,9 +440,13 @@ class DingTalkMediaCache:
         if not self.config.media_cache_enabled:
             return []
         attachments: list[DingTalkMediaAttachment] = []
-        for index, ref in enumerate(extract_media_refs(message), 1):
-            attachments.append(await self._download_ref(ref, message=message, message_id=message_id, index=index))
-        return attachments
+        try:
+            for index, ref in enumerate(extract_media_refs(message), 1):
+                attachments.append(await self._download_ref(ref, message=message, message_id=message_id, index=index))
+            return attachments
+        except BaseException:
+            _cleanup_cached_attachments(attachments)
+            raise
 
     async def _download_ref(
         self,
@@ -361,45 +457,90 @@ class DingTalkMediaCache:
         index: int,
     ) -> DingTalkMediaAttachment:
         """Resolve a download code or URL and persist the bounded media payload."""
+        stage = "resolve"
+        url = ""
         try:
-            url = ref.url
-            if not url and ref.download_code:
+            if ref.download_code:
                 url = await self.client.fetch_download_url(
                     download_code=ref.download_code,
                     robot_code=getattr(message, "robot_code", "") or self.config.robot_code,
                 )
+            elif ref.url:
+                url = ref.url
             if not url:
                 raise RuntimeError("missing DingTalk download URL")
-            _assert_download_url(url)
-            raw = await self.client.download_bytes(url, timeout_seconds=self.config.media_download_timeout_seconds)
-            if len(raw) > self.config.media_max_bytes:
-                raise RuntimeError(f"media exceeds max size ({len(raw)} > {self.config.media_max_bytes} bytes)")
-            path = self._write_cache(raw, ref=ref, message_id=message_id, index=index)
+            stage = "validate"
+            url = normalize_dingtalk_media_url(url, upgrade_trusted_http=True)
+            payload_limit = (
+                min(self.config.media_max_bytes, _VOICE_MEDIA_MAX_BYTES)
+                if ref.kind in {"voice", "audio"}
+                else self.config.media_max_bytes
+            )
+            stage = "download"
+            raw = await self.client.download_bytes(
+                url,
+                timeout_seconds=self.config.media_download_timeout_seconds,
+                max_bytes=payload_limit,
+            )
+            stage = "inspect"
+            detected = sniff_media_type(
+                raw,
+                kind=ref.kind,
+                filename=ref.filename,
+                fallback_mime=ref.mime_type,
+            )
+            path = self._write_cache(
+                raw,
+                ref=ref,
+                media_type=detected,
+                message_id=message_id,
+                index=index,
+            )
             return DingTalkMediaAttachment(
                 kind=ref.kind,
-                mime_type=ref.mime_type,
+                mime_type=detected.mime_type,
+                codec=detected.codec,
                 path=str(path),
                 filename=ref.filename,
                 size_bytes=len(raw),
             )
         except Exception as exc:
+            safe_error = _safe_media_error(exc)
+            scheme, hostname = dingtalk_media_url_origin(url)
+            logger.warning(
+                "dingtalk media download failed kind=%s stage=%s origin=%s://%s error=%s",
+                ref.kind,
+                stage,
+                scheme,
+                hostname or "unknown",
+                safe_error,
+            )
             return DingTalkMediaAttachment(
                 kind=ref.kind,
                 mime_type=ref.mime_type,
                 filename=ref.filename,
-                error=str(exc),
+                error=f"{stage}: {safe_error}",
             )
 
-    def _write_cache(self, data: bytes, *, ref: DingTalkMediaRef, message_id: str, index: int) -> Path:
+    def _write_cache(
+        self,
+        data: bytes,
+        *,
+        ref: DingTalkMediaRef,
+        media_type: DetectedMediaType,
+        message_id: str,
+        index: int,
+    ) -> Path:
         """Write media bytes under the per-client daily cache directory."""
         day = datetime.now().strftime("%Y%m%d")
         cache_dir = self.root / self.config.client_id / day
-        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if os.name == "posix":
+            os.chmod(cache_dir, 0o700)
         stem = _safe_stem(message_id or uuid.uuid4().hex)
-        extension = _extension(ref.filename, ref.mime_type, ref.kind)
+        extension = media_type.extension or _extension(ref.filename, media_type.mime_type, ref.kind)
         path = cache_dir / f"{stem}-{index}-{ref.kind}{extension}"
-        path.write_bytes(data)
-        return path
+        return _write_private_bytes(path, data)
 
 
 def _cache_root(config: DingTalkConfig) -> Path:
@@ -409,13 +550,17 @@ def _cache_root(config: DingTalkConfig) -> Path:
 
 
 def _mime_for(kind: str, filename: str) -> str:
+    suffix = Path(filename).suffix.lower() if filename else ""
+    explicit = _MEDIA_TYPES_BY_SUFFIX.get(suffix)
+    if explicit:
+        return explicit.mime_type
     guessed = mimetypes.guess_type(filename)[0] if filename else None
     if guessed:
         return guessed
     if kind == "image":
         return "image/jpeg"
     if kind in {"voice", "audio"}:
-        return "audio/mpeg"
+        return "application/octet-stream"
     if kind == "video":
         return "video/mp4"
     return "application/octet-stream"
@@ -430,10 +575,169 @@ def _extension(filename: str, mime_type: str, kind: str) -> str:
         return guessed
     return {
         "image": ".jpg",
-        "voice": ".amr",
-        "audio": ".mp3",
         "video": ".mp4",
     }.get(kind, ".bin")
+
+
+_MEDIA_TYPES_BY_SUFFIX = {
+    ".aac": DetectedMediaType("audio/aac", ".aac", "aac"),
+    ".aif": DetectedMediaType("audio/aiff", ".aif", "aiff"),
+    ".aiff": DetectedMediaType("audio/aiff", ".aiff", "aiff"),
+    ".amr": DetectedMediaType("audio/amr", ".amr", "amr"),
+    ".awb": DetectedMediaType("audio/amr-wb", ".amr", "amr-wb"),
+    ".caf": DetectedMediaType("audio/x-caf", ".caf", "caf"),
+    ".flac": DetectedMediaType("audio/flac", ".flac", "flac"),
+    ".m4a": DetectedMediaType("audio/mp4", ".m4a", "mp4a"),
+    ".mp3": DetectedMediaType("audio/mpeg", ".mp3", "mp3"),
+    ".ogg": DetectedMediaType("audio/ogg", ".ogg", ""),
+    ".opus": DetectedMediaType("audio/ogg", ".ogg", "opus"),
+    ".wav": DetectedMediaType("audio/wav", ".wav", "wav"),
+    ".webm": DetectedMediaType("audio/webm", ".webm", ""),
+    ".bmp": DetectedMediaType("image/bmp", ".bmp"),
+    ".gif": DetectedMediaType("image/gif", ".gif"),
+    ".jpeg": DetectedMediaType("image/jpeg", ".jpg"),
+    ".jpg": DetectedMediaType("image/jpeg", ".jpg"),
+    ".png": DetectedMediaType("image/png", ".png"),
+    ".webp": DetectedMediaType("image/webp", ".webp"),
+    ".mp4": DetectedMediaType("video/mp4", ".mp4", ""),
+    ".pdf": DetectedMediaType("application/pdf", ".pdf"),
+    ".zip": DetectedMediaType("application/zip", ".zip"),
+}
+
+_PREFERRED_EXTENSIONS = {
+    "application/pdf": ".pdf",
+    "application/zip": ".zip",
+    "audio/aac": ".aac",
+    "audio/aiff": ".aiff",
+    "audio/amr": ".amr",
+    "audio/amr-wb": ".amr",
+    "audio/flac": ".flac",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "audio/ogg": ".ogg",
+    "audio/wav": ".wav",
+    "audio/webm": ".webm",
+    "audio/x-caf": ".caf",
+    "image/bmp": ".bmp",
+    "image/gif": ".gif",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+}
+
+
+def sniff_media_type(
+    data: bytes,
+    *,
+    kind: str,
+    filename: str = "",
+    fallback_mime: str = "application/octet-stream",
+) -> DetectedMediaType:
+    """Identify common DingTalk media from magic bytes with safe fallbacks.
+
+    DingTalk's inbound audio callback provides no codec or filename.  In
+    particular, ``msgtype=audio`` does not imply MP3.  Byte signatures take
+    precedence over a filename supplied by the platform.
+    """
+    prefix = bytes(data[:4096])
+
+    if prefix.startswith(b"#!AMR-WB\n"):
+        return DetectedMediaType("audio/amr-wb", ".amr", "amr-wb")
+    if prefix.startswith(b"#!AMR\n"):
+        return DetectedMediaType("audio/amr", ".amr", "amr-nb")
+    if prefix.startswith(b"OggS"):
+        codec = ""
+        if b"OpusHead" in prefix:
+            codec = "opus"
+        elif b"\x01vorbis" in prefix:
+            codec = "vorbis"
+        elif b"Speex   " in prefix:
+            codec = "speex"
+        return DetectedMediaType("audio/ogg", ".ogg", codec)
+    if prefix.startswith(b"fLaC"):
+        return DetectedMediaType("audio/flac", ".flac", "flac")
+    if prefix.startswith(b"ID3") or _looks_like_mp3_frame(prefix):
+        return DetectedMediaType("audio/mpeg", ".mp3", "mp3")
+    if prefix.startswith(b"RIFF") and len(prefix) >= 12:
+        if prefix[8:12] == b"WAVE":
+            return DetectedMediaType("audio/wav", ".wav", _wav_codec(prefix))
+        if prefix[8:12] == b"WEBP":
+            return DetectedMediaType("image/webp", ".webp")
+    if prefix.startswith(b"FORM") and prefix[8:12] in {b"AIFF", b"AIFC"}:
+        return DetectedMediaType("audio/aiff", ".aiff", "aiff")
+    if prefix.startswith(b"caff"):
+        return DetectedMediaType("audio/x-caf", ".caf", "caf")
+    if kind in {"audio", "voice"} and _looks_like_aac_adts(prefix):
+        return DetectedMediaType("audio/aac", ".aac", "aac")
+    if len(prefix) >= 12 and prefix[4:8] == b"ftyp":
+        if kind in {"audio", "voice"}:
+            return DetectedMediaType("audio/mp4", ".m4a", "mp4a")
+        return DetectedMediaType("video/mp4", ".mp4", "")
+    if prefix.startswith(b"\x1aE\xdf\xa3"):
+        mime_type = "audio/webm" if kind in {"audio", "voice"} else "video/webm"
+        return DetectedMediaType(mime_type, ".webm", "")
+    if prefix.startswith(b"\x89PNG\r\n\x1a\n"):
+        return DetectedMediaType("image/png", ".png")
+    if prefix.startswith(b"\xff\xd8\xff"):
+        return DetectedMediaType("image/jpeg", ".jpg")
+    if prefix.startswith((b"GIF87a", b"GIF89a")):
+        return DetectedMediaType("image/gif", ".gif")
+    if prefix.startswith(b"BM"):
+        return DetectedMediaType("image/bmp", ".bmp")
+    if prefix.startswith(b"%PDF-"):
+        return DetectedMediaType("application/pdf", ".pdf")
+    if prefix.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return DetectedMediaType("application/zip", ".zip")
+
+    suffix = Path(filename).suffix.lower() if filename else ""
+    from_suffix = _MEDIA_TYPES_BY_SUFFIX.get(suffix)
+    if from_suffix and (kind not in {"audio", "voice"} or from_suffix.mime_type.startswith("audio/")):
+        return from_suffix
+
+    clean_mime = str(fallback_mime or "").partition(";")[0].strip().lower()
+    if clean_mime and clean_mime != "application/octet-stream":
+        if kind not in {"audio", "voice"} or clean_mime.startswith("audio/"):
+            extension = _PREFERRED_EXTENSIONS.get(clean_mime) or mimetypes.guess_extension(clean_mime) or ".bin"
+            return DetectedMediaType(clean_mime, extension, "")
+
+    return DetectedMediaType("application/octet-stream", ".bin", "")
+
+
+def _looks_like_mp3_frame(prefix: bytes) -> bool:
+    if len(prefix) < 2 or prefix[0] != 0xFF:
+        return False
+    # MPEG audio sync (11 bits) with a valid layer and bitrate index.
+    return (prefix[1] & 0xE0) == 0xE0 and (prefix[1] & 0x06) != 0
+
+
+def _looks_like_aac_adts(prefix: bytes) -> bool:
+    return len(prefix) >= 2 and prefix[0] == 0xFF and (prefix[1] & 0xF6) == 0xF0
+
+
+def _wav_codec(prefix: bytes) -> str:
+    fmt_index = prefix.find(b"fmt ")
+    if fmt_index < 0 or len(prefix) < fmt_index + 10:
+        return "wav"
+    format_tag = int.from_bytes(prefix[fmt_index + 8 : fmt_index + 10], "little")
+    bits_per_sample = (
+        int.from_bytes(prefix[fmt_index + 22 : fmt_index + 24], "little")
+        if len(prefix) >= fmt_index + 24
+        else 0
+    )
+    if format_tag == 1:
+        if bits_per_sample == 8:
+            return "pcm_u8"
+        if bits_per_sample in {16, 24, 32}:
+            return f"pcm_s{bits_per_sample}le"
+        return "pcm"
+    if format_tag == 3:
+        return f"pcm_f{bits_per_sample}le" if bits_per_sample in {32, 64} else "pcm_f"
+    return {
+        6: "pcm_alaw",
+        7: "pcm_mulaw",
+        17: "adpcm_ima_wav",
+    }.get(format_tag, "wav")
 
 
 def _safe_stem(value: str) -> str:
@@ -441,10 +745,70 @@ def _safe_stem(value: str) -> str:
     return safe[:80] or uuid.uuid4().hex
 
 
+def _write_private_bytes(path: Path, data: bytes) -> Path:
+    """Create a cache artifact atomically with owner-only POSIX permissions."""
+
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+    candidate = path
+    for _attempt in range(3):
+        try:
+            descriptor = os.open(candidate, flags, 0o600)
+            break
+        except FileExistsError:
+            candidate = path.with_name(f"{path.stem}-{uuid.uuid4().hex[:8]}{path.suffix}")
+    else:
+        raise FileExistsError(f"could not allocate private cache path for {path.name}")
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+        if os.name == "posix":
+            os.chmod(candidate, 0o600)
+        return candidate
+    except BaseException:
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _cleanup_cached_attachments(attachments: list[DingTalkMediaAttachment]) -> None:
+    for attachment in attachments:
+        if not attachment.path:
+            continue
+        try:
+            Path(attachment.path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _assert_download_url(url: str) -> None:
     """Validate URL shape before handing it to the DingTalk download client."""
-    parsed = urlparse(url)
-    if parsed.scheme.lower() not in {"http", "https"}:
-        raise ValueError("DingTalk media download URL must use http or https")
-    if not parsed.hostname:
-        raise ValueError("DingTalk media download URL is missing a host")
+    normalize_dingtalk_media_url(url)
+
+
+def _safe_media_error(exc: Exception) -> str:
+    """Describe a media failure without retaining signed URLs or handles."""
+
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None) or getattr(exc, "status_code", None)
+    if isinstance(status, int):
+        return f"{type(exc).__name__} status={status}"
+    message = str(exc)
+    safe_messages = (
+        "missing DingTalk download URL",
+        "DingTalk media download URL must use https",
+        "DingTalk media download URL must not contain user info",
+        "DingTalk media download URL has an invalid port",
+        "DingTalk media download URL must use the default https port",
+        "DingTalk media download URL is missing a host",
+        "DingTalk media download host is not trusted",
+        "DingTalk media redirect is missing Location",
+        "DingTalk media redirect loop detected",
+        "DingTalk media redirect limit exceeded",
+        "media exceeds max size",
+    )
+    for safe_message in safe_messages:
+        if safe_message in message:
+            return safe_message
+    return type(exc).__name__
