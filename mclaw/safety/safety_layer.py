@@ -123,12 +123,11 @@ def _terminal_cwd(arguments: dict[str, Any], parent_agent: Any = None) -> str:
     if workdir:
         return workdir
     try:
-        from mclaw.tools import terminal_tool
         from mclaw.tools.dispatch import get_current_session_id
+        from mclaw.tools.terminal_tool import get_session_cwd
 
-        current_id = get_current_session_id() or getattr(terminal_tool, "_current_session_id", None)
-        env = getattr(terminal_tool, "_env_registry", {}).get(current_id) if current_id else None
-        cwd = getattr(env, "cwd", None)
+        current_id = get_current_session_id()
+        cwd = get_session_cwd(current_id)
         if cwd:
             return str(cwd)
     except Exception:

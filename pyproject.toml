@@ -103,6 +103,7 @@ mclaw = [
     "skills/**/*",
     "skills/**/.rels",
     "pet/assets/**/*",
+    "dsoftbus/resources/mclaw_product_launcher.sh",
 ]
 
 [tool.setuptools.exclude-package-data]

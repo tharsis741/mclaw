@@ -21,6 +21,7 @@ from mclaw.tools.vision.client import call_vision_llm as _call_vision_llm
 from mclaw.tools.vision.config import (
     MAX_IMAGE_SIZE_BYTES as _MAX_IMAGE_SIZE_BYTES,
     resolve_download_timeout as _resolve_download_timeout,
+    resolve_max_pixels as _resolve_max_pixels,
     resolve_timeout as _resolve_timeout,
 )
 from mclaw.tools.vision.credentials import (
@@ -33,9 +34,9 @@ from mclaw.tools.vision.image_io import (
     _remove_partial_image,
 )
 from mclaw.tools.vision.processing import (
-    _compress_image_if_needed,
     _detect_image_mime_type,
     _image_to_base64_data_url,
+    _resize_image_if_needed,
 )
 
 logger = logging.getLogger(__name__)
@@ -101,10 +102,12 @@ def _run_vision_io(
             )
 
 
-def _build_messages(data_url: str, question: str) -> list[dict]:
+def _build_messages(data_url: str, question: str, max_pixels: int) -> list[dict]:
     """Build the multimodal chat payload expected by Qwen-compatible clients."""
     full_prompt = (
-        "先客观描述图片中与问题相关的内容，再回答下面的问题。\n\n"
+        "只检查回答问题所需的视觉信息，直接给出结论。"
+        "除非问题明确要求完整描述、解释或文字提取，否则不要复述整张图片。"
+        "无法辨认的内容请明确说明，不要猜测。\n\n"
         f"问题：{question}"
     )
     return [
@@ -112,7 +115,10 @@ def _build_messages(data_url: str, question: str) -> list[dict]:
             "role": "user",
             "content": [
                 {"type": "text", "text": full_prompt},
-                {"type": "image_url", "image_url": {"url": data_url}},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": data_url, "max_pixels": max_pixels},
+                },
             ],
         }
     ]
@@ -126,11 +132,11 @@ def vision_analyze(
     """Analyze an image from a URL or local path.
 
     Remote images are downloaded through SSRF-safe helpers and local images are
-    read in place. Temporary downloads and compression artifacts are cleaned up
+    read in place. Temporary downloads and resized artifacts are cleaned up
     after the model call.
     """
     temp_image_path: Path | None = None
-    compressed_image_path: Path | None = None
+    resized_image_path: Path | None = None
     should_cleanup = True
     remote_download_finished = threading.Event()
     remote_download_abandoned = threading.Event()
@@ -232,11 +238,15 @@ def vision_analyze(
         logger.info("Image ready: %s (%.1f KB, %s)", temp_image_path.name, image_size / 1024, mime)
 
         _raise_if_cancelled(cancel_event)
-        compressed_image_path = _compress_image_if_needed(temp_image_path)
-        if compressed_image_path != temp_image_path:
-            logger.info("Using compressed image for upload")
-            target_path = compressed_image_path
-            mime = "image/jpeg"
+        max_pixels = _resolve_max_pixels(parent_agent)
+        resized_image_path = _resize_image_if_needed(
+            temp_image_path,
+            max_pixels=max_pixels,
+        )
+        if resized_image_path != temp_image_path:
+            logger.info("Using resized image for upload (max_pixels=%d)", max_pixels)
+            target_path = resized_image_path
+            mime = _detect_image_mime_type(target_path) or mime
         else:
             target_path = temp_image_path
 
@@ -258,7 +268,7 @@ def vision_analyze(
                 success=False,
             )
 
-        messages = _build_messages(data_url, question)
+        messages = _build_messages(data_url, question, max_pixels)
         base_timeout = _resolve_timeout(parent_agent)
         extra = (len(data_url) / (1024 * 1024)) * 60
         timeout = max(base_timeout, min(base_timeout + extra, 600.0))
@@ -357,15 +367,15 @@ def vision_analyze(
             except Exception as cleanup_err:
                 logger.warning("Could not delete temporary file: %s", cleanup_err)
         if (
-            compressed_image_path
-            and compressed_image_path != temp_image_path
-            and compressed_image_path.exists()
+            resized_image_path
+            and resized_image_path != temp_image_path
+            and resized_image_path.exists()
         ):
             try:
-                compressed_image_path.unlink()
-                logger.debug("Cleaned up compressed image file")
+                resized_image_path.unlink()
+                logger.debug("Cleaned up resized image file")
             except Exception as cleanup_err:
-                logger.warning("Could not delete compressed file: %s", cleanup_err)
+                logger.warning("Could not delete resized file: %s", cleanup_err)
 
 
 def diagnose_vision_requirements(config: dict | None = None) -> dict:
@@ -386,10 +396,10 @@ VISION_ANALYZE_SCHEMA = {
         "description": (
             "Analyze an image using Qwen vision. Provide either an "
             "HTTP/HTTPS URL or a local file path. The tool downloads remote "
-            "images, validates and optionally compresses them, then sends the "
+            "images, validates and conditionally resizes them, then sends the "
             "image to a Qwen vision-capable model.\n\n"
-            "The response includes a full description of the image and an answer "
-            "to your specific question."
+            "The response answers your question directly and includes only the "
+            "relevant visual details unless you request a full description."
         ),
         "parameters": {
             "type": "object",

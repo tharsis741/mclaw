@@ -12,6 +12,8 @@ outbound handlers.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import copy
 import inspect
 import logging
 import threading
@@ -44,6 +46,13 @@ AgentEventCallback = Callable[[str, dict[str, Any]], Awaitable[None]]
 
 if TYPE_CHECKING:
     from mclaw.agent.core import MClaw
+
+
+class _Unset:
+    __slots__ = ()
+
+
+_UNSET = _Unset()
 
 
 @dataclass(slots=True)
@@ -87,26 +96,65 @@ class AgentRunner:
         provider_runtime: ProviderRuntimeContext,
         config: dict | None = None,
         enabled_toolsets: list[str] | None = None,
-        session_db: SessionDB | None = None,
+        session_db: SessionDB | None | _Unset = _UNSET,
         platform: str = "channel",
         max_cached_agents: int = 128,
         cache_idle_ttl_seconds: float = 3600.0,
         inbound_pipeline: InboundCapabilityPipeline | None = None,
         max_pending_messages: int = _DEFAULT_MAX_PENDING_MESSAGES,
         max_inbound_downloads: int = _DEFAULT_MAX_INBOUND_DOWNLOADS,
+        agent_system_prompt: str = "",
+        agent_workspace_root: str | None = None,
+        skip_memory: bool = False,
+        disable_tools: bool = False,
+        advance_background_review: bool = True,
+        call_source: str = "channel",
+        apply_inbound_pipeline: bool = True,
     ) -> None:
+        for name, value in (
+            ("skip_memory", skip_memory),
+            ("disable_tools", disable_tools),
+            ("advance_background_review", advance_background_review),
+            ("apply_inbound_pipeline", apply_inbound_pipeline),
+        ):
+            if type(value) is not bool:
+                raise TypeError(f"{name} must be a bool")
+        if not isinstance(agent_system_prompt, str):
+            raise TypeError("agent_system_prompt must be a string")
+        if agent_workspace_root is not None and not isinstance(
+            agent_workspace_root, str
+        ):
+            raise TypeError("agent_workspace_root must be a string or None")
+        if not isinstance(call_source, str) or not call_source:
+            raise TypeError("call_source must be a non-empty string")
         self.startup_provider_runtime = provider_runtime
         self.config = config or {}
         self.enabled_toolsets = enabled_toolsets or self.config.get("toolsets", ["mclaw-required"])
-        self.session_db = session_db or SessionDB()
+        self._owns_session_db = session_db is _UNSET
+        self.session_db = SessionDB() if self._owns_session_db else session_db
         self.platform = platform
         self.max_cached_agents = max_cached_agents
         self.cache_idle_ttl_seconds = cache_idle_ttl_seconds
         self.inbound_pipeline = (
-            inbound_pipeline if inbound_pipeline is not None else InboundCapabilityPipeline()
+            (
+                inbound_pipeline
+                if inbound_pipeline is not None
+                else InboundCapabilityPipeline()
+            )
+            if apply_inbound_pipeline
+            else None
         )
         self.max_pending_messages = max(1, int(max_pending_messages))
         self.max_inbound_downloads = max(1, int(max_inbound_downloads))
+        self.agent_system_prompt = agent_system_prompt
+        self.agent_workspace_root = (
+            str(Path(agent_workspace_root)) if agent_workspace_root else None
+        )
+        self.skip_memory = skip_memory
+        self.disable_tools = disable_tools
+        self.advance_background_review = advance_background_review
+        self.call_source = call_source
+        self.apply_inbound_pipeline = apply_inbound_pipeline
 
         self._agents: OrderedDict[str, tuple["MClaw", float]] = OrderedDict()
         self._locks: dict[str, asyncio.Lock] = {}
@@ -116,8 +164,14 @@ class AgentRunner:
         self._active_agents: dict[str, "MClaw"] = {}
         self._closing_sessions: dict[str, asyncio.Event] = {}
         self._closing_agents: dict[str, "MClaw"] = {}
+        self._retiring_sessions: set[str] = set()
+        self._retiring_agents: dict[str, "MClaw"] = {}
         self._cancelled_sessions: set[str] = set()
         self._event_callbacks: dict[str, tuple[asyncio.AbstractEventLoop, AgentEventCallback]] = {}
+        self._event_callback_futures: dict[
+            str, set[concurrent.futures.Future[Any]]
+        ] = {}
+        self._event_callback_lock = threading.Lock()
         self._ingress_queues: dict[str, deque[IngressReservation]] = {}
         self._ingress_generations: dict[str, int] = {}
         self._session_tasks: dict[str, asyncio.Task[Any]] = {}
@@ -259,6 +313,41 @@ class AgentRunner:
                 interrupted += 1
         return interrupted
 
+    async def cancel_and_reap(
+        self,
+        session_id: str,
+        *,
+        task_id: str,
+        deadline: float,
+    ) -> bool:
+        """Cancel one remote turn and confirm its terminal process scope is gone."""
+        if self.call_source != "dsoftbus":
+            raise RuntimeError("cancel_and_reap is reserved for remote DSoftBus turns")
+        self.interrupt(session_id)
+
+        from mclaw.tools.process_registry import process_registry
+
+        def terminate_owned_processes() -> dict[str, Any]:
+            return process_registry.terminate_scope(
+                task_id=task_id,
+                session_key=session_id,
+            )
+
+        initial = await asyncio.to_thread(terminate_owned_processes)
+        while not self._session_is_idle(session_id):
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.02, remaining))
+
+        # Close the spawn-vs-cancel window: after the Agent and every tool worker
+        # have drained, prove once more that the Task owns no surviving process.
+        final = await asyncio.to_thread(terminate_owned_processes)
+        return bool(
+            initial.get("termination_confirmed") is True
+            and final.get("termination_confirmed") is True
+        )
+
     def reset_session(self, session_id: str) -> bool:
         """Cancel active/pending work and evict cached agent for a superseded session."""
         had_pending = self._clear_pending(session_id)
@@ -272,9 +361,10 @@ class AgentRunner:
         if task is not None and task is not _current_task_or_none() and not task.done():
             self._cancelled_sessions.add(session_id)
             task.cancel()
+        self._retiring_session_set().add(session_id)
         if not agent and not task:
             self._cancelled_sessions.discard(session_id)
-            self._agents.pop(session_id, None)
+            self._try_retire_session(session_id)
         return had_work
 
     def session_replacement_block_reason(self, session_id: str) -> str | None:
@@ -308,6 +398,36 @@ class AgentRunner:
     ) -> None:
         """Attach an async event sink for agent streaming callbacks."""
         self._event_callbacks[session_id] = (loop, callback)
+        with self._event_callback_lock:
+            self._event_callback_futures.setdefault(session_id, set())
+
+    async def flush_session_events(self, session_id: str) -> None:
+        """Wait until every event emitted before this fence has been handled."""
+
+        while True:
+            with self._event_callback_lock:
+                pending = tuple(
+                    future
+                    for future in self._event_callback_futures.get(
+                        session_id, set()
+                    )
+                    if not future.done()
+                )
+            if not pending:
+                return
+            await asyncio.gather(
+                *(asyncio.wrap_future(future) for future in pending),
+                return_exceptions=True,
+            )
+
+    def unbind_session_events(self, session_id: str) -> None:
+        """Remove one event sink after its callbacks have crossed the flush fence."""
+
+        self._event_callbacks.pop(session_id, None)
+        with self._event_callback_lock:
+            futures = self._event_callback_futures.get(session_id, set())
+            if not any(not future.done() for future in futures):
+                self._event_callback_futures.pop(session_id, None)
 
     def _pending_capacity(self) -> int:
         """Return a valid queue capacity for initialized and legacy runners."""
@@ -421,8 +541,17 @@ class AgentRunner:
         reply_callback: ReplyCallback,
         extra_system: str = "",
         ingress_reservation: IngressReservation | None = None,
+        deadline_monotonic: float | None = None,
+        enqueue_if_busy: bool = True,
     ) -> AgentTurnResult:
         """Serialize turns per session and drain its bounded pending FIFO."""
+        if type(enqueue_if_busy) is not bool:
+            raise TypeError("enqueue_if_busy must be a bool")
+        if deadline_monotonic is not None and (
+            isinstance(deadline_monotonic, bool)
+            or not isinstance(deadline_monotonic, (int, float))
+        ):
+            raise TypeError("deadline_monotonic must be a number or None")
         if ingress_reservation is not None:
             if ingress_reservation.session_id != session_id:
                 self._discard_message_cache(message)
@@ -441,6 +570,14 @@ class AgentRunner:
 
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         if lock.locked():
+            if not enqueue_if_busy:
+                self.release_ingress(ingress_reservation)
+                self._discard_message_cache(message)
+                return AgentTurnResult(
+                    session_id=session_id,
+                    error="RUNNER_BUSY",
+                    raw_result={"runner_busy": True},
+                )
             if self._enqueue_pending(session_id, message):
                 self.release_ingress(ingress_reservation)
                 return AgentTurnResult(session_id=session_id, queued=True)
@@ -541,6 +678,7 @@ class AgentRunner:
                     session_id=session_id,
                     conversation_history=history,
                     extra_system=extra_system,
+                    deadline_monotonic=deadline_monotonic,
                 )
                 if session_id in self._cancelled_sessions:
                     self._cancelled_sessions.discard(session_id)
@@ -560,6 +698,8 @@ class AgentRunner:
             if owner_task is not None and session_tasks.get(session_id) is owner_task:
                 session_tasks.pop(session_id, None)
             lock.release()
+            if session_id in getattr(self, "_retiring_sessions", set()):
+                self._try_retire_session(session_id)
         return last_result
 
     async def _run_single_turn(
@@ -569,6 +709,7 @@ class AgentRunner:
         session_id: str,
         conversation_history: list[dict] | None,
         extra_system: str = "",
+        deadline_monotonic: float | None = None,
     ) -> AgentTurnResult:
         """Run one MClaw conversation turn on a worker thread."""
         agent: MClaw | None = None
@@ -577,9 +718,20 @@ class AgentRunner:
         worker_finished = threading.Event()
         discard_agent = False
         try:
-            closing_error = await self._wait_for_closing_session(session_id)
+            closing_error = await self._wait_for_closing_session(
+                session_id, deadline=deadline_monotonic
+            )
             if closing_error:
                 return AgentTurnResult(session_id=session_id, error=closing_error)
+            if (
+                deadline_monotonic is not None
+                and time.monotonic() >= float(deadline_monotonic)
+            ):
+                return AgentTurnResult(
+                    session_id=session_id,
+                    error="DEADLINE_EXCEEDED",
+                    raw_result={"deadline_exceeded": True},
+                )
             agent = self._get_or_create_agent(session_id=session_id)
             begin_turn = getattr(agent, "begin_turn", None)
             if callable(begin_turn):
@@ -590,9 +742,15 @@ class AgentRunner:
                 try:
                     return agent.run_conversation(
                         user_message=message.text,
-                        conversation_history=conversation_history,
-                        disable_tools=False,
+                        conversation_history=copy.deepcopy(conversation_history),
+                        disable_tools=getattr(self, "disable_tools", False),
                         extra_system=extra_system,
+                        advance_background_review=getattr(
+                            self, "advance_background_review", True
+                        ),
+                        call_source=getattr(self, "call_source", "channel"),
+                        deadline_monotonic=deadline_monotonic,
+                        cancel_event=cancel_event,
                     )
                 finally:
                     worker_finished.set()
@@ -639,6 +797,19 @@ class AgentRunner:
                 raw_result=result,
             )
         except Exception as exc:
+            if getattr(self, "call_source", "channel") == "dsoftbus":
+                logger.error(
+                    "remote agent turn failed type=%s",
+                    type(exc).__name__,
+                )
+                code = str(getattr(exc, "code", "PROVIDER_ERROR"))
+                if code not in {
+                    "AGENT_TOOLS_FORBIDDEN",
+                    "DEADLINE_EXCEEDED",
+                    "REMOTE_PROVIDER_UNAVAILABLE",
+                }:
+                    code = "PROVIDER_ERROR"
+                return AgentTurnResult(session_id=session_id, error=code)
             logger.exception("channel agent turn failed session=%s: %s", session_id, exc)
             return AgentTurnResult(session_id=session_id, error=str(exc))
         finally:
@@ -666,9 +837,13 @@ class AgentRunner:
                     )
 
                 if discard_agent or session_id in self._cancelled_sessions:
-                    self._agents.pop(session_id, None)
+                    self._retiring_session_set().add(session_id)
+                    self._retiring_agent_map()[session_id] = agent
+                    getattr(self, "_agents", {}).pop(session_id, None)
                 else:
                     self._touch_agent(session_id, agent)
+                if session_id in self._retiring_session_set():
+                    self._try_retire_session(session_id)
                 if discard_agent:
                     self._cancelled_sessions.discard(session_id)
 
@@ -737,9 +912,16 @@ class AgentRunner:
             )
         )
 
-    async def _wait_for_closing_session(self, session_id: str) -> str | None:
+    async def _wait_for_closing_session(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> str | None:
         """Wait for transient cleanup, but fail fast on a persistent safety fence."""
         while True:
+            if deadline is not None and time.monotonic() >= float(deadline):
+                return "DEADLINE_EXCEEDED"
             closing_event = getattr(self, "_closing_sessions", {}).get(session_id)
             if closing_event is None or closing_event.is_set():
                 return None
@@ -765,7 +947,12 @@ class AgentRunner:
                     )
                     return reason
             try:
-                await asyncio.wait_for(closing_event.wait(), timeout=0.1)
+                timeout = 0.1
+                if deadline is not None:
+                    timeout = min(timeout, max(0.0, float(deadline) - time.monotonic()))
+                if timeout <= 0:
+                    return "DEADLINE_EXCEEDED"
+                await asyncio.wait_for(closing_event.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 continue
             return None
@@ -780,7 +967,9 @@ class AgentRunner:
         if closing_sessions.get(session_id) is not closing_event:
             return
         closing_sessions.pop(session_id, None)
-        getattr(self, "_closing_agents", {}).pop(session_id, None)
+        closing_agent = getattr(self, "_closing_agents", {}).pop(session_id, None)
+        if closing_agent is not None and session_id in self._retiring_session_set():
+            self._retiring_agent_map()[session_id] = closing_agent
         closing_event.set()
         safe_cancel_trace(
             lambda: logger.info(
@@ -788,6 +977,8 @@ class AgentRunner:
                 session_id,
             )
         )
+        if session_id in self._retiring_session_set():
+            self._try_retire_session(session_id)
 
     def _get_or_create_agent(self, *, session_id: str) -> "MClaw":
         """Return an existing session agent or create one bound to channel config."""
@@ -803,13 +994,18 @@ class AgentRunner:
                 self._agents.move_to_end(session_id)
                 self._agents[session_id] = (agent, now)
                 return agent
-            self._agents.pop(session_id, None)
+            self._retiring_session_set().add(session_id)
+            if not self._try_retire_session(session_id):
+                raise RuntimeError("Cached channel Agent could not be retired safely")
         agent = MClaw(
             provider_runtime=provider_runtime,
             session_db=self.session_db,
             session_id=session_id,
             enabled_toolsets=self.enabled_toolsets,
             platform=self.platform,
+            system_prompt=self.agent_system_prompt,
+            workspace=self._workspace_for_session(session_id),
+            skip_memory=self.skip_memory,
             config=self.config,
             event_callback=lambda event, _session_id=session_id: self._emit_agent_event(_session_id, event),
         )
@@ -819,6 +1015,10 @@ class AgentRunner:
 
     def _runtime_for_session(self, session_id: str) -> ProviderRuntimeContext:
         """Restore session model state before consulting the in-memory agent cache."""
+        if self.session_db is None:
+            if self.startup_provider_runtime is None:
+                raise RuntimeError("REMOTE_PROVIDER_UNAVAILABLE")
+            return self.startup_provider_runtime
         snapshot = self.session_db.get_model_config(session_id)
         row = self.session_db.get_session(session_id) or {}
         return restore_session_runtime_context(
@@ -827,6 +1027,45 @@ class AgentRunner:
             row_model=str(row.get("model") or ""),
             fallback_context=self.startup_provider_runtime,
         )
+
+    def _workspace_for_session(self, session_id: str) -> str | None:
+        """Derive and, for tool-enabled remote turns, securely create a workspace."""
+
+        root = self.agent_workspace_root
+        if root is None:
+            return None
+        suffix = session_id.removeprefix("dsoftbus:")[:32]
+        workspace = Path(root) / suffix
+        if self.call_source == "dsoftbus" and not self.disable_tools:
+            from mclaw.dsoftbus.workspace import ensure_remote_workspace
+
+            workspace = ensure_remote_workspace(root, suffix)
+        return str(workspace)
+
+    def update_provider_runtime(
+        self, context: ProviderRuntimeContext | None
+    ) -> int:
+        """Publish the next-turn Provider and retire idle agents on mismatch."""
+
+        if context is not None and not isinstance(context, ProviderRuntimeContext):
+            raise TypeError("context must be a ProviderRuntimeContext or None")
+        self.startup_provider_runtime = context
+        retired = 0
+        for session_id, (agent, _timestamp) in tuple(
+            getattr(self, "_agents", {}).items()
+        ):
+            current = getattr(agent, "provider_runtime", None)
+            same = bool(
+                context is not None
+                and isinstance(current, ProviderRuntimeContext)
+                and current.fingerprint() == context.fingerprint()
+            )
+            if same:
+                continue
+            self._retiring_session_set().add(session_id)
+            if self._try_retire_session(session_id):
+                retired += 1
+        return retired
 
     def _emit_agent_event(self, session_id: str, event: dict[str, Any]) -> None:
         """Bridge synchronous agent callbacks back into the channel event loop."""
@@ -837,13 +1076,41 @@ class AgentRunner:
         if loop.is_closed():
             return
         future = asyncio.run_coroutine_threadsafe(callback(session_id, event), loop)
-        future.add_done_callback(lambda fut: self._log_event_callback_error(session_id, fut))
+        with self._event_callback_lock:
+            self._event_callback_futures.setdefault(session_id, set()).add(
+                future
+            )
 
-    def _log_event_callback_error(self, session_id: str, future: asyncio.Future) -> None:
+        def _completed(completed: concurrent.futures.Future[Any]) -> None:
+            with self._event_callback_lock:
+                current = self._event_callback_futures.get(session_id)
+                if current is not None:
+                    current.discard(completed)
+                    if not current and session_id not in self._event_callbacks:
+                        self._event_callback_futures.pop(session_id, None)
+            self._log_event_callback_error(session_id, completed)
+
+        future.add_done_callback(_completed)
+
+    def _log_event_callback_error(
+        self,
+        session_id: str,
+        future: concurrent.futures.Future[Any],
+    ) -> None:
         try:
             future.result()
         except Exception as exc:
-            logger.warning("channel agent event callback failed session=%s: %s", session_id, exc)
+            if self.call_source == "dsoftbus":
+                logger.warning(
+                    "remote agent event callback failed type=%s",
+                    type(exc).__name__,
+                )
+            else:
+                logger.warning(
+                    "channel agent event callback failed session=%s: %s",
+                    session_id,
+                    exc,
+                )
 
     def _touch_agent(self, session_id: str, agent: "MClaw") -> None:
         """Mark a cached agent as recently used."""
@@ -859,7 +1126,8 @@ class AgentRunner:
             if sid not in self._active_agents and now - ts > self.cache_idle_ttl_seconds
         ]
         for sid in stale:
-            self._agents.pop(sid, None)
+            self._retiring_session_set().add(sid)
+            self._try_retire_session(sid)
 
     def _enforce_cache_cap(self) -> None:
         """Keep the agent cache under its configured capacity."""
@@ -870,5 +1138,221 @@ class AgentRunner:
                 self._agents.move_to_end(sid)
                 checked += 1
                 continue
-            self._agents.pop(sid, None)
-            checked = 0
+            self._retiring_session_set().add(sid)
+            if self._try_retire_session(sid):
+                checked = 0
+            else:
+                self._agents.move_to_end(sid)
+                checked += 1
+
+    def _close_agent(self, agent: "MClaw", deadline: float | None) -> bool:
+        close = getattr(agent, "close", None)
+        if not callable(close):
+            return True
+        try:
+            parameters = inspect.signature(close).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        try:
+            if "deadline" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                result = close(deadline=deadline)
+            else:
+                result = close()
+        except BaseException as error:
+            if self.call_source == "dsoftbus":
+                logger.warning(
+                    "remote Agent close failed type=%s",
+                    type(error).__name__,
+                )
+            else:
+                logger.warning("channel Agent close failed", exc_info=True)
+            return False
+        return result is not False
+
+    def _retiring_session_set(self) -> set[str]:
+        retiring = getattr(self, "_retiring_sessions", None)
+        if retiring is None:
+            retiring = set()
+            self._retiring_sessions = retiring
+        return retiring
+
+    def _retiring_agent_map(self) -> dict[str, "MClaw"]:
+        agents = getattr(self, "_retiring_agents", None)
+        if agents is None:
+            agents = {}
+            self._retiring_agents = agents
+        return agents
+
+    def _session_is_idle(self, session_id: str) -> bool:
+        if session_id in getattr(self, "_active_agents", {}):
+            return False
+        closing = getattr(self, "_closing_sessions", {}).get(session_id)
+        if closing is not None and not closing.is_set():
+            return False
+        task = getattr(self, "_session_tasks", {}).get(session_id)
+        if task is not None and not task.done():
+            return False
+        pending = getattr(self, "_pending", {}).get(session_id)
+        if isinstance(pending, ChannelMessage):
+            return False
+        if isinstance(pending, (deque, list, tuple)) and pending:
+            return False
+        ingress = getattr(self, "_ingress_queues", {}).get(session_id)
+        if ingress and any(not item.released for item in ingress):
+            return False
+        lock = getattr(self, "_locks", {}).get(session_id)
+        if lock is not None and lock.locked():
+            return False
+        cached = getattr(self, "_agents", {}).get(session_id)
+        agent = (
+            cached[0]
+            if cached
+            else self._retiring_agent_map().get(session_id)
+            or getattr(self, "_closing_agents", {}).get(session_id)
+        )
+        has_outstanding = getattr(agent, "_has_outstanding_turn_workers", None)
+        return not (callable(has_outstanding) and has_outstanding())
+
+    def _all_sessions_idle(self) -> bool:
+        sessions = (
+            set(getattr(self, "_agents", {}))
+            | set(getattr(self, "_active_agents", {}))
+            | set(getattr(self, "_closing_sessions", {}))
+            | set(getattr(self, "_session_tasks", {}))
+            | set(getattr(self, "_pending", {}))
+            | set(getattr(self, "_ingress_queues", {}))
+            | set(getattr(self, "_locks", {}))
+        )
+        return all(self._session_is_idle(session_id) for session_id in sessions)
+
+    def _try_retire_session(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        """Close and forget one idle cached Agent without dropping its strong reference."""
+        retiring = self._retiring_session_set()
+        retiring.add(session_id)
+        if not self._session_is_idle(session_id):
+            return False
+        agents = getattr(self, "_agents", {})
+        cached = agents.get(session_id)
+        closing_agent = getattr(self, "_closing_agents", {}).get(session_id)
+        retiring_agent = self._retiring_agent_map().get(session_id)
+        agent = cached[0] if cached else retiring_agent or closing_agent
+        effective_deadline = deadline if deadline is not None else time.monotonic() + 5.0
+        if agent is not None and not self._close_agent(agent, effective_deadline):
+            return False
+        if cached is not None and agents.get(session_id) is cached:
+            agents.pop(session_id, None)
+        self._retiring_agent_map().pop(session_id, None)
+        getattr(self, "_locks", {}).pop(session_id, None)
+        getattr(self, "_cancelled_sessions", set()).discard(session_id)
+        getattr(self, "_event_callbacks", {}).pop(session_id, None)
+        with getattr(self, "_event_callback_lock", threading.Lock()):
+            event_futures = getattr(self, "_event_callback_futures", {})
+            if not any(
+                not future.done()
+                for future in event_futures.get(session_id, set())
+            ):
+                event_futures.pop(session_id, None)
+        pending_map = getattr(self, "_pending", {})
+        pending = pending_map.get(session_id)
+        if not pending:
+            pending_map.pop(session_id, None)
+        ingress_map = getattr(self, "_ingress_queues", {})
+        ingress = ingress_map.get(session_id)
+        if not ingress:
+            ingress_map.pop(session_id, None)
+        getattr(self, "_ingress_generations", {}).pop(session_id, None)
+        task_map = getattr(self, "_session_tasks", {})
+        task = task_map.get(session_id)
+        if task is None or task.done():
+            task_map.pop(session_id, None)
+        closing_map = getattr(self, "_closing_sessions", {})
+        closing = closing_map.get(session_id)
+        if closing is None or closing.is_set():
+            closing_map.pop(session_id, None)
+            getattr(self, "_closing_agents", {}).pop(session_id, None)
+        retiring.discard(session_id)
+        return True
+
+    async def wait_for_idle(self, *, deadline: float) -> bool:
+        """Wait for every active, queued, ingress, lock, and closing fence to drain."""
+        while True:
+            for session_id in tuple(getattr(self, "_retiring_sessions", set())):
+                self._try_retire_session(session_id, deadline=deadline)
+            if self._all_sessions_idle():
+                return True
+            remaining = float(deadline) - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.02, remaining))
+
+    async def forget_session(
+        self,
+        session_id: str,
+        *,
+        deadline: float | None = None,
+    ) -> bool:
+        """Interrupt, drain, close, and remove all state owned for one session."""
+        effective_deadline = deadline if deadline is not None else time.monotonic() + 5.0
+        self._retiring_session_set().add(session_id)
+        self.interrupt(session_id)
+        self._clear_pending(session_id)
+        self._cancel_ingress(session_id)
+        while not self._session_is_idle(session_id):
+            remaining = float(effective_deadline) - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.02, remaining))
+        return self._try_retire_session(session_id, deadline=effective_deadline)
+
+    async def dispose_all(
+        self,
+        *,
+        deadline: float,
+        close_owned_session_db: bool = True,
+    ) -> bool:
+        """Drain every session and close only resources owned by this runner."""
+        sessions = (
+            set(getattr(self, "_agents", {}))
+            | set(getattr(self, "_active_agents", {}))
+            | set(getattr(self, "_closing_sessions", {}))
+            | set(getattr(self, "_closing_agents", {}))
+            | set(getattr(self, "_session_tasks", {}))
+            | set(getattr(self, "_pending", {}))
+            | set(getattr(self, "_ingress_queues", {}))
+            | set(getattr(self, "_locks", {}))
+            | set(getattr(self, "_event_callbacks", {}))
+            | set(getattr(self, "_retiring_agents", {}))
+            | set(getattr(self, "_retiring_sessions", set()))
+        )
+        self._retiring_session_set().update(sessions)
+        self.interrupt_all()
+        for session_id in sessions:
+            self._clear_pending(session_id)
+            self._cancel_ingress(session_id)
+        if not await self.wait_for_idle(deadline=deadline):
+            return False
+        success = True
+        for session_id in tuple(self._retiring_session_set()):
+            success = self._try_retire_session(session_id, deadline=deadline) and success
+        db = getattr(self, "session_db", None)
+        if success and close_owned_session_db and getattr(self, "_owns_session_db", False) and db is not None:
+            close_with_deadline = getattr(db, "close_with_deadline", None)
+            if callable(close_with_deadline):
+                success = bool(close_with_deadline(deadline))
+            else:
+                close = getattr(db, "close", None)
+                if callable(close) and time.monotonic() < float(deadline):
+                    close()
+                else:
+                    success = False
+            if success:
+                self.session_db = None
+        return success

@@ -56,6 +56,8 @@ class QwenVisionClient:
             "max_tokens": 2000,
             "temperature": 0.1,
         }
+        if credentials.model.strip().lower().startswith("qwen3"):
+            kwargs["extra_body"] = {"enable_thinking": False}
 
         async with client:
             async with asyncio.timeout(max(0.001, timeout)):

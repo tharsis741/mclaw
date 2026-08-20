@@ -259,6 +259,17 @@ def spawn_background_review(
         except Exception as exc:
             logger.warning("Background review failed: session=%s error=%s", session_id, exc, exc_info=True)
         finally:
+            if review_agent is not None:
+                close = getattr(review_agent, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except BaseException:
+                        logger.warning(
+                            "Background review Agent close failed: session=%s",
+                            session_id,
+                            exc_info=True,
+                        )
             if review_memory:
                 try:
                     parent._refresh_memory_snapshot()

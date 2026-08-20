@@ -72,6 +72,17 @@ def _coerce_float(value: Any, default: float) -> float:
     return float(value)
 
 
+def _channel_toolsets(value: Any) -> list[str]:
+    from mclaw.tools.toolsets import validate_toolset
+
+    result = [
+        name
+        for name in _coerce_list(value)
+        if validate_toolset(name, allow_platform=False, allow_scoped=False)
+    ]
+    return result or ["mclaw-required"]
+
+
 @dataclass
 class WeixinConfig:
     """Normalized settings consumed by the Weixin runtime and media helpers."""
@@ -131,7 +142,9 @@ class WeixinConfig:
             media_download_timeout_seconds=_coerce_float(raw.get("media_download_timeout_seconds"), 60.0),
             media_upload_timeout_seconds=_coerce_float(raw.get("media_upload_timeout_seconds"), 120.0),
             media_max_bytes=_coerce_int(raw.get("media_max_bytes"), 100 * 1024 * 1024),
-            toolsets=_coerce_list(raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]),
+            toolsets=_channel_toolsets(
+                raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]
+            ),
         )
 
     def validate(self) -> list[str]:

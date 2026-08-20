@@ -76,6 +76,12 @@ _COMMAND_COMPLETIONS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec("skill creation", "创建新 Skill"),
 )
 
+_DSOFTBUS_COMMANDS: tuple[SlashCommandSpec, ...] = (
+    SlashCommandSpec("devices", "打开可信设备与可配对设备界面"),
+    SlashCommandSpec("pair", "打开设备配对界面"),
+    SlashCommandSpec("unpair", "打开解除配对界面"),
+)
+
 _COMMAND_BY_NAME = {spec.name: spec for spec in _COMMANDS}
 
 
@@ -90,6 +96,11 @@ def iter_builtin_commands(*, visible_only: bool = False) -> tuple[SlashCommandSp
 def iter_builtin_completions() -> tuple[SlashCommandSpec, ...]:
     """Return slash completions, including multi-word command shortcuts."""
     return (*iter_builtin_commands(visible_only=True), *_COMMAND_COMPLETIONS)
+
+
+def iter_dsoftbus_commands() -> tuple[SlashCommandSpec, ...]:
+    """Return product-only commands; callers must prove an active Runtime."""
+    return _DSOFTBUS_COMMANDS
 
 
 def builtin_command_names(*, visible_only: bool = False) -> frozenset[str]:

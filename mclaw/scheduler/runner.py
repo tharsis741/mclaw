@@ -23,6 +23,7 @@ from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.scheduler.formatting import default_output_dir, write_run_output
 from mclaw.scheduler.models import SchedulerJob, SchedulerRun
 from mclaw.state import SessionDB
+from mclaw.tools.toolsets import validate_toolset
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +55,24 @@ class SchedulerRunner:
         """Execute the job prompt and return the updated run record."""
         started_at = run.started_at or time.time()
         run.started_at = started_at
+        agent_holder: dict[str, Any] = {}
         try:
             session_id = self._resolve_session(job, run)
             run.session_id = session_id
             history = self._history_for_session(session_id)
-            extra_system = self._scheduler_context(job, run)
-            agent_holder: dict[str, Any] = {}
-
+            enabled_toolsets = self._effective_toolsets(job)
+            extra_system = self._scheduler_context(
+                job,
+                run,
+                enabled_toolsets=enabled_toolsets,
+            )
             def _execute() -> dict[str, Any]:
-                agent = self._make_agent(job=job, run=run, session_id=session_id)
+                agent = self._make_agent(
+                    job=job,
+                    run=run,
+                    session_id=session_id,
+                    enabled_toolsets=enabled_toolsets,
+                )
                 agent_holder["agent"] = agent
                 return agent.run_conversation(
                     user_message=job.prompt,
@@ -84,12 +94,20 @@ class SchedulerRunner:
                     except Exception as exc:
                         logger.debug("scheduler agent interrupt failed after timeout: %s", exc)
                 # The worker thread may still unwind cooperatively after interrupt.
+                future.add_done_callback(
+                    lambda _future: self._close_agent(agent_holder.get("agent"))
+                )
                 future.cancel()
                 executor.shutdown(wait=False, cancel_futures=True)
                 raise TimeoutError(f"scheduler run timed out after {job.timeout_seconds}s")
+            except BaseException:
+                self._close_agent(agent_holder.get("agent"))
+                raise
             finally:
                 if not future.cancelled():
                     executor.shutdown(wait=False, cancel_futures=False)
+
+            self._close_agent(agent_holder.get("agent"))
 
             run.final_response = str(result.get("final_response") or "")
             run.error = ""
@@ -107,6 +125,19 @@ class SchedulerRunner:
             run.finished_at = time.time()
             run.output_path = write_run_output(output_dir=self.output_dir, job=job, run=run)
             return run
+
+    @staticmethod
+    def _close_agent(agent: Any) -> bool:
+        """Close a completed scheduler Agent while accepting lightweight test factories."""
+        close = getattr(agent, "close", None)
+        if not callable(close):
+            return True
+        try:
+            result = close()
+        except BaseException:
+            logger.warning("scheduler Agent close failed", exc_info=True)
+            return False
+        return result is not False
 
     def _resolve_session(self, job: SchedulerJob, run: SchedulerRun) -> str:
         """Resolve or create the session governed by the job's session policy."""
@@ -133,15 +164,34 @@ class SchedulerRunner:
             return history[1:]
         return history
 
-    def _make_agent(self, *, job: SchedulerJob, run: SchedulerRun, session_id: str) -> Any:
+    def _effective_toolsets(self, job: SchedulerJob) -> list[str]:
+        """Filter persisted jobs again at the final scheduler execution boundary."""
+        effective: list[str] = []
+        for raw_name in job.enabled_toolsets or []:
+            name = str(raw_name or "").strip()
+            if not name or name in effective:
+                continue
+            if validate_toolset(name, allow_platform=False, allow_scoped=False):
+                effective.append(name)
+        return effective or ["mclaw-required"]
+
+    def _make_agent(
+        self,
+        *,
+        job: SchedulerJob,
+        run: SchedulerRun,
+        session_id: str,
+        enabled_toolsets: list[str] | None = None,
+    ) -> Any:
         """Construct the agent with scheduler-scoped platform and tool settings."""
         provider_runtime = self._runtime_for_session(session_id)
+        effective_toolsets = enabled_toolsets or self._effective_toolsets(job)
         if self.agent_factory is not None:
             return self.agent_factory(
                 provider_runtime=provider_runtime,
                 session_db=self.session_db,
                 session_id=session_id,
-                enabled_toolsets=job.enabled_toolsets,
+                enabled_toolsets=effective_toolsets,
                 max_iterations=job.max_iterations,
                 platform="scheduler",
                 workspace=job.workdir or None,
@@ -154,7 +204,7 @@ class SchedulerRunner:
             provider_runtime=provider_runtime,
             session_db=self.session_db,
             session_id=session_id,
-            enabled_toolsets=job.enabled_toolsets,
+            enabled_toolsets=effective_toolsets,
             max_iterations=job.max_iterations,
             platform="scheduler",
             workspace=job.workdir or None,
@@ -173,7 +223,13 @@ class SchedulerRunner:
             fallback_context=self.startup_provider_runtime,
         )
 
-    def _scheduler_context(self, job: SchedulerJob, run: SchedulerRun) -> str:
+    def _scheduler_context(
+        self,
+        job: SchedulerJob,
+        run: SchedulerRun,
+        *,
+        enabled_toolsets: list[str] | None = None,
+    ) -> str:
         """Build extra system context that identifies the scheduler run."""
         scheduled_for = "-"
         if run.scheduled_for is not None:
@@ -186,7 +242,7 @@ class SchedulerRunner:
                 f"run_id: {run.id}",
                 f"scheduled_for: {scheduled_for}",
                 f"workdir: {job.workdir}",
-                f"enabled_toolsets: {', '.join(job.enabled_toolsets or [])}",
+                f"enabled_toolsets: {', '.join(enabled_toolsets or self._effective_toolsets(job))}",
                 f"max_iterations: {job.max_iterations}",
                 f"timeout_seconds: {job.timeout_seconds}",
                 "[End MClaw Scheduler Run]",

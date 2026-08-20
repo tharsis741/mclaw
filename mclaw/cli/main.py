@@ -9,17 +9,42 @@ channel launch decisions in one place so the interactive app receives a fully
 resolved runtime configuration.
 """
 
+from __future__ import annotations
+
 import argparse
+from dataclasses import dataclass, replace
 import multiprocessing as mp
 import logging
 import os
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mclaw.providers.resolver import ProviderResolutionError
+    from mclaw.providers.runtime import ProviderRuntimeContext
 
 from mclaw.cli.env_loader import load_mclaw_dotenv
 from mclaw.cli.runtime.session_commands import RESUME_LATEST_SESSION
 from mclaw.cli.tui.console import configure_text_output, print_plain
 from mclaw.constants import display_mclaw_path
+
+
+@dataclass(frozen=True)
+class StartupRuntimeResolution:
+    """One provider resolution result plus evidence for safe discovery-only entry."""
+
+    context: ProviderRuntimeContext | None
+    resume_session_id: str
+    unavailable_error: ProviderResolutionError | None
+    resume_snapshot: dict[str, Any] | None
+    discovery_only_approved: bool = False
+
+    def __iter__(self):
+        """Retain tuple-unpack compatibility for successful internal callers."""
+
+        yield self.context
+        yield self.resume_session_id
 
 
 def _setup_logging(level: str = "INFO"):
@@ -400,6 +425,21 @@ def _first_run_check() -> bool:
     # If the config file exists, keep checking whether it contains usable content.
     from mclaw.cli.config import load_config
     cfg = load_config(strict=True)
+    dsoftbus = cfg.get("dsoftbus")
+    if (
+        isinstance(dsoftbus, dict)
+        and dsoftbus.get("enabled") == "auto"
+        and dsoftbus.get("discovery_without_provider") is True
+    ):
+        try:
+            from mclaw.dsoftbus.entrypoint import is_discovery_only_candidate
+
+            if is_discovery_only_candidate(cfg):
+                return False
+        except Exception:
+            # Platform admission remains fail-closed: an unavailable or
+            # malformed candidate probe falls through to ordinary Setup.
+            pass
     has_model = bool(cfg.get("model"))
     fallback_entries = cfg.get("fallback_providers")
     has_fallback_model = any(
@@ -463,9 +503,24 @@ def _resolve_configured_runtime(args, config: dict):
 
 def _resolve_startup_runtime(args, config: dict, workspace: str):
     """Restore a requested session selector before validating startup credentials."""
+    from mclaw.providers.resolver import ProviderResolutionError
+
+    def _configured_resolution() -> StartupRuntimeResolution:
+        try:
+            context = _resolve_configured_runtime(args, config)
+        except ProviderResolutionError as error:
+            if error.code not in {
+                "provider_required",
+                "missing_model",
+                "missing_credential",
+            }:
+                raise
+            return StartupRuntimeResolution(None, "", error, None)
+        return StartupRuntimeResolution(context, "", None, None)
+
     resume_ref = str(getattr(args, "resume", "") or "")
     if not resume_ref:
-        return _resolve_configured_runtime(args, config), ""
+        return _configured_resolution()
 
     from mclaw.providers.resolver import restore_provider_runtime_context
     from mclaw.state import SessionDB
@@ -478,29 +533,44 @@ def _resolve_startup_runtime(args, config: dict, workspace: str):
             session_id = db.resolve_session_id(resume_ref, workspace=workspace)
         if not session_id:
             print_plain(f"  未找到可恢复的会话: {resume_ref}，已开始新会话。")
-            return _resolve_configured_runtime(args, config), ""
+            return _configured_resolution()
 
         session = db.get_session(session_id)
         if not session:
             raise ValueError(f"Session not found: {session_id}")
         snapshot = db.get_model_config(session_id)
-        explicit_model = str(getattr(args, "model", "") or "")
-        context = restore_provider_runtime_context(
-            snapshot,
-            config=config,
-            model=explicit_model or (str(session.get("model") or "") if not snapshot else ""),
-            provider=str(getattr(args, "provider", "") or ""),
-            base_url=str(getattr(args, "base_url", "") or ""),
-            api_key=str(getattr(args, "api_key", "") or ""),
-        )
-        return context, session_id
+        try:
+            explicit_model = str(getattr(args, "model", "") or "")
+            context = restore_provider_runtime_context(
+                snapshot,
+                config=config,
+                model=explicit_model or (str(session.get("model") or "") if not snapshot else ""),
+                provider=str(getattr(args, "provider", "") or ""),
+                base_url=str(getattr(args, "base_url", "") or ""),
+                api_key=str(getattr(args, "api_key", "") or ""),
+            )
+        except ProviderResolutionError as error:
+            if error.code not in {
+                "provider_required",
+                "missing_model",
+                "missing_credential",
+            }:
+                raise
+            retained = dict(snapshot) if isinstance(snapshot, dict) else None
+            return StartupRuntimeResolution(None, "", error, retained)
+        return StartupRuntimeResolution(context, session_id, None, dict(snapshot) if isinstance(snapshot, dict) else None)
     finally:
         db.close()
 
 
 def _run_chat(args):
     """Resolve first-run setup, provider credentials, and then enter the TUI."""
-    from mclaw.cli.config import load_merged_config, ensure_mclaw_home, ConfigError
+    from mclaw.cli.config import (
+        ConfigError,
+        ensure_mclaw_home,
+        load_config_source_snapshot,
+        load_merged_config,
+    )
     from mclaw.cli.colors import Colors, color
 
     ensure_mclaw_home()
@@ -519,11 +589,27 @@ def _run_chat(args):
             print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
             sys.exit(1)
         if not provider_configured:
-            print_plain(color("  未配置任何供应商，退出。\n", Colors.RED))
-            sys.exit(1)
+            from mclaw.cli.config import load_config
+            from mclaw.dsoftbus.entrypoint import is_discovery_only_candidate
 
+            setup_config = load_config(strict=True)
+            dsoftbus = setup_config.get("dsoftbus", {})
+            marker = isinstance(dsoftbus, dict) and dsoftbus.get(
+                "discovery_without_provider"
+            ) is True
+            if not marker or not is_discovery_only_candidate(setup_config):
+                print_plain(color("  未配置任何供应商，退出。\n", Colors.RED))
+                sys.exit(1)
+
+    lookup_cwd = Path.cwd()
     try:
-        config = load_merged_config()
+        source_snapshot = load_config_source_snapshot(lookup_cwd)
+        raw_user_config = source_snapshot.user_config_copy()
+        raw_project_config = source_snapshot.project_config_copy()
+        config = load_merged_config(
+            cwd=lookup_cwd,
+            source_snapshot=source_snapshot,
+        )
     except ConfigError as exc:
         print_plain(color(f"\n  配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
@@ -551,9 +637,33 @@ def _run_chat(args):
             sys.exit(1)
 
     config["_launch_cwd"] = os.getcwd()
+    from mclaw.cli.runtime.workspace_trust import resolve_interactive_workspace
+
+    workspace = resolve_interactive_workspace(config)
 
     try:
-        provider_runtime, resume_id = _resolve_startup_runtime(args, config, os.getcwd())
+        resolution = _resolve_startup_runtime(args, config, workspace)
+        if resolution.context is None:
+            from mclaw.dsoftbus.entrypoint import can_enter_discovery_only
+
+            error = resolution.unavailable_error
+            assert error is not None
+            approved = can_enter_discovery_only(
+                error_code=error.code,
+                resume_snapshot=resolution.resume_snapshot,
+                cli_values={
+                    "api_key": str(getattr(args, "api_key", "") or ""),
+                    "base_url": str(getattr(args, "base_url", "") or ""),
+                    "model": str(getattr(args, "model", "") or ""),
+                    "provider": str(getattr(args, "provider", "") or ""),
+                },
+                raw_user_config=raw_user_config,
+                raw_project_config=raw_project_config,
+                merged_config=config,
+            )
+            if not approved:
+                raise error
+            resolution = replace(resolution, discovery_only_approved=True)
     except (ValueError, ConfigError) as exc:
         print_plain(color(f"\n  模型接入配置错误: {exc}\n", Colors.RED))
         sys.exit(1)
@@ -561,10 +671,13 @@ def _run_chat(args):
     enabled_toolsets = config.get("toolsets", ["mclaw-required"])
     from mclaw.cli.app import run_interactive
     run_interactive(
-        provider_runtime=provider_runtime,
-        resume_session_id=resume_id,
+        provider_runtime=resolution.context,
+        resume_session_id=resolution.resume_session_id,
         enabled_toolsets=enabled_toolsets,
         config=config,
+        workspace_path=workspace,
+        provider_resolution_error=resolution.unavailable_error,
+        discovery_only_approved=resolution.discovery_only_approved,
     )
 
 
@@ -1232,6 +1345,18 @@ def _run_setup_impl(args):
             _SETUP_CONFIGURED_COUNT = len(configured)
 
     if not configured:
+        dsoftbus_selected = _run_setup_dsoftbus_selection(config)
+        dsoftbus = config.get("dsoftbus")
+        if (
+            dsoftbus_selected
+            and isinstance(dsoftbus, dict)
+            and dsoftbus.get("enabled") == "auto"
+            and dsoftbus.get("discovery_without_provider") is True
+        ):
+            save_config(config)
+            print_plain(color("\n  设置完成：已启用可信设备发现与配对。", Colors.GREEN, Colors.BOLD))
+            print_plain(color("  启动: run mclaw\n", Colors.CYAN))
+            return
         print_plain(color("\n  未配置任何接入方，退出。\n", Colors.RED))
         sys.exit(1)
 
@@ -1320,6 +1445,83 @@ def _merge_channel_config_from_disk(config: dict, channel_name: str, keys: tuple
             target_channel[key] = disk_channel[key]
 
 
+_DSOFTBUS_SETUP_OPTION = {
+    "id": "dsoftbus",
+    "label": "可信设备协作",
+    "description": (
+        "发现并连接Open Harmony可信设备，允许双方 M-Claw 通信并使用对方设备上的工具。"
+    ),
+}
+
+
+def _dsoftbus_setup_available(runtime) -> bool:
+    """Return whether this host may expose the Kaihong-only Setup option."""
+    features = getattr(runtime, "features", None)
+    is_enabled = getattr(features, "is_enabled", None)
+    return bool(callable(is_enabled) and is_enabled("dsoftbus"))
+
+
+def _dsoftbus_setup_selected(config: dict) -> bool:
+    current = config.get("dsoftbus")
+    return isinstance(current, dict) and current.get("enabled") == "auto"
+
+
+def _apply_setup_dsoftbus_selection(config: dict, *, selected: bool) -> None:
+    """Atomically project the single product choice onto internal policy fields."""
+    from mclaw.cli.config import DEFAULT_CONFIG
+
+    current = config.get("dsoftbus")
+    current_values = current if isinstance(current, dict) else {}
+    default_dsoftbus = DEFAULT_CONFIG["dsoftbus"]
+    updated = {
+        key: current_values.get(key, value)
+        for key, value in default_dsoftbus.items()
+    }
+    updated["enabled"] = "auto" if selected else False
+    updated["discovery_without_provider"] = selected
+    updated["accept_remote_messages"] = selected
+    updated["allow_remote_tools"] = selected
+    config["dsoftbus"] = updated
+
+
+def _run_setup_dsoftbus_selection(
+    config: dict,
+    *,
+    runtime=None,
+) -> bool:
+    """Prompt for the one Kaihong-only capability when no shared page is active."""
+    from mclaw.runtime.manager import RuntimeManager
+
+    resolved_runtime = runtime if runtime is not None else RuntimeManager.current(config)
+    if not _dsoftbus_setup_available(resolved_runtime):
+        return False
+
+    from mclaw.cli.colors import Colors, color
+    from mclaw.cli.tui.console import print_plain
+    from mclaw.cli.tui.selection_prompt import prompt_multi_select
+
+    try:
+        choices = prompt_multi_select(
+            "M-Claw 可选能力",
+            [dict(_DSOFTBUS_SETUP_OPTION)],
+            hint="使用 ↑/↓ 移动，Space 选择，Enter 确认。",
+            default_selected=["dsoftbus"] if _dsoftbus_setup_selected(config) else [],
+        )
+    except (EOFError, KeyboardInterrupt):
+        print_plain()
+        raise _SetupCancelled
+
+    selected = "dsoftbus" in choices
+    _apply_setup_dsoftbus_selection(config, selected=selected)
+
+    print_plain()
+    print_plain(
+        _setup_label("可信设备协作")
+        + color("已启用" if selected else "未启用", Colors.GREEN if selected else Colors.DIM)
+    )
+    return selected
+
+
 def _run_setup_capability_selection(config: dict) -> None:
     """Select optional tools, channels, and ASR mode during setup."""
     from mclaw.cli.colors import Colors, color
@@ -1353,6 +1555,9 @@ def _run_setup_capability_selection(config: dict) -> None:
         capability_items.append(
             {"id": "browser", "label": "浏览器自动化", "description": "在浏览器中执行点击、输入等网页操作。"}
         )
+    dsoftbus_available = _dsoftbus_setup_available(runtime)
+    if dsoftbus_available:
+        capability_items.append(dict(_DSOFTBUS_SETUP_OPTION))
     channel_items = [
         {
             "id": "weixin",
@@ -1380,13 +1585,15 @@ def _run_setup_capability_selection(config: dict) -> None:
         for item in current_toolsets
         if item in {"vision", "browser"} and runtime.features.toolset_enabled(item)
     )
+    if dsoftbus_available and _dsoftbus_setup_selected(config):
+        default_optional.append("dsoftbus")
     default_channels = [item for item in current_toolsets if item in {"weixin", "dingtalk"}]
 
     try:
         optional = prompt_multi_select(
-            "M-Claw 可选工具配置",
+            "M-Claw 可选能力",
             capability_items,
-            hint="选择需要启用的可选工具；必需工具始终启用。",
+            hint="选择需要启用的可选能力；必需能力始终启用。",
             default_selected=default_optional,
         )
         channels = prompt_multi_select(
@@ -1434,6 +1641,11 @@ def _run_setup_capability_selection(config: dict) -> None:
 
     enabled_optional: list[str] = []
     enabled_web_tools: list[str] = []
+    if dsoftbus_available:
+        _apply_setup_dsoftbus_selection(
+            config,
+            selected="dsoftbus" in optional,
+        )
     if "web_extract" in optional and _setup_configure_web_extract(
         config, print_plain=print_plain, color=color, Colors=Colors
     ):
@@ -1548,6 +1760,8 @@ def _run_setup_capability_selection(config: dict) -> None:
         *[name for name in enabled_optional if name != "web"],
         *enabled_channels,
     ]
+    if dsoftbus_available and "dsoftbus" in optional:
+        enabled_names.append("dsoftbus")
     display_names = {
         "web_extract": "网页提取",
         "web_search": "网页搜索",
@@ -1555,6 +1769,7 @@ def _run_setup_capability_selection(config: dict) -> None:
         "browser": "浏览器自动化",
         "weixin": "微信",
         "dingtalk": "钉钉",
+        "dsoftbus": "可信设备协作",
     }
     enabled_display = "、".join(display_names.get(name, name) for name in enabled_names)
     print_plain()
@@ -1910,10 +2125,11 @@ def _ensure_vision_config(config: dict) -> None:
         and not str(vision_cfg.get("base_url") or "").strip()
     ):
         vision_cfg["provider"] = qwen_provider
-    vision_cfg.setdefault("model", "qwen-vl-max")
+    vision_cfg.setdefault("model", "qwen3-vl-flash")
     if not str(vision_cfg.get("model") or "").strip():
-        vision_cfg["model"] = "qwen-vl-max"
+        vision_cfg["model"] = "qwen3-vl-flash"
     vision_cfg.setdefault("base_url", "")
+    vision_cfg.setdefault("max_pixels", 1_310_720)
     vision_cfg.setdefault("timeout", 30)
     vision_cfg.setdefault("download_timeout", 30)
 

@@ -484,6 +484,37 @@ def test_setup_single_select_scrolls_and_waits_for_enter() -> None:
             assert prompt_single_select("Models", items, max_visible_items=20) == "model-22"
 
 
+def test_setup_single_select_arrows_change_default_without_space_or_tab() -> None:
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from mclaw.cli.tui.selection_prompt import prompt_single_select
+
+    items = [{"id": "yes", "label": "是"}, {"id": "no", "label": "否"}]
+    with create_pipe_input() as pipe:
+        pipe.send_text("\x1b[A\r")
+        with create_app_session(input=pipe, output=DummyOutput()):
+            assert (
+                prompt_single_select("Question", items, default_selected="no")
+                == "yes"
+            )
+
+
+def test_setup_single_select_does_not_treat_y_as_confirmation() -> None:
+    from prompt_toolkit.application.current import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+
+    from mclaw.cli.tui.selection_prompt import prompt_single_select
+
+    items = [{"id": "yes", "label": "是"}, {"id": "no", "label": "否"}]
+    with create_pipe_input() as pipe:
+        pipe.send_text("y\r")
+        with create_app_session(input=pipe, output=DummyOutput()):
+            assert prompt_single_select("Question", items, default_selected="no") == "no"
+
+
 def test_setup_skill_selection_ctrl_a_toggles_all() -> None:
     from prompt_toolkit.application.current import create_app_session
     from prompt_toolkit.input import create_pipe_input

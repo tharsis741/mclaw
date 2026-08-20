@@ -30,6 +30,12 @@ BROWSER_TOOLS = [
 ]
 WEIXIN_TOOLS = ["weixin_send_file"]
 DINGTALK_TOOLS = ["dingtalk_send_file"]
+DSOFTBUS_TOOLS = [
+    "dsoftbus_list_peers",
+    "dsoftbus_get_device_context",
+    "dsoftbus_run_agent_task",
+]
+DSOFTBUS_ARTIFACT_TOOLS = ["return_artifact"]
 
 REQUIRED_TOOLSETS = ["credentials", "terminal", "file", "memory", "skills", "session_search", "delegation"]
 OPTIONAL_TOOLSETS = ["web", "vision", "browser", "weixin", "dingtalk"]
@@ -126,6 +132,22 @@ TOOLSETS: dict[str, dict[str, Any]] = {
         "tools": DINGTALK_TOOLS,
         "kind": "optional",
     },
+    "dsoftbus": {
+        "description": "Trusted OpenHarmony device discovery and M-Claw messaging",
+        "display": {"emoji": "✉", "summary_zh": "可信设备协作"},
+        "tools": DSOFTBUS_TOOLS,
+        "kind": "platform",
+    },
+    "dsoftbus-remote": {
+        "description": "Internal scoped marker for inbound DSoftBus turns",
+        "tools": [],
+        "kind": "scoped",
+    },
+    "dsoftbus-artifact": {
+        "description": "Internal Task-output adapter for inbound DSoftBus turns",
+        "tools": DSOFTBUS_ARTIFACT_TOOLS,
+        "kind": "scoped",
+    },
     "minimal": {
         "description": "Minimal toolset for simple tasks",
         "tools": ["terminal", "read_file", "write_file"],
@@ -140,11 +162,16 @@ TOOLSETS["mclaw-required"] = {
 }
 
 
-def resolve_toolset(name: str) -> list[str]:
+def resolve_toolset(name: str, *, include_platform: bool = False) -> list[str]:
     """Resolve a toolset name to a flat list of tool names."""
     if name == "all":
         tools = set()
         for ts in TOOLSETS.values():
+            kind = ts.get("kind")
+            if kind == "scoped":
+                continue
+            if kind == "platform" and not include_platform:
+                continue
             tools.update(ts.get("tools", []))
         return sorted(tools)
     ts = TOOLSETS.get(name)
@@ -153,11 +180,15 @@ def resolve_toolset(name: str) -> list[str]:
     return list(ts.get("tools", []))
 
 
-def resolve_multiple_toolsets(names: list[str]) -> set[str]:
+def resolve_multiple_toolsets(
+    names: list[str],
+    *,
+    include_platform: bool = False,
+) -> set[str]:
     """Resolve multiple toolset names into a deduplicated tool-name set."""
     tools = set()
     for name in names:
-        tools.update(resolve_toolset(name))
+        tools.update(resolve_toolset(name, include_platform=include_platform))
     return tools
 
 
@@ -166,6 +197,21 @@ def get_optional_toolset_names() -> list[str]:
     return list(OPTIONAL_TOOLSETS)
 
 
-def validate_toolset(name: str) -> bool:
+def validate_toolset(
+    name: str,
+    *,
+    allow_platform: bool = False,
+    allow_scoped: bool = False,
+) -> bool:
     """Return whether a toolset name or the special `all` preset is valid."""
-    return name in TOOLSETS or name == "all"
+    if name == "all":
+        return True
+    definition = TOOLSETS.get(name)
+    if definition is None:
+        return False
+    kind = definition.get("kind")
+    if kind == "platform" and not allow_platform:
+        return False
+    if kind == "scoped" and not allow_scoped:
+        return False
+    return True

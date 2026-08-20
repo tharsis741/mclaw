@@ -1,0 +1,1 @@
+{"binding":"https://gitcode.com/m-robots/mclaw/specs/a2a-softbus/v1","bindingVersion":1,"rpc":{"error":{"code":-32010,"data":[{"@type":"type.googleapis.com/google.rpc.ErrorInfo","domain":"mclaw.dsoftbus","metadata":{"outcomeUnknown":"false"},"reason":"PEER_NOT_READY"}],"message":"Peer is not ready"},"id":"12345678-1234-4234-9234-123456789abc","jsonrpc":"2.0"}}

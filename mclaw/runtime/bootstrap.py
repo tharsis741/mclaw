@@ -25,10 +25,13 @@ _KAIHONG_RELEASE_ROOT = Path("/data/local/release")
 OHOS_IDENTITY_KEYS = (
     "const.ohos.fullname",
     "const.ohos.version",
+    "const.ohos.apiversion",
     "const.product.software.version",
+    "const.product.manufacturer",
     "const.product.brand",
     "const.product.name",
     "const.product.model",
+    "const.product.cpu.abilist",
 )
 
 

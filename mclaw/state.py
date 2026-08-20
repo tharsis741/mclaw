@@ -16,6 +16,7 @@ Key design decisions:
 
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -332,6 +333,107 @@ class SessionDB:
         finally:
             self._lock.release()
 
+    def close_with_deadline(self, deadline: float) -> bool:
+        """Close the connection without waiting beyond an absolute monotonic deadline."""
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return False
+        deadline = float(deadline)
+        if not math.isfinite(deadline):
+            return False
+        remaining = max(0.0, deadline - time.monotonic())
+        if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+            logger.warning("SessionDB deadline close skipped: lock timeout")
+            return False
+        try:
+            if self._conn is None:
+                return True
+            try:
+                self._conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                self._conn.close()
+                self._conn = None
+                return True
+            except Exception:
+                logger.warning("SessionDB deadline close failed: database close error")
+                return False
+        finally:
+            self._lock.release()
+
+    def _execute_write_with_deadline(
+        self,
+        fn: Callable[[sqlite3.Connection], T],
+        *,
+        deadline: float,
+    ) -> tuple[bool, T | None]:
+        """Attempt one bounded write transaction with the existing retry policy."""
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            return False, None
+        deadline = float(deadline)
+        if not math.isfinite(deadline):
+            return False, None
+
+        for attempt in range(self._WRITE_MAX_RETRIES):
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0 or not self._lock.acquire(timeout=remaining):
+                logger.warning("SessionDB deadline write skipped: lock timeout")
+                return False, None
+            retry_busy = False
+            previous_busy_timeout = 1000
+            try:
+                if self._conn is None:
+                    return False, None
+                row = self._conn.execute("PRAGMA busy_timeout").fetchone()
+                if row is not None:
+                    previous_busy_timeout = int(row[0])
+                bounded_busy_ms = min(150, max(0, int(remaining * 1000)))
+                self._conn.execute(f"PRAGMA busy_timeout={bounded_busy_ms}")
+                self._conn.execute("BEGIN IMMEDIATE")
+                result = fn(self._conn)
+                self._conn.commit()
+                self._write_count += 1
+                return True, result
+            except sqlite3.OperationalError as exc:
+                try:
+                    if self._conn is not None:
+                        self._conn.rollback()
+                except Exception:
+                    pass
+                category = str(exc).casefold()
+                retry_busy = "locked" in category or "busy" in category
+                if not retry_busy:
+                    logger.warning("SessionDB deadline write failed: operational error")
+                    return False, None
+            except BaseException:
+                try:
+                    if self._conn is not None:
+                        self._conn.rollback()
+                except Exception:
+                    pass
+                logger.warning("SessionDB deadline write failed: transaction error")
+                return False, None
+            finally:
+                try:
+                    if self._conn is not None:
+                        self._conn.execute(
+                            f"PRAGMA busy_timeout={max(0, previous_busy_timeout)}"
+                        )
+                except Exception:
+                    pass
+                self._lock.release()
+
+            if not retry_busy or attempt >= self._WRITE_MAX_RETRIES - 1:
+                break
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining <= 0:
+                break
+            time.sleep(
+                min(
+                    random.uniform(self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S),
+                    remaining,
+                )
+            )
+        logger.warning("SessionDB deadline write skipped: database busy")
+        return False, None
+
     def _init_schema(self):
         """Create or upgrade the durable schema used by sessions and schedulers."""
         cursor = self._conn.cursor()
@@ -519,27 +621,129 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def end_session_with_deadline(
+        self,
+        session_id: str,
+        end_reason: str,
+        *,
+        deadline: float,
+    ) -> bool:
+        """End an existing session without crossing the shared shutdown deadline."""
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+                (time.time(), end_reason, session_id),
+            )
+            return cursor.rowcount == 1
+
+        completed, updated = self._execute_write_with_deadline(
+            _do,
+            deadline=deadline,
+        )
+        return bool(completed and updated)
+
     def switch_active_session(
         self,
         current_session_id: str,
         target_session_id: str,
         *,
         end_reason: str,
+        target_model: str,
+        target_model_config: dict[str, Any],
     ) -> None:
-        """End the current session and reopen the target in one transaction."""
+        """End current and reopen an existing target with one Provider snapshot."""
+        if not isinstance(target_model_config, dict):
+            raise TypeError("target_model_config must be a dict")
+        serialized = json.dumps(target_model_config, ensure_ascii=False)
+
         def _do(conn):
+            now = time.time()
             ended = conn.execute(
                 "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
-                (time.time(), end_reason, current_session_id),
+                (now, end_reason, current_session_id),
             )
             if ended.rowcount != 1:
                 raise ValueError(f"Session not found: {current_session_id}")
             updated = conn.execute(
-                "UPDATE sessions SET ended_at = NULL, end_reason = NULL WHERE id = ?",
-                (target_session_id,),
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL, "
+                "model = ?, model_config = ? WHERE id = ?",
+                (target_model, serialized, target_session_id),
             )
             if updated.rowcount != 1:
                 raise ValueError(f"Session not found: {target_session_id}")
+
+        self._execute_write(_do)
+
+    def create_and_switch_active_session(
+        self,
+        current_session_id: str,
+        target_session_id: str,
+        *,
+        end_reason: str,
+        source: str,
+        model: str,
+        model_config: dict[str, Any],
+        system_prompt: str,
+        workspace: str | None,
+        user_id: str | None = None,
+        parent_session_id: str | None = None,
+    ) -> None:
+        """Create a new target and end current in the same transaction."""
+        if not isinstance(model_config, dict):
+            raise TypeError("model_config must be a dict")
+        serialized = json.dumps(model_config, ensure_ascii=False)
+        normalized_workspace = _normalize_workspace_path(workspace)
+        workspace_key = _workspace_key(normalized_workspace)
+
+        def _do(conn):
+            now = time.time()
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, user_id, model, model_config, system_prompt,
+                   parent_session_id, workspace, workspace_key, started_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    target_session_id,
+                    source,
+                    user_id,
+                    model,
+                    serialized,
+                    system_prompt,
+                    parent_session_id,
+                    normalized_workspace,
+                    workspace_key,
+                    now,
+                ),
+            )
+            ended = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = ? WHERE id = ?",
+                (now, end_reason, current_session_id),
+            )
+            if ended.rowcount != 1:
+                raise ValueError(f"Session not found: {current_session_id}")
+
+        self._execute_write(_do)
+
+    def reopen_session_with_model(
+        self,
+        session_id: str,
+        *,
+        target_model: str,
+        target_model_config: dict[str, Any],
+    ) -> None:
+        """Reopen one existing row and publish its current Provider snapshot."""
+        if not isinstance(target_model_config, dict):
+            raise TypeError("target_model_config must be a dict")
+        serialized = json.dumps(target_model_config, ensure_ascii=False)
+
+        def _do(conn):
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = NULL, end_reason = NULL, "
+                "model = ?, model_config = ? WHERE id = ?",
+                (target_model, serialized, session_id),
+            )
+            if updated.rowcount != 1:
+                raise ValueError(f"Session not found: {session_id}")
 
         self._execute_write(_do)
 

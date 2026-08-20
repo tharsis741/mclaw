@@ -11,7 +11,9 @@ routing, and the shared agent runner into one long-lived channel process.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import time
 
 from mclaw.channels.dingtalk.adapter import DingTalkAdapter
 from mclaw.channels.dingtalk.command_router import DingTalkCommandRouter
@@ -44,7 +46,8 @@ class DingTalkRuntime:
         runtime_lock: DingTalkRuntimeLock | None = None,
     ) -> None:
         self.dingtalk_config = DingTalkConfig.from_config(config)
-        self.session_db = session_db or SessionDB()
+        self._owns_session_db = session_db is None
+        self.session_db = SessionDB() if session_db is None else session_db
         self.client = client or DingTalkClient(self.dingtalk_config)
         self.runner = runner or AgentRunner(
             provider_runtime=provider_runtime,
@@ -98,6 +101,10 @@ class DingTalkRuntime:
             return
         self._stopping = True
         self._running = False
+        deadline = time.monotonic() + (
+            self.dingtalk_config.shutdown_timeout_seconds
+            + self.dingtalk_config.close_timeout_seconds
+        )
         if self._stop_event is not None:
             self._stop_event.set()
         try:
@@ -128,12 +135,22 @@ class DingTalkRuntime:
                     await asyncio.wait_for(close_task, timeout=self.dingtalk_config.close_timeout_seconds)
                 except asyncio.TimeoutError:
                     logger.warning("dingtalk client close timed out")
+            dispose_all = getattr(self.runner, "dispose_all", None)
+            if callable(dispose_all):
+                outcome = dispose_all(deadline=deadline, close_owned_session_db=False)
+                if inspect.isawaitable(outcome):
+                    await outcome
         finally:
             clear_state = getattr(self.adapter, "clear_runtime_state", None)
             if clear_state:
                 clear_state()
             if self.runtime_lock is not None:
                 self.runtime_lock.release()
+            if self._owns_session_db and self.session_db is not None:
+                close = getattr(self.session_db, "close_with_deadline", None)
+                if callable(close):
+                    close(deadline)
+                self.session_db = None
             self._stop_event = None
             self._stopping = False
 

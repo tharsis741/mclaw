@@ -95,61 +95,177 @@ class CommandsRenderer:
             namespace=namespace,
         ))
 
-    def render_help(self, *, push_to_talk_label: str) -> None:
+    def render_help(
+        self,
+        *,
+        push_to_talk_label: str,
+        dsoftbus_enabled: bool = False,
+    ) -> None:
+        blocks = [
+            section_block("常用命令"),
+            command_block([
+                ("/help", "显示命令列表"),
+                ("/model <名称>", "切换模型，缺少密钥时提示配置"),
+                ("/model-update", "刷新和查看 models.dev 模型库缓存"),
+                ("/provider", "查看供应商和密钥状态"),
+                ("/search-backend", "查看或切换联网搜索后端"),
+                ("/extract-backend", "查看或切换网页提取后端"),
+                ("/schedule", "打开本地任务中心"),
+                ("/skills", "查看和使用技能"),
+                ("/usage", "查看本次会话 Token 用量"),
+                ("/doctor", "检查运行环境和工具可用性"),
+                ("/history", "查看历史会话"),
+                ("/resume <id>", "恢复历史会话"),
+                ("/title <名称>", "设置会话标题"),
+                ("/clear", "清屏并开启新会话"),
+                ("/save", "导出会话 JSON"),
+                ("/quit", "退出 M-Claw"),
+            ]),
+        ]
+        if dsoftbus_enabled:
+            blocks.extend([
+                spacer_block(),
+                section_block("可信设备"),
+                command_block([
+                    ("/devices", "打开可信设备与可配对设备界面"),
+                    ("/pair", "打开设备配对界面"),
+                    ("/unpair", "打开解除配对界面"),
+                ]),
+            ])
+        blocks.extend([
+            spacer_block(),
+            section_block("文件安全层"),
+            command_block([
+                ("/rollback", "查看最近可撤销文件变更"),
+                ("/rollback 1", "撤销第 1 条变更"),
+                ("/rollback undo", "恢复最近一条已撤销变更"),
+                ("/checkpoints status", "查看 checkpoint 存储状态"),
+                ("/checkpoints prune", "清理过期或孤儿 checkpoint"),
+            ]),
+            spacer_block(),
+            section_block("语音与桌面宠物"),
+            command_block([
+                ("/asr-mode [wake_word|push_to_talk]", "启用语音输入"),
+                ("/asr-status", "查看 ASR 状态"),
+                ("/keyboard-mode", "关闭 ASR，切回键盘输入"),
+                ("/pet [on|off|status|save|test]", "控制桌面宠物"),
+            ]),
+            spacer_block(),
+            section_block("快捷键"),
+            key_value_block([
+                ("发送", "Enter"),
+                ("换行", "Shift+Enter"),
+                ("中断", "Ctrl+C"),
+                ("退出", "Ctrl+D"),
+                ("清空输入", "Ctrl+U"),
+                ("光标/历史/补全", "Up/Down, Right, Tab"),
+                ("ASR 按键说话", push_to_talk_label),
+            ]),
+            spacer_block(),
+            text_block(
+                "Ctrl+U = 清空当前输入 · Right = 接受历史建议 · Tab = 接受命令补全 · Up/Down = 光标/历史/补全导航",
+                muted=True,
+            ),
+        ])
         self._panel_model(PanelModel(
             title="M-Claw 命令中心",
             namespace="help",
-            blocks=(
-                section_block("常用命令"),
-                command_block([
-                    ("/help", "显示命令列表"),
-                    ("/model <名称>", "切换模型，缺少密钥时提示配置"),
-                    ("/model-update", "刷新和查看 models.dev 模型库缓存"),
-                    ("/provider", "查看供应商和密钥状态"),
-                    ("/search-backend", "查看或切换联网搜索后端"),
-                    ("/extract-backend", "查看或切换网页提取后端"),
-                    ("/schedule", "打开本地任务中心"),
-                    ("/skills", "查看和使用技能"),
-                    ("/usage", "查看本次会话 Token 用量"),
-                    ("/doctor", "检查运行环境和工具可用性"),
-                    ("/history", "查看历史会话"),
-                    ("/resume <id>", "恢复历史会话"),
-                    ("/title <名称>", "设置会话标题"),
-                    ("/clear", "清屏并开启新会话"),
-                    ("/save", "导出会话 JSON"),
-                    ("/quit", "退出 M-Claw"),
-                ]),
-                spacer_block(),
-                section_block("文件安全层"),
-                command_block([
-                    ("/rollback", "查看最近可撤销文件变更"),
-                    ("/rollback 1", "撤销第 1 条变更"),
-                    ("/rollback undo", "恢复最近一条已撤销变更"),
-                    ("/checkpoints status", "查看 checkpoint 存储状态"),
-                    ("/checkpoints prune", "清理过期或孤儿 checkpoint"),
-                ]),
-                spacer_block(),
-                section_block("语音与桌面宠物"),
-                command_block([
-                    ("/asr-mode [wake_word|push_to_talk]", "启用语音输入"),
-                    ("/asr-status", "查看 ASR 状态"),
-                    ("/keyboard-mode", "关闭 ASR，切回键盘输入"),
-                    ("/pet [on|off|status|save|test]", "控制桌面宠物"),
-                ]),
-                spacer_block(),
-                section_block("快捷键"),
-                key_value_block([
-                    ("发送", "Enter"),
-                    ("换行", "Shift+Enter"),
-                    ("中断", "Ctrl+C"),
-                    ("退出", "Ctrl+D"),
-                    ("清空输入", "Ctrl+U"),
-                    ("光标/历史/补全", "Up/Down, Right, Tab"),
-                    ("ASR 按键说话", push_to_talk_label),
-                ]),
-                spacer_block(),
-                text_block("Ctrl+U = 清空当前输入 · Right = 接受历史建议 · Tab = 接受命令补全 · Up/Down = 光标/历史/补全导航", muted=True),
+            blocks=tuple(blocks),
+        ))
+
+    def render_dsoftbus_devices(
+        self,
+        devices: list[dict[str, str]],
+        trusted_devices: list[dict] | None = None,
+        pairable_devices: list[dict] | None = None,
+    ) -> None:
+        """Render Runtime peers and redacted system DeviceManager targets."""
+
+        blocks = []
+        if devices:
+            rows = []
+            for device in devices:
+                device_id = str(device.get("deviceId") or "")
+                short_id = device_id.rsplit(":", 1)[-1][:12]
+                connection = str(device.get("connectionState") or "CLOSED")
+                agent = str(device.get("agentAvailability") or "UNAVAILABLE")
+                rows.append((
+                    device.get("deviceName") or "未命名设备",
+                    "在线" if device.get("devicePresence") == "ONLINE" else "离线",
+                    "可用" if agent == "READY" else "未就绪",
+                    connection,
+                    short_id,
+                ))
+            blocks.append(table_block(
+                (
+                    PanelColumn("设备", role="primary"),
+                    PanelColumn("信任网络", role="success", no_wrap=True),
+                    PanelColumn("Agent", role="accent", no_wrap=True),
+                    PanelColumn("连接", role="muted", no_wrap=True),
+                    PanelColumn("设备标识", role="muted", no_wrap=True),
+                ),
+                rows,
+            ))
+        else:
+            blocks.append(key_value_block([("Runtime 设备", "当前没有已验证的在线可信设备")]))
+        trusted_devices = trusted_devices or []
+        blocks.extend([spacer_block(), section_block("系统可信设备")])
+        if trusted_devices:
+            blocks.append(
+                table_block(
+                    (
+                        PanelColumn("设备", role="primary"),
+                        PanelColumn("状态", role="success", no_wrap=True),
+                        PanelColumn("设备类型", role="muted", no_wrap=True),
+                        PanelColumn("管理标识", role="muted", no_wrap=True),
+                    ),
+                    [
+                        (
+                            str(device.get("deviceName") or "未命名设备"),
+                            "在线" if device.get("online") else "当前不可用",
+                            str(device.get("deviceTypeId", "")),
+                            str(device.get("deviceIdSha256") or "")[:12],
+                        )
+                        for device in trusted_devices
+                    ],
+                )
+            )
+        else:
+            blocks.append(key_value_block([("DeviceManager", "当前没有可管理的可信设备")]))
+        pairable_devices = pairable_devices or []
+        blocks.extend([spacer_block(), section_block("可配对设备")])
+        if pairable_devices:
+            blocks.append(
+                table_block(
+                    (
+                        PanelColumn("设备", role="primary"),
+                        PanelColumn("设备类型", role="muted", no_wrap=True),
+                        PanelColumn("候选标识", role="muted", no_wrap=True),
+                    ),
+                    [
+                        (
+                            str(device.get("deviceName") or "未命名设备"),
+                            str(device.get("deviceTypeId", "")),
+                            str(device.get("deviceIdSha256") or "")[:12],
+                        )
+                        for device in pairable_devices
+                    ],
+                )
+            )
+        else:
+            blocks.append(key_value_block([("DeviceManager", "当前没有扫描到可配对设备")]))
+        blocks.extend([
+            spacer_block(),
+            text_block(
+                "输入 /pair 后由 M-Claw 选择候选；PIN、对端确认和系统授权仍由系统处理。",
+                muted=True,
             ),
+        ])
+        self._panel_model(PanelModel(
+            title="M-Claw · 可信设备",
+            namespace="dsoftbus_devices",
+            blocks=tuple(blocks),
+            tone="info",
         ))
 
     def render_doctor(self, text: str) -> None:

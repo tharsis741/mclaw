@@ -15,6 +15,7 @@ import logging
 import os
 import platform as _platform_mod
 import re
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,7 @@ class RuntimeTerminalSession:
 
 _env_registry: dict[str, RuntimeTerminalSession] = {}
 _current_session_id: str | None = None
+_SESSION_STATE_LOCK = threading.RLock()
 _CREDENTIAL_FILE_REFERENCE_RE = re.compile(
     r"""(?:
         (?<![\w])\.env[^\s/\\\"';&|]*
@@ -127,9 +129,8 @@ def _skill_store_terminal_mutation_error(command: str, workdir: str = "") -> str
 
     protected_roots = _protected_skill_roots()
     effective_cwd = workdir or ""
-    if not effective_cwd and _current_session_id:
-        session_env = _env_registry.get(_current_session_id)
-        effective_cwd = getattr(session_env, "cwd", "") if session_env is not None else ""
+    if not effective_cwd:
+        effective_cwd = get_session_cwd()
 
     for candidate in _skill_store_mutation_targets(command, effective_cwd):
         candidate_path = _resolve_guard_path(candidate, effective_cwd)
@@ -155,17 +156,44 @@ def set_current_session(session_id: str | None) -> None:
     unless it still has active background processes.
     """
     global _current_session_id
-    if _current_session_id is not None and _current_session_id in _env_registry:
-        # Active background processes retain their session environment.
-        try:
-            from mclaw.tools.process_registry import process_registry
-            if process_registry.has_active_processes(_current_session_id):
-                _current_session_id = session_id
+    try:
+        normalized = None if session_id is None else str(session_id)
+        with _SESSION_STATE_LOCK:
+            previous = _current_session_id
+            has_environment = bool(previous and previous in _env_registry)
+        retain_previous = False
+        if has_environment and previous:
+            try:
+                from mclaw.tools.process_registry import process_registry
+
+                retain_previous = process_registry.has_active_processes(previous)
+            except BaseException:
+                retain_previous = True
+                logger.warning(
+                    "Terminal session cleanup deferred after process lookup failure"
+                )
+        with _SESSION_STATE_LOCK:
+            if _current_session_id != previous:
                 return
-        except ImportError:
-            logger.debug("Process registry unavailable during terminal session switch", exc_info=True)
-        cleanup_session(_current_session_id)
-    _current_session_id = session_id
+            if previous and not retain_previous:
+                _env_registry.pop(previous, None)
+            _current_session_id = normalized
+    except BaseException:
+        logger.warning("Terminal current-session update was deferred")
+
+
+def get_current_session_id() -> str | None:
+    """Return only the current public session identifier."""
+    with _SESSION_STATE_LOCK:
+        return _current_session_id
+
+
+def get_session_cwd(session_id: str | None = None) -> str:
+    """Return a copied cwd scalar without exposing terminal env or secrets."""
+    with _SESSION_STATE_LOCK:
+        sid = session_id if session_id is not None else _current_session_id
+        session = _env_registry.get(sid) if sid else None
+        return str(session.cwd) if session is not None else ""
 
 
 def _get_or_create_env(
@@ -176,31 +204,53 @@ def _get_or_create_env(
     session_key: str | None = None,
 ) -> RuntimeTerminalSession:
     """Create or update the active session environment snapshot."""
-    active_session = session_key if session_key is not None else _current_session_id
+    with _SESSION_STATE_LOCK:
+        active_session = (
+            session_key if session_key is not None else _current_session_id
+        )
 
     if not active_session:
         return RuntimeTerminalSession(cwd=cwd or os.getcwd(), timeout=timeout, env=dict(env_vars or {}), scoped_secret_keys=set(scoped_secret_keys or set()))
 
-    if active_session not in _env_registry:
-        env = RuntimeTerminalSession(cwd=cwd or os.getcwd(), timeout=timeout, env=dict(env_vars or {}), scoped_secret_keys=set(scoped_secret_keys or set()))
-        _env_registry[active_session] = env
-    else:
-        env = _env_registry[active_session]
-        if cwd:
-            env.cwd = cwd
-        env.timeout = timeout
-        env.env = dict(env_vars or {})
-        env.scoped_secret_keys = set(scoped_secret_keys or set())
+    with _SESSION_STATE_LOCK:
+        if active_session not in _env_registry:
+            _env_registry[active_session] = RuntimeTerminalSession(
+                cwd=cwd or os.getcwd(),
+                timeout=timeout,
+                env=dict(env_vars or {}),
+                scoped_secret_keys=set(scoped_secret_keys or set()),
+            )
+        else:
+            env = _env_registry[active_session]
+            if cwd:
+                env.cwd = cwd
+            env.timeout = timeout
+            env.env = dict(env_vars or {})
+            env.scoped_secret_keys = set(scoped_secret_keys or set())
+        current = _env_registry[active_session]
+        return RuntimeTerminalSession(
+            cwd=current.cwd,
+            timeout=current.timeout,
+            env=dict(current.env),
+            scoped_secret_keys=set(current.scoped_secret_keys),
+        )
 
-    return env
+
+def _commit_session_cwd(session_id: str | None, expected: str, updated: str) -> None:
+    if not session_id:
+        return
+    with _SESSION_STATE_LOCK:
+        current = _env_registry.get(session_id)
+        if current is not None and current.cwd == expected:
+            current.cwd = updated
 
 
 def cleanup_session(session_id: str | None = None) -> None:
     """Drop terminal cwd/env state for a finished session."""
-    global _env_registry, _current_session_id
-    sid = session_id or _current_session_id
-    if sid and sid in _env_registry:
-        del _env_registry[sid]
+    with _SESSION_STATE_LOCK:
+        sid = session_id or _current_session_id
+        if sid:
+            _env_registry.pop(sid, None)
 
 
 def _truncate_output(output: str, limit: int = MAX_RESULT_SIZE_CHARS) -> str:
@@ -273,8 +323,21 @@ def terminal_tool(
     """Execute a shell command; optional background via process registry."""
     effective_timeout = _coerce_timeout(timeout) or DEFAULT_TIMEOUT
     effective_cwd = workdir or ""
-    active_session = session_key if session_key is not None else _current_session_id
-    session_env = _env_registry.get(active_session) if active_session else None
+    with _SESSION_STATE_LOCK:
+        active_session = (
+            session_key if session_key is not None else _current_session_id
+        )
+        stored = _env_registry.get(active_session) if active_session else None
+        session_env = (
+            RuntimeTerminalSession(
+                cwd=stored.cwd,
+                timeout=stored.timeout,
+                env=dict(stored.env),
+                scoped_secret_keys=set(stored.scoped_secret_keys),
+            )
+            if stored is not None
+            else None
+        )
     try:
         scoped_env, scoped_secret_keys = build_scoped_env(required_for)
     except SecretRequestError as exc:
@@ -482,6 +545,7 @@ def terminal_tool(
 
     try:
         runtime = RuntimeManager.current()
+        original_cwd = session.cwd
         result = runtime.exec(
             command,
             cwd=effective_cwd or session.cwd or os.getcwd(),
@@ -491,6 +555,7 @@ def terminal_tool(
             cancel_event=get_interrupt_event(),
         )
         session.cwd = result.cwd
+        _commit_session_cwd(active_session, original_cwd, result.cwd)
     except Exception as exc:
         return json.dumps(
             {
@@ -549,10 +614,10 @@ def _handle_terminal(args: dict, **kwargs) -> str:
     cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
     cfg = cfg or {}
     effective_timeout = _resolve_timeout(args.get("timeout"), cfg if isinstance(cfg, dict) else {})
-    from mclaw.tools.dispatch import get_current_session_id
+    from mclaw.tools.dispatch import get_current_session_id, get_current_task_id
 
     session_key = get_current_session_id() or str(getattr(parent_agent, "session_id", "") or "")
-    if not effective_workdir and session_key not in _env_registry:
+    if not effective_workdir and not get_session_cwd(session_key or None):
         effective_workdir = str(getattr(parent_agent, "workspace_path", "") or "").strip() or None
 
     return terminal_tool(
@@ -560,7 +625,7 @@ def _handle_terminal(args: dict, **kwargs) -> str:
         timeout=effective_timeout,
         workdir=effective_workdir,
         background=bool(args.get("background", False)),
-        task_id=kwargs.get("task_id"),
+        task_id=kwargs.get("task_id") or get_current_task_id() or None,
         check_interval=args.get("check_interval"),
         pty=bool(args.get("pty", False)),
         notify_on_complete=bool(args.get("notify_on_complete", False)),

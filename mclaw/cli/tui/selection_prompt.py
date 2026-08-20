@@ -194,7 +194,10 @@ def prompt_multi_select(
         if _single
         else 0
     )
-    selected = {"index": initial_index, "ids": default_ids}
+    selected = {
+        "index": initial_index,
+        "ids": {normalized[initial_index]["id"]} if _single else default_ids,
+    }
 
     def fragments() -> StyleAndTextTuples:
         result: StyleAndTextTuples = [("class:title", f"{title}\n")]
@@ -222,7 +225,7 @@ def prompt_multi_select(
             ("", "\n"),
             (
                 "class:hint",
-                "↑/↓ 移动，Tab/Space 选择，Enter 确认，Esc 返回\n"
+                "↑/↓ 选择，Enter 确认，Esc 返回\n"
                 if _single
                 else (
                     "↑/↓ 移动，Tab/Space 勾选，Ctrl+A 全选/取消全选，Enter 确认，Esc 跳过\n"
@@ -239,11 +242,15 @@ def prompt_multi_select(
     @kb.add("up")
     def _(event):
         selected["index"] = (selected["index"] - 1) % len(normalized)
+        if _single:
+            selected["ids"] = {normalized[selected["index"]]["id"]}
         event.app.invalidate()
 
     @kb.add("down")
     def _(event):
         selected["index"] = (selected["index"] + 1) % len(normalized)
+        if _single:
+            selected["ids"] = {normalized[selected["index"]]["id"]}
         event.app.invalidate()
 
     @kb.add("tab")
@@ -270,11 +277,7 @@ def prompt_multi_select(
     @kb.add("enter")
     def _(event):
         if _single:
-            item_id = next(
-                (item["id"] for item in normalized if item["id"] in selected["ids"]),
-                normalized[selected["index"]]["id"],
-            )
-            event.app.exit(result=[item_id])
+            event.app.exit(result=[normalized[selected["index"]]["id"]])
             return
         event.app.exit(result=[item["id"] for item in normalized if item["id"] in selected["ids"]])
 

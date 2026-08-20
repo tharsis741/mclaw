@@ -6,9 +6,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from prompt_toolkit.completion import Completer, Completion
 
-from mclaw.cli.runtime.commands import iter_builtin_completions
+from mclaw.cli.runtime.commands import (
+    iter_builtin_completions,
+    iter_dsoftbus_commands,
+)
 from mclaw.cli.skill_registry import SkillRegistry
 
 
@@ -31,8 +36,14 @@ def slash_token_before_cursor(document) -> str | None:
 class SlashCompleter(Completer):
     """Provide completions for /commands and skills when user types '/'."""
 
-    def __init__(self, skill_registry: SkillRegistry):
+    def __init__(
+        self,
+        skill_registry: SkillRegistry,
+        *,
+        include_dsoftbus: Callable[[], bool] | None = None,
+    ):
         self.skill_registry = skill_registry
+        self._include_dsoftbus = include_dsoftbus or (lambda: False)
 
     def get_completions(self, document, complete_event):
         token = slash_token_before_cursor(document)
@@ -43,7 +54,10 @@ class SlashCompleter(Completer):
         start_position = -len(token)
 
         # Built-in commands
-        for spec in iter_builtin_completions():
+        commands = iter_builtin_completions()
+        if self._include_dsoftbus():
+            commands = (*commands, *iter_dsoftbus_commands())
+        for spec in commands:
             if spec.name.startswith(prefix):
                 yield Completion(
                     f"/{spec.name}",

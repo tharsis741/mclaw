@@ -61,6 +61,9 @@ _TOOL_TO_FEATURE = {
     "browser_scroll": "browser_tool",
     "browser_press": "browser_tool",
     "browser_download": "browser_tool",
+    "dsoftbus_list_peers": "dsoftbus",
+    "dsoftbus_get_device_context": "dsoftbus",
+    "dsoftbus_run_agent_task": "dsoftbus",
 }
 
 _TOOLSET_TO_FEATURE = {
@@ -68,6 +71,7 @@ _TOOLSET_TO_FEATURE = {
     "file": "file",
     "delegation": "delegation",
     "browser": "browser_tool",
+    "dsoftbus": "dsoftbus",
 }
 
 
@@ -110,6 +114,7 @@ def runtime_features(
     checkpoint: FeatureState = FeatureState.UNKNOWN,
     pet: FeatureState = FeatureState.UNKNOWN,
     browser_tool: FeatureState = FeatureState.UNKNOWN,
+    dsoftbus: FeatureState = FeatureState.DISABLED,
     reasons: dict[str, str] | None = None,
 ) -> RuntimeFeatures:
     """Build the standard runtime capability matrix for one host profile."""
@@ -122,6 +127,7 @@ def runtime_features(
         "checkpoint": checkpoint,
         "pet": pet,
         "browser_tool": browser_tool,
+        "dsoftbus": dsoftbus,
     }
     return RuntimeFeatures(
         {

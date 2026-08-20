@@ -22,11 +22,12 @@ class ToolEntry:
         "name", "toolset", "schema", "handler", "check_fn", "diagnose_fn",
         "requires_env", "is_async", "description", "emoji",
         "max_result_size_chars",
+        "async_timeout_seconds",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn=None, diagnose_fn=None,
                  requires_env=None, is_async=False, description="", emoji="",
-                 max_result_size_chars=None):
+                 max_result_size_chars=None, async_timeout_seconds=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -38,6 +39,7 @@ class ToolEntry:
         self.description = description
         self.emoji = emoji
         self.max_result_size_chars = max_result_size_chars
+        self.async_timeout_seconds = async_timeout_seconds
 
 
 class ToolRegistry:
@@ -58,6 +60,7 @@ class ToolRegistry:
         check_fn: Callable | None = None, diagnose_fn: Callable | None = None, requires_env: list | None = None,
         is_async: bool = False, description: str = "", emoji: str = "",
         max_result_size_chars: int | float | None = None,
+        async_timeout_seconds: int | float | None = None,
     ):
         """Register one callable tool and its model-visible schema."""
         existing = self._tools.get(name)
@@ -72,6 +75,7 @@ class ToolRegistry:
             is_async=is_async,
             description=description or schema.get("description", ""),
             emoji=emoji, max_result_size_chars=max_result_size_chars,
+            async_timeout_seconds=async_timeout_seconds,
         )
 
     def get_definitions(self, tool_names: set[str], config: dict | None = None) -> list[dict]:
@@ -182,6 +186,7 @@ class ToolRegistry:
                 return _run_async(
                     entry.handler(args, **kwargs),
                     parent_agent=kwargs.get("parent_agent"),
+                    timeout_seconds=entry.async_timeout_seconds,
                 )
             return entry.handler(args, **kwargs)
         except Exception as e:

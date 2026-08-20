@@ -14,6 +14,7 @@ oversized results before they enter conversation history.
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -33,13 +34,26 @@ from mclaw.tools.interrupt import (
     set_interrupt_event,
 )
 from mclaw.tools.registry import registry
-from mclaw.tools.toolsets import resolve_multiple_toolsets
+from mclaw.tools.toolsets import DSOFTBUS_TOOLS, resolve_multiple_toolsets
 
 logger = logging.getLogger(__name__)
+
+_DSOFTBUS_INBOUND_FORBIDDEN_TOOLS = frozenset(DSOFTBUS_TOOLS)
+
+
+def _dsoftbus_forbidden_result(tool_name: str) -> str:
+    from mclaw.tools.registry import tool_error
+
+    return tool_error(
+        f"Tool '{tool_name}' is not available to an inbound DSoftBus agent.",
+        code="AGENT_TOOLS_FORBIDDEN",
+        success=False,
+    )
 
 # Per-call context set by core.py before handle_function_calls and read by tools.
 _current_session_db: ContextVar[Any] = ContextVar("current_session_db", default=None)
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
+_current_task_id: ContextVar[str] = ContextVar("current_task_id", default="")
 _tool_whitelist: ContextVar[set[str] | None] = ContextVar("tool_whitelist", default=None)
 _tool_action_whitelist: ContextVar[dict[str, set[str]] | None] = ContextVar("tool_action_whitelist", default=None)
 
@@ -73,6 +87,21 @@ def get_session_db() -> Any:
 def get_current_session_id() -> str:
     """Get the current session_id from context."""
     return _current_session_id.get()
+
+
+def set_current_task_id(task_id: str) -> Any:
+    """Bind an owning Task id across Agent and tool worker context copies."""
+    return _current_task_id.set(str(task_id or ""))
+
+
+def reset_current_task_id(token: Any) -> None:
+    """Restore the Task id that preceded a remote Agent execution."""
+    _current_task_id.reset(token)
+
+
+def get_current_task_id() -> str:
+    """Return the Task id that owns processes spawned by the current tool call."""
+    return _current_task_id.get()
 
 
 @contextmanager
@@ -168,6 +197,7 @@ _TOOL_MODULES = (
     "mclaw.tools.browser_tool",
     "mclaw.tools.weixin_tool",
     "mclaw.tools.dingtalk_tool",
+    "mclaw.dsoftbus.tools",
 )
 _discovery_done = False
 _discovery_failed_modules: set[str] = set()
@@ -502,9 +532,15 @@ def handle_function_call(
     task_id: str = "",
     session_id: str = "",
     enabled_tools: set[str] | None = None,
+    call_source: str = "turn",
 ) -> str:
     """Dispatch a tool call by name, returning JSON string result."""
     _discover_tools()
+    if (
+        call_source == "dsoftbus"
+        and tool_name in _DSOFTBUS_INBOUND_FORBIDDEN_TOOLS
+    ):
+        return _dsoftbus_forbidden_result(tool_name)
     if enabled_tools is not None and tool_name not in enabled_tools:
         return json.dumps(
             {"error": f"Tool '{tool_name}' is not enabled for this session."},
@@ -914,7 +950,7 @@ def _concurrent_tool_timeout(tool_name: str, parent_agent: Any = None) -> int:
     return max(1, timeout)
 
 
-def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -> int:
+def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -> float:
     """Return per-call timeout for tools that must run on the serial path."""
     timeout = 120
     cfg = getattr(parent_agent, "config", {}) if parent_agent is not None else {}
@@ -926,6 +962,12 @@ def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -
         args = {}
     if not isinstance(args, dict):
         args = {}
+
+    if tool_name == "dsoftbus_run_agent_task":
+        # The Task lifecycle is terminated by completion, explicit CancelTask,
+        # operation-specific limits, or Runtime shutdown.  The serial worker
+        # remains cancellation-aware while deliberately having no total cap.
+        return math.inf
 
     if tool_name == "terminal":
         try:
@@ -1052,6 +1094,7 @@ def _dispatch_single(
     checkpoint_manager: Any | None,
     memory_manager: Any | None = None,
     parent_agent: Any = None,
+    forbidden_tool_names: set[str] | frozenset[str] | None = None,
 ) -> str:
     """Single tool dispatch with availability check + optional checkpoint."""
     func = call.get("function", {})
@@ -1068,6 +1111,10 @@ def _dispatch_single(
             extracted = _extract_json_object(raw_args)
             if extracted is not None:
                 arguments = extracted
+
+    # Layer -1: source-specific hard boundary, independent of the schema list.
+    if forbidden_tool_names is not None and tool_name in forbidden_tool_names:
+        return _dsoftbus_forbidden_result(tool_name)
 
     # Layer 0: availability gate to block hallucinated tool names.
     if tool_name not in tool_names:
@@ -1189,6 +1236,7 @@ def _run_tool_worker(
     memory_manager: Any,
     parent_agent: Any,
     cancel_event: threading.Event | None,
+    forbidden_tool_names: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Run one tool into a private slot that the dispatcher snapshots once."""
     token = set_interrupt_event(cancel_event) if cancel_event is not None else None
@@ -1203,6 +1251,7 @@ def _run_tool_worker(
             checkpoint_manager,
             memory_manager,
             parent_agent,
+            forbidden_tool_names,
         )
     except Exception as exc:
         from mclaw.tools.registry import tool_error
@@ -1382,6 +1431,7 @@ def handle_function_calls(
     checkpoint_manager: Any = None,
     parent_agent: Any = None,
     cancel_event: threading.Event | None = None,
+    call_source: str = "turn",
 ) -> list:
     """Dispatch a batch of tool calls with turn cancellation and time bounds."""
     if not calls:
@@ -1389,6 +1439,11 @@ def handle_function_calls(
 
     if cancel_event is None:
         cancel_event = get_interrupt_event()
+    forbidden_tool_names = (
+        _DSOFTBUS_INBOUND_FORBIDDEN_TOOLS
+        if call_source == "dsoftbus"
+        else None
+    )
     use_concurrent = _should_parallelize_tool_batch(calls)
 
     if use_concurrent:
@@ -1416,6 +1471,7 @@ def handle_function_calls(
                     memory_manager,
                     parent_agent,
                     cancel_event,
+                    forbidden_tool_names,
                 ),
                 daemon=True,
                 name=f"mclaw-tool-{tool_name}",
@@ -1586,6 +1642,7 @@ def handle_function_calls(
                 memory_manager,
                 parent_agent,
                 cancel_event,
+                forbidden_tool_names,
             ),
             daemon=True,
             name=f"mclaw-tool-{tool_name}",

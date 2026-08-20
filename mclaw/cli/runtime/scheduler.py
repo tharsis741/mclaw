@@ -1226,7 +1226,11 @@ class RuntimeSchedulerCoordinator:
         for name in self.available_toolsets():
             if name not in configured:
                 configured.append(name)
-        result = [name for name in configured if validate_toolset(name)]
+        result = [
+            name
+            for name in configured
+            if validate_toolset(name, allow_platform=False, allow_scoped=False)
+        ]
         return result or ["mclaw-required"]
 
     def _draft_job_stub(self) -> SchedulerJob:

@@ -38,6 +38,12 @@ from mclaw.agent.transports.base import (
 )
 from mclaw.agent.transports.factory import create_transport
 from mclaw.agent.usage import UsageRecord
+from mclaw.dsoftbus.protocol import (
+    MODEL_STREAM_QUEUE_BYTES_MAX,
+    MODEL_STREAM_QUEUE_MAX,
+    REMOTE_MODEL_ACCUMULATOR_BYTES_MAX,
+    REMOTE_MODEL_MAX_OUTPUT_TOKENS,
+)
 from mclaw.prompts.background import build_memory_flush_system_prompt
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.state import SessionDB
@@ -46,6 +52,26 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRIES = 5
 _COMPRESSION_FALLBACK_TARGET_RATIO = 0.80
+_DSOFTBUS_REMOTE_DATA_TOOLS = frozenset(
+    {
+        "dsoftbus_get_device_context",
+        "dsoftbus_list_peers",
+        "dsoftbus_run_agent_task",
+    }
+)
+
+
+def _close_transport_once(transport: Any) -> bool:
+    """Close a transport wrapper or its owned SDK client, never both."""
+    if transport is None:
+        return True
+    close = getattr(transport, "close", None)
+    if not callable(close):
+        close = getattr(getattr(transport, "client", None), "close", None)
+    if not callable(close):
+        return True
+    close()
+    return True
 
 # ponytail: one process-global commit lock keeps cancel/begin linearizable;
 # split it per workspace only if contention is ever measured.
@@ -328,10 +354,79 @@ class MClaw:
         # Subagent isolation.
         skip_memory: bool = False,
         config: dict | None = None,
+        persist_session: bool = True,
     ):
+        """Construct transactionally and close every owned partial resource on error."""
+        self._close_lock = threading.Lock()
+        self._close_complete = False
+        self._closed_transport_ids: set[int] = set()
+        self._constructor_published = False
+        self.transport = None
+        self.context_compressor = None
+        self._memory_manager = None
+        self._memory_store = None
+        try:
+            self._initialize(
+                provider_runtime=provider_runtime,
+                usage_sink=usage_sink,
+                system_prompt=system_prompt,
+                session_db=session_db,
+                session_id=session_id,
+                parent_session_id=parent_session_id,
+                max_iterations=max_iterations,
+                platform=platform,
+                enabled_toolsets=enabled_toolsets,
+                stream_callback=stream_callback,
+                tool_callback=tool_callback,
+                tool_end_callback=tool_end_callback,
+                status_callback=status_callback,
+                event_callback=event_callback,
+                print_fn=print_fn,
+                workspace=workspace,
+                skip_memory=skip_memory,
+                config=config,
+                persist_session=persist_session,
+            )
+            self._constructor_published = True
+        except BaseException:
+            try:
+                self.close(
+                    deadline=time.monotonic() + 5.0,
+                    force_constructor_rollback=True,
+                )
+            except BaseException:
+                pass
+            raise
+
+    def _initialize(
+        self,
+        *,
+        provider_runtime: ProviderRuntimeContext,
+        usage_sink: Callable[[UsageRecord], None] | None = None,
+        system_prompt: str = "",
+        session_db: SessionDB = None,
+        session_id: str = None,
+        parent_session_id: str = None,
+        max_iterations: int | None = None,
+        platform: str = "cli",
+        enabled_toolsets: List[str] = None,
+        stream_callback: Callable = None,
+        tool_callback: Callable = None,
+        tool_end_callback: Callable = None,
+        status_callback: Callable = None,
+        event_callback: Callable = None,
+        print_fn: Callable = None,
+        workspace: str = None,
+        skip_memory: bool = False,
+        config: dict | None = None,
+        persist_session: bool = True,
+    ) -> None:
         """Create session-scoped runtime state without starting a model call."""
         if not isinstance(provider_runtime, ProviderRuntimeContext):
             raise TypeError("provider_runtime must be a ProviderRuntimeContext")
+        if type(persist_session) is not bool:
+            raise TypeError("persist_session must be a bool")
+        self._persist_session = persist_session
         self.provider_runtime = provider_runtime
         self.transport = create_transport(provider_runtime)
         self._usage_sink = usage_sink
@@ -481,26 +576,28 @@ class MClaw:
 
         # Create the session record in the database.
         if self._session_db:
-            self._session_db.create_session(
-                session_id=self.session_id,
-                source=self.platform,
-                model=self.model,
-                model_config=self.provider_runtime.snapshot(),
-                system_prompt=self.system_prompt,
-                parent_session_id=parent_session_id,
-                workspace=self.workspace_path or None,
-            )
+            if self._persist_session:
+                self._session_db.create_session(
+                    session_id=self.session_id,
+                    source=self.platform,
+                    model=self.model,
+                    model_config=self.provider_runtime.snapshot(),
+                    system_prompt=self.system_prompt,
+                    parent_session_id=parent_session_id,
+                    workspace=self.workspace_path or None,
+                )
             row = self._session_db.get_session(self.session_id) or {}
             self.session_input_tokens = int(row.get("input_tokens") or 0)
             self.session_output_tokens = int(row.get("output_tokens") or 0)
             self.session_cache_read_tokens = int(row.get("cache_read_tokens") or 0)
             self.session_cache_write_tokens = int(row.get("cache_write_tokens") or 0)
             self.session_reasoning_tokens = int(row.get("reasoning_tokens") or 0)
-            self._session_db.update_model_config(
-                self.session_id,
-                model=self.model,
-                model_config=self.provider_runtime.snapshot(),
-            )
+            if self._persist_session:
+                self._session_db.update_model_config(
+                    self.session_id,
+                    model=self.model,
+                    model_config=self.provider_runtime.snapshot(),
+                )
             if hasattr(self._session_db, "count_user_messages"):
                 try:
                     self.session_user_messages = self._session_db.count_user_messages(self.session_id)
@@ -1370,15 +1467,23 @@ class MClaw:
         if not isinstance(context, ProviderRuntimeContext):
             raise TypeError("context must be a ProviderRuntimeContext")
         next_transport = create_transport(context)
-        next_context_window = resolve_context_length(context)
-        next_system_prompt = self._build_system_prompt(model=context.model)
-        if self._session_db:
-            self._session_db.update_model_config(
-                self.session_id,
-                model=context.model,
-                model_config=context.snapshot(),
-            )
+        try:
+            next_context_window = resolve_context_length(context)
+            next_system_prompt = self._build_system_prompt(model=context.model)
+            if self._session_db and getattr(self, "_persist_session", True):
+                self._session_db.update_model_config(
+                    self.session_id,
+                    model=context.model,
+                    model_config=context.snapshot(),
+                )
+        except BaseException:
+            try:
+                _close_transport_once(next_transport)
+            except BaseException:
+                pass
+            raise
 
+        previous_transport = self.transport
         self.provider_runtime = context
         self.transport = next_transport
         self._replace_system_message(next_system_prompt)
@@ -1388,6 +1493,87 @@ class MClaw:
                 context,
                 context_window=next_context_window,
             )
+        try:
+            _close_transport_once(previous_transport)
+        except BaseException:
+            logger.warning("Previous model transport close failed", exc_info=True)
+
+    def activate_session_persistence(self) -> None:
+        """Enable writes only after the host commits a provisional Agent's row."""
+        self._persist_session = True
+
+    def close(
+        self,
+        *,
+        deadline: float | None = None,
+        force_constructor_rollback: bool = False,
+    ) -> bool:
+        """Cooperatively close session-private transports within a shared deadline."""
+        if type(force_constructor_rollback) is not bool:
+            raise TypeError("force_constructor_rollback must be a bool")
+        if deadline is None:
+            deadline = time.monotonic() + 5.0
+        if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+            raise ValueError("deadline must be an absolute monotonic timestamp")
+        if not force_constructor_rollback:
+            while True:
+                remaining = max(0.0, float(deadline) - time.monotonic())
+                if remaining <= 0:
+                    return False
+                workers = getattr(self, "_turn_workers_drained", None)
+                workers_done = workers is None or workers.wait(timeout=min(0.05, remaining))
+                turn_lock = getattr(self, "_interrupt_lock", None)
+                if turn_lock is None:
+                    turn_active = False
+                else:
+                    with turn_lock:
+                        turn_active = bool(getattr(self, "_turn_active", False))
+                if workers_done and not turn_active:
+                    break
+        remaining = max(0.0, float(deadline) - time.monotonic())
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = threading.Lock()
+            self._close_lock = close_lock
+        if remaining <= 0 or not close_lock.acquire(timeout=remaining):
+            return False
+        try:
+            if getattr(self, "_close_complete", False):
+                return True
+            closed_transport_ids = getattr(self, "_closed_transport_ids", None)
+            if closed_transport_ids is None:
+                closed_transport_ids = set()
+                self._closed_transport_ids = closed_transport_ids
+            resources: list[Any] = []
+            main_transport = getattr(self, "transport", None)
+            compressor = getattr(self, "context_compressor", None)
+            for candidate in (main_transport, compressor):
+                if candidate is not None and all(
+                    candidate is not existing for existing in resources
+                ):
+                    resources.append(candidate)
+
+            for resource in resources:
+                identity = id(resource)
+                if identity in closed_transport_ids:
+                    continue
+                if time.monotonic() >= float(deadline):
+                    return False
+                _close_transport_once(resource)
+                closed_transport_ids.add(identity)
+            self._close_complete = True
+            return True
+        except Exception as error:
+            if getattr(self, "platform", "") == "dsoftbus":
+                logger.warning(
+                    "Remote Agent private transport close failed type=%s",
+                    type(error).__name__,
+                )
+            else:
+                logger.warning("Agent private transport close failed", exc_info=True)
+            return False
+        finally:
+            close_lock.release()
 
     def _replace_system_message(self, content: str) -> None:
         if self.messages and self.messages[0].get("role") == "system":
@@ -1616,7 +1802,13 @@ class MClaw:
 
         if not messages or messages[0].get("role") != "system":
             system_prompt_text = self._build_system_prompt()
-            logger.info("[SYSTEM PROMPT]\n%s", system_prompt_text)
+            if call_source == "dsoftbus":
+                logger.info(
+                    "[SYSTEM PROMPT] source=dsoftbus utf8_bytes=%d",
+                    len(system_prompt_text.encode("utf-8")),
+                )
+            else:
+                logger.info("[SYSTEM PROMPT]\n%s", system_prompt_text)
             messages.insert(0, {"role": "system", "content": system_prompt_text})
 
         self._checkpoint_turn_id = uuid.uuid4().hex[:12]
@@ -1687,6 +1879,10 @@ class MClaw:
             )
 
         disabled_names = set(disabled_tool_names or ())
+        if call_source == "dsoftbus":
+            # The inbound schema never exposes DSoftBus tools, even if a
+            # caller supplies a forged config or toolset list.
+            disabled_names.update(_DSOFTBUS_REMOTE_DATA_TOOLS)
         if disable_tools:
             active_tools: List[Dict[str, Any]] = []
             active_tool_names: set[str] = set()
@@ -1895,27 +2091,44 @@ class MClaw:
                             display_budget.input_tokens,
                         )
                     self._emit_status("Waiting for model...")
-                    # Log the full message list before API calls to diagnose context growth.
+                    # Remote content is untrusted and never enters content previews.
                     try:
                         _msgs_log = []
                         for i, m in enumerate(messages):
                             _entry = {"index": i, "role": m.get("role", "?")}
                             _content = m.get("content", "")
                             if isinstance(_content, str):
-                                _entry["content_preview"] = _redact_log_secrets(_content[:200])
                                 _entry["content_length"] = len(_content)
+                                if call_source != "dsoftbus":
+                                    _entry["content_preview"] = _redact_log_secrets(
+                                        _content[:200]
+                                    )
                             else:
-                                _entry["content_preview"] = _redact_log_secrets(str(_content)[:200])
                                 _entry["content_length"] = len(str(_content))
+                                if call_source != "dsoftbus":
+                                    _entry["content_preview"] = _redact_log_secrets(
+                                        str(_content)[:200]
+                                    )
                             if m.get("tool_calls"):
                                 _tcs = m["tool_calls"]
                                 _entry["tool_calls_count"] = len(_tcs)
-                                _entry["tool_calls_preview"] = [
-                                    {"name": (tc.get("function", {}) or {}).get("name", "?"),
-                                     "args_preview": _redact_log_secrets(((tc.get("function", {}) or {}).get("arguments", "")[:100]))}
-                                    for tc in _tcs
-                                ]
-                            if m.get("tool_call_id"):
+                                if call_source != "dsoftbus":
+                                    _entry["tool_calls_preview"] = [
+                                        {
+                                            "name": (tc.get("function", {}) or {}).get(
+                                                "name", "?"
+                                            ),
+                                            "args_preview": _redact_log_secrets(
+                                                (
+                                                    (tc.get("function", {}) or {}).get(
+                                                        "arguments", ""
+                                                    )[:100]
+                                                )
+                                            ),
+                                        }
+                                        for tc in _tcs
+                                    ]
+                            if m.get("tool_call_id") and call_source != "dsoftbus":
                                 _entry["tool_call_id"] = m["tool_call_id"]
                             _msgs_log.append(_entry)
                         _total_chars = sum(e.get("content_length", 0) for e in _msgs_log)
@@ -1931,8 +2144,16 @@ class MClaw:
                         messages=messages,
                         tools=active_tools,
                         options=ModelCallOptions(
-                            stream=bool(self._stream_callback),
+                            stream=(
+                                call_source == "dsoftbus"
+                                or bool(self._stream_callback)
+                            ),
                             timeout=30.0,
+                            max_output_tokens=(
+                                REMOTE_MODEL_MAX_OUTPUT_TOKENS
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
                             source=call_source,
                             dynamic_system_context=dynamic_system_context,
                             stream_activity_callback=(
@@ -1945,6 +2166,37 @@ class MClaw:
                                 session_id=self.session_id,
                                 enabled=cache_enabled,
                             ),
+                            deadline_monotonic=deadline_monotonic,
+                            response_utf8_max_bytes=(
+                                REMOTE_MODEL_ACCUMULATOR_BYTES_MAX
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
+                            stream_queue_max_items=(
+                                MODEL_STREAM_QUEUE_MAX
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
+                            stream_queue_max_bytes=(
+                                MODEL_STREAM_QUEUE_BYTES_MAX
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
+                            stream_accumulator_max_bytes=(
+                                REMOTE_MODEL_ACCUMULATOR_BYTES_MAX
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
+                            register_worker=(
+                                self._register_turn_worker
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
+                            unregister_worker=(
+                                self._unregister_turn_worker
+                                if call_source == "dsoftbus"
+                                else None
+                            ),
                         ),
                         stream_callback=self._stream_callback,
                         interrupted=cancel_event.is_set,
@@ -1953,6 +2205,16 @@ class MClaw:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
                     break
                 except ModelCallError as error:
+                    remote_error_code = (
+                        error.code
+                        if error.code
+                        in {
+                            "DEADLINE_EXCEEDED",
+                            "INVALID_AGENT_RESPONSE",
+                            "PROVIDER_ERROR",
+                        }
+                        else "PROVIDER_ERROR"
+                    )
                     if (
                         error.context_limit
                         and self.context_compressor
@@ -2066,20 +2328,52 @@ class MClaw:
                             if error.retry_after is not None
                             else jittered_backoff(retry_count)
                         )
-                        logger.warning(
-                            "API error (attempt %d/%d), retrying in %.1fs: %s",
-                            retry_count, MAX_RETRIES, wait, error,
-                        )
+                        if call_source == "dsoftbus":
+                            logger.warning(
+                                "API error source=dsoftbus type=%s attempt=%d/%d "
+                                "retry_seconds=%.1f",
+                                type(error).__name__,
+                                retry_count,
+                                MAX_RETRIES,
+                                wait,
+                            )
+                        else:
+                            logger.warning(
+                                "API error (attempt %d/%d), retrying in %.1fs: %s",
+                                retry_count,
+                                MAX_RETRIES,
+                                wait,
+                                error,
+                            )
                         self._emit_status(f"Retrying in {wait:.0f}s...")
-                        deadline = time.time() + wait
-                        while time.time() < deadline:
+                        retry_deadline = time.monotonic() + wait
+                        if deadline_monotonic is not None:
+                            retry_deadline = min(
+                                retry_deadline, float(deadline_monotonic)
+                            )
+                        while time.monotonic() < retry_deadline:
                             if self._is_interrupted(cancel_event):
                                 break
-                            time.sleep(0.2)
+                            time.sleep(
+                                min(
+                                    0.2,
+                                    max(0.0, retry_deadline - time.monotonic()),
+                                )
+                            )
                         continue
-                    logger.error("API error (not retried): %s", error)
+                    if call_source == "dsoftbus":
+                        logger.error(
+                            "API error source=dsoftbus type=%s retried=false",
+                            type(error).__name__,
+                        )
+                    else:
+                        logger.error("API error (not retried): %s", error)
                     self._clear_unconfirmed_context_display()
-                    final_response = f"API Error: {error}"
+                    final_response = (
+                        "Provider error"
+                        if call_source == "dsoftbus"
+                        else f"API Error: {error}"
+                    )
                     self.messages = messages
                     return {
                         "final_response": final_response,
@@ -2087,7 +2381,11 @@ class MClaw:
                         "model": self.model,
                         "session_id": self.session_id,
                         "api_calls": api_call_count,
-                        "error": str(error),
+                        "error": (
+                            remote_error_code
+                            if call_source == "dsoftbus"
+                            else str(error)
+                        ),
                         "interrupted": interrupted,
                         "stop_reason": stop_reason,
                         "completed": False,
@@ -2141,6 +2439,33 @@ class MClaw:
             finish = result.finish_reason
             reasoning_text = result.reasoning.text if result.reasoning else None
 
+            forged_dsoftbus_call = bool(
+                call_source == "dsoftbus"
+                and tool_calls
+                and any(
+                    isinstance(tool_call, dict)
+                    and str((tool_call.get("function") or {}).get("name") or "")
+                    in _DSOFTBUS_REMOTE_DATA_TOOLS
+                    for tool_call in tool_calls
+                )
+            )
+            if tool_calls and (disable_tools or forged_dsoftbus_call):
+                self._clear_unconfirmed_context_display()
+                self.messages = messages
+                return {
+                    "final_response": "",
+                    "messages": messages,
+                    "model": self.model,
+                    "session_id": self.session_id,
+                    "api_calls": api_call_count,
+                    "error": "AGENT_TOOLS_FORBIDDEN",
+                    "interrupted": False,
+                    "stop_reason": "agent_tools_forbidden",
+                    "completed": False,
+                    "assistant_rounds": assistant_rounds,
+                    "token_usage": self._finish_turn_usage(),
+                }
+
             finish_after_cleanup = (
                 bool(assistant_content and assistant_content.strip())
                 and self._is_cleanup_only_tool_batch(tool_calls)
@@ -2192,6 +2517,8 @@ class MClaw:
                     "reasoning": result.reasoning,
                     "cancel_event": cancel_event,
                 }
+                if call_source == "dsoftbus":
+                    execute_kwargs["call_source"] = call_source
                 if disable_tools or disabled_names:
                     execute_kwargs["allowed_tool_names"] = active_tool_names
                 pending_result = self._execute_tool_calls(
@@ -2316,7 +2643,10 @@ class MClaw:
             except Exception as exc:
                 logger.debug("Background review scheduling failed: %s", exc)
 
-        return {
+        completed = bool(
+            not interrupted and not incomplete_response and final_response
+        )
+        turn_result = {
             "final_response": final_response,
             "messages": messages,
             "model": self.model,
@@ -2326,13 +2656,15 @@ class MClaw:
             "abort_reason": abort_reason,
             "abort_message": abort_message,
             "stop_reason": stop_reason,
-            "completed": bool(
-                not interrupted and not incomplete_response and final_response
-            ),
+            "completed": completed,
             "assistant_rounds": assistant_rounds,
             "token_usage": turn_usage,
             "skills_changed": bool(getattr(self, "_skills_changed_in_turn", False)),
         }
+        if call_source == "dsoftbus" and stop_reason == "timeout" and not completed:
+            turn_result["deadline_exceeded"] = True
+            turn_result["error"] = "DEADLINE_EXCEEDED"
+        return turn_result
 
     # ── Tool execution ──
 
@@ -2355,6 +2687,7 @@ class MClaw:
         reasoning: ReasoningTrace | None = None,
         cancel_event: threading.Event | None = None,
         allowed_tool_names: set[str] | None = None,
+        call_source: str = "turn",
     ):
         """Dispatch tool calls and append normalized results to the conversation.
 
@@ -2386,8 +2719,9 @@ class MClaw:
         checkpoint_mgr = self._get_checkpoint_manager()
         checkpoint_mgr.new_turn()
 
-        # Filter disabled tools.
-        disabled = set(getattr(self, "config", {}).get("tools", {}).get("disabled", []))
+        disabled = set(
+            getattr(self, "config", {}).get("tools", {}).get("disabled", [])
+        )
         filtered_calls = []
         has_install_prepare = False
         for tc in tool_calls:
@@ -2397,7 +2731,14 @@ class MClaw:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc["id"],
-                    "content": json.dumps({"error": f"Tool {fn_name} is disabled by project configuration"}),
+                    "content": json.dumps(
+                        {
+                            "error": (
+                                f"Tool {fn_name} is disabled by project "
+                                "configuration"
+                            )
+                        }
+                    ),
                 })
                 continue
             if fn_name == "skill_manage":
@@ -2414,8 +2755,9 @@ class MClaw:
                                 {
                                     "success": False,
                                     "error": (
-                                        "Only one skill_manage(action='install_prepare') "
-                                        "call is allowed per tool batch."
+                                        "Only one skill_manage(action="
+                                        "'install_prepare') call is allowed "
+                                        "per tool batch."
                                     ),
                                 }
                             ),
@@ -2459,15 +2801,15 @@ class MClaw:
         if is_subagent:
             logger.info("[subagent-%s] dispatching tools: %s", _sid_tail, tool_names)
 
-        context_tokens = set_tool_context(
-            session_db=self._session_db,
-            session_id=self.session_id,
-            cancel_event=cancel_event,
-        )
         dispatch_tool_names = (
             set(self.valid_tool_names)
             if allowed_tool_names is None
             else set(allowed_tool_names)
+        )
+        context_tokens = set_tool_context(
+            session_db=self._session_db,
+            session_id=self.session_id,
+            cancel_event=cancel_event,
         )
         try:
             results = handle_function_calls(
@@ -2477,6 +2819,7 @@ class MClaw:
                 checkpoint_manager=checkpoint_mgr,
                 parent_agent=self,
                 cancel_event=cancel_event,
+                call_source=call_source,
             )
         finally:
             reset_tool_context(context_tokens)

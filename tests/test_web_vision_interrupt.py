@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 from __future__ import annotations
 
 import asyncio
@@ -153,7 +157,11 @@ def _configure_local_vision(monkeypatch, image, base_url: str, timeout: float) -
     _bypass_test_proxy(monkeypatch)
     image.write_bytes(b"image")
     monkeypatch.setattr(vision_tool, "_detect_image_mime_type", lambda _path: "image/png")
-    monkeypatch.setattr(vision_tool, "_compress_image_if_needed", lambda path: path)
+    monkeypatch.setattr(
+        vision_tool,
+        "_resize_image_if_needed",
+        lambda path, **_kwargs: path,
+    )
     monkeypatch.setattr(
         vision_tool,
         "_image_to_base64_data_url",
@@ -171,6 +179,7 @@ def _configure_local_vision(monkeypatch, image, base_url: str, timeout: float) -
         ),
     )
     monkeypatch.setattr(vision_tool, "_resolve_timeout", lambda _parent: timeout)
+    monkeypatch.setattr(vision_tool, "_resolve_max_pixels", lambda _parent: 1_310_720)
 
 
 def _bypass_test_proxy(monkeypatch) -> None:
@@ -396,13 +405,13 @@ def test_vision_cancel_after_download_skips_processing_and_cleans_temp(monkeypat
         cancel_event.set()
         return destination
 
-    def fail_processing(_path):
+    def fail_processing(_path, **_kwargs):
         nonlocal processing_called
         processing_called = True
         raise AssertionError("processing started after cancellation")
 
     monkeypatch.setattr(vision_tool, "_download_image_async", download)
-    monkeypatch.setattr(vision_tool, "_compress_image_if_needed", fail_processing)
+    monkeypatch.setattr(vision_tool, "_resize_image_if_needed", fail_processing)
 
     token = set_interrupt_event(cancel_event)
     try:
@@ -525,7 +534,11 @@ def test_vision_cancel_after_model_response_skips_empty_response_retry(tmp_path,
     model_calls = 0
 
     monkeypatch.setattr(vision_tool, "_detect_image_mime_type", lambda _path: "image/png")
-    monkeypatch.setattr(vision_tool, "_compress_image_if_needed", lambda path: path)
+    monkeypatch.setattr(
+        vision_tool,
+        "_resize_image_if_needed",
+        lambda path, **_kwargs: path,
+    )
     monkeypatch.setattr(
         vision_tool,
         "_image_to_base64_data_url",
@@ -543,6 +556,7 @@ def test_vision_cancel_after_model_response_skips_empty_response_retry(tmp_path,
         ),
     )
     monkeypatch.setattr(vision_tool, "_resolve_timeout", lambda _parent: 1)
+    monkeypatch.setattr(vision_tool, "_resolve_max_pixels", lambda _parent: 1_310_720)
 
     async def call_model(*_args, **_kwargs) -> str:
         nonlocal model_calls

@@ -10,11 +10,14 @@ security-sensitive settings or enable desktop GUI behavior for every checkout.
 """
 
 import copy
+from dataclasses import dataclass
 import os
 import platform
 import re
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import yaml
@@ -29,6 +32,10 @@ _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 class ConfigError(Exception):
     """Raised when M-Claw configuration is invalid or violates security rules."""
+
+    def __init__(self, message: str, *, code: str = "CONFIG_INVALID") -> None:
+        super().__init__(message)
+        self.code = code
 
 
 # Config paths.
@@ -60,7 +67,12 @@ def find_project_config(start_dir: Path | None = None) -> Path | None:
     return None
 
 
-_FORBIDDEN_PROJECT_FIELDS = {"sandbox.root", "delegation_dir", "security.trusted_workspaces"}
+_FORBIDDEN_PROJECT_FIELDS = {
+    "sandbox.root",
+    "delegation_dir",
+    "security.trusted_workspaces",
+    "dsoftbus",
+}
 
 
 def _check_forbidden_fields(config: dict, path: str = "") -> None:
@@ -75,6 +87,17 @@ def _check_forbidden_fields(config: dict, path: str = "") -> None:
             for item in value:
                 if isinstance(item, dict):
                     _check_forbidden_fields(item, full_key)
+
+
+def _normalize_project_config(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a source-safe project config copy with host-only fields removed."""
+    config = copy.deepcopy(dict(raw))
+    _check_forbidden_fields(config)
+    display_cfg = config.get("display")
+    pet_cfg = display_cfg.get("pet") if isinstance(display_cfg, dict) else None
+    if isinstance(pet_cfg, dict):
+        pet_cfg.pop("enabled", None)
+    return config
 
 
 def load_project_config(path: Path) -> dict:
@@ -93,14 +116,53 @@ def load_project_config(path: Path) -> dict:
     else:
         raise ConfigError(".mclaw.yaml must contain a YAML mapping.")
 
-    _check_forbidden_fields(config)
-    # Project config may tune pet visuals, but cannot force desktop GUI startup
-    # for every checkout. Runtime enablement remains controlled by user config.
-    display_cfg = config.get("display")
-    pet_cfg = display_cfg.get("pet") if isinstance(display_cfg, dict) else None
-    if isinstance(pet_cfg, dict):
-        pet_cfg.pop("enabled", None)
-    return config
+    return _normalize_project_config(config)
+
+
+def _freeze_config_tree(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {copy.deepcopy(key): _freeze_config_tree(item) for key, item in value.items()}
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_config_tree(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_config_tree(item) for item in value)
+    return copy.deepcopy(value)
+
+
+def _thaw_config_tree(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {copy.deepcopy(key): _thaw_config_tree(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_config_tree(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw_config_tree(item) for item in value}
+    return copy.deepcopy(value)
+
+
+@dataclass(frozen=True)
+class ConfigSourceSnapshot:
+    """One immutable user/project configuration I/O snapshot."""
+
+    raw_user_config: Mapping[str, Any]
+    raw_project_config: Mapping[str, Any]
+    project_path: Path | None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "raw_user_config", _freeze_config_tree(self.raw_user_config))
+        object.__setattr__(self, "raw_project_config", _freeze_config_tree(self.raw_project_config))
+        object.__setattr__(
+            self,
+            "project_path",
+            Path(self.project_path) if self.project_path is not None else None,
+        )
+
+    def user_config_copy(self) -> dict[str, Any]:
+        return _thaw_config_tree(self.raw_user_config)
+
+    def project_config_copy(self) -> dict[str, Any]:
+        return _thaw_config_tree(self.raw_project_config)
 
 
 def _load_user_config_file(config_path: Path) -> dict[str, Any]:
@@ -119,24 +181,46 @@ def _load_user_config_file(config_path: Path) -> dict[str, Any]:
     return raw
 
 
-def load_merged_config(cwd: Path | None = None) -> dict:
-    """Load user config merged with project-level .mclaw.yaml if present."""
+def load_raw_user_config(*, strict: bool = True) -> dict[str, Any]:
+    """Load only user-owned fields while validating their merged semantics."""
     ensure_mclaw_home()
-    config = copy.deepcopy(DEFAULT_CONFIG)
+    config_path = get_config_path()
+    try:
+        raw = _load_user_config_file(config_path) if config_path.exists() else {}
+        merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw)
+        _validate_config(merged)
+        return copy.deepcopy(raw)
+    except ConfigError as exc:
+        if strict:
+            raise
+        print_plain(f"Warning: Failed to load config: {exc.code}")
+        return {}
 
-    # 1. User-level config
-    user_path = get_config_path()
-    if user_path.exists():
-        user_config = _load_user_config_file(user_path)
-        config = _deep_merge(config, user_config)
 
-    # 2. Project-level config
+def load_config_source_snapshot(cwd: Path | None = None) -> ConfigSourceSnapshot:
+    """Read user and project config once and return an immutable source snapshot."""
+    ensure_mclaw_home()
+    raw_user = load_raw_user_config(strict=True)
     project_path = find_project_config(cwd)
-    if project_path:
-        project_config = load_project_config(project_path)
-        config = _deep_merge(config, project_config)
-        config["_project_config_dir"] = str(project_path.parent)
+    raw_project = load_project_config(project_path) if project_path else {}
+    return ConfigSourceSnapshot(raw_user, raw_project, project_path)
 
+
+def load_merged_config(
+    cwd: Path | None = None,
+    *,
+    source_snapshot: ConfigSourceSnapshot | None = None,
+) -> dict:
+    """Load and strictly validate one user/project configuration snapshot."""
+    ensure_mclaw_home()
+    snapshot = source_snapshot or load_config_source_snapshot(cwd)
+    user_config = snapshot.user_config_copy()
+    project_config = _normalize_project_config(snapshot.project_config_copy())
+    config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), user_config)
+    config = _deep_merge(config, project_config)
+    if snapshot.project_path is not None:
+        config["_project_config_dir"] = str(snapshot.project_path.parent)
+    _validate_config(config)
     return config
 
 
@@ -198,6 +282,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "tools": {
         "disabled": [],
     },
+    "dsoftbus": {
+        "enabled": False,
+        "discovery_without_provider": False,
+        "accept_remote_messages": False,
+        "allow_remote_tools": False,
+        "per_peer_requests_per_minute": 6,
+        "global_requests_per_minute": 12,
+        "remote_token_budget_per_hour": 100_000,
+    },
     "terminal": {
         "cwd": ".",
         "timeout": 180,
@@ -227,8 +320,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "auxiliary": {
         "vision": {
             "provider": "qwen",
-            "model": "qwen-vl-max",
+            "model": "qwen3-vl-flash",
             "base_url": "",
+            "max_pixels": 1_310_720,
             "timeout": 30,
             "download_timeout": 30,
         },
@@ -428,6 +522,83 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
+_DSOFTBUS_CONFIG_KEYS = frozenset(
+    {
+        "enabled",
+        "discovery_without_provider",
+        "accept_remote_messages",
+        "allow_remote_tools",
+        "per_peer_requests_per_minute",
+        "global_requests_per_minute",
+        "remote_token_budget_per_hour",
+    }
+)
+
+
+def _raise_dsoftbus_config(field: str) -> None:
+    raise ConfigError(
+        f"Invalid dsoftbus configuration field: {field}",
+        code="DSOFTBUS_CONFIG_INVALID",
+    )
+
+
+def _validate_toolset_list(value: Any, path: str) -> None:
+    from mclaw.tools.toolsets import validate_toolset
+
+    if not isinstance(value, list):
+        raise ConfigError(f"{path} must be a list")
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise ConfigError(f"{path} contains an invalid toolset")
+        if not validate_toolset(item, allow_platform=False, allow_scoped=False):
+            raise ConfigError(f"{path} contains a disallowed toolset")
+
+
+def _validate_config(config: Mapping[str, Any]) -> None:
+    """Validate host-sensitive configuration after all source merging."""
+    dsoftbus = config.get("dsoftbus")
+    if not isinstance(dsoftbus, Mapping):
+        _raise_dsoftbus_config("dsoftbus")
+    if set(dsoftbus) != _DSOFTBUS_CONFIG_KEYS:
+        _raise_dsoftbus_config("keys")
+
+    enabled = dsoftbus.get("enabled")
+    if enabled is not False and enabled != "auto":
+        _raise_dsoftbus_config("enabled")
+    discovery_only = dsoftbus.get("discovery_without_provider")
+    if type(discovery_only) is not bool:
+        _raise_dsoftbus_config("discovery_without_provider")
+    accept_remote = dsoftbus.get("accept_remote_messages")
+    if type(accept_remote) is not bool:
+        _raise_dsoftbus_config("accept_remote_messages")
+    allow_remote_tools = dsoftbus.get("allow_remote_tools")
+    if type(allow_remote_tools) is not bool:
+        _raise_dsoftbus_config("allow_remote_tools")
+    if discovery_only and enabled is False:
+        _raise_dsoftbus_config("discovery_without_provider")
+
+    per_peer = dsoftbus.get("per_peer_requests_per_minute")
+    global_rate = dsoftbus.get("global_requests_per_minute")
+    token_budget = dsoftbus.get("remote_token_budget_per_hour")
+    if type(per_peer) is not int or not 1 <= per_peer <= 60:
+        _raise_dsoftbus_config("per_peer_requests_per_minute")
+    if type(global_rate) is not int or not per_peer <= global_rate <= 240:
+        _raise_dsoftbus_config("global_requests_per_minute")
+    if type(token_budget) is not int or not 1_000 <= token_budget <= 10_000_000:
+        _raise_dsoftbus_config("remote_token_budget_per_hour")
+
+    _validate_toolset_list(config.get("toolsets"), "toolsets")
+    channels = config.get("channels")
+    if isinstance(channels, Mapping):
+        for channel_name in ("weixin", "dingtalk"):
+            channel = channels.get(channel_name)
+            if isinstance(channel, Mapping) and "toolsets" in channel:
+                _validate_toolset_list(
+                    channel.get("toolsets"),
+                    f"channels.{channel_name}.toolsets",
+                )
+
+
 def load_config(*, strict: bool = False) -> dict[str, Any]:
     """Load configuration from M-Claw home config.yaml, merged with defaults."""
     ensure_mclaw_home()
@@ -435,14 +606,16 @@ def load_config(*, strict: bool = False) -> dict[str, Any]:
 
     config = copy.deepcopy(DEFAULT_CONFIG)
 
-    if config_path.exists():
-        try:
+    try:
+        if config_path.exists():
             user_config = _load_user_config_file(config_path)
             config = _deep_merge(config, user_config)
-        except ConfigError as exc:
-            if strict:
-                raise
-            print_plain(f"Warning: Failed to load config: {exc}")
+        _validate_config(config)
+    except ConfigError as exc:
+        if strict:
+            raise
+        print_plain(f"Warning: Failed to load config: {exc.code}")
+        config = copy.deepcopy(DEFAULT_CONFIG)
 
     return config
 

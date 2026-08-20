@@ -172,6 +172,41 @@ def test_reasoning_activity_is_status_only_until_visible_text_arrives() -> None:
     ]
 
 
+def test_remote_agent_messages_use_remote_titles_without_changing_status_bar() -> None:
+    chat, _pet = make_chat_with_pet()
+    chat.runtime_state.set_status(RuntimeStatus.TOOLS, "Running local tool")
+    rendered: list[tuple[str, dict]] = []
+    chat._response_renderer = SimpleNamespace(
+        render_response=lambda text, **kwargs: rendered.append((text, kwargs))
+    )
+
+    chat._on_agent_event(
+        {
+            "type": "assistant.message",
+            "content": "remote reasoning",
+            "content_source": "reasoning_content",
+            "is_final": False,
+            "origin": "dsoftbus",
+        }
+    )
+    chat._on_agent_event(
+        {
+            "type": "assistant.message",
+            "content": "remote progress",
+            "content_source": "content",
+            "is_final": False,
+            "origin": "dsoftbus",
+        }
+    )
+
+    assert [item[1]["title"] for item in rendered] == [
+        "- 远端 M-Claw 思考中...",
+        "- 远端 M-Claw 任务进展：",
+    ]
+    assert chat.runtime_state.status == RuntimeStatus.TOOLS
+    assert chat.runtime_state.detail == "Running local tool"
+
+
 def test_all_agent_status_messages_are_self_contained() -> None:
     cases = {
         "Refreshing context...": "Refreshing context",

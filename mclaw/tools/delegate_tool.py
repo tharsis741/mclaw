@@ -159,9 +159,9 @@ def _resolve_working_directory(parent_agent) -> Optional[str]:
     parent_session_id = str(getattr(parent_agent, "session_id", "") or "")
     if parent_session_id:
         try:
-            from mclaw.tools.terminal_tool import _env_registry
+            from mclaw.tools.terminal_tool import get_session_cwd
 
-            terminal_cwd = getattr(_env_registry.get(parent_session_id), "cwd", None)
+            terminal_cwd = get_session_cwd(parent_session_id)
         except ImportError:
             pass
     candidates = [
@@ -198,11 +198,51 @@ def _persist_oversized_summary(child: Any, summary: str) -> str | None:
     return str(handoff_path)
 
 
+def _dispose_child_agent(child: Any) -> None:
+    """Close a child Agent before releasing its terminal-session state."""
+    close = getattr(child, "close", None)
+    child_session_id = getattr(child, "session_id", None)
+    if not callable(close) and not child_session_id:
+        return
+    dispose_lock = getattr(child, "_delegate_dispose_lock", None)
+    if dispose_lock is None:
+        dispose_lock = threading.Lock()
+        try:
+            child._delegate_dispose_lock = dispose_lock
+        except (AttributeError, TypeError):
+            pass
+    with dispose_lock:
+        if getattr(child, "_delegate_disposed", False):
+            return
+        try:
+            child._delegate_disposed = True
+        except (AttributeError, TypeError):
+            pass
+    if callable(close):
+        try:
+            close()
+        except BaseException:
+            logger.warning("Could not close delegated child Agent", exc_info=True)
+    if child_session_id:
+        try:
+            from mclaw.tools.terminal_tool import cleanup_session
+
+            cleanup_session(child_session_id)
+        except BaseException:
+            logger.warning("Could not clean delegated child terminal state", exc_info=True)
+
+
 def _strip_blocked_toolsets(toolsets: List[str]) -> List[str]:
     """Remove blocked toolset names from a requested child toolset list."""
+    from mclaw.tools.toolsets import validate_toolset
+
     return [
         t for t in toolsets
-        if t in ALLOWED_DELEGATE_TOOLSETS and t not in _BLOCKED_TOOLSET_NAMES
+        if (
+            t in ALLOWED_DELEGATE_TOOLSETS
+            and t not in _BLOCKED_TOOLSET_NAMES
+            and validate_toolset(t, allow_platform=False, allow_scoped=False)
+        )
     ]
 
 
@@ -222,6 +262,8 @@ def _resolve_child_toolsets(
       1. Explicit requested toolsets, limited to ALLOWED_DELEGATE_TOOLSETS.
       2. DEFAULT_DELEGATE_TOOLSETS when no explicit toolsets are requested.
     """
+    from mclaw.tools.toolsets import validate_toolset
+
     desired = list(DEFAULT_DELEGATE_TOOLSETS)
     if requested_toolsets:
         desired.extend(str(t) for t in requested_toolsets if str(t).strip())
@@ -234,6 +276,8 @@ def _resolve_child_toolsets(
             continue
         seen.add(toolset)
         if toolset not in ALLOWED_DELEGATE_TOOLSETS or toolset in _BLOCKED_TOOLSET_NAMES:
+            continue
+        if not validate_toolset(toolset, allow_platform=False, allow_scoped=False):
             continue
         if parent_allowed is not None and toolset not in parent_allowed:
             continue
@@ -427,22 +471,26 @@ def _run_single_child(
     # Relay child tool calls to progress_callback without invoking the
     # parent's _tool_callback; child tool calls should not render in the
     # parent TUI as normal parent actions.
-    if progress_callback:
-        def _relay_tool(tool_name: str, args: dict):
+    try:
+        if progress_callback:
+            def _relay_tool(tool_name: str, args: dict):
+                progress_callback(SubtaskEvent(
+                    task_index, SUBAGENT_TOOL_CALL,
+                    {"tool": tool_name, "args_bytes": len(str(args))},
+                    delegation_id=delegation_id,
+                ))
+
+            child._tool_callback = _relay_tool
+
+            # Emit a started event.
             progress_callback(SubtaskEvent(
-                task_index, SUBAGENT_TOOL_CALL,
-                {"tool": tool_name, "args_bytes": len(str(args))},
+                task_index, SUBAGENT_STARTED,
+                {"goal": goal[:100], "depth": child._delegate_depth},
                 delegation_id=delegation_id,
             ))
-
-        child._tool_callback = _relay_tool
-
-        # Emit a started event.
-        progress_callback(SubtaskEvent(
-            task_index, SUBAGENT_STARTED,
-            {"goal": goal[:100], "depth": child._delegate_depth},
-            delegation_id=delegation_id,
-        ))
+    except BaseException:
+        _dispose_child_agent(child)
+        raise
 
     api_calls_before = int(getattr(child, "session_api_calls", 0) or 0)
     try:
@@ -615,11 +663,7 @@ def _run_single_child(
             "duration_seconds": duration,
         }
     finally:
-        from mclaw.tools.terminal_tool import cleanup_session
-
-        child_session_id = getattr(child, "session_id", None)
-        if child_session_id:
-            cleanup_session(child_session_id)
+        _dispose_child_agent(child)
 
 def _run_all_children_background(
     task_list: list,
@@ -835,6 +879,8 @@ def delegate_task(
             children.append((i, task, child))
     except Exception as exc:
         logger.exception("构建子代理失败")
+        for _index, _task, built_child in children:
+            _dispose_child_agent(built_child)
         return json.dumps({
             "error": f"构建子代理失败: {exc}",
             "success": False,
@@ -851,6 +897,8 @@ def delegate_task(
     cancel_event = get_interrupt_event()
 
     if cancel_event is not None and cancel_event.is_set():
+        for _index, _task, child in children:
+            _dispose_child_agent(child)
         return tool_error(
             "delegate_task was not started because the turn was cancelled",
             success=False,
@@ -874,6 +922,8 @@ def delegate_task(
                     cancel_event,
                 )
             finally:
+                for _index, _task, child in children:
+                    _dispose_child_agent(child)
                 unregister = getattr(parent_agent, "_unregister_turn_worker", None)
                 if callable(unregister):
                     unregister(threading.current_thread())
@@ -885,6 +935,8 @@ def delegate_task(
         try:
             thread.start()
         except BaseException:
+            for _index, _task, child in children:
+                _dispose_child_agent(child)
             unregister = getattr(parent_agent, "_unregister_turn_worker", None)
             if callable(unregister):
                 unregister(thread)

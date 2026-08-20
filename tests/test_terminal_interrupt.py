@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import json
 import logging
 import os
@@ -1248,7 +1252,7 @@ def test_terminal_reports_unconfirmed_tree_kill_as_completion_unknown(
     assert registered == [fence]
 
 
-def test_process_wait_interrupts_without_killing_background() -> None:
+def test_process_wait_interrupt_terminates_owned_background(monkeypatch) -> None:
     import mclaw.tools.process_registry as process_module
     from mclaw.tools.interrupt import reset_interrupt_event, set_interrupt_event
 
@@ -1261,6 +1265,19 @@ def test_process_wait_interrupts_without_killing_background() -> None:
     registry._running[session.id] = session
     registry._ensure_checkpoint_present = lambda: None
     registry._default_wait_timeout = lambda: 5
+    killed: list[str] = []
+
+    def kill_process(session_id: str) -> dict:
+        killed.append(session_id)
+        session.exited = True
+        session.exit_code = -15
+        return {
+            "status": "killed",
+            "termination_confirmed": True,
+            "exit_code": -15,
+        }
+
+    monkeypatch.setattr(registry, "kill_process", kill_process)
     cancel_event = threading.Event()
     token = set_interrupt_event(cancel_event)
     threading.Timer(0.05, cancel_event.set).start()
@@ -1273,9 +1290,117 @@ def test_process_wait_interrupts_without_killing_background() -> None:
 
     assert result["status"] == "interrupted"
     assert result["interrupted"] is True
+    assert result["termination_confirmed"] is True
     assert time.monotonic() - began < 0.5
+    assert killed == [session.id]
     assert registry.get(session.id) is session
-    assert session.exited is False
+    assert session.exited is True
+
+
+def test_registered_background_kill_reaps_parent_before_group_confirmation(
+    monkeypatch,
+) -> None:
+    import mclaw.tools.process_registry as process_module
+
+    events: list[str] = []
+
+    class FakeProcess:
+        returncode = None
+
+        def wait(self, timeout=None):
+            events.append("reap_parent")
+            self.returncode = -15
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    registry = process_module.ProcessRegistry()
+    session = process_module.ProcessSession(
+        id="owned-background",
+        command="long task",
+        task_id="task-1",
+        session_key="dsoftbus:session-1",
+        pid=321,
+        process=FakeProcess(),
+        process_group_id=654,
+        started_at=time.time(),
+    )
+    registry._running[session.id] = session
+    monkeypatch.setattr(process_module, "_IS_WINDOWS", False)
+    monkeypatch.setattr(
+        process_module,
+        "kill_process_group",
+        lambda process_group_id: (
+            events.append(f"signal_group:{process_group_id}"),
+            True,
+        )[1],
+    )
+
+    def confirm_group(process_group_id: int, *, timeout: float) -> bool:
+        if timeout == 0:
+            events.append(f"probe_initial:{process_group_id}")
+            return False
+        assert events[-2:] == ["signal_group:654", "reap_parent"]
+        events.append(f"probe_final:{process_group_id}")
+        return True
+
+    monkeypatch.setattr(process_module, "wait_for_process_group_exit", confirm_group)
+
+    result = registry.kill_process(session.id)
+
+    assert result["status"] == "killed"
+    assert result["termination_confirmed"] is True
+    assert events == [
+        "probe_initial:654",
+        "signal_group:654",
+        "reap_parent",
+        "probe_final:654",
+    ]
+
+
+def test_terminate_scope_matches_both_remote_task_and_session(monkeypatch) -> None:
+    import mclaw.tools.process_registry as process_module
+
+    registry = process_module.ProcessRegistry()
+    matching = process_module.ProcessSession(
+        id="matching",
+        command="one",
+        task_id="task-1",
+        session_key="dsoftbus:session-1",
+    )
+    wrong_task = process_module.ProcessSession(
+        id="wrong-task",
+        command="two",
+        task_id="task-2",
+        session_key="dsoftbus:session-1",
+    )
+    wrong_session = process_module.ProcessSession(
+        id="wrong-session",
+        command="three",
+        task_id="task-1",
+        session_key="dsoftbus:session-2",
+    )
+    registry._running = {
+        session.id: session
+        for session in (matching, wrong_task, wrong_session)
+    }
+    killed: list[str] = []
+
+    def kill_process(session_id: str) -> dict:
+        killed.append(session_id)
+        return {"status": "killed", "termination_confirmed": True}
+
+    monkeypatch.setattr(registry, "kill_process", kill_process)
+
+    report = registry.terminate_scope(
+        task_id="task-1",
+        session_key="dsoftbus:session-1",
+    )
+
+    assert report["termination_confirmed"] is True
+    assert report["target_count"] == 1
+    assert killed == ["matching"]
 
 
 def test_dispatcher_to_terminal_cancel_kills_the_real_process(tmp_path: Path) -> None:

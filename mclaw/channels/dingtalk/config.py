@@ -81,6 +81,17 @@ def _coerce_float(value: Any, default: float) -> float:
     return float(value)
 
 
+def _channel_toolsets(value: Any) -> list[str]:
+    from mclaw.tools.toolsets import validate_toolset
+
+    result = [
+        name
+        for name in _coerce_list(value)
+        if validate_toolset(name, allow_platform=False, allow_scoped=False)
+    ]
+    return result or ["mclaw-required"]
+
+
 @dataclass
 class DingTalkConfig:
     """Resolved DingTalk channel settings from config and scoped environment."""
@@ -151,7 +162,9 @@ class DingTalkConfig:
             media_cache_dir=str(raw.get("media_cache_dir") or env("DINGTALK_MEDIA_CACHE_DIR") or "").strip(),
             media_download_timeout_seconds=_coerce_float(raw.get("media_download_timeout_seconds"), 60.0),
             media_max_bytes=_coerce_int(raw.get("media_max_bytes"), 100 * 1024 * 1024),
-            toolsets=_coerce_list(raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]),
+            toolsets=_channel_toolsets(
+                raw.get("toolsets") or root.get("toolsets") or ["mclaw-required"]
+            ),
         )
 
     def allowed_user_set(self) -> set[str]:

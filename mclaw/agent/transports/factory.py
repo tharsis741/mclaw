@@ -13,6 +13,15 @@ _DEFAULT_TRANSPORT_TIMEOUT = 60.0
 _LOCAL_API_KEY_PLACEHOLDER = "local-no-key"
 
 
+def _close_failed_client(client) -> None:
+    close = getattr(client, "close", None)
+    if callable(close):
+        try:
+            close()
+        except BaseException:
+            pass
+
+
 def _client_api_key(context: ProviderRuntimeContext) -> str:
     if context.api_key:
         return context.api_key
@@ -21,20 +30,47 @@ def _client_api_key(context: ProviderRuntimeContext) -> str:
     return _LOCAL_API_KEY_PLACEHOLDER
 
 
-def create_transport(context: ProviderRuntimeContext) -> ModelTransport:
-    """Bind the resolved context, zero-retry SDK client, and protocol adapter."""
-    api_key = _client_api_key(context)
+def resolve_transport_class(
+    context: ProviderRuntimeContext,
+) -> type[ModelTransport]:
+    """Validate one resolved context and return its import-safe adapter class."""
+
+    if not isinstance(context, ProviderRuntimeContext):
+        raise TypeError("context must be ProviderRuntimeContext")
+    _client_api_key(context)
     if context.api_mode == "chat_completions":
         if context.profile.auth_scheme != "bearer":
             raise ValueError(
                 f"Provider '{context.provider}' has incompatible auth scheme "
                 f"'{context.profile.auth_scheme}' for chat_completions"
             )
-        import openai
-
         from mclaw.agent.transports.openai_chat_completions import (
             OpenAIChatCompletionsTransport,
         )
+
+        return OpenAIChatCompletionsTransport
+    if context.api_mode == "anthropic_messages":
+        if context.profile.auth_scheme != "anthropic_x_api_key":
+            raise ValueError(
+                f"Provider '{context.provider}' has incompatible auth scheme "
+                f"'{context.profile.auth_scheme}' for anthropic_messages"
+            )
+        from mclaw.agent.transports.anthropic_messages import (
+            AnthropicMessagesTransport,
+        )
+
+        return AnthropicMessagesTransport
+    raise ValueError(
+        f"Provider '{context.provider}' has unsupported api_mode '{context.api_mode}'"
+    )
+
+
+def create_transport(context: ProviderRuntimeContext) -> ModelTransport:
+    """Bind the resolved context, zero-retry SDK client, and protocol adapter."""
+    api_key = _client_api_key(context)
+    transport_class = resolve_transport_class(context)
+    if context.api_mode == "chat_completions":
+        import openai
 
         client = openai.OpenAI(
             api_key=api_key,
@@ -42,17 +78,14 @@ def create_transport(context: ProviderRuntimeContext) -> ModelTransport:
             max_retries=0,
             timeout=_DEFAULT_TRANSPORT_TIMEOUT,
         )
-        return OpenAIChatCompletionsTransport(context, client)
+        try:
+            return transport_class(context, client)
+        except BaseException:
+            _close_failed_client(client)
+            raise
 
     if context.api_mode == "anthropic_messages":
-        if context.profile.auth_scheme != "anthropic_x_api_key":
-            raise ValueError(
-                f"Provider '{context.provider}' has incompatible auth scheme "
-                f"'{context.profile.auth_scheme}' for anthropic_messages"
-            )
         import anthropic
-
-        from mclaw.agent.transports.anthropic_messages import AnthropicMessagesTransport
 
         client = anthropic.Anthropic(
             api_key=api_key,
@@ -60,8 +93,10 @@ def create_transport(context: ProviderRuntimeContext) -> ModelTransport:
             max_retries=0,
             timeout=_DEFAULT_TRANSPORT_TIMEOUT,
         )
-        return AnthropicMessagesTransport(context, client)
+        try:
+            return transport_class(context, client)
+        except BaseException:
+            _close_failed_client(client)
+            raise
 
-    raise ValueError(
-        f"Provider '{context.provider}' has unsupported api_mode '{context.api_mode}'"
-    )
+    raise AssertionError("validated transport mode was not constructed")

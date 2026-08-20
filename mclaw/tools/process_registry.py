@@ -93,6 +93,10 @@ class ProcessSession:
     watcher_interval: int = 0
     secret_redactions: tuple[str, ...] = field(default_factory=tuple, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _termination_lock: threading.Lock = field(
+        default_factory=threading.Lock,
+        repr=False,
+    )
     _reader_thread: threading.Thread | None = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess/winpty handle when use_pty=True
 
@@ -789,7 +793,7 @@ class ProcessRegistry:
         }
 
     def wait(self, session_id: str, timeout: int | None = None) -> dict:
-        """Block until a process exits, timeout expires, or user interrupt fires."""
+        """Block until exit; cancellation terminates and reaps the process tree."""
         default_timeout = self._default_wait_timeout()
         max_timeout = default_timeout
         requested = self._positive_int(timeout, 0) if timeout is not None else None
@@ -821,12 +825,28 @@ class ProcessRegistry:
                     result["timeout_note"] = timeout_note
                 return result
             if is_interrupted():
+                termination = self.kill_process(session_id)
+                confirmed = termination.get("status") in {
+                    "killed",
+                    "already_exited",
+                }
                 result = {
-                    "status": "interrupted",
+                    "status": "interrupted" if confirmed else "cancel_requested",
                     "interrupted": True,
                     "output": self._redacted_output_tail(session, 1000),
-                    "note": "User interrupted wait",
+                    "note": (
+                        "User interrupted wait; process tree terminated and reaped"
+                        if confirmed
+                        else "User interrupted wait; process-tree termination could not be confirmed"
+                    ),
+                    "termination_confirmed": confirmed,
                 }
+                if not confirmed:
+                    result["completion_unknown"] = True
+                    result["error"] = str(
+                        termination.get("error")
+                        or "Process tree could not be confirmed stopped"
+                    )
                 if timeout_note:
                     result["timeout_note"] = timeout_note
                 return result
@@ -896,61 +916,149 @@ class ProcessRegistry:
         return None
 
     def kill_process(self, session_id: str) -> dict:
-        """Terminate a running process through PTY, process tree, or recovered PID."""
+        """Terminate, reap, and confirm the complete registered process tree."""
         session = self.get(session_id)
         if session is None:
             return {"status": "not_found", "error": f"No process with ID {session_id}"}
-        if session.exited:
-            return {"status": "already_exited", "exit_code": session.exit_code}
-        try:
-            if session._pty is not None:
-                # PTY mode: terminate through the PTY handle first.
-                try:
-                    session._pty.terminate(force=True)
-                except Exception as exc:
-                    logger.debug("PTY terminate failed for %s: %s", session.id, exc)
-            elif session.process and session.pid:
-                # Fall back to the platform process-tree killer on Windows and Unix.
-                kill_process_tree(session.pid)
-            elif session.detached and session.pid_scope == "host" and session.pid:
-                if not self._is_host_pid_alive(session.pid):
-                    with session._lock:
-                        session.exited = True
-                        session.exit_code = None
-                    self._move_to_finished(session)
-                    return {"status": "already_exited", "exit_code": session.exit_code}
-                kill_process_tree(session.pid)
-            else:
+        with session._termination_lock:
+            process_group_id = (
+                session.process_group_id
+                if not _IS_WINDOWS and session.process_group_id
+                else None
+            )
+            group_already_gone = bool(
+                process_group_id
+                and wait_for_process_group_exit(process_group_id, timeout=0.0)
+            )
+            if session.exited and (process_group_id is None or group_already_gone):
+                return {
+                    "status": "already_exited",
+                    "exit_code": session.exit_code,
+                    "termination_confirmed": True,
+                }
+
+            started = time.monotonic()
+            termination_deadline = started + PROCESS_TERMINATION_BUDGET_SECONDS
+            try:
+                if process_group_id is not None:
+                    tree_targeted = kill_process_group(process_group_id)
+                elif session.pid:
+                    tree_targeted = kill_process_tree(session.pid)
+                else:
+                    return {
+                        "status": "error",
+                        "error": "Cannot kill: no process handle",
+                        "completion_unknown": True,
+                        "termination_confirmed": False,
+                    }
+
+                # A PTY implementation may not place the child in an observable
+                # POSIX group. Keep its own forced termination as the fallback.
+                if session._pty is not None and not tree_targeted:
+                    try:
+                        session._pty.terminate(force=True)
+                        tree_targeted = True
+                    except Exception as exc:
+                        logger.debug("PTY terminate failed for %s: %s", session.id, exc)
+
+                exit_code = self._wait_for_exit_after_kill(
+                    session,
+                    timeout=max(
+                        0.05,
+                        termination_deadline - time.monotonic(),
+                    ),
+                )
+                direct_stopped = (
+                    session.process is None
+                    or session.process.poll() is not None
+                )
+                tree_stopped = (
+                    wait_for_process_group_exit(
+                        process_group_id,
+                        timeout=max(
+                            0.0,
+                            termination_deadline - time.monotonic(),
+                        ),
+                    )
+                    if process_group_id is not None
+                    else bool(tree_targeted and direct_stopped)
+                )
+                if not direct_stopped or not tree_stopped:
+                    raise RuntimeError(
+                        "Process tree could not be confirmed stopped and reaped"
+                    )
+                with session._lock:
+                    session.exited = True
+                    session.exit_code = exit_code if exit_code is not None else -15
+                    session.finished_at = time.time()
+                self._move_to_finished(session)
+                return {
+                    "status": "killed",
+                    "session_id": session.id,
+                    "exit_code": session.exit_code,
+                    "termination_confirmed": True,
+                }
+            except Exception as error:
+                safe_cancel_trace(
+                    lambda: logger.warning(
+                        "[CANCEL_TRACE] background_tree_termination_unconfirmed "
+                        "session_id=%s pid=%s process_group_id=%s elapsed_ms=%d",
+                        session.id,
+                        session.pid,
+                        process_group_id,
+                        int((time.monotonic() - started) * 1000),
+                    )
+                )
                 return {
                     "status": "error",
-                    "error": "Cannot kill: no process handle",
+                    "error": str(error),
+                    "completion_unknown": True,
+                    "termination_confirmed": False,
                 }
-            exit_code = self._wait_for_exit_after_kill(session)
-            with session._lock:
-                session.exited = True
-                session.exit_code = exit_code if exit_code is not None else -15
-                session.finished_at = time.time()
-            self._move_to_finished(session)
-            return {
-                "status": "killed",
-                "session_id": session.id,
-                "exit_code": session.exit_code,
+
+    def terminate_scope(
+        self,
+        *,
+        task_id: str | None = None,
+        session_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Terminate every process owned by the exact task/session scope."""
+        with self._lock:
+            candidates = {
+                session.id: session
+                for session in (*self._running.values(), *self._finished.values())
             }
-        except Exception as e:
-            return {"status": "error", "error": str(e)}
+        targets = list(candidates.values())
+        if task_id is not None:
+            targets = [session for session in targets if session.task_id == task_id]
+        if session_key is not None:
+            targets = [
+                session for session in targets if session.session_key == session_key
+            ]
+
+        results = [self.kill_process(session.id) for session in targets]
+        unconfirmed = [
+            result
+            for result in results
+            if result.get("status") not in {"killed", "already_exited"}
+            or result.get("termination_confirmed") is not True
+        ]
+        return {
+            "target_count": len(targets),
+            "terminated_count": sum(
+                result.get("status") == "killed" for result in results
+            ),
+            "already_exited_count": sum(
+                result.get("status") == "already_exited" for result in results
+            ),
+            "termination_confirmed": not unconfirmed,
+            "results": results,
+        }
 
     def kill_all(self, task_id: str | None = None) -> int:
         """Kill running processes, scoped to task_id when provided."""
-        with self._lock:
-            targets = list(self._running.values())
-        if task_id:
-            targets = [s for s in targets if s.task_id == task_id]
-        killed = 0
-        for s in targets:
-            result = self.kill_process(s.id)
-            if result.get("status") == "killed":
-                killed += 1
-        return killed
+        report = self.terminate_scope(task_id=task_id)
+        return int(report["terminated_count"])
 
     # ── Listing / active checks ──
 

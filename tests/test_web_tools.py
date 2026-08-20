@@ -825,7 +825,7 @@ def test_setup_configures_selected_capabilities_in_order_with_qwen_intl(monkeypa
     cli_main._run_setup_capability_selection(config)
 
     assert prompt_titles == [
-        "M-Claw 可选工具配置",
+        "M-Claw 可选能力",
         "M-Claw IM 交互配置",
         "M-Claw 语音输入",
     ]

@@ -2,15 +2,18 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Image detection, compression, and encoding helpers."""
+"""Image detection, resizing, and encoding helpers."""
 
 from __future__ import annotations
 
 import base64
 import logging
+import math
 import tempfile
 import uuid
 from pathlib import Path
+
+from mclaw.tools.vision.config import DEFAULT_MAX_PIXELS
 
 logger = logging.getLogger(__name__)
 
@@ -57,64 +60,79 @@ def _rgb_for_jpeg(img):
     return img.convert("RGB")
 
 
-def _compress_image_if_needed(
+def _resize_image_if_needed(
     image_path: Path,
-    max_dimension: int = 2048,
-    quality: int = 85,
-    max_file_size: int = 1_500_000,
+    max_pixels: int = DEFAULT_MAX_PIXELS,
+    alignment: int = 32,
+    jpeg_quality: int = 85,
 ) -> Path:
-    """Resize and/or re-encode only when the image exceeds configured limits."""
-    file_size = image_path.stat().st_size
+    """Downscale an image only when its total pixel count exceeds ``max_pixels``."""
+    if max_pixels <= 0:
+        raise ValueError("max_pixels must be positive")
+    if alignment <= 0:
+        raise ValueError("alignment must be positive")
     if image_path.suffix.lower() == ".svg":
         return image_path
 
     try:
         from PIL import Image, ImageOps
     except ImportError:
-        logger.debug("Pillow not installed; skipping image compression")
+        logger.debug("Pillow not installed; skipping image resize")
         return image_path
 
     try:
         with Image.open(image_path) as img:
+            source_format = (img.format or "").upper()
             img = ImageOps.exif_transpose(img)
             width, height = img.size
-            needs_resize = max(width, height) > max_dimension
-            needs_compress = file_size > max_file_size
-            if not needs_resize and not needs_compress:
+            source_pixels = width * height
+            if source_pixels <= max_pixels:
                 return image_path
 
-            if needs_resize:
-                ratio = max_dimension / max(width, height)
-                new_size = (max(1, int(width * ratio)), max(1, int(height * ratio)))
-                img = img.resize(new_size, Image.LANCZOS)
-                logger.info("Image resized %dx%d -> %dx%d", width, height, new_size[0], new_size[1])
+            scale = math.sqrt(max_pixels / source_pixels)
+            scaled_width = max(1, int(width * scale))
+            scaled_height = max(1, int(height * scale))
+            new_width = (
+                scaled_width // alignment * alignment
+                if scaled_width >= alignment
+                else scaled_width
+            )
+            new_height = (
+                scaled_height // alignment * alignment
+                if scaled_height >= alignment
+                else scaled_height
+            )
 
-            img = _rgb_for_jpeg(img)
+            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
             temp_dir = Path(tempfile.gettempdir()) / "mclaw-vision"
             temp_dir.mkdir(parents=True, exist_ok=True)
-            compressed_path = temp_dir / f"compressed_{uuid.uuid4().hex[:8]}.jpg"
+            preserve_png = source_format == "PNG"
+            suffix = ".png" if preserve_png else ".jpg"
+            resized_path = temp_dir / f"resized_{uuid.uuid4().hex[:8]}{suffix}"
 
-            last_quality = quality
-            for q in (quality, 70, 50, 30):
-                last_quality = q
-                img.save(compressed_path, format="JPEG", quality=q, optimize=True)
-                if compressed_path.stat().st_size <= max_file_size:
-                    break
-
-            compressed_size = compressed_path.stat().st_size
-            if compressed_size >= file_size and not needs_resize:
-                compressed_path.unlink(missing_ok=True)
-                return image_path
+            if preserve_png:
+                img.save(resized_path, format="PNG", optimize=True)
+            else:
+                _rgb_for_jpeg(img).save(
+                    resized_path,
+                    format="JPEG",
+                    quality=jpeg_quality,
+                    optimize=True,
+                )
 
             logger.info(
-                "Image compressed %.1f KB -> %.1f KB (quality=%d)",
-                file_size / 1024,
-                compressed_size / 1024,
-                last_quality,
+                "Image resized %dx%d (%d pixels) -> %dx%d (%d pixels)",
+                width,
+                height,
+                source_pixels,
+                new_width,
+                new_height,
+                new_width * new_height,
             )
-            return compressed_path
+            return resized_path
     except Exception as exc:
-        logger.warning("Image compression failed (%s), using original", exc)
+        logger.warning("Image resize failed (%s), using original", exc)
         return image_path
 
 

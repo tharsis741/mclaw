@@ -11,7 +11,9 @@ the shared channel adapter into one private-chat gateway process.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
+import time
 
 from mclaw.channels.audio_transcription import build_inbound_pipeline
 from mclaw.channels.runner import AgentRunner
@@ -49,7 +51,8 @@ class WeixinRuntime:
         runtime_lock: WeixinRuntimeLock | None = None,
     ) -> None:
         self.weixin_config = WeixinConfig.from_config(config)
-        self.session_db = session_db or SessionDB()
+        self._owns_session_db = session_db is None
+        self.session_db = SessionDB() if session_db is None else session_db
         self.account_store = account_store or WeixinAccountStore()
         self.token_store = token_store or ContextTokenStore()
         self.client = client or ILinkClient(
@@ -106,6 +109,7 @@ class WeixinRuntime:
 
     async def stop(self) -> None:
         """Stop polling, drain active dispatch tasks, close iLink, and release state."""
+        deadline = time.monotonic() + self.weixin_config.shutdown_timeout_seconds
         self._running = False
         interrupt_all = getattr(self.runner, "interrupt_all", None)
         if interrupt_all:
@@ -117,17 +121,37 @@ class WeixinRuntime:
             try:
                 await asyncio.wait_for(
                     asyncio.gather(*tasks, return_exceptions=True),
-                    timeout=self.weixin_config.shutdown_timeout_seconds,
+                    timeout=max(0.001, deadline - time.monotonic()),
                 )
             except asyncio.TimeoutError:
                 logger.warning("weixin runtime shutdown timed out waiting for %d dispatch task(s)", len(tasks))
                 for task in tasks:
                     task.cancel()
-                await asyncio.gather(*tasks, return_exceptions=True)
+                remaining = max(0.0, deadline - time.monotonic())
+                if remaining > 0:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*tasks, return_exceptions=True),
+                            timeout=remaining,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
         try:
-            await self.client.close()
+            dispose_all = getattr(self.runner, "dispose_all", None)
+            if callable(dispose_all):
+                outcome = dispose_all(deadline=deadline, close_owned_session_db=False)
+                if inspect.isawaitable(outcome):
+                    await outcome
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining > 0:
+                await asyncio.wait_for(self.client.close(), timeout=remaining)
         finally:
             unregister_weixin_outbound_targets_for_adapter(self.adapter)
+            if self._owns_session_db and self.session_db is not None:
+                close = getattr(self.session_db, "close_with_deadline", None)
+                if callable(close):
+                    close(deadline)
+                self.session_db = None
             if self.runtime_lock is not None:
                 self.runtime_lock.release()
 

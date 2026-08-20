@@ -51,7 +51,11 @@ from mclaw.cli.runtime.skill_commands import (
     RuntimeSkillImportConfirmationCoordinator,
     RuntimeSkillImportConfirmationHooks,
 )
-from mclaw.cli.runtime.workspace_trust import ensure_workspace_trusted, normalize_workspace_path
+from mclaw.cli.runtime.workspace_trust import (
+    ensure_workspace_trusted,
+    normalize_workspace_path,
+    resolve_interactive_workspace,
+)
 from mclaw.cli.slash_completer import SlashCompleter, slash_token_before_cursor
 from mclaw.pet.config import ensure_pet_config
 from mclaw.pet.controller import PetController
@@ -89,6 +93,8 @@ from mclaw.cli.tui.renderers.delegation import DelegationRenderer
 from mclaw.cli.tui.renderers.response import (
     INTERMEDIATE_ASSISTANT_TITLE,
     INTERMEDIATE_ASSISTANT_TITLE_STYLE,
+    REMOTE_INTERMEDIATE_ASSISTANT_TITLE,
+    REMOTE_THINKING_ASSISTANT_TITLE,
     ResponseRenderer,
     THINKING_ASSISTANT_TITLE,
     THINKING_ASSISTANT_TITLE_STYLE,
@@ -306,39 +312,83 @@ class InteractiveChat:
         self.__dict__["_prompt_app"] = value
 
     @property
-    def provider_runtime(self) -> ProviderRuntimeContext:
+    def provider_runtime(self) -> ProviderRuntimeContext | None:
         agent_runtime = getattr(getattr(self, "agent", None), "provider_runtime", None)
         return agent_runtime or self.pending_provider_runtime
 
     @property
     def model(self) -> str:
-        return self.provider_runtime.model
+        runtime = self.provider_runtime
+        return runtime.model if runtime is not None else "未配置模型"
 
     @property
     def provider(self) -> str:
-        return self.provider_runtime.provider
+        runtime = self.provider_runtime
+        return runtime.provider if runtime is not None else "未配置"
 
     @property
     def api_key(self) -> str:
-        return self.provider_runtime.api_key
+        runtime = self.provider_runtime
+        return runtime.api_key if runtime is not None else ""
 
     @property
     def base_url(self) -> str:
-        return self.provider_runtime.base_url
+        runtime = self.provider_runtime
+        return runtime.base_url if runtime is not None else ""
 
     @property
     def api_mode(self) -> str:
-        return self.provider_runtime.api_mode
+        runtime = self.provider_runtime
+        return runtime.api_mode if runtime is not None else ""
 
     def __init__(
         self,
-        provider_runtime: ProviderRuntimeContext,
+        provider_runtime: ProviderRuntimeContext | None,
         session_id: str = None,
         resume_session_id: str = None,
         enabled_toolsets: list = None,
         config: dict | None = None,
+        workspace_path: str | None = None,
+        dsoftbus_runtime=None,
+        provider_unavailable_error=None,
     ):
-        """Initialize a session, bind renderers, and create the agent runtime."""
+        """Initialize transactionally so partial construction can be unwound."""
+        self._project_env_snapshot: dict[str, str | None] = {}
+        self._project_env_restored = False
+        self._session_db = None
+        self._session_lock = None
+        self.session_id = ""
+        self._session_row_preexisting = True
+        self._construction_complete = False
+        self._closed_before_run = False
+        self.pet = None
+        self.agent = None
+        self.dsoftbus_runtime = dsoftbus_runtime
+        self.provider_unavailable_error = provider_unavailable_error
+        try:
+            self._initialize(
+                provider_runtime=provider_runtime,
+                session_id=session_id,
+                resume_session_id=resume_session_id,
+                enabled_toolsets=enabled_toolsets,
+                config=config,
+                workspace_path=workspace_path,
+            )
+            self._construction_complete = True
+        except BaseException:
+            self._rollback_failed_construction()
+            raise
+
+    def _initialize(
+        self,
+        provider_runtime: ProviderRuntimeContext | None,
+        session_id: str = None,
+        resume_session_id: str = None,
+        enabled_toolsets: list = None,
+        config: dict | None = None,
+        workspace_path: str | None = None,
+    ) -> None:
+        """Acquire the session resources owned by one interactive instance."""
         self.enabled_toolsets = enabled_toolsets
         self.config = config or {}
         self.pending_provider_runtime = provider_runtime
@@ -347,15 +397,14 @@ class InteractiveChat:
         self._project_name = ""
         if self.config.get("_project_config_dir"):
             self._project_name = Path(self.config["_project_config_dir"]).resolve().name
-        self.workspace_path = normalize_workspace_path(
-            self.config.get("_launch_cwd")
-            or os.environ.get("TERMINAL_CWD")
-            or os.getcwd()
+        self.workspace_path = (
+            normalize_workspace_path(workspace_path)
+            if workspace_path is not None
+            else resolve_interactive_workspace(self.config)
         )
 
         # Snapshot project-level terminal.env overrides so shutdown can restore
         # the process environment after the interactive session exits.
-        self._project_env_snapshot: dict[str, str | None] = {}
         terminal_cfg = self.config.get("terminal", {}) if isinstance(self.config.get("terminal", {}), dict) else {}
         terminal_env = terminal_cfg.get("env", {})
         if terminal_env:
@@ -382,7 +431,6 @@ class InteractiveChat:
         self._asr_ptt_lock = threading.Lock()
         self._asr_ptt_inflight = False
         self._ptt_key = self._resolve_push_to_talk_key()
-        self.pet = PetController.from_config(self.config, session_id=self.session_id)
         self._last_chat_result: dict | None = None
         self._safety_renderer = SafetyRenderer(
             printer=_cprint,
@@ -430,12 +478,11 @@ class InteractiveChat:
         # Session DB
         from mclaw.state import SessionDB
         self._session_db = SessionDB()
-        self._session_lock: InteractiveSessionLock | None = None
 
         # Resume previous session if requested
         self._resume_history = []
         resume_resolved = False
-        if resume_session_id:
+        if resume_session_id and provider_runtime is not None:
             requested_resume = str(resume_session_id)
             if requested_resume == RESUME_LATEST_SESSION:
                 resolved = self._session_db.latest_session_id(source="cli", workspace=self.workspace_path)
@@ -451,12 +498,19 @@ class InteractiveChat:
                 else:
                     self._get_runtime_renderer().warning(f"未找到会话: {requested_resume}，已开始新会话。")
 
-        try:
-            self._acquire_session_lock(self.session_id)
-        except Exception:
-            self._release_session_lock()
-            self._session_db.close()
-            raise
+        self._session_row_preexisting = bool(self._session_db.get_session(self.session_id))
+
+        self._acquire_session_lock(self.session_id)
+
+        # A product host may be allowed to open M-Claw before a model Provider
+        # is available.  Keep that case inside the same TUI and own a normal
+        # session row so cleanup remains identical to a Provider-backed run.
+        if provider_runtime is None and not self._session_row_preexisting:
+            self._session_db.create_session(
+                self.session_id,
+                source="cli",
+                workspace=self.workspace_path,
+            )
 
         # History file for prompt_toolkit
         history_dir = get_mclaw_home() / "history"
@@ -469,15 +523,20 @@ class InteractiveChat:
 
         # Agent (lazy init so config errors show before TUI)
         self.agent = None
-        try:
-            self._init_agent()
-            if resume_resolved:
-                self._session_db.reopen_session(self.session_id)
-            self.pet.start_if_enabled()
-        except Exception:
-            self._release_session_lock()
-            self._session_db.close()
-            raise
+        self.pet = PetController.from_config(
+            self.config,
+            session_id=self.session_id,
+        )
+        if provider_runtime is not None:
+            self._init_agent(persist_session=not resume_resolved)
+        self.pet.start_if_enabled()
+        if resume_resolved and self.agent is not None:
+            self._session_db.reopen_session_with_model(
+                self.session_id,
+                target_model=self.agent.model,
+                target_model_config=self.agent.provider_runtime.snapshot(),
+            )
+            self.agent.activate_session_persistence()
 
         # Recover detached background processes from last checkpoint
         try:
@@ -487,6 +546,71 @@ class InteractiveChat:
                 self._get_runtime_renderer().dim(f"已从上次会话恢复 {recovered} 个后台进程。")
         except Exception:
             pass
+
+    @staticmethod
+    def _cleanup_call(fn, *args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BaseException:
+            return None
+
+    def _close_agent_with_deadline(self, deadline: float) -> bool:
+        agent = getattr(self, "agent", None)
+        if agent is None:
+            return True
+        closed = self._close_agent_instance(agent, deadline)
+        if closed:
+            self.agent = None
+        return closed
+
+    @staticmethod
+    def _close_agent_instance(agent, deadline: float) -> bool:
+        close = getattr(agent, "close", None)
+        if not callable(close):
+            return True
+        try:
+            closed = close(deadline=deadline)
+        except BaseException:
+            return False
+        return closed is not False
+
+    def _rollback_failed_construction(self, deadline: float | None = None) -> None:
+        """Best-effort inverse of resources acquired before ``run()``."""
+        from mclaw.dsoftbus.protocol import DSOFTBUS_SHUTDOWN_TIMEOUT_S
+
+        if deadline is None:
+            deadline = time.monotonic() + DSOFTBUS_SHUTDOWN_TIMEOUT_S
+        db = getattr(self, "_session_db", None)
+        session_id = str(getattr(self, "session_id", "") or "")
+        if db is not None and session_id and not self._session_row_preexisting:
+            row = self._cleanup_call(db.get_session, session_id)
+            if row is not None and not row.get("ended_at"):
+                end = getattr(db, "end_session_with_deadline", None)
+                if callable(end):
+                    self._cleanup_call(
+                        end,
+                        session_id,
+                        "startup_failed",
+                        deadline=deadline,
+                    )
+        self._close_agent_with_deadline(deadline)
+        pet = getattr(self, "pet", None)
+        if pet is not None:
+            self._cleanup_call(pet.stop)
+        self._cleanup_call(self._release_session_lock)
+        if db is not None:
+            close = getattr(db, "close_with_deadline", None)
+            if callable(close):
+                self._cleanup_call(close, deadline)
+            self._session_db = None
+        self._cleanup_call(self._restore_project_env)
+
+    def close_before_run(self, deadline: float) -> None:
+        """Close a fully constructed Chat that never entered ``run()``."""
+        if self._closed_before_run:
+            return
+        self._closed_before_run = True
+        self._rollback_failed_construction(deadline)
 
     # ── SubtaskManager ──
 
@@ -662,7 +786,13 @@ class InteractiveChat:
         if self._app:
             self._app.invalidate()
 
-    def _create_agent(self, provider_runtime: ProviderRuntimeContext, session_id: str):
+    def _create_agent(
+        self,
+        provider_runtime: ProviderRuntimeContext,
+        session_id: str,
+        *,
+        persist_session: bool = True,
+    ):
         """Construct one agent without mutating the active interactive state."""
         from mclaw.agent.core import MClaw
 
@@ -679,15 +809,20 @@ class InteractiveChat:
             print_fn=_cprint,
             workspace=self.workspace_path,
             config=self.config,
+            persist_session=persist_session,
         )
 
         agent._delegate_progress_callback = self._delegate_progress_callback
         agent.secret_request_callback = self._secret_request_many_prompt
         return agent
 
-    def _init_agent(self):
+    def _init_agent(self, *, persist_session: bool = True):
         """Create the core agent and attach UI callbacks for one session."""
-        self.agent = self._create_agent(self.pending_provider_runtime, self.session_id)
+        self.agent = self._create_agent(
+            self.pending_provider_runtime,
+            self.session_id,
+            persist_session=persist_session,
+        )
 
         if self._resume_history:
             self._set_agent_messages(self._resume_history)
@@ -879,16 +1014,25 @@ class InteractiveChat:
             return
 
         try:
+            remote = event.get("origin") == "dsoftbus"
             if event.get("content_source") == "reasoning_content":
                 self._render_response(
                     text,
-                    title=THINKING_ASSISTANT_TITLE,
+                    title=(
+                        REMOTE_THINKING_ASSISTANT_TITLE
+                        if remote
+                        else THINKING_ASSISTANT_TITLE
+                    ),
                     title_style=THINKING_ASSISTANT_TITLE_STYLE,
                 )
             else:
                 self._render_response(
                     text,
-                    title=INTERMEDIATE_ASSISTANT_TITLE,
+                    title=(
+                        REMOTE_INTERMEDIATE_ASSISTANT_TITLE
+                        if remote
+                        else INTERMEDIATE_ASSISTANT_TITLE
+                    ),
                     title_style=INTERMEDIATE_ASSISTANT_TITLE_STYLE,
                 )
         except Exception:
@@ -1658,32 +1802,39 @@ class InteractiveChat:
     def _get_command_router(self) -> CommandRouter:
         router = getattr(self, "_command_router", None)
         if router is None:
+            handlers = {
+                "quit": lambda parsed: False,
+                "help": lambda parsed: self._show_help(),
+                "clear": lambda parsed: self._new_session(clear_screen=True),
+                "model": lambda parsed: self._handle_model_switch(parsed.args.strip()),
+                "model-update": lambda parsed: self._handle_model_update(parsed.args.strip()),
+                "search-backend": self._handle_search_backend_command,
+                "extract-backend": self._handle_extract_backend_command,
+                "asr-mode": lambda parsed: self._handle_asr_mode(parsed.args.strip()),
+                "keyboard-mode": lambda parsed: self._handle_keyboard_mode(),
+                "asr-status": lambda parsed: self._show_asr_status(),
+                "pet": lambda parsed: self._handle_pet_command(parsed.args.strip()),
+                "usage": lambda parsed: self._show_usage(),
+                "doctor": self._handle_doctor_command,
+                "history": lambda parsed: self._show_history(),
+                "resume": self._handle_resume_command,
+                "rollback": lambda parsed: self._handle_rollback_command(parsed.args.strip()),
+                "checkpoints": lambda parsed: self._handle_checkpoints_command(parsed.args.strip()),
+                "title": self._handle_title_command,
+                "provider": lambda parsed: self._show_providers(parsed.args.strip()),
+                "save": self._handle_save_command,
+                "schedule": self._handle_schedule_command,
+                "skills": self._handle_skills_command,
+                "skill": self._handle_skill_command,
+            }
+            if getattr(self, "dsoftbus_runtime", None) is not None:
+                handlers.update({
+                    "devices": self._handle_device_management_command,
+                    "pair": self._handle_device_management_command,
+                    "unpair": self._handle_device_management_command,
+                })
             router = CommandRouter(
-                {
-                    "quit": lambda parsed: False,
-                    "help": lambda parsed: self._show_help(),
-                    "clear": lambda parsed: self._new_session(clear_screen=True),
-                    "model": lambda parsed: self._handle_model_switch(parsed.args.strip()),
-                    "model-update": lambda parsed: self._handle_model_update(parsed.args.strip()),
-                    "search-backend": self._handle_search_backend_command,
-                    "extract-backend": self._handle_extract_backend_command,
-                    "asr-mode": lambda parsed: self._handle_asr_mode(parsed.args.strip()),
-                    "keyboard-mode": lambda parsed: self._handle_keyboard_mode(),
-                    "asr-status": lambda parsed: self._show_asr_status(),
-                    "pet": lambda parsed: self._handle_pet_command(parsed.args.strip()),
-                    "usage": lambda parsed: self._show_usage(),
-                    "doctor": self._handle_doctor_command,
-                    "history": lambda parsed: self._show_history(),
-                    "resume": self._handle_resume_command,
-                    "rollback": lambda parsed: self._handle_rollback_command(parsed.args.strip()),
-                    "checkpoints": lambda parsed: self._handle_checkpoints_command(parsed.args.strip()),
-                    "title": self._handle_title_command,
-                    "provider": lambda parsed: self._show_providers(parsed.args.strip()),
-                    "save": self._handle_save_command,
-                    "schedule": self._handle_schedule_command,
-                    "skills": self._handle_skills_command,
-                    "skill": self._handle_skill_command,
-                },
+                handlers,
                 unknown_handler=self._handle_unknown_command,
             )
             self._command_router = router
@@ -1739,6 +1890,155 @@ class InteractiveChat:
                 print_fn=_cprint,
             )
         ).handle_search_backend(parsed.args.strip())
+        return True
+
+    def _get_device_management_coordinator(self):
+        coordinator = getattr(self, "_device_management_coordinator", None)
+        if coordinator is None:
+            from mclaw.dsoftbus.device_management import DeviceManagementCoordinator
+
+            runtime = getattr(self, "dsoftbus_runtime", None)
+            if runtime is None:
+                return None
+            coordinator = DeviceManagementCoordinator(
+                runtime,
+                terminal_prompt_runner=self._run_in_terminal_prompt,
+            )
+            self._device_management_coordinator = coordinator
+        return coordinator
+
+    def _run_in_terminal_prompt(self, prompt):
+        """Suspend the live TUI before running a nested keyboard selector.
+
+        Slash commands execute on the Runtime process thread while the main
+        prompt_toolkit Application owns stdin on its event-loop thread.  A
+        second Application may therefore read the terminal only inside
+        prompt_toolkit's run-in-terminal boundary.
+        """
+
+        app = getattr(self, "_app", None)
+        loop = getattr(app, "loop", None)
+        if app is None or loop is None or not getattr(app, "is_running", False):
+            return prompt()
+        if threading.current_thread() is getattr(app, "_loop_thread", None):
+            raise RuntimeError("terminal prompt cannot block the TUI event loop")
+
+        from concurrent.futures import Future
+        from prompt_toolkit.application import run_in_terminal
+
+        completed = Future()
+
+        async def run_prompt():
+            try:
+                value = await run_in_terminal(
+                    prompt,
+                    render_cli_done=False,
+                    in_executor=True,
+                )
+            except BaseException as error:
+                completed.set_exception(error)
+            else:
+                completed.set_result(value)
+
+        def schedule_prompt() -> None:
+            app.create_background_task(run_prompt())
+
+        context = getattr(app, "context", None)
+        if context is None:
+            loop.call_soon_threadsafe(schedule_prompt)
+        else:
+            loop.call_soon_threadsafe(schedule_prompt, context=context.copy())
+        return completed.result()
+
+    def _handle_device_management_command(self, parsed: ParsedSlashCommand) -> bool:
+        from mclaw.dsoftbus.device_management import DeviceManagementError
+
+        renderer = self._get_commands_renderer()
+        action = parsed.canonical_name
+        if parsed.args.strip():
+            renderer.render_notice(
+                "M-Claw · 可信设备",
+                f"/{action} 不接受参数。",
+                detail=f"请直接输入 /{action}。",
+                kind="warning",
+            )
+            return True
+        coordinator = self._get_device_management_coordinator()
+        if coordinator is None:
+            renderer.render_notice(
+                "M-Claw · 可信设备",
+                "当前会话未启用 Kaihong DSoftBus Runtime。",
+                kind="warning",
+            )
+            return True
+        try:
+            result = coordinator.execute(action)
+        except DeviceManagementError as error:
+            messages = {
+                "DEVICE_LIST_UNAVAILABLE": "暂时无法读取 Runtime 设备列表。",
+                "DEVICE_DISCOVERY_FAILED": "系统设备发现失败。",
+                "DEVICE_DISCOVERY_BUSY": "已有设备发现操作正在进行。",
+                "DEVICE_RUNTIME_INACTIVE": "当前 Kaihong DSoftBus Runtime 未处于可用状态。",
+                "DEVICE_MANAGER_UNAVAILABLE": "当前系统没有可用的设备管理入口。",
+                "DEVICE_MANAGER_PERMISSION_DENIED": "M-Claw 没有设备管理所需的系统权限。",
+                "DEVICE_NOT_FOUND": "当前没有符合本次操作条件的设备。",
+                "DEVICE_NOT_MANAGED": "该信任关系不是由 M-Claw 创建，未执行解除配对。",
+                "DEVICE_BIND_FAILED": "系统没有完成设备配对。",
+                "DEVICE_BIND_TIMEOUT": "系统配对确认尚未完成，结果暂时未知。",
+                "DEVICE_STATE_INVALID": "Runtime 返回了无效的设备状态。",
+                "DEVICE_TARGET_AMBIGUOUS": "系统返回了重复的设备标识，操作已停止。",
+                "DEVICE_UNBIND_FAILED": "系统拒绝了解除配对操作。",
+                "DEVICE_UNBIND_UNCONFIRMED": "系统已接收操作，但尚未确认信任关系已移除。",
+                "WORKER_DIED": "DSoftBus Worker 已退出，未继续设备操作。",
+                "WORKER_NOT_READY": "DSoftBus Worker 尚未就绪。",
+            }
+            renderer.render_notice(
+                "M-Claw · 可信设备",
+                messages.get(error.code, "设备管理操作失败。"),
+                detail=f"错误码：{error.code}",
+                kind="danger",
+            )
+            return True
+        if action == "devices":
+            renderer.render_dsoftbus_devices(
+                [device.public_dict() for device in result.devices],
+                [device.public_dict() for device in result.trusted_devices],
+                [device.public_dict() for device in result.pairable_devices],
+            )
+            return True
+        if action == "pair":
+            if result.status == "cancelled":
+                renderer.render_notice(
+                    "M-Claw · 设备配对",
+                    "已取消，系统信任关系没有改变。",
+                    kind="info",
+                )
+                return True
+            renderer.render_notice(
+                "M-Claw · 设备配对",
+                "设备配对已完成。",
+                detail=(
+                    "系统 DeviceManager 已确认 M-Claw 信任关系。对端不需要在配对时运行 "
+                    "M-Claw；进行 Agent 通信时两端都需要保持 run mclaw 前台会话。"
+                ),
+                kind="success",
+            )
+            return True
+        if result.status == "cancelled":
+            renderer.render_notice(
+                "M-Claw · 解除配对",
+                "已取消，系统信任关系没有改变。",
+                kind="info",
+            )
+            return True
+        renderer.render_notice(
+            "M-Claw · 解除配对",
+            "已解除设备配对。",
+            detail=(
+                "系统 DeviceManager 已确认移除信任关系，现有 DSoftBus 连接已关闭。"
+            ),
+            kind="success",
+        )
         return True
 
     def _handle_extract_backend_command(self, parsed: ParsedSlashCommand) -> bool:
@@ -1875,6 +2175,23 @@ class InteractiveChat:
         if runner is not None:
             runner.startup_provider_runtime = self.provider_runtime
 
+    def _refresh_dsoftbus_provider_runtime(self) -> None:
+        """Publish the committed local Provider snapshot without undoing the UI change."""
+        runtime = getattr(self, "dsoftbus_runtime", None)
+        if runtime is None:
+            return
+        try:
+            runtime.update_provider_runtime(self.provider_runtime)
+        except Exception:
+            logger.exception("DSoftBus Provider snapshot synchronization failed")
+            try:
+                runtime.update_provider_runtime(None)
+            except Exception:
+                logger.debug(
+                    "DSoftBus Provider fail-closed publication was unavailable",
+                    exc_info=True,
+                )
+
     def _build_scheduler_dingtalk_client(self):
         try:
             from mclaw.channels.dingtalk.config import DingTalkConfig
@@ -1916,22 +2233,41 @@ class InteractiveChat:
             if reason:
                 raise RuntimeError(f"Cannot resume another session yet: {reason}")
         current_session_id = self.session_id
+        current_agent = self.agent
         current_lock = self._session_lock
         target_lock = current_lock
         if target_session_id != current_session_id:
             target_lock = InteractiveSessionLock(target_session_id)
             target_lock.acquire()
 
+        target_agent = None
         try:
-            target_agent = self._create_agent(provider_runtime, target_session_id)
+            target_agent = self._create_agent(
+                provider_runtime,
+                target_session_id,
+                persist_session=False,
+            )
             target_agent.messages = history
             target_agent.session_user_messages = self._count_user_messages(history)
-            self._session_db.switch_active_session(
-                current_session_id,
-                target_session_id,
-                end_reason="user_resume",
-            )
-        except Exception:
+            snapshot = target_agent.provider_runtime.snapshot()
+            if target_session_id == current_session_id:
+                self._session_db.reopen_session_with_model(
+                    current_session_id,
+                    target_model=target_agent.model,
+                    target_model_config=snapshot,
+                )
+            else:
+                self._session_db.switch_active_session(
+                    current_session_id,
+                    target_session_id,
+                    end_reason="user_resume",
+                    target_model=target_agent.model,
+                    target_model_config=snapshot,
+                )
+            target_agent.activate_session_persistence()
+        except BaseException:
+            if target_agent is not None:
+                self._close_agent_instance(target_agent, time.monotonic() + 5.0)
             if target_lock is not current_lock and target_lock:
                 target_lock.release()
             raise
@@ -1941,9 +2277,17 @@ class InteractiveChat:
         self.pending_provider_runtime = target_agent.provider_runtime
         self._session_lock = target_lock
         self._resume_history = []
+        set_current_session(target_session_id)
+        pet = getattr(self, "pet", None)
+        if pet is not None:
+            pet.set_session_id(target_session_id)
         self._refresh_scheduler_provider_runtime()
+        self._refresh_dsoftbus_provider_runtime()
         if current_lock is not target_lock and current_lock:
             current_lock.release()
+        if current_agent is not None and current_agent is not target_agent:
+            if not self._close_agent_instance(current_agent, time.monotonic() + 5.0):
+                logger.warning("Replaced interactive Agent did not close before deadline")
 
     def _get_session_command_coordinator(self):
         from mclaw.cli.runtime.session_commands import RuntimeSessionCommandCoordinator, RuntimeSessionCommandHooks
@@ -2045,7 +2389,10 @@ class InteractiveChat:
         dispatcher = getattr(self, "_slash_input_dispatcher", None)
         if dispatcher is None:
             dispatcher = SlashInputDispatcher(
-                builtin_commands=lambda: self.skill_registry.builtin_commands,
+                builtin_commands=lambda: (
+                    self.skill_registry.builtin_commands
+                    | self._get_command_router().command_names
+                ),
                 dispatch_builtin=self.process_command,
                 get_skill=self.skill_registry.get_skill,
                 invoke_skill=self._invoke_skill,
@@ -2065,6 +2412,14 @@ class InteractiveChat:
 
     def _invoke_skill(self, skill, user_intent: str, raw_text: str = "") -> bool:
         """Load skill content into context and send user intent."""
+        if self.agent is None:
+            self._get_commands_renderer().render_notice(
+                "M-Claw",
+                "尚未配置可用模型，暂时不能调用 Skill。",
+                detail="设备管理仍可使用 /devices、/pair 和 /unpair。",
+                kind="warning",
+            )
+            return True
         if str(user_intent or "").strip():
             command_text = str(raw_text or "").strip()
             if not command_text:
@@ -2132,9 +2487,29 @@ class InteractiveChat:
         context = result.runtime_context
         if context is None:
             raise ValueError("Successful model switch is missing a runtime context")
-        self.agent.switch_model(context)
+        if self.agent is None:
+            target_agent = self._create_agent(
+                context,
+                self.session_id,
+                persist_session=False,
+            )
+            try:
+                self._session_db.reopen_session_with_model(
+                    self.session_id,
+                    target_model=target_agent.model,
+                    target_model_config=target_agent.provider_runtime.snapshot(),
+                )
+                target_agent.activate_session_persistence()
+            except BaseException:
+                self._close_agent_instance(target_agent, time.monotonic() + 5.0)
+                raise
+            self.agent = target_agent
+            self.provider_unavailable_error = None
+        else:
+            self.agent.switch_model(context)
         self.pending_provider_runtime = self.agent.provider_runtime
         self._refresh_scheduler_provider_runtime()
+        self._refresh_dsoftbus_provider_runtime()
 
         if is_global:
             try:
@@ -2579,6 +2954,8 @@ class InteractiveChat:
                 handle_skills_command=lambda args: handle_skills_command(args, format_output=True),
                 render_help=lambda push_to_talk_label: self._get_commands_renderer().render_help(
                     push_to_talk_label=push_to_talk_label,
+                    dsoftbus_enabled=getattr(self, "dsoftbus_runtime", None)
+                    is not None,
                 ),
                 render_doctor=self._get_commands_renderer().render_doctor,
                 render_usage=lambda agent, model, session_start: self._get_commands_renderer().render_usage(
@@ -2599,14 +2976,12 @@ class InteractiveChat:
         launch_cfg = str(self.config.get("_launch_cwd") or "").strip() if isinstance(self.config, dict) else ""
         terminal_cwd = None
         try:
-            from mclaw.tools import terminal_tool
+            from mclaw.tools.terminal_tool import get_session_cwd
 
-            sid = getattr(terminal_tool, "_current_session_id", None)
-            env = getattr(terminal_tool, "_env_registry", {}).get(sid) if sid else None
-            terminal_cwd = getattr(env, "cwd", None)
+            terminal_cwd = get_session_cwd(self.session_id)
         except Exception:
             pass
-        launch_cwd = os.environ.get("TERMINAL_CWD") or os.getcwd()
+        launch_cwd = getattr(self, "workspace_path", "")
         for candidate in (recent, configured_cwd, launch_cfg, terminal_cwd, launch_cwd):
             if candidate and str(candidate) != "." and not is_mclaw_runtime_path(candidate):
                 return str(candidate)
@@ -2732,17 +3107,30 @@ class InteractiveChat:
 
     def _restore_project_env(self) -> None:
         """Restore original environment variables overwritten by project config."""
+        if getattr(self, "_project_env_restored", False):
+            return
         for key, original in getattr(self, "_project_env_snapshot", {}).items():
             if original is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = original
+        self._project_env_restored = True
 
-    def _end_current_session(self, reason: str, flush: bool = True):
+    def _end_current_session(
+        self,
+        reason: str,
+        flush: bool = True,
+        deadline: float | None = None,
+    ) -> bool:
         """Flush memories and end the current session."""
+        remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+        if remaining is not None and remaining <= 0:
+            flush = False
         if flush and self.agent and not self._force_exit_no_flush:
             try:
-                self.agent.flush_memories(timeout=7.0)
+                timeout = 7.0 if remaining is None else min(7.0, remaining)
+                if timeout > 0:
+                    self.agent.flush_memories(timeout=timeout)
             except Exception:
                 pass
 
@@ -2755,9 +3143,25 @@ class InteractiveChat:
         except Exception:
             pass
 
-        self._session_db.end_session(self.session_id, reason)
+        if self._session_db is None:
+            return True
+        if deadline is None:
+            self._session_db.end_session(self.session_id, reason)
+            return True
+        end = getattr(self._session_db, "end_session_with_deadline", None)
+        if not callable(end):
+            return False
+        return bool(end(self.session_id, reason, deadline=deadline))
 
     def _new_session(self, clear_screen: bool = False):
+        if self.agent is None:
+            if clear_screen and self._app:
+                out = self._app.output
+                out.erase_screen()
+                out.cursor_goto(0, 0)
+                out.flush()
+            self._show_banner()
+            return
         replacement_block_reason = getattr(self.agent, "_replacement_block_reason", None)
         if callable(replacement_block_reason):
             reason = replacement_block_reason()
@@ -2768,22 +3172,98 @@ class InteractiveChat:
                     kind="danger",
                 )
                 return
-        self._end_current_session("user_new_session", flush=False)
+        old_session_id = self.session_id
+        old_agent = self.agent
+        old_lock = self._session_lock
         new_session_id = f"session_{uuid.uuid4().hex[:12]}"
+        new_lock = InteractiveSessionLock(new_session_id)
+        target_agent = None
         try:
-            self._switch_session_lock(new_session_id)
+            new_lock.acquire()
+            target_agent = self._create_agent(
+                self.provider_runtime,
+                new_session_id,
+                persist_session=False,
+            )
+            self._session_db.create_and_switch_active_session(
+                old_session_id,
+                new_session_id,
+                end_reason="user_new_session",
+                source=target_agent.platform,
+                model=target_agent.model,
+                model_config=target_agent.provider_runtime.snapshot(),
+                system_prompt=target_agent.system_prompt,
+                workspace=self.workspace_path,
+                user_id=None,
+                parent_session_id=None,
+            )
+            target_agent.activate_session_persistence()
         except InteractiveSessionLockError as exc:
+            if target_agent is not None:
+                self._close_agent_instance(target_agent, time.monotonic() + 5.0)
+            new_lock.release()
             self._get_commands_renderer().render_notice("M-Claw 会话", str(exc), kind="danger")
             return
+        except BaseException as exc:
+            if target_agent is not None:
+                self._close_agent_instance(target_agent, time.monotonic() + 5.0)
+            new_lock.release()
+            self._get_commands_renderer().render_notice(
+                "M-Claw 会话",
+                f"新会话创建失败: {type(exc).__name__}",
+                kind="danger",
+            )
+            return
+
         self.session_id = new_session_id
         self.session_start = datetime.now()
-        self._init_agent()
+        self.agent = target_agent
+        self.pending_provider_runtime = target_agent.provider_runtime
+        self._session_lock = new_lock
+        set_current_session(new_session_id)
+        pet = getattr(self, "pet", None)
+        if pet is not None:
+            pet.set_session_id(new_session_id)
+        self._refresh_scheduler_provider_runtime()
+        self._refresh_dsoftbus_provider_runtime()
+        if old_lock is not None:
+            old_lock.release()
+        if old_agent is not None and not self._close_agent_instance(
+            old_agent,
+            time.monotonic() + 5.0,
+        ):
+            logger.warning("Previous interactive Agent did not close before deadline")
+        self._cleanup_replaced_session_runtime(old_session_id)
         if clear_screen and self._app:
             out = self._app.output
             out.erase_screen()
             out.cursor_goto(0, 0)
             out.flush()
         self._get_commands_renderer().render_notice("M-Claw 会话", f"新会话已开启: {self.session_id[:16]}", kind="success")
+
+    def _cleanup_replaced_session_runtime(self, session_id: str) -> None:
+        """Clean terminal/process state only after the replacement DB commit."""
+        try:
+            from mclaw.tools.process_registry import process_registry
+
+            killed = process_registry.kill_all(task_id=session_id)
+            if process_registry.has_active_processes(session_id):
+                logger.warning(
+                    "Replaced session retains active background processes: session=%s",
+                    session_id[:16],
+                )
+                return
+            from mclaw.tools import terminal_tool
+
+            terminal_tool.cleanup_session(session_id)
+            if killed > 0:
+                self._get_runtime_renderer().background_processes_stopped(killed)
+        except Exception:
+            logger.warning(
+                "Replaced session cleanup was deferred: session=%s",
+                session_id[:16],
+                exc_info=True,
+            )
 
     # ── Banner ──
 
@@ -2838,6 +3318,31 @@ class InteractiveChat:
         from mclaw.cli.runtime.workers import RuntimeWorkerHooks
 
         active_turn_cancel_event = None
+        active_dsoftbus_turn_token = None
+
+        def _begin_dsoftbus_local_turn() -> None:
+            nonlocal active_dsoftbus_turn_token
+            runtime = getattr(self, "dsoftbus_runtime", None)
+            if runtime is None or active_dsoftbus_turn_token is not None:
+                return
+            token = str(uuid.uuid4())
+            try:
+                runtime.local_turn_started(token)
+            except Exception:
+                return
+            active_dsoftbus_turn_token = token
+
+        def _finish_dsoftbus_local_turn() -> None:
+            nonlocal active_dsoftbus_turn_token
+            token = active_dsoftbus_turn_token
+            active_dsoftbus_turn_token = None
+            runtime = getattr(self, "dsoftbus_runtime", None)
+            if runtime is None or token is None:
+                return
+            try:
+                runtime.local_turn_finished(token)
+            except Exception:
+                pass
 
         def _safe_invalidate() -> None:
             try:
@@ -2847,6 +3352,8 @@ class InteractiveChat:
 
         def _pump_watchers() -> None:
             """Run watcher scheduler and enqueue watcher events."""
+            if self.agent is None:
+                return
             try:
                 from mclaw.tools.process_registry import process_registry
                 process_registry.pump_due_watchers()
@@ -2854,6 +3361,8 @@ class InteractiveChat:
                 pass
 
         def _pop_completion_event():
+            if self.agent is None:
+                return None
             try:
                 from mclaw.tools.process_registry import process_registry
             except Exception:
@@ -2873,13 +3382,14 @@ class InteractiveChat:
             state.begin_turn()
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="requesting")
             self._pet_emit_for_runtime_status(PetEventType.TURN_STARTED, text="background process event")
+            _begin_dsoftbus_local_turn()
             _safe_invalidate()
 
         def _run_background_turn(notice: str) -> None:
             set_current_session(self.session_id)
             self.chat(notice)
 
-        def _finish_agent_turn(*, emit_done_status: bool) -> None:
+        def _finish_agent_turn_body(*, emit_done_status: bool) -> None:
             nonlocal active_turn_cancel_event
             result = getattr(self, "_last_chat_result", {}) or {}
             state = self._runtime_state()
@@ -2912,6 +3422,12 @@ class InteractiveChat:
             elif state.status == RuntimeStatus.DONE:
                 self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED)
             _safe_invalidate()
+
+        def _finish_agent_turn(*, emit_done_status: bool) -> None:
+            try:
+                _finish_agent_turn_body(emit_done_status=emit_done_status)
+            finally:
+                _finish_dsoftbus_local_turn()
 
         background_coordinator = RuntimeBackgroundCoordinator(
             RuntimeBackgroundHooks(
@@ -2955,10 +3471,26 @@ class InteractiveChat:
             state.begin_turn()
             self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="requesting")
             self._pet_emit_for_runtime_status(PetEventType.TURN_STARTED, text=user_input[:80])
+            _begin_dsoftbus_local_turn()
             _safe_invalidate()
 
         def _run_user_turn(user_input: str) -> None:
             set_current_session(self.session_id)
+            if self.agent is None:
+                self._last_chat_result = {
+                    "completed": False,
+                    "stop_reason": "provider_unavailable",
+                }
+                self._get_commands_renderer().render_notice(
+                    "M-Claw",
+                    "尚未配置可用模型，暂时不能进行对话。",
+                    detail=(
+                        "可先使用 /devices、/pair、/unpair 管理可信设备，"
+                        "或使用 /model 配置模型。"
+                    ),
+                    kind="warning",
+                )
+                return
             self.chat(user_input)
 
         def _finish_user_turn() -> None:
@@ -2970,8 +3502,11 @@ class InteractiveChat:
                 drain_pet_commands=self._drain_pet_commands,
                 pump_background_watchers=_pump_watchers,
                 drain_background_completions=_drain_completion_queue,
-                pump_scheduler=lambda: self._get_scheduler_coordinator().pump(),
-                has_pending_scheduler_input=lambda: self._get_scheduler_coordinator().has_pending_input(),
+                pump_scheduler=lambda: self._get_scheduler_coordinator().pump()
+                if self.agent is not None
+                else None,
+                has_pending_scheduler_input=lambda: self.agent is not None
+                and self._get_scheduler_coordinator().has_pending_input(),
                 handle_scheduler_input=lambda text: self._get_scheduler_coordinator().handle_input(text),
                 has_pending_secret_request=lambda: bool(self._pending_secret_request),
                 handle_secret_request=self._handle_secret_request_input,
@@ -3028,21 +3563,66 @@ class InteractiveChat:
             if getattr(self, "pet", None) is not None:
                 self.pet.stop()
 
+        def _begin_dsoftbus_shutdown() -> None:
+            runtime = getattr(self, "dsoftbus_runtime", None)
+            if runtime is not None:
+                runtime.begin_shutdown()
+
+        def _stop_dsoftbus(deadline: float) -> None:
+            runtime = getattr(self, "dsoftbus_runtime", None)
+            if runtime is not None:
+                runtime.stop(deadline)
+
+        def _close_session_db(deadline: float) -> bool:
+            db = getattr(self, "_session_db", None)
+            if db is None:
+                return True
+            close = getattr(db, "close_with_deadline", None)
+            if not callable(close):
+                return False
+            result = bool(close(deadline))
+            if result:
+                self._session_db = None
+            return result
+
         RuntimeShutdownCoordinator(
             self._runtime(),
             RuntimeShutdownHooks(
                 stop_asr_service=_stop_asr_service,
                 interrupt_agent=_interrupt_agent,
+                begin_dsoftbus_shutdown=_begin_dsoftbus_shutdown,
+                stop_dsoftbus=_stop_dsoftbus,
                 restore_project_env=self._restore_project_env,
                 stop_pet=_stop_pet,
-                end_session=lambda flush: self._end_current_session("session_end", flush=flush),
-                close_session_db=self._session_db.close,
+                end_session=lambda flush, deadline: self._end_current_session(
+                    "session_end",
+                    flush=flush,
+                    deadline=deadline,
+                ),
+                close_active_agent=self._close_agent_with_deadline,
+                close_session_db=_close_session_db,
                 clear_terminal_title=_clear_terminal_title,
             ),
         ).shutdown(process_thread, anim_thread)
 
     def run(self):
-        """Build and run the prompt_toolkit application."""
+        """Run the whole interactive lifecycle under one cleanup boundary."""
+        process_thread = None
+        animation_thread = None
+        self._run_entered = True
+        try:
+            return self._run_application()
+        finally:
+            handles = getattr(self, "_runtime_worker_handles", None)
+            if handles is not None:
+                process_thread, animation_thread = handles
+            try:
+                self._shutdown_runtime_threads(process_thread, animation_thread)
+            finally:
+                self._release_session_lock()
+
+    def _run_application(self):
+        """Build and execute prompt_toolkit after the outer cleanup is armed."""
         cli_ref = self
 
         _set_terminal_title("M-Claw")
@@ -3083,7 +3663,13 @@ class InteractiveChat:
                 Condition(lambda: not bool(cli_ref._pending_key_setup or cli_ref._pending_secret_request)),
             ),
             completer=ConditionalCompleter(
-                SlashCompleter(self.skill_registry),
+                SlashCompleter(
+                    self.skill_registry,
+                    include_dsoftbus=lambda: getattr(
+                        self, "dsoftbus_runtime", None
+                    )
+                    is not None,
+                ),
                 Condition(lambda: not bool(cli_ref._pending_key_setup or cli_ref._pending_secret_request)),
             ),
             complete_while_typing=Condition(lambda: not bool(cli_ref._pending_key_setup or cli_ref._pending_secret_request)),
@@ -3306,7 +3892,27 @@ class InteractiveChat:
                 is_ui_running=lambda: bool(getattr(app, "is_running", False)),
             ),
         )
+        dsoftbus_runtime = getattr(self, "dsoftbus_runtime", None)
+        if dsoftbus_runtime is not None:
+            dsoftbus_start = dsoftbus_runtime.start()
+            if dsoftbus_start.get("state") == "DEGRADED":
+                diagnostic = dsoftbus_runtime.diagnostic_snapshot()
+                resource = diagnostic.get("resource", {})
+                code = str(
+                    resource.get("productInputCode")
+                    or dsoftbus_start.get("primaryErrorCode")
+                    or "WORKER_START_FAILED"
+                )
+                from mclaw.dsoftbus.runtime_profile import activation_error_message
+
+                RuntimeRenderer(printer=_cprint).warning(
+                    "可信设备协作已关闭："
+                    f"{activation_error_message(code)}（{code}）。"
+                    "普通 M-Claw 仍可使用。",
+                    leading_newline=True,
+                )
         process_thread, anim_thread = supervisor.start()
+        self._runtime_worker_handles = (process_thread, anim_thread)
 
         set_current_session(self.session_id)
 
@@ -3315,27 +3921,53 @@ class InteractiveChat:
                 app.run()
         except (EOFError, KeyboardInterrupt, BrokenPipeError):
             pass
-        finally:
-            try:
-                self._shutdown_runtime_threads(process_thread, anim_thread)
-            finally:
-                self._release_session_lock()
 
 
 def run_interactive(
-    provider_runtime: ProviderRuntimeContext,
+    provider_runtime: ProviderRuntimeContext | None,
     resume_session_id: str = None,
     enabled_toolsets: list = None,
     config: dict | None = None,
+    workspace_path: str | None = None,
+    provider_resolution_error=None,
+    discovery_only_approved: bool = False,
 ):
-    """Entry point to launch the interactive TUI."""
+    """Construct the optional DSoftBus Runtime at the sole interactive entrypoint."""
     from mclaw.cli.config import ConfigError
+    from mclaw.dsoftbus.active import clear_active_runtime, install_active_runtime
+    from mclaw.dsoftbus.entrypoint import is_discovery_only_candidate
+    from mclaw.dsoftbus.product import ProductActivationError, create_product_runtime
+    from mclaw.dsoftbus.protocol import DSOFTBUS_SHUTDOWN_TIMEOUT_S
 
-    workspace = os.environ.get("TERMINAL_CWD") or os.getcwd()
+    normalized_config = config if isinstance(config, dict) else {}
+    normal_mode = (
+        provider_runtime is not None
+        and provider_resolution_error is None
+        and discovery_only_approved is False
+    )
+    providerless_product_mode = (
+        provider_runtime is None
+        and provider_resolution_error is not None
+        and discovery_only_approved is True
+    )
+    if not normal_mode and not providerless_product_mode:
+        if provider_resolution_error is not None:
+            raise provider_resolution_error
+        raise ValueError("Invalid interactive Provider/product-runtime combination")
+
+    candidate = is_discovery_only_candidate(normalized_config)
+    if providerless_product_mode and not candidate:
+        raise provider_resolution_error
+
+    workspace = (
+        normalize_workspace_path(workspace_path)
+        if workspace_path is not None
+        else resolve_interactive_workspace(normalized_config)
+    )
     try:
         trusted = ensure_workspace_trusted(
             workspace,
-            config=config,
+            config=normalized_config,
             prompt=prompt_workspace_risk_confirmation,
         )
     except ConfigError as exc:
@@ -3344,14 +3976,67 @@ def run_interactive(
     if not trusted:
         return
 
+    runtime = None
+    chat = None
+    chat_run_entered = False
     try:
-        chat = InteractiveChat(
-            provider_runtime=provider_runtime,
-            resume_session_id=resume_session_id,
-            enabled_toolsets=enabled_toolsets,
-            config=config,
-        )
-    except InteractiveSessionLockError as exc:
-        RuntimeRenderer(printer=_cprint).warning(str(exc), leading_newline=True)
-        return
-    chat.run()
+        if candidate:
+            try:
+                runtime = create_product_runtime(
+                    provider_runtime=provider_runtime,
+                    config=normalized_config,
+                    workspace=workspace,
+                    require_activation=True,
+                )
+            except ProductActivationError as error:
+                from mclaw.dsoftbus.runtime_profile import activation_error_message
+
+                RuntimeRenderer(printer=_cprint).warning(
+                    "可信设备协作已关闭："
+                    f"{activation_error_message(error.code)}（{error.code}）。"
+                    "普通 M-Claw 仍可使用。",
+                    leading_newline=True,
+                )
+                runtime = None
+            if runtime is not None:
+                install_active_runtime(runtime)
+
+        selected_toolsets = [
+            name
+            for name in list(enabled_toolsets or ["mclaw-required"])
+            if name not in {"dsoftbus", "dsoftbus-remote"}
+        ]
+        if runtime is not None and "dsoftbus" not in selected_toolsets:
+            selected_toolsets.append("dsoftbus")
+        try:
+            chat = InteractiveChat(
+                provider_runtime=provider_runtime,
+                resume_session_id=resume_session_id,
+                enabled_toolsets=selected_toolsets,
+                config=normalized_config,
+                workspace_path=workspace,
+                dsoftbus_runtime=runtime,
+                provider_unavailable_error=provider_resolution_error,
+            )
+        except InteractiveSessionLockError as exc:
+            RuntimeRenderer(printer=_cprint).warning(str(exc), leading_newline=True)
+            return
+        chat_run_entered = True
+        chat.run()
+    finally:
+        deadline = time.monotonic() + DSOFTBUS_SHUTDOWN_TIMEOUT_S
+        if chat is not None and not chat_run_entered:
+            try:
+                chat.close_before_run(deadline)
+            except BaseException:
+                pass
+        if runtime is not None:
+            try:
+                runtime.begin_shutdown()
+            except BaseException:
+                pass
+            try:
+                runtime.stop(deadline)
+            except BaseException:
+                pass
+            clear_active_runtime(runtime)

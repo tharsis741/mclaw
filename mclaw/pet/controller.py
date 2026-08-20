@@ -30,6 +30,7 @@ class PetController:
     def __init__(self, config: PetConfig, session_id: str = ""):
         self.config = config
         self.session_id = session_id
+        self._session_id_lock = threading.Lock()
         self._queue: mp.Queue | None = None
         self._command_queue: mp.Queue | None = None
         self._process: mp.Process | None = None
@@ -54,6 +55,15 @@ class PetController:
     @property
     def last_error(self) -> str:
         return self._last_error
+
+    def set_session_id(self, session_id: str) -> None:
+        """Replace the event tag without performing queue or process I/O."""
+        try:
+            value = str(session_id or "")
+        except BaseException:
+            value = ""
+        with self._session_id_lock:
+            self.session_id = value
 
     def start_if_enabled(self) -> bool:
         """Start the sidecar only when configuration and environment allow it."""
@@ -183,11 +193,13 @@ class PetController:
             self._last_low_priority_at[event_name] = now
 
         state_name = state.value if isinstance(state, PetState) else state
+        with self._session_id_lock:
+            session_id = self.session_id
         event = PetEvent(
             type=event_name,
             state=state_name,
             text=text,
-            session_id=self.session_id,
+            session_id=session_id,
             payload=payload or {},
         )
         try:

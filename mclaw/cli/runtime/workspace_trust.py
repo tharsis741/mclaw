@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from mclaw.cli.config import load_config, save_config
@@ -21,6 +21,18 @@ def normalize_workspace_path(path: str | os.PathLike[str]) -> str:
     except OSError:
         workspace = workspace.absolute()
     return os.path.normpath(str(workspace))
+
+
+def resolve_interactive_workspace(config: Mapping[str, object] | None = None) -> str:
+    """Freeze the one workspace used by resume, trust, Chat, and DSoftBus."""
+
+    source = config if isinstance(config, Mapping) else {}
+    candidate = (
+        os.environ.get("TERMINAL_CWD")
+        or source.get("_launch_cwd")
+        or os.getcwd()
+    )
+    return normalize_workspace_path(str(candidate))
 
 
 def workspace_compare_key(path: str | os.PathLike[str]) -> str:

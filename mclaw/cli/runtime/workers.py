@@ -51,8 +51,21 @@ class RuntimeWorkerSupervisor:
         """Start daemon worker threads owned by the interactive runtime."""
         process_thread = threading.Thread(target=self._process_loop, daemon=True)
         animation_thread = threading.Thread(target=self._animation_loop, daemon=True)
-        process_thread.start()
-        animation_thread.start()
+        started_threads: list[threading.Thread] = []
+        try:
+            process_thread.start()
+            started_threads.append(process_thread)
+            animation_thread.start()
+            started_threads.append(animation_thread)
+        except BaseException:
+            self.runtime.request_exit()
+            deadline = time.monotonic() + 2.0
+            for thread in reversed(started_threads):
+                try:
+                    thread.join(timeout=max(0.0, deadline - time.monotonic()))
+                except BaseException:
+                    pass
+            raise
         return RuntimeWorkerHandles(process_thread, animation_thread)
 
     def _safe_invalidate(self) -> None:

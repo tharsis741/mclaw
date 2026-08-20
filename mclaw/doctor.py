@@ -581,6 +581,85 @@ def _append_dingtalk_checks(results: list[CheckResult], cfg: dict | None) -> Non
     )
 
 
+def _append_dsoftbus_checks(results: list[CheckResult], cfg: dict | None) -> None:
+    """Read static pins or cached active state without constructing a Runtime."""
+    config = cfg if isinstance(cfg, dict) else {}
+    section = config.get("dsoftbus", {})
+    requested = isinstance(section, dict) and section.get("enabled") == "auto"
+    try:
+        from mclaw.dsoftbus.active import get_active_runtime
+        from mclaw.dsoftbus.entrypoint import is_discovery_only_candidate
+
+        candidate = is_discovery_only_candidate(config)
+        active = get_active_runtime()
+        if active is not None:
+            diagnostic = active.diagnostic_snapshot()
+            lifecycle = diagnostic.get("lifecycle", {})
+            resource = diagnostic.get("resource", {})
+            state = str(lifecycle.get("state") or "UNKNOWN")
+            input_code = str(resource.get("productInputCode") or "")
+            detail = f"active; state={state}"
+            if input_code:
+                detail += f"; product_input={input_code}"
+            results.append(
+                CheckResult(
+                    "dsoftbus runtime",
+                    state in {"READY", "DEGRADED"},
+                    detail,
+                    "重新启动 M-Claw；它会自动校验或重建本机 DSoftBus Profile。",
+                    severity="error" if candidate else "warn",
+                )
+            )
+            return
+        if not requested:
+            results.append(CheckResult("dsoftbus runtime", True, "not enabled; optional"))
+            return
+        if not candidate:
+            results.append(
+                CheckResult(
+                    "dsoftbus runtime",
+                    False,
+                    "requested; current host is not an authenticated OpenHarmony 6.1 candidate",
+                    "Run M-Claw on the target Kaihong OS/OpenHarmony 6.1 device.",
+                    severity="warn",
+                )
+            )
+            return
+        from mclaw.constants import get_mclaw_home
+        from mclaw.dsoftbus.baseline import RUNTIME_PROFILE_FILENAME, load_runtime_profile
+
+        profile_path = get_mclaw_home() / "dsoftbus" / RUNTIME_PROFILE_FILENAME
+        if not profile_path.is_file() or profile_path.is_symlink():
+            results.append(
+                CheckResult(
+                    "dsoftbus runtime",
+                    False,
+                    "candidate; local Profile is not ready",
+                    "启动 M-Claw；它会在本机自动采集 DSoftBus Profile。",
+                )
+            )
+            return
+        profile = load_runtime_profile(profile_path)
+        results.append(
+            CheckResult(
+                "dsoftbus runtime",
+                True,
+                "candidate; local Profile is canonical",
+                "重新启动 M-Claw 以执行当前环境快速校验。",
+            )
+        )
+    except Exception:
+        results.append(
+            CheckResult(
+                "dsoftbus runtime",
+                False,
+                "static diagnostics unavailable",
+                "Inspect the DSoftBus Profile and local runtime health.",
+                severity="error" if requested else "warn",
+            )
+        )
+
+
 def run_doctor() -> list[CheckResult]:
     """Collect diagnostics across config, runtime, tools, channels, and host state."""
     from mclaw.cli.config import ConfigError
@@ -710,10 +789,12 @@ def run_doctor() -> list[CheckResult]:
         )
     )
 
+
     _append_runtime_module_checks(results)
 
     _append_weixin_checks(results, cfg)
     _append_dingtalk_checks(results, cfg)
+    _append_dsoftbus_checks(results, cfg)
 
     try:
         from mclaw.tools.registry import registry
@@ -945,6 +1026,13 @@ def _product_doctor_lines(results: list[CheckResult]) -> list[DoctorLine]:
     add("IM通道", "Weixin", _select_checks(results, ("weixin channel",)), _channel_detail)
     add("IM通道", "DingTalk", _select_checks(results, ("dingtalk channel",)), _channel_detail)
 
+    add(
+        "分布式互联",
+        "Dsoftbus Runtime",
+        _select_checks(results, ("dsoftbus runtime",)),
+        lambda checks: _doctor_detail(checks[0]),
+    )
+
     for item in results:
         if id(item) in mapped or item.ok:
             continue
@@ -979,7 +1067,7 @@ def format_doctor(results: list[CheckResult]) -> str:
         f"  失败      {failed}",
     ]
 
-    section_order = ["核心运行时", "工具能力", "IM通道", "其他"]
+    section_order = ["核心运行时", "工具能力", "分布式互联", "IM通道", "其他"]
     grouped: dict[str, list[DoctorLine]] = {section: [] for section in section_order}
     for item in product_lines:
         grouped.setdefault(item.section, []).append(item)

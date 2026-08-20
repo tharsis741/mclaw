@@ -1,3 +1,7 @@
+# Copyright © 2026 Shenzhen Kaihong Digital Industry Development Co., Ltd.
+# All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 import importlib
 import json
 import threading
@@ -27,20 +31,22 @@ from mclaw.tools.skill_tools import manage_tool, read_tools
 from mclaw.tools.toolsets import resolve_toolset
 
 
-def test_cancellation_contract_exactly_covers_all_34_registered_tools() -> None:
+def test_cancellation_contract_exactly_covers_all_registered_tools() -> None:
     from mclaw.tools.dispatch import _discover_tools
 
     _discover_tools()
-    toolset_tools = set(resolve_toolset("all"))
+    toolset_tools = set(resolve_toolset("all", include_platform=True)) | set(
+        resolve_toolset("dsoftbus-artifact")
+    )
     registered_tools = set(registry._tools)
     declared_tools = set(CANCELLATION_STRATEGY_BY_TOOL)
 
-    assert len(toolset_tools) == 34
+    assert len(toolset_tools) == 38
     assert registered_tools == toolset_tools
     assert declared_tools == toolset_tools
-    assert len(ATOMIC_LOCAL_TOOLS) == 13
+    assert len(ATOMIC_LOCAL_TOOLS) == 14
     assert len(COOPERATIVE_TOOLS) == 4
-    assert len(ASYNC_OR_FENCED_TOOLS) == 17
+    assert len(ASYNC_OR_FENCED_TOOLS) == 20
     assert ATOMIC_LOCAL_TOOLS.isdisjoint(COOPERATIVE_TOOLS)
     assert ATOMIC_LOCAL_TOOLS.isdisjoint(ASYNC_OR_FENCED_TOOLS)
     assert COOPERATIVE_TOOLS.isdisjoint(ASYNC_OR_FENCED_TOOLS)
@@ -91,7 +97,7 @@ def test_uncooperative_started_tool_is_fail_closed_for_every_registered_name(
     monkeypatch,
     tool_name: str,
 ) -> None:
-    """The universal worker fence is the worst-case fallback for all 34 tools."""
+    """The universal worker fence is the fallback for every registered tool."""
 
     cancel_event = threading.Event()
     entered = threading.Event()

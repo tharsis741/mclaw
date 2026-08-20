@@ -9,9 +9,13 @@ from __future__ import annotations
 import json
 import math
 import re
+import threading
+import time
 from abc import ABC, abstractmethod
+from collections import deque
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from mclaw.agent.prompt_cache import PromptCachePlan
@@ -106,6 +110,21 @@ class ModelCallOptions:
     dynamic_system_context: str = ""
     cache_plan: PromptCachePlan | None = None
     stream_activity_callback: Callable[[str], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    deadline_monotonic: float | None = None
+    response_utf8_max_bytes: int | None = None
+    stream_queue_max_items: int | None = None
+    stream_queue_max_bytes: int | None = None
+    stream_accumulator_max_bytes: int | None = None
+    register_worker: Callable[[Any], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
+    unregister_worker: Callable[[Any], None] | None = field(
         default=None,
         repr=False,
         compare=False,
@@ -216,6 +235,7 @@ class ModelCallError(Exception):
     retry_after: float | None = None
     status_code: int | None = None
     raw_exception: Exception | None = field(default=None, repr=False)
+    code: str = "PROVIDER_ERROR"
 
     def __post_init__(self) -> None:
         Exception.__init__(self, self.message)
@@ -227,9 +247,28 @@ class ModelCallError(Exception):
 class ModelTransport(ABC):
     """One provider-bound protocol adapter; each call performs one SDK attempt."""
 
+    supports_dsoftbus_remote_fence: bool = False
+
     def __init__(self, context: ProviderRuntimeContext, client: Any) -> None:
         self.context = context
         self.client = client
+        self._close_lock = threading.Lock()
+        self._close_complete = False
+
+    def close(self) -> bool:
+        """Close the owned SDK client exactly once."""
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = threading.Lock()
+            self._close_lock = close_lock
+        with close_lock:
+            if getattr(self, "_close_complete", False):
+                return True
+            close = getattr(getattr(self, "client", None), "close", None)
+            if callable(close):
+                close()
+            self._close_complete = True
+            return True
 
     @abstractmethod
     def call(
@@ -243,6 +282,176 @@ class ModelTransport(ABC):
     ) -> ModelCallResult:
         """Execute exactly one SDK request and return its normalized result."""
         raise NotImplementedError
+
+
+class StreamBufferLimitError(RuntimeError):
+    """A normalized stream exceeded its local item, byte, or event bound."""
+
+
+@dataclass(frozen=True, slots=True)
+class NormalizedStreamEvent:
+    arrived_at: float
+    value: Any
+    byte_length: int
+
+
+class BoundedNormalizedEventBuffer:
+    """Thread-safe data queue with byte reservations and out-of-band terminal state."""
+
+    def __init__(
+        self,
+        *,
+        max_items: int | None,
+        max_bytes: int | None,
+    ) -> None:
+        if (max_items is None) != (max_bytes is None):
+            raise ValueError("stream queue item/byte bounds must be paired")
+        if max_items is not None and (
+            type(max_items) is not int
+            or max_items < 1
+            or type(max_bytes) is not int
+            or max_bytes < 1
+        ):
+            raise ValueError("stream queue bounds must be positive integers")
+        self._max_items = max_items
+        self._max_bytes = max_bytes
+        self._condition = threading.Condition(threading.Lock())
+        self._events: deque[NormalizedStreamEvent] = deque()
+        self._bytes = 0
+        self._terminal = threading.Event()
+        self._terminal_error: Exception | None = None
+
+    @staticmethod
+    def _measure(value: Any) -> int:
+        try:
+            return len(_stable_json(json_safe_value(value)).encode("utf-8"))
+        except (OverflowError, RecursionError, TypeError, UnicodeEncodeError, ValueError) as error:
+            raise StreamBufferLimitError("normalized stream event is invalid") from error
+
+    def put(
+        self,
+        value: Any,
+        *,
+        deadline_monotonic: float | None,
+        stop_requested: threading.Event,
+    ) -> bool:
+        byte_length = self._measure(value)
+        with self._condition:
+            if self._max_bytes is not None and byte_length > self._max_bytes:
+                self._finish_locked(
+                    StreamBufferLimitError("normalized stream event exceeds byte cap")
+                )
+                return False
+            while (
+                self._max_items is not None
+                and (
+                    len(self._events) >= self._max_items
+                    or self._bytes > self._max_bytes - byte_length
+                )
+            ):
+                if stop_requested.is_set() or self._terminal.is_set():
+                    return False
+                remaining = (
+                    None
+                    if deadline_monotonic is None
+                    else deadline_monotonic - time.monotonic()
+                )
+                if remaining is not None and remaining <= 0:
+                    self._finish_locked(TimeoutError("model stream deadline exceeded"))
+                    return False
+                self._condition.wait(
+                    timeout=0.05 if remaining is None else min(0.05, remaining)
+                )
+            if stop_requested.is_set() or self._terminal.is_set():
+                return False
+            event = NormalizedStreamEvent(
+                arrived_at=time.monotonic(),
+                value=json_safe_value(value),
+                byte_length=byte_length,
+            )
+            self._events.append(event)
+            self._bytes += byte_length
+            self._condition.notify_all()
+            return True
+
+    def get(self, timeout: float) -> NormalizedStreamEvent | None:
+        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool):
+            raise TypeError("timeout must be a number")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while not self._events:
+                if self._terminal.is_set():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._condition.wait(timeout=remaining)
+            event = self._events.popleft()
+            self._bytes -= event.byte_length
+            if self._bytes < 0:
+                raise AssertionError("normalized stream byte reservation underflow")
+            self._condition.notify_all()
+            return event
+
+    def _finish_locked(self, error: Exception | None) -> None:
+        if self._terminal.is_set():
+            return
+        self._terminal_error = error
+        self._terminal.set()
+        self._condition.notify_all()
+
+    def finish(self, error: Exception | None = None) -> None:
+        with self._condition:
+            self._finish_locked(error)
+
+    @property
+    def finished(self) -> bool:
+        return self._terminal.is_set()
+
+    @property
+    def empty(self) -> bool:
+        with self._condition:
+            return not self._events
+
+    @property
+    def terminal_error(self) -> Exception | None:
+        return self._terminal_error
+
+    def diagnostic_snapshot(self) -> Mapping[str, int | bool]:
+        with self._condition:
+            return {
+                "byteCount": self._bytes,
+                "eventCount": len(self._events),
+                "finished": self._terminal.is_set(),
+            }
+
+
+def effective_call_deadline(
+    options: ModelCallOptions,
+    fallback_timeout: float,
+) -> float:
+    """Return the earlier of a relative watchdog and an absolute turn deadline."""
+
+    if not isinstance(options, ModelCallOptions):
+        raise TypeError("options must be ModelCallOptions")
+    if (
+        isinstance(fallback_timeout, bool)
+        or not isinstance(fallback_timeout, (int, float))
+        or not math.isfinite(float(fallback_timeout))
+        or float(fallback_timeout) <= 0
+    ):
+        raise ValueError("fallback_timeout must be finite and positive")
+    deadline = time.monotonic() + float(fallback_timeout)
+    if options.deadline_monotonic is not None:
+        absolute = float(options.deadline_monotonic)
+        if not math.isfinite(absolute):
+            raise ValueError("deadline_monotonic must be finite")
+        deadline = min(deadline, absolute)
+    return deadline
+
+
+def remaining_call_time(deadline_monotonic: float) -> float:
+    return max(0.0, deadline_monotonic - time.monotonic())
 
 
 def _redact_error_message(message: str, api_key: str) -> str:

@@ -63,6 +63,17 @@ class BannerRenderer:
             rows.append((toolset, summary, emoji, tools))
         return rows
 
+    @staticmethod
+    def _toolset_label(emoji: str, toolset: str) -> str:
+        """Keep one visible gap after glyphs whose font ink spans the next cell."""
+
+        if not emoji:
+            return toolset
+        # Kaihong M-Terminal renders U+2709 across the following cell even
+        # without an emoji variation selector, hiding the normal one-cell gap.
+        gap = "  " if emoji == "✉" else " "
+        return f"{emoji}{gap}{toolset}"
+
     def render(self, *, model: str, provider: str, session_id: str, agent) -> None:
         """Print startup context for the active model, session, workspace, and tools."""
         term_w = shutil.get_terminal_size().columns
@@ -118,7 +129,7 @@ class BannerRenderer:
                 return d
 
             for toolset, desc, emoji, tools in toolset_rows:
-                label = f"{emoji} {toolset}" if emoji else toolset
+                label = self._toolset_label(emoji, toolset)
                 if len(label) > 20:
                     label = label[:17] + "..."
                 detail = _clean_desc(desc) or f"{len(tools)} tools"

@@ -16,6 +16,7 @@ than only to local token estimates.
 
 import json
 import logging
+import threading
 import time
 from dataclasses import replace
 from typing import Any, Callable
@@ -152,6 +153,8 @@ class ContextCompressor:
         self._usage_callback = usage_callback
         self._summary_runtime: ProviderRuntimeContext | None = None
         self._summary_transport = None
+        self._close_lock = threading.Lock()
+        self._close_complete = False
 
         self._refresh_context_budgets(context_window)
         self.compression_count = 0
@@ -210,6 +213,7 @@ class ContextCompressor:
             raise TypeError("provider_runtime must be a ProviderRuntimeContext")
         if type(context_window) is not int or context_window <= 0:
             raise ValueError("context_window must be a positive integer")
+        previous_summary_transport = self._summary_transport
         self.provider_runtime = provider_runtime
         self._refresh_context_budgets(context_window)
         self._summary_runtime = None
@@ -220,6 +224,12 @@ class ContextCompressor:
         self.display_context_tokens = None
         self.display_context_estimated = False
         self._display_estimate_emitted = False
+
+        if previous_summary_transport is not None:
+            try:
+                self._close_summary_transport(previous_summary_transport)
+            except Exception:
+                logger.warning("Previous summary transport close failed", exc_info=True)
 
         logger.info(
             "Context compressor reconfigured: model=%s context_length=%d "
@@ -234,6 +244,31 @@ class ContextCompressor:
             previous_context_length,
             previous_threshold_tokens,
         )
+
+    @staticmethod
+    def _close_summary_transport(transport: Any) -> None:
+        close = getattr(transport, "close", None)
+        if not callable(close):
+            close = getattr(getattr(transport, "client", None), "close", None)
+        if callable(close):
+            close()
+
+    def close(self) -> bool:
+        """Release the lazily created summary transport exactly once."""
+        close_lock = getattr(self, "_close_lock", None)
+        if close_lock is None:
+            close_lock = threading.Lock()
+            self._close_lock = close_lock
+        with close_lock:
+            if getattr(self, "_close_complete", False):
+                return True
+            transport = getattr(self, "_summary_transport", None)
+            if transport is not None:
+                self._close_summary_transport(transport)
+            self._summary_transport = None
+            self._summary_runtime = None
+            self._close_complete = True
+            return True
 
     def update_from_response(self, usage: dict[str, Any]) -> None:
         """Store real token counts from API response.

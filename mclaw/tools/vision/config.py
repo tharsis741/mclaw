@@ -18,10 +18,13 @@ _QWEN_PROFILE = get_runtime_profile(DEFAULT_PROVIDER)
 DASHSCOPE_BASE_URL = _QWEN_PROFILE.base_url
 QWEN_BASE_URL_ENV_VAR = _QWEN_PROFILE.base_url_env_var
 QWEN_CREDENTIAL_ENV_VARS = _QWEN_PROFILE.env_vars
-QWEN_DEFAULT_MODEL = "qwen-vl-max"
+QWEN_DEFAULT_MODEL = "qwen3-vl-flash"
 
 DEFAULT_VISION_TIMEOUT = 30.0
 DEFAULT_DOWNLOAD_TIMEOUT = 30.0
+DEFAULT_MAX_PIXELS = 1_310_720
+MIN_MAX_PIXELS = 65_536
+MAX_MAX_PIXELS = 16_777_216
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
 
 
@@ -97,3 +100,11 @@ def resolve_download_timeout(parent_agent: Any = None) -> float:
         except ValueError:
             pass
     return DEFAULT_DOWNLOAD_TIMEOUT
+
+
+def resolve_max_pixels(parent_agent: Any = None) -> int:
+    """Return a bounded pixel budget for vision image preprocessing."""
+    val = vision_config(parent_agent=parent_agent).get("max_pixels")
+    if type(val) is int and MIN_MAX_PIXELS <= val <= MAX_MAX_PIXELS:
+        return val
+    return DEFAULT_MAX_PIXELS

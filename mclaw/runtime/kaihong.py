@@ -8,11 +8,14 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import platform as host_platform
+import re
 import shutil
 from pathlib import Path
 
 from mclaw.constants import get_mclaw_home
 from mclaw.runtime.base import Runtime
+from mclaw.runtime.bootstrap import BootstrapPathResolver
 from mclaw.runtime.features import FeatureState, runtime_features
 from mclaw.runtime.paths import PathPolicy
 from mclaw.runtime.process import ProcessProfile
@@ -36,6 +39,41 @@ def _browser_feature() -> FeatureState:
         return FeatureState.ENABLED if check_browser_requirements() else FeatureState.AVAILABLE_WITH_INSTALL
     except Exception:
         return FeatureState.AVAILABLE_WITH_INSTALL
+
+
+_DSOFTBUS_IDENTITY_KEYS = (
+    "const.ohos.version",
+    "const.ohos.fullname",
+    "const.product.software.version",
+)
+_OH61_VERSION = re.compile(r"(?<!\d)6\.1(?!\d)")
+
+
+def _dsoftbus_feature() -> tuple[FeatureState, str]:
+    """Resolve the strict OH 6.1 DSoftBus candidate without loading Native code."""
+    if host_platform.machine().strip().lower() not in {"aarch64", "arm64"}:
+        return FeatureState.DISABLED, "OH_ARCH_UNSUPPORTED"
+
+    parameters = dict(BootstrapPathResolver.read_ohos_parameters())
+    missing = [key for key in _DSOFTBUS_IDENTITY_KEYS if not str(parameters.get(key) or "").strip()]
+    if missing:
+        executable = shutil.which("param")
+        if not executable and Path("/bin/param").is_file():
+            executable = "/bin/param"
+        if executable:
+            from mclaw.platform.detect import _read_live_parameter
+
+            for key in missing:
+                value = _read_live_parameter(executable, key)
+                if value:
+                    parameters[key] = value
+
+    values = [str(parameters.get(key) or "").strip() for key in _DSOFTBUS_IDENTITY_KEYS]
+    if any(not value for value in values):
+        return FeatureState.DISABLED, "OH_IDENTITY_INCOMPLETE"
+    if any(_OH61_VERSION.search(value) is None for value in values):
+        return FeatureState.DISABLED, "OH_IDENTITY_CONFLICT"
+    return FeatureState.ENABLED, "OH61_CANDIDATE"
 
 
 class KaihongRuntime(Runtime):
@@ -65,10 +103,12 @@ class KaihongRuntime(Runtime):
         git_available = shutil.which("git") is not None
         pet_feature = _pet_feature()
         browser_feature = _browser_feature()
+        dsoftbus_feature, dsoftbus_reason = _dsoftbus_feature()
         features = runtime_features(
             checkpoint=FeatureState.ENABLED if git_available else FeatureState.DISABLED,
             pet=pet_feature,
             browser_tool=browser_feature,
+            dsoftbus=dsoftbus_feature,
             reasons={
                 "checkpoint": "git available" if git_available else "git not found; checkpoint disabled",
                 "pet": (
@@ -81,6 +121,7 @@ class KaihongRuntime(Runtime):
                     if browser_feature == FeatureState.ENABLED
                     else "Playwright or Chromium is unavailable"
                 ),
+                "dsoftbus": dsoftbus_reason,
             },
         )
         shell = ShellProfile(name="sh", executable="/bin/sh", family="posix", args_prefix=("-c",), supports_tty=True)

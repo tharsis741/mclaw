@@ -324,12 +324,16 @@ def test_startup_resume_overlay_matrix(monkeypatch, tmp_path) -> None:
     assert endpoint_overlay.base_url == "https://proxy.example/v1"
     assert endpoint_overlay.base_url_source == "explicit"
     assert endpoint_overlay.api_key == "overlay-key"
-    with pytest.raises(ProviderResolutionError, match="requires a model"):
-        main._resolve_startup_runtime(
-            _args(resume="resume-target", provider="anthropic"),
-            {},
-            str(tmp_path),
-        )
+    unavailable = main._resolve_startup_runtime(
+        _args(resume="resume-target", provider="anthropic"),
+        {},
+        str(tmp_path),
+    )
+    assert unavailable.context is None
+    assert unavailable.resume_session_id == ""
+    assert isinstance(unavailable.unavailable_error, ProviderResolutionError)
+    assert unavailable.unavailable_error.code == "missing_model"
+    assert unavailable.resume_snapshot == snapshot
 
 
 def test_startup_empty_snapshot_bootstraps_from_row_model(monkeypatch, tmp_path) -> None:
@@ -506,10 +510,13 @@ def test_interactive_resume_failure_preserves_current_state(monkeypatch) -> None
     chat._session_lock = old_lock
     chat.agent = old_agent
     chat.pending_provider_runtime = old
-    chat._create_agent = lambda runtime, session_id: SimpleNamespace(
+    chat._create_agent = lambda runtime, session_id, *, persist_session: SimpleNamespace(
         provider_runtime=runtime,
+        model=runtime.model,
         messages=[],
         session_user_messages=0,
+        activate_session_persistence=lambda: None,
+        close=lambda **_kwargs: True,
     )
     chat._session_db = SimpleNamespace(
         switch_active_session=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("db failed"))
@@ -644,7 +651,11 @@ def test_startup_resume_agent_failure_does_not_reopen_target(monkeypatch, tmp_pa
 
     monkeypatch.setattr(app, "InteractiveSessionLock", Lock)
     monkeypatch.setattr(app, "get_skill_registry", lambda: SimpleNamespace(refresh=lambda: None))
-    monkeypatch.setattr(InteractiveChat, "_init_agent", lambda _self: (_ for _ in ()).throw(RuntimeError("init failed")))
+    monkeypatch.setattr(
+        InteractiveChat,
+        "_init_agent",
+        lambda _self, **_kwargs: (_ for _ in ()).throw(RuntimeError("init failed")),
+    )
 
     with pytest.raises(RuntimeError, match="init failed"):
         InteractiveChat(
@@ -669,7 +680,13 @@ def test_session_db_switch_active_session_is_transactional(tmp_path) -> None:
         db.create_session("target", "cli")
         db.end_session("target", "old")
 
-        db.switch_active_session("current", "target", end_reason="user_resume")
+        db.switch_active_session(
+            "current",
+            "target",
+            end_reason="user_resume",
+            target_model="gpt-5.6",
+            target_model_config={"schema_version": 1},
+        )
 
         current = db.get_session("current")
         target = db.get_session("target")
@@ -679,7 +696,13 @@ def test_session_db_switch_active_session_is_transactional(tmp_path) -> None:
         assert target["end_reason"] is None
 
         with pytest.raises(ValueError, match="missing"):
-            db.switch_active_session("target", "missing", end_reason="should_rollback")
+            db.switch_active_session(
+                "target",
+                "missing",
+                end_reason="should_rollback",
+                target_model="gpt-5.6",
+                target_model_config={"schema_version": 1},
+            )
         assert db.get_session("target")["ended_at"] is None
     finally:
         db.close()
