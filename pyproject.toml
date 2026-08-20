@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "m-claw"
-version = "1.0.0"
+version = "1.1.0"
 description = "Robot agent runtime for M-Robots OS"
 readme = "README.zh-CN.md"
 requires-python = ">=3.11"
