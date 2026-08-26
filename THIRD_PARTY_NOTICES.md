@@ -1,12 +1,12 @@
 # Third Party Notices and Information
 
-This file contains third-party notices for software included in M Claw. These
+This file contains third-party notices for software included in M-Claw. These
 notices are provided for attribution and license compliance; they do not modify
-the license terms for M Claw's original work.
+the license terms for M-Claw's original work.
 
 ## Hermes Agent
 
-Portions of M Claw include code or source text derived from Hermes Agent,
+Portions of M-Claw include code or source text derived from Hermes Agent,
 developed by Nous Research.
 
 - Project: Hermes Agent
@@ -14,11 +14,11 @@ developed by Nous Research.
 - License: MIT License
 - Copyright: Copyright (c) 2025 Nous Research
 
-The following paths identify the M Claw source files that contain
+The following paths identify the M-Claw source files that contain
 Hermes Agent-derived material and the corresponding upstream reference paths.
 Paths in the right column are relative to the Hermes Agent repository.
 
-| M Claw file | Hermes Agent reference path |
+| M-Claw file | Hermes Agent reference path |
 | --- | --- |
 | `mclaw/agent/context_compressor.py` | `agent/context_compressor.py` |
 | `mclaw/agent/memory_manager.py` | `agent/memory_manager.py` |
