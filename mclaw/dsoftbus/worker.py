@@ -21,6 +21,8 @@ from pathlib import Path
 import platform
 import queue
 import stat
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -39,6 +41,7 @@ from .baseline import (
 from .protocol import (
     CLIENT_SERVICE_NAME,
     COMMAND_BURST_MAX,
+    DEVICE_MANAGER_OPERATION_TIMEOUT_S,
     IPC_LINE_MAX,
     NATIVE_ABI_VERSION,
     NATIVE_EVENT_BYTES_MAX,
@@ -102,6 +105,30 @@ _DEVICE_MANAGER_DEVICE_MAX = 256
 _DEVICE_MANAGER_DEVICE_ID_MAX = 96
 _DEVICE_MANAGER_DEVICE_NAME_MAX = 127
 _DEVICE_MANAGER_NETWORK_ID_MAX = 96
+_DEVICE_MANAGER_BRIDGE_MAGIC = b"MDB1"
+_DEVICE_MANAGER_BRIDGE_VERSION = 1
+_DEVICE_MANAGER_BRIDGE_HEADER = struct.Struct("<4sHHIiI")
+_DEVICE_MANAGER_BRIDGE_PAYLOAD_MAX = 256 * 1024
+_DEVICE_MANAGER_BRIDGE_EVENT_CAP = 512
+_DEVICE_MANAGER_BRIDGE_TIMEOUT_S = DEVICE_MANAGER_OPERATION_TIMEOUT_S
+_DEVICE_MANAGER_BRIDGE_HELLO = 1
+_DEVICE_MANAGER_BRIDGE_LIST_TRUSTED = 2
+_DEVICE_MANAGER_BRIDGE_START_DISCOVERY = 3
+_DEVICE_MANAGER_BRIDGE_STOP_DISCOVERY = 4
+_DEVICE_MANAGER_BRIDGE_BIND = 5
+_DEVICE_MANAGER_BRIDGE_UNBIND = 6
+_DEVICE_MANAGER_BRIDGE_STOP = 7
+_DEVICE_MANAGER_BRIDGE_DEVICE_FOUND = 0x4001
+_DEVICE_MANAGER_BRIDGE_DISCOVERY_FAILED = 0x4002
+_DEVICE_MANAGER_BRIDGE_BIND_RESULT = 0x4003
+_DEVICE_MANAGER_BRIDGE_REMOTE_DIED = 0x4004
+_DEVICE_MANAGER_BRIDGE_EOF = object()
+_OHOS_PARAMETER_FILES = (
+    Path("/etc/param/ohos.para"),
+    Path("/system/etc/param/ohos.para"),
+    Path("/sys_prod/etc/param/ohos.para"),
+)
+
 
 class WorkerFailure(RuntimeError):
     """A stable, non-sensitive worker failure."""
@@ -120,7 +147,7 @@ def _is_hex64(value: str) -> bool:
     return len(value) == 64 and all(character in _HEX64 for character in value)
 
 
-def _read_small_text(path: Path, *, maximum: int = 65_536) -> str:
+def _read_small_bytes(path: Path, *, maximum: int = 65_536) -> bytes:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -143,6 +170,11 @@ def _read_small_text(path: Path, *, maximum: int = 65_536) -> str:
             _fail("IDENTITY_READ_FAILED")
     finally:
         os.close(descriptor)
+    return raw
+
+
+def _read_small_text(path: Path, *, maximum: int = 65_536) -> str:
+    raw = _read_small_bytes(path, maximum=maximum)
     try:
         return raw.decode("utf-8").rstrip("\x00\r\n")
     except UnicodeDecodeError as error:
@@ -178,6 +210,79 @@ def _supplementary_gids() -> tuple[int, ...]:
     return tuple(sorted(values))
 
 
+def _verified_system_parameter_tool(profile: RuntimeProfile) -> str:
+    artifact = profile.document["runtimeClosure"]["systemParameterTool"]
+    expected = Path(str(artifact["resolvedPath"]))
+    try:
+        selected = Path(str(artifact["path"])).resolve(strict=True)
+        metadata = expected.stat(follow_symlinks=False)
+    except OSError as error:
+        raise WorkerFailure("PROFILE_INVALID") from error
+    if (
+        selected != expected
+        or expected.is_symlink()
+        or not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_size != artifact["byteLength"]
+        or f"0{stat.S_IMODE(metadata.st_mode):03o}" != artifact["mode"]
+        or getattr(metadata, "st_uid", artifact["uid"]) != artifact["uid"]
+        or getattr(metadata, "st_gid", artifact["gid"]) != artifact["gid"]
+        or _hash_regular(expected) != artifact["sha256"]
+    ):
+        _fail("PROFILE_INVALID")
+    return str(expected)
+
+
+def _read_live_api_level(profile: RuntimeProfile) -> str:
+    executable = _verified_system_parameter_tool(profile)
+    try:
+        result = subprocess.run(
+            [executable, "get", "const.ohos.apiversion"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd="/",
+            env={},
+            timeout=3.0,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise WorkerFailure("TARGET_IDENTITY_MISMATCH") from error
+    raw = result.stdout
+    if result.returncode != 0 or result.stderr or not raw or len(raw) > 128:
+        _fail("TARGET_IDENTITY_MISMATCH")
+    try:
+        return raw.decode("utf-8").strip()
+    except UnicodeDecodeError as error:
+        raise WorkerFailure("TARGET_IDENTITY_MISMATCH") from error
+
+
+def _observed_api_level(profile: RuntimeProfile) -> int:
+    values: set[str] = set()
+    for path in _OHOS_PARAMETER_FILES:
+        # Some Kaihong OS 5.x products expose the first two conventional
+        # locations as read-only links into ``/sys_prod``.  Identity reads do
+        # not follow links; instead, inspect the explicit product partition
+        # path when it exists.
+        if path.is_symlink() or not path.is_file():
+            continue
+        text = _read_small_text(path, maximum=1_048_576)
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() == "const.ohos.apiversion":
+                values.add(value.strip().strip("\"'"))
+    if not values:
+        values.add(_read_live_api_level(profile))
+    if len(values) != 1:
+        _fail("TARGET_IDENTITY_MISMATCH")
+    value = next(iter(values))
+    if not value.isdecimal() or not 1 <= int(value) <= 10_000:
+        _fail("TARGET_IDENTITY_MISMATCH")
+    return int(value)
+
+
 def _validate_environment(profile: RuntimeProfile) -> None:
     closure = profile.document["runtimeClosure"]
     expected_loader_path = (
@@ -211,8 +316,15 @@ def _load_profile() -> RuntimeProfile:
     expected_sha = os.environ.get(_PROFILE_SHA_ENV, "")
     if not profile_text.startswith("/") or not _is_hex64(expected_sha):
         _fail("PROFILE_ENVIRONMENT_INVALID")
+    try:
+        candidate = load_runtime_profile(profile_text)
+        api_level = _observed_api_level(candidate)
+        if api_level != int(candidate.document["target"]["apiLevel"]):
+            _fail("TARGET_IDENTITY_MISMATCH")
+    except (BaselineError, KeyError, TypeError, ValueError) as error:
+        raise WorkerFailure("PROFILE_INVALID") from error
     observed = ObservedRuntimeIdentity(
-        api_level=23,
+        api_level=api_level,
         abi="arm64-v8a",
         machine=platform.machine(),
         uid=os.getuid(),
@@ -268,15 +380,19 @@ def _hash_regular(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _mapped_files() -> dict[str, int]:
-    text = _read_small_text(Path("/proc/self/maps"), maximum=4_194_304)
+def _mapped_files(maps_path: Path = Path("/proc/self/maps")) -> dict[str, int]:
+    raw = _read_small_bytes(maps_path, maximum=4_194_304)
     result: dict[str, int] = {}
-    for line in text.splitlines():
+    for line in raw.splitlines():
         parts = line.split(maxsplit=5)
         if len(parts) != 6:
             continue
-        pathname = parts[5]
-        if not pathname.startswith("/") or pathname.endswith(" (deleted)"):
+        pathname_raw = parts[5]
+        if not pathname_raw.startswith(b"/") or pathname_raw.endswith(b" (deleted)"):
+            continue
+        try:
+            pathname = pathname_raw.decode("utf-8")
+        except UnicodeDecodeError:
             continue
         try:
             resolved = str(Path(pathname).resolve(strict=True))
@@ -295,10 +411,11 @@ def _maps_gate(
     closure = profile.document["runtimeClosure"]
     required: dict[str, Mapping[str, Any]] = {
         "bundledLibcxx": closure["libraries"]["bundledLibcxx"],
-        "permission": closure["libraries"]["permission"],
         "shim": closure["libraries"]["shim"],
         "systemLibcxx": closure["libraries"]["systemLibcxx"],
     }
+    if "permission" in closure["libraries"]:
+        required["permission"] = closure["libraries"]["permission"]
     if include_softbus:
         softbus = closure.get("softbus") or profile.document["softbus"]["library"]
         required["softbus"] = {
@@ -306,9 +423,9 @@ def _maps_gate(
             "sha256": softbus["sha256"],
         }
     if include_device_manager:
-        required["cjBindFfi"] = closure["libraries"]["cjBindFfi"]
-        required["cjBindNative"] = closure["libraries"]["cjBindNative"]
-        required["deviceManagerFfi"] = closure["libraries"]["deviceManagerFfi"]
+        for name in ("cjBindFfi", "cjBindNative", "deviceManagerFfi"):
+            if name in closure["libraries"]:
+                required[name] = closure["libraries"][name]
     maps = _mapped_files()
     records: list[Mapping[str, Any]] = []
     for label in sorted(required):
@@ -340,6 +457,52 @@ def _maps_gate(
     return hashlib.sha256(rendered).hexdigest(), tuple(records)
 
 
+def _device_manager_bridge_maps_gate(
+    profile: RuntimeProfile, pid: int
+) -> tuple[str, tuple[Mapping[str, Any], ...]]:
+    if pid <= 0:
+        _fail("DEVICE_MANAGER_BRIDGE_IDENTITY_MISMATCH")
+    closure = profile.document["runtimeClosure"]
+    bridge = closure.get("deviceManagerBridge")
+    device_manager = closure["libraries"].get("deviceManagerSdk")
+    if not isinstance(bridge, Mapping) or not isinstance(device_manager, Mapping):
+        _fail("PROFILE_INVALID")
+    required = {
+        "deviceManagerBridge": bridge,
+        "deviceManagerSdk": device_manager,
+        "systemLibcxx": closure["libraries"]["systemLibcxx"],
+    }
+    maps = _mapped_files(Path(f"/proc/{pid}/maps"))
+    records: list[Mapping[str, Any]] = []
+    for label in sorted(required):
+        artifact = required[label]
+        expected_path = str(Path(str(artifact["resolvedPath"])).resolve(strict=True))
+        if expected_path not in maps or _hash_regular(Path(expected_path)) != artifact["sha256"]:
+            _fail("DEVICE_MANAGER_BRIDGE_MAPS_MISMATCH")
+        records.append(
+            MappingProxyType(
+                {
+                    "mapSegments": maps[expected_path],
+                    "name": label,
+                    "path": expected_path,
+                    "sha256": artifact["sha256"],
+                }
+            )
+        )
+    forbidden = (
+        closure["libraries"]["bundledLibcxx"],
+        closure["libraries"]["releaseLibcxx"],
+    )
+    for artifact in forbidden:
+        forbidden_path = str(
+            Path(str(artifact["resolvedPath"])).resolve(strict=True)
+        )
+        if forbidden_path in maps:
+            _fail("DEVICE_MANAGER_BRIDGE_ABI_CONTAMINATED")
+    rendered = canonical_json_bytes([dict(record) for record in records])
+    return hashlib.sha256(rendered).hexdigest(), tuple(records)
+
+
 @dataclass(frozen=True, slots=True)
 class NativeNode:
     network_id: str
@@ -360,6 +523,7 @@ class NativeTrustedDevice:
     device_name: str
     device_type_id: int
     network_id: str
+    public_device_id: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -425,6 +589,354 @@ def _raise_native_status(status: int, native_code: int, operation: str) -> None:
     _fail(_native_failure_code(status, operation), native_code=native_code)
 
 
+def _read_bridge_exact(stream: BinaryIO, length: int) -> bytes:
+    blocks: list[bytes] = []
+    remaining = length
+    while remaining:
+        block = stream.read(remaining)
+        if not block:
+            raise WorkerFailure("DEVICE_MANAGER_BRIDGE_CLOSED")
+        blocks.append(block)
+        remaining -= len(block)
+    return b"".join(blocks)
+
+
+def _valid_public_device_id(value: str) -> bool:
+    prefix = "urn:mclaw:device:oh:"
+    digest = value[len(prefix) :] if value.startswith(prefix) else ""
+    return len(digest) == 64 and all(character in _HEX64 for character in digest)
+
+
+class _DeviceManagerBridgeClient:
+    """Bounded owner-side client for the selected system C++ bridge."""
+
+    def __init__(self, profile: RuntimeProfile) -> None:
+        closure = profile.document["runtimeClosure"]
+        artifact = closure.get("deviceManagerBridge")
+        if not isinstance(artifact, Mapping):
+            _fail("PROFILE_INVALID")
+        bridge_path = str(artifact["resolvedPath"])
+        library_dirs: list[str] = []
+        for record in (
+            closure["libraries"]["systemLibcxx"],
+            *(
+                value
+                for name, value in closure["libraries"].items()
+                if name == "deviceManagerSdk"
+            ),
+        ):
+            directory = str(Path(str(record["resolvedPath"])).parent)
+            if directory not in library_dirs:
+                library_dirs.append(directory)
+        environment = {
+            "HOME": "/data/local/tmp",
+            "LD_LIBRARY_PATH": ":".join(library_dirs),
+            "PATH": "/system/bin:/vendor/bin:/bin",
+            "TMPDIR": "/data/local/tmp",
+        }
+        token_marker = os.environ.get(_TOKEN_PROCESS_ENV)
+        if token_marker:
+            environment[_TOKEN_PROCESS_ENV] = token_marker
+        try:
+            self._process = subprocess.Popen(
+                [bridge_path, "--serve"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd="/",
+                env=environment,
+                close_fds=True,
+                bufsize=0,
+            )
+        except OSError as error:
+            raise WorkerFailure("DEVICE_MANAGER_BRIDGE_START_FAILED") from error
+        if self._process.stdin is None or self._process.stdout is None:
+            self._process.kill()
+            self._process.wait()
+            _fail("DEVICE_MANAGER_BRIDGE_START_FAILED")
+        self._frames: deque[tuple[int, int, int, bytes]] = deque()
+        self._pending_events: deque[tuple[int, int, bytes]] = deque()
+        self._condition = threading.Condition()
+        self._reader_failure: WorkerFailure | None = None
+        self._request_id = 0
+        self._closed = False
+        self._reader = threading.Thread(
+            target=self._reader_loop,
+            name="mclaw-device-manager-bridge-reader",
+            daemon=False,
+        )
+        self._reader.start()
+        try:
+            self._request(_DEVICE_MANAGER_BRIDGE_HELLO)
+            self.maps_sha256, self.map_records = _device_manager_bridge_maps_gate(
+                profile, self._process.pid
+            )
+        except Exception:
+            self.close(suppress_errors=True)
+            raise
+
+    @property
+    def pid(self) -> int:
+        return self._process.pid
+
+    def _reader_loop(self) -> None:
+        assert self._process.stdout is not None
+        try:
+            while True:
+                raw_header = _read_bridge_exact(
+                    self._process.stdout, _DEVICE_MANAGER_BRIDGE_HEADER.size
+                )
+                magic, version, message_type, request_id, status, length = (
+                    _DEVICE_MANAGER_BRIDGE_HEADER.unpack(raw_header)
+                )
+                if (
+                    magic != _DEVICE_MANAGER_BRIDGE_MAGIC
+                    or version != _DEVICE_MANAGER_BRIDGE_VERSION
+                    or length > _DEVICE_MANAGER_BRIDGE_PAYLOAD_MAX
+                ):
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+                payload = _read_bridge_exact(self._process.stdout, length)
+                with self._condition:
+                    if len(self._frames) >= _DEVICE_MANAGER_BRIDGE_EVENT_CAP:
+                        _fail("DEVICE_MANAGER_BRIDGE_EVENT_OVERFLOW")
+                    self._frames.append(
+                        (message_type, request_id, status, payload)
+                    )
+                    self._condition.notify_all()
+        except WorkerFailure as error:
+            with self._condition:
+                self._reader_failure = error
+                self._condition.notify_all()
+        except Exception:
+            with self._condition:
+                self._reader_failure = WorkerFailure(
+                    "DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR"
+                )
+                self._condition.notify_all()
+
+    def _next_frame(self, deadline: float) -> tuple[int, int, int, bytes]:
+        with self._condition:
+            while not self._frames:
+                if self._reader_failure is not None:
+                    raise self._reader_failure
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _fail("DEVICE_MANAGER_BRIDGE_TIMEOUT")
+                self._condition.wait(remaining)
+            return self._frames.popleft()
+
+    def _accept_event(
+        self, message_type: int, request_id: int, status: int, payload: bytes
+    ) -> None:
+        if (
+            request_id != 0
+            or message_type
+            not in {
+                _DEVICE_MANAGER_BRIDGE_DEVICE_FOUND,
+                _DEVICE_MANAGER_BRIDGE_DISCOVERY_FAILED,
+                _DEVICE_MANAGER_BRIDGE_BIND_RESULT,
+                _DEVICE_MANAGER_BRIDGE_REMOTE_DIED,
+            }
+            or len(self._pending_events) >= _DEVICE_MANAGER_BRIDGE_EVENT_CAP
+        ):
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+        self._pending_events.append((message_type, status, payload))
+
+    def _request(self, operation: int, payload: bytes = b"") -> bytes:
+        if (
+            self._closed
+            or operation < _DEVICE_MANAGER_BRIDGE_HELLO
+            or operation > _DEVICE_MANAGER_BRIDGE_STOP
+            or len(payload) > _DEVICE_MANAGER_BRIDGE_PAYLOAD_MAX
+        ):
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+        self._request_id += 1
+        request_id = self._request_id
+        header = _DEVICE_MANAGER_BRIDGE_HEADER.pack(
+            _DEVICE_MANAGER_BRIDGE_MAGIC,
+            _DEVICE_MANAGER_BRIDGE_VERSION,
+            operation,
+            request_id,
+            0,
+            len(payload),
+        )
+        assert self._process.stdin is not None
+        try:
+            self._process.stdin.write(header)
+            self._process.stdin.write(payload)
+            self._process.stdin.flush()
+        except (BrokenPipeError, OSError) as error:
+            raise WorkerFailure("DEVICE_MANAGER_BRIDGE_CLOSED") from error
+        deadline = time.monotonic() + _DEVICE_MANAGER_BRIDGE_TIMEOUT_S
+        while True:
+            message_type, response_id, status, response_payload = self._next_frame(
+                deadline
+            )
+            if 0x4000 <= message_type < 0x8000:
+                self._accept_event(
+                    message_type, response_id, status, response_payload
+                )
+                continue
+            if message_type != operation | 0x8000 or response_id != request_id:
+                _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+            if status != 0:
+                _fail("NATIVE_ERROR", native_code=status)
+            return response_payload
+
+    @staticmethod
+    def _encode_string(value: str) -> bytes:
+        encoded = value.encode("utf-8")
+        if not 1 <= len(encoded) <= _DEVICE_MANAGER_DEVICE_ID_MAX:
+            _fail("INVALID_REQUEST")
+        return struct.pack("<I", len(encoded)) + encoded
+
+    @staticmethod
+    def _take_string(
+        payload: bytes, offset: int, *, minimum: int, maximum: int
+    ) -> tuple[str, int]:
+        if offset + 4 > len(payload):
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        length = struct.unpack_from("<I", payload, offset)[0]
+        offset += 4
+        if length < minimum or length > maximum or offset + length > len(payload):
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        raw = payload[offset : offset + length]
+        try:
+            value = raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as error:
+            raise WorkerFailure("DEVICE_MANAGER_DATA_INVALID") from error
+        if "\x00" in value:
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        return value, offset + length
+
+    @classmethod
+    def _take_device(
+        cls, payload: bytes, offset: int, *, trusted: bool
+    ) -> tuple[NativeTrustedDevice, int]:
+        device_id, offset = cls._take_string(
+            payload,
+            offset,
+            minimum=1,
+            maximum=_DEVICE_MANAGER_DEVICE_ID_MAX,
+        )
+        device_name, offset = cls._take_string(
+            payload,
+            offset,
+            minimum=0,
+            maximum=_DEVICE_MANAGER_DEVICE_NAME_MAX,
+        )
+        network_id, offset = cls._take_string(
+            payload,
+            offset,
+            minimum=1 if trusted else 0,
+            maximum=_DEVICE_MANAGER_NETWORK_ID_MAX,
+        )
+        if offset + 2 > len(payload):
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        device_type_id = struct.unpack_from("<H", payload, offset)[0]
+        offset += 2
+        return (
+            NativeTrustedDevice(
+                device_id=device_id,
+                device_name=device_name,
+                device_type_id=device_type_id,
+                network_id=network_id,
+            ),
+            offset,
+        )
+
+    def list_trusted_devices(self) -> tuple[NativeTrustedDevice, ...]:
+        payload = self._request(_DEVICE_MANAGER_BRIDGE_LIST_TRUSTED)
+        if len(payload) < 4:
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        count = struct.unpack_from("<I", payload, 0)[0]
+        if count > _DEVICE_MANAGER_DEVICE_MAX:
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        devices: list[NativeTrustedDevice] = []
+        seen: set[str] = set()
+        offset = 4
+        for _ in range(count):
+            device, offset = self._take_device(payload, offset, trusted=True)
+            if device.device_id in seen:
+                _fail("DEVICE_TARGET_AMBIGUOUS")
+            seen.add(device.device_id)
+            devices.append(device)
+        if offset != len(payload):
+            _fail("DEVICE_MANAGER_DATA_INVALID")
+        return tuple(devices)
+
+    def start_discovery(self) -> None:
+        payload = self._request(_DEVICE_MANAGER_BRIDGE_START_DISCOVERY)
+        if payload:
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+
+    def stop_discovery(self) -> None:
+        payload = self._request(_DEVICE_MANAGER_BRIDGE_STOP_DISCOVERY)
+        if payload:
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+
+    def bind(self, device_id: str) -> None:
+        payload = self._request(
+            _DEVICE_MANAGER_BRIDGE_BIND, self._encode_string(device_id)
+        )
+        if payload:
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+
+    def unbind(self, device_id: str) -> None:
+        payload = self._request(
+            _DEVICE_MANAGER_BRIDGE_UNBIND, self._encode_string(device_id)
+        )
+        if payload:
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+
+    def drain_events(self) -> tuple[tuple[int, int, bytes], ...]:
+        with self._condition:
+            if self._reader_failure is not None and not self._frames:
+                raise self._reader_failure
+            while self._frames:
+                message_type, request_id, status, payload = self._frames.popleft()
+                if not 0x4000 <= message_type < 0x8000:
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+                self._accept_event(message_type, request_id, status, payload)
+        events = tuple(self._pending_events)
+        self._pending_events.clear()
+        return events
+
+    def close(self, *, suppress_errors: bool = False) -> None:
+        if self._closed:
+            return
+        failure: BaseException | None = None
+        try:
+            if self._process.poll() is None:
+                payload = self._request(_DEVICE_MANAGER_BRIDGE_STOP)
+                if payload:
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+        except BaseException as error:
+            failure = error
+        self._closed = True
+        if self._process.stdin is not None:
+            try:
+                self._process.stdin.close()
+            except OSError:
+                pass
+        try:
+            self._process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self._process.terminate()
+            try:
+                self._process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self._process.kill()
+                self._process.wait(timeout=2)
+        self._reader.join(timeout=2)
+        if self._reader.is_alive() and failure is None:
+            failure = WorkerFailure("DEVICE_MANAGER_BRIDGE_STOP_FAILED")
+        if self._process.returncode not in {0, None} and failure is None:
+            failure = WorkerFailure("DEVICE_MANAGER_BRIDGE_STOP_FAILED")
+        if failure is not None and not suppress_errors:
+            raise failure
+
+
 class NativeBackend(Protocol):
     maps_sha256: str
 
@@ -484,6 +996,7 @@ class RealNativeBackend:
         self._stopped = False
         self._context = ctypes.c_void_p()
         self._library: Any | None = None
+        self._device_manager_bridge: _DeviceManagerBridgeClient | None = None
         self._device_manager_maps_verified = False
         self._device_discovery_active = False
         self._device_discovery_failure: int | None = None
@@ -513,6 +1026,24 @@ class RealNativeBackend:
             _fail("WORKER_STOPPED")
         if started and not self._started:
             _fail("INVALID_WORKER_STATE")
+
+    def _uses_device_manager_bridge(self) -> bool:
+        return "deviceManagerBridge" in self._profile.document["runtimeClosure"]
+
+    def _get_device_manager_bridge(self) -> _DeviceManagerBridgeClient:
+        if not self._uses_device_manager_bridge():
+            _fail("PROFILE_INVALID")
+        if self._device_manager_bridge is None:
+            self._device_manager_bridge = _DeviceManagerBridgeClient(self._profile)
+            combined = canonical_json_bytes(
+                {
+                    "bridgeMapsSha256": self._device_manager_bridge.maps_sha256,
+                    "workerMapsSha256": self.maps_sha256,
+                }
+            )
+            self.maps_sha256 = hashlib.sha256(combined).hexdigest()
+            self._device_manager_maps_verified = True
+        return self._device_manager_bridge
 
     def _load(self) -> None:
         ctypes = self._ctypes
@@ -941,6 +1472,9 @@ class RealNativeBackend:
         return _bounded_text(value, "udid", minimum=1, maximum=64)
 
     def _verify_device_manager_maps(self) -> None:
+        if self._uses_device_manager_bridge():
+            self._get_device_manager_bridge()
+            return
         if not self._device_manager_maps_verified:
             self.maps_sha256, _ = _maps_gate(
                 self._profile,
@@ -949,10 +1483,89 @@ class RealNativeBackend:
             )
             self._device_manager_maps_verified = True
 
+    def _drain_device_manager_bridge_events(self) -> None:
+        if self._device_manager_bridge is None:
+            return
+        for message_type, status, payload in self._device_manager_bridge.drain_events():
+            if message_type == _DEVICE_MANAGER_BRIDGE_DEVICE_FOUND:
+                if status != 0 or not self._device_discovery_active:
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+                device, offset = self._device_manager_bridge._take_device(
+                    payload, 0, trusted=False
+                )
+                if offset != len(payload):
+                    _fail("DEVICE_MANAGER_DATA_INVALID")
+                digest = hashlib.sha256(device.device_id.encode("utf-8")).hexdigest()
+                existing = self._discovered_devices.get(digest)
+                if existing is not None and existing.device_id != device.device_id:
+                    _fail("DEVICE_TARGET_AMBIGUOUS")
+                if existing is not None:
+                    public_device_id = (
+                        device.public_device_id or existing.public_device_id
+                    )
+                    if (
+                        device.public_device_id
+                        and existing.public_device_id
+                        and device.public_device_id != existing.public_device_id
+                    ):
+                        public_device_id = ""
+                    device = NativeTrustedDevice(
+                        device_id=device.device_id,
+                        device_name=device.device_name or existing.device_name,
+                        device_type_id=device.device_type_id,
+                        network_id=device.network_id or existing.network_id,
+                        public_device_id=public_device_id,
+                    )
+                self._discovered_devices[digest] = device
+                continue
+            if message_type == _DEVICE_MANAGER_BRIDGE_DISCOVERY_FAILED:
+                if payload or status == 0:
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+                self._device_discovery_failure = _bounded_int(
+                    status, -(2**31), 2**31 - 1
+                )
+                continue
+            if message_type == _DEVICE_MANAGER_BRIDGE_BIND_RESULT:
+                device_id, offset = self._device_manager_bridge._take_string(
+                    payload,
+                    0,
+                    minimum=1,
+                    maximum=_DEVICE_MANAGER_DEVICE_ID_MAX,
+                )
+                if offset != len(payload):
+                    _fail("DEVICE_MANAGER_DATA_INVALID")
+                digest = hashlib.sha256(device_id.encode("utf-8")).hexdigest()
+                current = self._device_bind_results.get(digest)
+                if current is None or current[0] != "pending":
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+                self._device_bind_results[digest] = (
+                    ("bound", 0)
+                    if status == 0
+                    else ("failed", _bounded_int(status, -(2**31), 2**31 - 1))
+                )
+                continue
+            if message_type == _DEVICE_MANAGER_BRIDGE_REMOTE_DIED:
+                if payload or status != 0:
+                    _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+                _fail("DEVICE_MANAGER_SERVICE_DIED")
+            _fail("DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR")
+
     def _device_snapshot(
         self, *, discovered: bool
     ) -> tuple[tuple[NativeTrustedDevice, ...], int]:
         self._require_active()
+        if self._uses_device_manager_bridge():
+            bridge = self._get_device_manager_bridge()
+            self._drain_device_manager_bridge_events()
+            if discovered:
+                devices = tuple(
+                    sorted(
+                        self._discovered_devices.values(),
+                        key=lambda item: item.device_id,
+                    )
+                )
+                return devices, self._device_discovery_failure or 0
+            return bridge.list_trusted_devices(), 0
         ctypes = self._ctypes
         devices = ctypes.POINTER(self._trusted_device_type)()
         count = ctypes.c_uint32()
@@ -1030,6 +1643,11 @@ class RealNativeBackend:
             _fail("DEVICE_DISCOVERY_BUSY")
         self._discovered_devices.clear()
         self._device_discovery_failure = None
+        if self._uses_device_manager_bridge():
+            bridge = self._get_device_manager_bridge()
+            bridge.start_discovery()
+            self._device_discovery_active = True
+            return
         native_code = self._ctypes.c_int32()
         status = self._library.dsb_start_device_discovery(
             self._context, self._ctypes.byref(native_code)
@@ -1051,6 +1669,17 @@ class RealNativeBackend:
         self._require_active()
         if not self._device_discovery_active:
             _fail("DEVICE_DISCOVERY_INACTIVE")
+        if self._uses_device_manager_bridge():
+            bridge = self._get_device_manager_bridge()
+            self._drain_device_manager_bridge_events()
+            if self._device_discovery_active:
+                bridge.stop_discovery()
+                # The bridge serializes every callback accepted before the
+                # stop response.  Drain those frames while this generation is
+                # still active, then close the generation locally.
+                self._drain_device_manager_bridge_events()
+                self._device_discovery_active = False
+            return self._device_snapshot(discovered=True)
         native_code = self._ctypes.c_int32()
         status = self._library.dsb_stop_device_discovery(
             self._context, self._ctypes.byref(native_code)
@@ -1075,6 +1704,10 @@ class RealNativeBackend:
         current = self._device_bind_results.get(device_id_sha256)
         if current is not None and current[0] == "pending":
             _fail("DEVICE_BIND_BUSY")
+        if self._uses_device_manager_bridge():
+            self._get_device_manager_bridge().bind(target.device_id)
+            self._device_bind_results[device_id_sha256] = ("pending", 0)
+            return
         native_code = self._ctypes.c_int32()
         status = self._library.dsb_begin_device_bind(
             self._context,
@@ -1088,6 +1721,7 @@ class RealNativeBackend:
         self._require_active()
         if not _is_hex64(device_id_sha256):
             _fail("INVALID_REQUEST")
+        self._drain_device_manager_bridge_events()
         value = self._device_bind_results.get(device_id_sha256)
         if value is None:
             _fail("DEVICE_BIND_NOT_FOUND")
@@ -1116,6 +1750,9 @@ class RealNativeBackend:
         if len(matches) != 1:
             _fail("DEVICE_TARGET_AMBIGUOUS")
         target = matches[0]
+        if self._uses_device_manager_bridge():
+            self._get_device_manager_bridge().unbind(target.device_id)
+            return hashlib.sha256(target.device_id.encode("utf-8")).hexdigest()
         native_code = self._ctypes.c_int32()
         status = self._library.dsb_unbind_device(
             self._context,
@@ -1214,6 +1851,7 @@ class RealNativeBackend:
     def poll(self, timeout_ms: int) -> NativeEvent | None:
         self._require_active()
         timeout_ms = _bounded_int(timeout_ms, 0, _POLL_MAX_MS)
+        self._drain_device_manager_bridge_events()
         ctypes = self._ctypes
         pointer = ctypes.c_void_p()
         status = self._library.dsb_poll(
@@ -1222,6 +1860,7 @@ class RealNativeBackend:
         if status == _DSB_E_TIMEOUT:
             if pointer.value:
                 _fail("NATIVE_EVENT_INVALID")
+            self._drain_device_manager_bridge_events()
             return None
         _raise_native_status(status, 0, "poll")
         if not pointer.value:
@@ -1407,6 +2046,10 @@ class RealNativeBackend:
             self._library.dsb_release_event(pointer)
 
     def _destroy(self) -> None:
+        if self._device_manager_bridge is not None:
+            bridge = self._device_manager_bridge
+            self._device_manager_bridge = None
+            bridge.close(suppress_errors=True)
         if self._library is None or not self._context.value:
             return
         if self._started:
@@ -2025,7 +2668,7 @@ class WorkerProcess:
                 if digest in digests:
                     _fail("DEVICE_TARGET_AMBIGUOUS")
                 digests.add(digest)
-                _bounded_text(
+                network_id = _bounded_text(
                     native_device.network_id,
                     "networkId",
                     minimum=0,
@@ -2042,6 +2685,18 @@ class WorkerProcess:
                         ),
                         "deviceTypeId": _bounded_int(
                             native_device.device_type_id, 0, 2**16 - 1
+                        ),
+                        "networkIdSha256": (
+                            hashlib.sha256(network_id.encode("utf-8")).hexdigest()
+                            if network_id
+                            else ""
+                        ),
+                        "publicDeviceId": (
+                            native_device.public_device_id
+                            if _valid_public_device_id(
+                                native_device.public_device_id
+                            )
+                            else ""
                         ),
                     }
                 )
@@ -2552,14 +3207,38 @@ def main() -> int:
         except Exception:
             pass
         return 78
+    protocol_stdout = -1
+    protocol_stderr = -1
+    sink = -1
+    try:
+        protocol_stdout = os.dup(sys.stdout.fileno())
+        protocol_stderr = os.dup(sys.stderr.fileno())
+        sink = os.open(os.devnull, os.O_WRONLY | getattr(os, "O_CLOEXEC", 0))
+        os.dup2(sink, sys.stdout.fileno())
+        os.dup2(sink, sys.stderr.fileno())
+    except OSError:
+        for descriptor in (protocol_stdout, protocol_stderr):
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+        return 78
+    finally:
+        if sink >= 0:
+            os.close(sink)
     process = WorkerProcess(
         profile=profile,
         stdin=sys.stdin.buffer,
-        stdout_fd=sys.stdout.fileno(),
-        stderr_fd=sys.stderr.fileno(),
+        stdout_fd=protocol_stdout,
+        stderr_fd=protocol_stderr,
         backend_factory=RealNativeBackend,
     )
-    return process.run()
+    try:
+        return process.run()
+    finally:
+        os.close(protocol_stdout)
+        os.close(protocol_stderr)
 
 
 __all__ = [

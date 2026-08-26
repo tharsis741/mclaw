@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "m-claw"
-version = "1.1.0"
+version = "1.1.1"
 description = "Robot agent runtime for M-Robots OS"
 readme = "README.zh-CN.md"
 requires-python = ">=3.11"
@@ -63,23 +63,19 @@ dependencies = [
     "exa-py>=2.9.0,<3",
     "trafilatura>=2.1.0,<3",
 
-    # Browser automation
-    "playwright>=1.40.0",
-
-    # Runtime integrations: MCP, voice, pet, and channels
+    # Runtime integrations: MCP, voice, and channels
     "mcp>=1.2.0,<2",
     "dashscope>=1.25.6",
     "silk-python>=0.2.8,<0.3",
     "sounddevice>=0.5.0",
     "numpy>=1.26",
-    "PySide6>=6.7,<7",
     "qrcode>=8.0,<9",
     "dingtalk-stream>=0.20",
     "alibabacloud-dingtalk>=2.2.39",
 
     # Document / office skill runtime dependencies
     "python-pptx>=1.0.0,<2",
-    "Pillow>=10.0.0,<12",
+    "Pillow>=10.0.0,<13",
     "defusedxml>=0.7.1,<1",
     "markitdown[pptx]>=0.1.0",
 
@@ -90,6 +86,14 @@ dependencies = [
     # Platform PTY support
     "pywinpty>=2.0.0,<3; platform_system=='Windows'",
     "ptyprocess>=0.7.0,<1; platform_system!='Windows'",
+]
+
+[project.optional-dependencies]
+browser = [
+    "playwright>=1.40.0",
+]
+desktop = [
+    "PySide6>=6.7,<7",
 ]
 
 [project.scripts]
@@ -103,7 +107,6 @@ mclaw = [
     "skills/**/*",
     "skills/**/.rels",
     "pet/assets/**/*",
-    "dsoftbus/resources/mclaw_product_launcher.sh",
 ]
 
 [tool.setuptools.exclude-package-data]

@@ -124,6 +124,7 @@ class _FakeDriver:
                 "deviceIdSha256": "e" * 64,
                 "deviceName": "Kaihong C",
                 "deviceTypeId": 533,
+                "publicDeviceId": "",
             }
         ]
         self.pair_calls: list[str] = []
@@ -158,8 +159,11 @@ class _FakeDriver:
     def list_trusted_devices(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(value) for value in self.trusted_devices)
 
-    def discover_devices(self) -> tuple[dict[str, Any], ...]:
-        return tuple(dict(value) for value in self.discovered_devices)
+    def discover_devices(self) -> dict[str, Any]:
+        return {
+            "devices": tuple(dict(value) for value in self.discovered_devices),
+            "failureNativeCode": None,
+        }
 
     def pair_device(self, device_id_sha256: str) -> dict[str, Any]:
         self.pair_calls.append(device_id_sha256)
@@ -315,9 +319,12 @@ def test_runtime_discovers_redacted_candidates_and_binds_one_exact_digest(
     runtime.start()
 
     discovered = runtime.discover_devices()
-    assert discovered == driver.discovered_devices
+    assert discovered == {
+        "devices": driver.discovered_devices,
+        "failureNativeCode": None,
+    }
     assert "raw" not in repr(discovered)
-    discovered[0]["deviceName"] = "local mutation"
+    discovered["devices"][0]["deviceName"] = "local mutation"
     assert driver.discovered_devices[0]["deviceName"] == "Kaihong C"
 
     with pytest.raises(DsoftbusRuntimeError) as invalid:

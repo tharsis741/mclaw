@@ -31,10 +31,7 @@ from mclaw.dsoftbus.worker_supervisor import (
 
 
 _FAKE_WORKER = (
-    Path(__file__).parent
-    / "fixtures"
-    / "dsoftbus"
-    / "fake_worker_target.py"
+    Path(__file__).parent / "fixtures" / "dsoftbus" / "fake_worker_target.py"
 ).resolve()
 _TOKEN_HASH = "sha256:" + "a" * 64
 _RUNTIME_ID = "00000000-0000-4000-8000-000000000101"
@@ -160,6 +157,8 @@ def test_supervisor_typed_phase_b_operations_and_event_handoff() -> None:
             "deviceIdSha256": "e" * 64,
             "deviceName": "Candidate device",
             "deviceTypeId": 533,
+            "networkIdSha256": "",
+            "publicDeviceId": "",
         }
     ]
     assert discovery["failureNativeCode"] is None
@@ -214,6 +213,48 @@ def test_supervisor_typed_phase_b_operations_and_event_handoff() -> None:
     supervisor.stop(time.monotonic() + 2)
 
 
+def test_supervisor_preserves_native_discovery_failure_details() -> None:
+    supervisor = _supervisor(mode="phase-b-device-discovery-error")
+    verified = supervisor.start()
+    publications = freeze_local_publications(
+        template=parse_local_manifest_template(_LOCAL_YAML),
+        verified_device_id=verified.public_device_id,
+        verified_agent_id=verified.public_agent_id,
+        runtime_instance_id=_RUNTIME_ID,
+    )
+    supervisor.complete_manifest_phase_b(publications.gate_mapping())
+    supervisor.start_node_events()
+    supervisor.start_device_discovery()
+
+    with pytest.raises(WorkerSupervisorError) as caught:
+        supervisor.stop_device_discovery()
+
+    assert caught.value.code == "NATIVE_ERROR"
+    assert caught.value.native_code == -902
+    assert caught.value.phase == "stop_device_discovery"
+    supervisor.stop(time.monotonic() + 2)
+
+
+def test_supervisor_preserves_partial_discovery_native_code() -> None:
+    supervisor = _supervisor(mode="phase-b-device-discovery-partial")
+    verified = supervisor.start()
+    publications = freeze_local_publications(
+        template=parse_local_manifest_template(_LOCAL_YAML),
+        verified_device_id=verified.public_device_id,
+        verified_agent_id=verified.public_agent_id,
+        runtime_instance_id=_RUNTIME_ID,
+    )
+    supervisor.complete_manifest_phase_b(publications.gate_mapping())
+    supervisor.start_node_events()
+    supervisor.start_device_discovery()
+
+    discovery = supervisor.stop_device_discovery()
+
+    assert len(discovery["devices"]) == 1
+    assert discovery["failureNativeCode"] == -903
+    supervisor.stop(time.monotonic() + 2)
+
+
 def test_supervisor_counts_one_terminal_event_overflow_per_epoch() -> None:
     supervisor = _supervisor(mode="phase-b-overflow")
     verified = supervisor.start()
@@ -246,7 +287,9 @@ def test_supervisor_counts_one_terminal_event_overflow_per_epoch() -> None:
 
 
 def test_discovery_phase_b_freezes_then_snapshots_listens_and_connects() -> None:
-    async def lifecycle() -> tuple[dict[str, Any], dict[str, Any], tuple[Any, ...], dict[str, Any]]:
+    async def lifecycle() -> tuple[
+        dict[str, Any], dict[str, Any], tuple[Any, ...], dict[str, Any]
+    ]:
         resources = DiscoveryOwnerResources(
             supervisor=_supervisor(),
             manifest_template=parse_local_manifest_template(_LOCAL_YAML),
@@ -318,7 +361,7 @@ def test_discovery_unbind_closes_route_removes_presence_and_confirms_absence() -
     }
     assert after == ()
     assert peers == ()
-    assert diagnostic["operationCounts"]["list_trusted_devices"] == 4
+    assert diagnostic["operationCounts"]["list_trusted_devices"] == 6
     assert diagnostic["operationCounts"]["unbind_device"] == 1
     assert stopped["workerAlive"] is False
 
@@ -335,17 +378,19 @@ def test_product_pairing_discovers_binds_and_only_unpairs_mclaw_owned_acl(
             discovery_window_s=0,
         )
         started = dict(await resources.start(_RUNTIME_ID))
-        external_before = tuple(
-            dict(item) for item in resources.list_trusted_devices()
-        )
-        discovered = tuple(dict(item) for item in await resources.discover_devices())
+        external_before = tuple(dict(item) for item in resources.list_trusted_devices())
+        discovery = await resources.discover_devices()
+        assert discovery["failureNativeCode"] is None
+        discovered = tuple(dict(item) for item in discovery["devices"])
         paired = dict(await resources.pair_device("e" * 64))
-        managed_after = tuple(
-            dict(item) for item in resources.list_trusted_devices()
+        managed_after = tuple(dict(item) for item in resources.list_trusted_devices())
+        paired_discovery = tuple(
+            dict(item) for item in (await resources.discover_devices())["devices"]
         )
         unpaired = dict(await resources.unbind_device("e" * 64))
-        managed_final = tuple(
-            dict(item) for item in resources.list_trusted_devices()
+        managed_final = tuple(dict(item) for item in resources.list_trusted_devices())
+        unpaired_discovery = tuple(
+            dict(item) for item in (await resources.discover_devices())["devices"]
         )
         stopped = dict(await resources.stop(lambda: time.monotonic() + 2))
         return (
@@ -354,8 +399,10 @@ def test_product_pairing_discovers_binds_and_only_unpairs_mclaw_owned_acl(
             discovered,
             paired,
             managed_after,
+            paired_discovery,
             unpaired,
             managed_final,
+            unpaired_discovery,
             ownership_path.read_text(encoding="utf-8"),
             stopped,
         )
@@ -366,8 +413,10 @@ def test_product_pairing_discovers_binds_and_only_unpairs_mclaw_owned_acl(
         discovered,
         paired,
         managed_after,
+        paired_discovery,
         unpaired,
         managed_final,
+        unpaired_discovery,
         ownership,
         stopped,
     ) = asyncio.run(lifecycle())
@@ -378,6 +427,7 @@ def test_product_pairing_discovers_binds_and_only_unpairs_mclaw_owned_acl(
             "deviceIdSha256": "e" * 64,
             "deviceName": "Candidate device",
             "deviceTypeId": 533,
+            "publicDeviceId": "",
         },
     )
     assert paired == {
@@ -387,11 +437,88 @@ def test_product_pairing_discovers_binds_and_only_unpairs_mclaw_owned_acl(
         "status": "bound",
     }
     assert managed_after[0]["deviceIdSha256"] == "e" * 64
+    assert paired_discovery == ()
     assert unpaired["deviceIdSha256"] == "e" * 64
     assert unpaired["unbound"] is True
     assert managed_final == ()
+    assert unpaired_discovery == discovered
     assert '"deviceIdSha256":[]' in ownership
     assert stopped["workerAlive"] is False
+
+
+def test_discovery_unbind_does_not_report_success_before_trust_state_converges() -> None:
+    async def lifecycle() -> None:
+        resources = DiscoveryOwnerResources(
+            supervisor=_supervisor(mode="phase-b-unbind-unconfirmed"),
+            manifest_template=parse_local_manifest_template(_LOCAL_YAML),
+            unbind_confirm_timeout_s=0.01,
+            unbind_poll_interval_s=0.001,
+        )
+        await resources.start(_RUNTIME_ID)
+        with pytest.raises(WorkerSupervisorError, match="DEVICE_UNBIND_UNCONFIRMED"):
+            await resources.unbind_device("d" * 64)
+        assert tuple(resources.list_trusted_devices()) != ()
+        await resources.stop(lambda: time.monotonic() + 2)
+
+    asyncio.run(lifecycle())
+
+
+def test_product_discovery_correlates_online_softbus_identity() -> None:
+    async def lifecycle() -> tuple[dict[str, Any], dict[str, Any]]:
+        resources = DiscoveryOwnerResources(
+            supervisor=_supervisor(mode="phase-b-connected-candidate"),
+            manifest_template=parse_local_manifest_template(_LOCAL_YAML),
+            discovery_window_s=0,
+        )
+        started = dict(await resources.start(_RUNTIME_ID))
+        discovery = dict(await resources.discover_devices())
+        await resources.stop(lambda: time.monotonic() + 2)
+        return started, discovery
+
+    started, discovery = asyncio.run(lifecycle())
+    assert started["state"] == "READY"
+    assert discovery == {
+        "devices": (
+            {
+                "deviceIdSha256": "e" * 64,
+                "deviceName": "Candidate device",
+                "deviceTypeId": 533,
+                "publicDeviceId": derive_public_device_id("peer-b"),
+            },
+        ),
+        "failureNativeCode": None,
+    }
+
+
+def test_product_pairing_retains_pending_ownership_after_unconfirmed_success(
+    tmp_path: Path,
+) -> None:
+    async def lifecycle() -> tuple[str, bool, str]:
+        ownership_path = tmp_path / "dsoftbus" / "paired-devices.json"
+        resources = DiscoveryOwnerResources(
+            supervisor=_supervisor(mode="phase-b-bind-unconfirmed"),
+            manifest_template=parse_local_manifest_template(_LOCAL_YAML),
+            pairing_state_path=ownership_path,
+            discovery_window_s=0,
+            bind_confirm_timeout_s=0.01,
+            bind_poll_interval_s=0.005,
+        )
+        await resources.start(_RUNTIME_ID)
+        await resources.discover_devices()
+        try:
+            await resources.pair_device("e" * 64)
+        except WorkerSupervisorError as error:
+            code = error.code
+            outcome_unknown = error.outcome_unknown
+        else:
+            raise AssertionError("unconfirmed bind was accepted")
+        await resources.stop(lambda: time.monotonic() + 2)
+        return code, outcome_unknown, ownership_path.read_text(encoding="utf-8")
+
+    code, outcome_unknown, ownership = asyncio.run(lifecycle())
+    assert code == "DEVICE_BIND_UNCONFIRMED"
+    assert outcome_unknown is True
+    assert f'"deviceIdSha256":["{"e" * 64}"]' in ownership
 
 
 def test_discovery_rebuilds_native_handles_after_worker_epoch_death() -> None:
@@ -603,4 +730,3 @@ def test_owner_thread_is_stable_for_direct_supervisor_use() -> None:
     thread.join()
     assert errors == ["WORKER_SUPERVISOR_OWNER_MISMATCH"]
     supervisor.stop(time.monotonic() + 2)
-

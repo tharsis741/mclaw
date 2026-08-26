@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 from collections import deque
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -397,6 +398,8 @@ def test_device_discovery_and_bind_results_are_exact_and_cross_bound() -> None:
                 "deviceIdSha256": digest,
                 "deviceName": "Kaihong B",
                 "deviceTypeId": 533,
+                "networkIdSha256": hashlib.sha256(b"network-b").hexdigest(),
+                "publicDeviceId": "urn:mclaw:device:oh:" + "a" * 64,
             }
         ],
         "failureNativeCode": None,
@@ -452,6 +455,8 @@ def test_device_discovery_and_bind_results_are_exact_and_cross_bound() -> None:
                     "deviceIdSha256": "e" * 64,
                     "deviceName": "Kaihong B",
                     "deviceTypeId": 533,
+                    "networkIdSha256": "",
+                    "publicDeviceId": "",
                 }
             ],
             "failureNativeCode": None,

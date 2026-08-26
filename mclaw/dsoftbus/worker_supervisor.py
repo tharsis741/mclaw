@@ -18,6 +18,7 @@ import base64
 from collections import deque
 from dataclasses import dataclass, field
 import hashlib
+import logging
 import os
 from pathlib import Path
 import subprocess
@@ -37,6 +38,9 @@ from .presence import derive_public_device_id
 from .worker_ipc import ParentStdinWriter, WorkerIpcFailure, WorkerIpcState
 
 
+logger = logging.getLogger(__name__)
+
+
 _HEX64 = frozenset("0123456789abcdef")
 _TOKEN_DOMAIN = b"mclaw-dsoftbus-token-id\0"
 _THREAD_JOIN_GRACE_S = 1.0
@@ -45,14 +49,34 @@ _THREAD_JOIN_GRACE_S = 1.0
 class WorkerSupervisorError(RuntimeError):
     """Stable, non-sensitive Worker supervision failure."""
 
-    def __init__(self, code: str, *, outcome_unknown: bool = False) -> None:
+    def __init__(
+        self,
+        code: str,
+        *,
+        outcome_unknown: bool = False,
+        native_code: int | None = None,
+        phase: str = "",
+    ) -> None:
         super().__init__(code)
         self.code = code
         self.outcome_unknown = outcome_unknown
+        self.native_code = native_code
+        self.phase = phase
 
 
-def _fail(code: str, *, outcome_unknown: bool = False) -> NoReturn:
-    raise WorkerSupervisorError(code, outcome_unknown=outcome_unknown)
+def _fail(
+    code: str,
+    *,
+    outcome_unknown: bool = False,
+    native_code: int | None = None,
+    phase: str = "",
+) -> NoReturn:
+    raise WorkerSupervisorError(
+        code,
+        outcome_unknown=outcome_unknown,
+        native_code=native_code,
+        phase=phase,
+    )
 
 
 def _is_hex64(value: Any) -> bool:
@@ -406,10 +430,10 @@ class _Epoch:
     waiters: dict[str, _ResponseWaiter] = field(default_factory=dict)
     threads: dict[str, threading.Thread] = field(default_factory=dict)
     failure_code: str = ""
+    worker_diagnostic_code: str = ""
     event_overflow_counted: bool = False
     exit_code: int | None = None
     stopping: bool = False
-    stop_response_received: bool = False
 
 
 def _read_bounded_line(stream: BinaryIO) -> bytes | None:
@@ -451,6 +475,14 @@ def _parse_readiness(raw: bytes, expected_pid: int) -> _Readiness:
 
 
 def _parse_startup_diagnostic(raw: bytes) -> str:
+    return (
+        "WORKER_START_FAILED"
+        if _parse_worker_diagnostic_code(raw)
+        else "WORKER_PROTOCOL_ERROR"
+    )
+
+
+def _parse_worker_diagnostic_code(raw: bytes) -> str:
     try:
         value = protocol.strict_json_loads(
             raw,
@@ -470,8 +502,8 @@ def _parse_startup_diagnostic(raw: bytes) -> str:
         ):
             raise protocol.ProtocolError("INVALID_REQUEST", "diagnostic invalid")
     except protocol.ProtocolError:
-        return "WORKER_PROTOCOL_ERROR"
-    return "WORKER_START_FAILED"
+        return ""
+    return code
 
 
 class WorkerSupervisor:
@@ -505,6 +537,9 @@ class WorkerSupervisor:
         self._last_pid: int | None = None
         self._last_start_ticks: int | None = None
         self._last_epoch_digest: str | None = None
+        self._last_failure_code = ""
+        self._last_worker_diagnostic_code = ""
+        self._last_exit_code: int | None = None
         self._first_start_attempted = False
         self._recovery_enabled = False
         self._restart_times: deque[float] = deque()
@@ -538,6 +573,16 @@ class WorkerSupervisor:
                 self._event_overflow_count += 1
             if first_failure:
                 epoch.failure_code = code
+                self._last_failure_code = code
+                self._last_worker_diagnostic_code = epoch.worker_diagnostic_code
+                logger.warning(
+                    "[DSOFTBUS_WORKER] failed pid=%s code=%s "
+                    "workerDiagnosticCode=%s exitCode=%s",
+                    epoch.handle.pid,
+                    code,
+                    epoch.worker_diagnostic_code or "none",
+                    epoch.exit_code if epoch.exit_code is not None else "pending",
+                )
             ipc = epoch.ipc
             if ipc is not None:
                 ipc.fail_epoch()
@@ -581,6 +626,9 @@ class WorkerSupervisor:
                     if not epoch.stopping and not epoch.exit_event.is_set():
                         self._mark_failure(epoch, "WORKER_DIED")
                     return
+                epoch.worker_diagnostic_code = (
+                    _parse_worker_diagnostic_code(raw) or "INVALID_DIAGNOSTIC"
+                )
                 self._mark_failure(epoch, "WORKER_PROTOCOL_ERROR")
         except WorkerSupervisorError as error:
             if not epoch.stopping:
@@ -612,12 +660,19 @@ class WorkerSupervisor:
                     with self._condition:
                         events_enabled = self._events_enabled
                     if not events_enabled:
+                        epoch.worker_diagnostic_code = "EVENT_BEFORE_ADMISSION"
                         self._mark_failure(epoch, "WORKER_PROTOCOL_ERROR")
                         return
                     if event["event"] == "overflow":
                         self._mark_failure(epoch, "PARENT_EVENT_CAPACITY_FATAL")
                         return
                     if event["event"] == "fatal":
+                        data = event.get("data")
+                        epoch.worker_diagnostic_code = (
+                            str(data.get("code"))
+                            if isinstance(data, Mapping) and data.get("code")
+                            else "WORKER_FATAL_EVENT"
+                        )
                         self._mark_failure(epoch, "WORKER_PROTOCOL_ERROR")
                         return
                     with self._condition:
@@ -662,10 +717,19 @@ class WorkerSupervisor:
             exit_code = -1
         with self._condition:
             epoch.exit_code = exit_code
+            self._last_exit_code = exit_code
             epoch.exit_event.set()
             unexpected = not epoch.stopping
             self._condition.notify_all()
         if unexpected:
+            logger.warning(
+                "[DSOFTBUS_WORKER] exited pid=%s exitCode=%s "
+                "failureCode=%s workerDiagnosticCode=%s",
+                epoch.handle.pid,
+                exit_code,
+                epoch.failure_code or "none",
+                epoch.worker_diagnostic_code or "none",
+            )
             self._mark_failure(epoch, "WORKER_DIED")
 
     def _new_thread(
@@ -734,7 +798,7 @@ class WorkerSupervisor:
         except WorkerIpcFailure as error:
             with self._condition:
                 epoch.waiters.pop(command_id, None)
-            raise WorkerSupervisorError(error.code) from error
+            raise WorkerSupervisorError(error.code, phase=operation) from error
 
         completed = self._wait_condition(
             lambda: (
@@ -754,16 +818,27 @@ class WorkerSupervisor:
             _fail(
                 "WORKER_CONTROL_TIMEOUT",
                 outcome_unknown=classification == "outcomeUnknown",
+                phase=operation,
             )
         with self._condition:
             epoch.waiters.pop(command_id, None)
         if waiter.error_code:
-            _fail(waiter.error_code, outcome_unknown=waiter.outcome_unknown)
+            _fail(
+                waiter.error_code,
+                outcome_unknown=waiter.outcome_unknown,
+                phase=operation,
+            )
         response = waiter.response
         if response is None:
-            _fail(epoch.failure_code or "WORKER_DIED")
+            _fail(epoch.failure_code or "WORKER_DIED", phase=operation)
         if response["ok"] is not True:
-            _fail(str(response["error"]["code"]))
+            error = response["error"]
+            native_code = int(error["nativeCode"])
+            _fail(
+                str(error["code"]),
+                native_code=native_code if native_code != 0 else None,
+                phase=operation,
+            )
         return response["result"]
 
     def _verify_hello(
@@ -938,14 +1013,33 @@ class WorkerSupervisor:
         return epoch
 
     def _business_request(
-        self, operation: str, args: Mapping[str, Any]
+        self,
+        operation: str,
+        args: Mapping[str, Any],
+        *,
+        timeout_s: float | None = None,
     ) -> Mapping[str, Any]:
         epoch = self._phase_b_epoch()
         return self._request(
             epoch,
             operation,
             args,
-            absolute_deadline=self._monotonic() + self._control_timeout,
+            absolute_deadline=(
+                self._monotonic()
+                + (self._control_timeout if timeout_s is None else timeout_s)
+            ),
+        )
+
+    def _device_manager_request(
+        self, operation: str, args: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        return self._business_request(
+            operation,
+            args,
+            timeout_s=max(
+                self._control_timeout,
+                float(protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S),
+            ),
         )
 
     def start_node_events(self) -> None:
@@ -991,7 +1085,7 @@ class WorkerSupervisor:
     def start_device_discovery(self) -> None:
         """Start one M-Claw-owned DeviceManager discovery session."""
 
-        result = self._business_request(
+        result = self._device_manager_request(
             "start_device_discovery", MappingProxyType({})
         )
         if result["started"] is not True:
@@ -1000,7 +1094,7 @@ class WorkerSupervisor:
     def stop_device_discovery(self) -> Mapping[str, Any]:
         """Stop discovery and return only redacted candidate identifiers."""
 
-        result = self._business_request(
+        result = self._device_manager_request(
             "stop_device_discovery", MappingProxyType({})
         )
         return MappingProxyType(
@@ -1011,6 +1105,8 @@ class WorkerSupervisor:
                             "deviceIdSha256": str(device["deviceIdSha256"]),
                             "deviceName": str(device["deviceName"]),
                             "deviceTypeId": int(device["deviceTypeId"]),
+                            "networkIdSha256": str(device["networkIdSha256"]),
+                            "publicDeviceId": str(device["publicDeviceId"]),
                         }
                     )
                     for device in result["devices"]
@@ -1023,7 +1119,7 @@ class WorkerSupervisor:
     def begin_device_bind(self, device_id_sha256: str) -> Mapping[str, Any]:
         """Begin one system-confirmed app-level DeviceManager bind."""
 
-        result = self._business_request(
+        result = self._device_manager_request(
             "begin_device_bind",
             MappingProxyType({"deviceIdSha256": device_id_sha256}),
         )
@@ -1039,7 +1135,7 @@ class WorkerSupervisor:
     ) -> Mapping[str, Any]:
         """Read the terminal or pending outcome of one local bind request."""
 
-        result = self._business_request(
+        result = self._device_manager_request(
             "get_device_bind_status",
             MappingProxyType({"deviceIdSha256": device_id_sha256}),
         )
@@ -1052,7 +1148,7 @@ class WorkerSupervisor:
         )
 
     def list_trusted_devices(self) -> tuple[Mapping[str, Any], ...]:
-        result = self._business_request(
+        result = self._device_manager_request(
             "list_trusted_devices", MappingProxyType({})
         )
         return tuple(
@@ -1068,7 +1164,7 @@ class WorkerSupervisor:
         )
 
     def unbind_device(self, network_id: str) -> Mapping[str, Any]:
-        result = self._business_request(
+        result = self._device_manager_request(
             "unbind_device", MappingProxyType({"networkId": network_id})
         )
         return MappingProxyType(
@@ -1276,7 +1372,6 @@ class WorkerSupervisor:
                     control=True,
                 )
                 cooperative = dict(result) == {"stopped": True}
-                epoch.stop_response_received = cooperative
             except WorkerSupervisorError:
                 cooperative = False
         if cooperative:
@@ -1371,6 +1466,9 @@ class WorkerSupervisor:
                 "closed": self._closed,
                 "firstStartAttempted": self._first_start_attempted,
                 "manifestPhaseBComplete": self._publication_gate is not None,
+                "lastExitCode": self._last_exit_code,
+                "lastFailureCode": self._last_failure_code,
+                "lastWorkerDiagnosticCode": self._last_worker_diagnostic_code,
                 "nativeNodeEventsStarted": (
                     self._verified is not None
                     and self._native_started_epoch == self._verified.worker_epoch

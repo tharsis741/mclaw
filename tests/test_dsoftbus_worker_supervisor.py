@@ -406,7 +406,6 @@ def _config() -> dict[str, Any]:
     return {
         "dsoftbus": {
             "accept_remote_messages": False,
-            "discovery_without_provider": True,
             "enabled": "auto",
             "global_requests_per_minute": 12,
             "per_peer_requests_per_minute": 6,

@@ -32,9 +32,6 @@ from mclaw.runtime.bootstrap import BootstrapPathResolver
 from . import baseline as baseline_contract
 from .baseline import (
     BUNDLED_LIBCXX_LIBRARY,
-    CJ_BIND_FFI_LIBRARY,
-    CJ_BIND_NATIVE_LIBRARY,
-    DEVICE_MANAGER_FFI_LIBRARY,
     DISTRIBUTED_DATASYNC_PERMISSION,
     LINUX_CAPABILITY_NAMES,
     ObservedRuntimeIdentity,
@@ -48,8 +45,7 @@ from .baseline import (
     RUNTIME_PROFILE_BYTES_MAX,
     RUNTIME_PROFILE_FILENAME,
     RUNTIME_PROFILE_SCHEMA,
-    SHIM_LIBRARY,
-    SYSTEM_LIBCXX_LIBRARY,
+    SYSTEM_PARAMETER_TOOL,
     TOKEN_LAUNCHER,
     WORKER_BOOTSTRAP_RELATIVE_PATH,
     WORKER_CODE_MANIFEST_FILENAME,
@@ -61,6 +57,7 @@ from .baseline import (
     preflight_runtime_profile,
 )
 from .protocol import canonical_json_bytes
+from .platform_adapter import OpenHarmonyAdapter, select_openharmony_adapter
 from .manifest import (
     MANIFEST_SCHEMA,
     LocalManifestTemplate,
@@ -95,7 +92,6 @@ _PARAMETER_PLACEHOLDERS = frozenset(
     {"default", "generic", "n/a", "none", "null", "unknown", "undefined", "unset"}
 )
 _GENERIC_PRODUCT_MODELS = frozenset({"generic", "ohos", "openharmony"})
-_OH61_VERSION = re.compile(r"(?<!\d)6\.1(?!\d)")
 _VERSION_COMPONENT = re.compile(
     r"(?<![0-9A-Za-z])"
     r"(?P<version>[0-9]+(?:\.[0-9A-Za-z]+){1,7}(?:[-+][0-9A-Za-z._-]+)?)"
@@ -138,6 +134,7 @@ class _OhosDeviceIdentity:
     abi: str
     machine: str
     versions: Mapping[str, str]
+    adapter: OpenHarmonyAdapter
 
 
 def _read_regular_no_follow(path: Path, *, maximum: int, code: str) -> bytes:
@@ -601,11 +598,8 @@ def _device_identity_from_parameters(
     versions = {
         key: str(parameters.get(key) or "").strip() for key in _VERSION_KEYS
     }
-    if any(
-        not value or _OH61_VERSION.search(value) is None
-        for value in versions.values()
-    ):
-        _fail("OH61_IDENTITY_UNAVAILABLE")
+    if any(not value for value in versions.values()):
+        _fail("OH_IDENTITY_UNAVAILABLE")
 
     normalized_machine = str(machine or "").strip().casefold()
     if normalized_machine == "arm64":
@@ -619,12 +613,14 @@ def _device_identity_from_parameters(
     if re.fullmatch(r"[1-9][0-9]{0,3}", api_text) is None or not abi_values:
         _fail("DEVICE_IDENTITY_UNAVAILABLE")
     api_level = int(api_text)
-    if (
-        api_level != 23
-        or normalized_machine != "aarch64"
-        or "arm64-v8a" not in abi_values
-    ):
-        _fail("OH61_RUNTIME_UNSUPPORTED")
+    adapter = select_openharmony_adapter(
+        api_level=api_level,
+        fullname=versions["const.ohos.fullname"],
+        abi_values=abi_values,
+        machine=normalized_machine,
+    )
+    if adapter is None:
+        _fail("OH_RUNTIME_UNSUPPORTED")
 
     manufacturer = _first_meaningful(
         parameters, "const.product.manufacturer", "const.product.brand"
@@ -653,6 +649,7 @@ def _device_identity_from_parameters(
         abi="arm64-v8a",
         machine=normalized_machine,
         versions=MappingProxyType(versions),
+        adapter=adapter,
     )
 
 
@@ -843,7 +840,7 @@ def _build_document(
     identity: _OhosDeviceIdentity,
 ) -> dict[str, Any]:
     if not platform.python_version().startswith("3.12."):
-        _fail("OH61_RUNTIME_UNSUPPORTED")
+        _fail("OH_RUNTIME_UNSUPPORTED")
     capability_set = _capability_set()
     selinux_context = _selinux_context()
     uid = os.getuid()
@@ -856,18 +853,31 @@ def _build_document(
     ).hexdigest()
 
     softbus = _artifact(REMOTE_SOFTBUS_LIBRARY)
+    system_libcxx = next(
+        (
+            candidate
+            for candidate in identity.adapter.system_libcxx_candidates
+            if Path(candidate).is_file()
+        ),
+        identity.adapter.system_libcxx_candidates[0],
+    )
     libraries = {
         "bundledLibcxx": _artifact(BUNDLED_LIBCXX_LIBRARY),
-        "cjBindFfi": _artifact(CJ_BIND_FFI_LIBRARY),
-        "cjBindNative": _artifact(CJ_BIND_NATIVE_LIBRARY),
-        "deviceManagerFfi": _artifact(DEVICE_MANAGER_FFI_LIBRARY),
-        "permission": _artifact(PERMISSION_LIBRARY),
         "releaseLibcxx": _artifact(RELEASE_LIBCXX_LIBRARY),
-        "shim": _artifact(SHIM_LIBRARY),
-        "systemLibcxx": _artifact(SYSTEM_LIBCXX_LIBRARY),
+        "shim": _artifact(identity.adapter.shim_library),
+        "systemLibcxx": _artifact(system_libcxx),
     }
+    if identity.adapter.permission_strategy == "ability-access-control":
+        libraries["permission"] = _artifact(PERMISSION_LIBRARY)
+    libraries.update(
+        {
+            name: _artifact(path)
+            for name, path in identity.adapter.device_manager_libraries.items()
+        }
+    )
     target = {
         "abi": identity.abi,
+        "adapterId": identity.adapter.adapter_id,
         "apiLevel": identity.api_level,
         "capabilitySet": list(capability_set),
         "gid": gid,
@@ -901,7 +911,12 @@ def _build_document(
         },
         "softbus": softbus,
         "softbusSocketCap": DEFAULT_SOCKET_CAP,
+        "systemParameterTool": _artifact(SYSTEM_PARAMETER_TOOL),
     }
+    if identity.adapter.device_manager_bridge is not None:
+        closure["deviceManagerBridge"] = _artifact(
+            identity.adapter.device_manager_bridge
+        )
     fingerprint_source = {
         "runtimeClosure": closure,
         "softbus": {
@@ -1027,8 +1042,8 @@ def activation_error_message(code: str) -> str:
         "MANIFEST_INSTALL_INVALID": "无法初始化本机设备信息",
         "MCLAW_TOKEN_INVALID": "M-Claw 系统身份配置无效",
         "MCLAW_TOKEN_MISSING": "未找到 M-Claw 系统身份",
-        "OH61_IDENTITY_UNAVAILABLE": "无法确认 OpenHarmony 6.1 系统信息",
-        "OH61_RUNTIME_UNSUPPORTED": "当前系统运行环境不受支持",
+        "OH_IDENTITY_UNAVAILABLE": "无法确认 OpenHarmony 系统信息",
+        "OH_RUNTIME_UNSUPPORTED": "当前 OpenHarmony 系统运行环境不受支持",
         "RUNTIME_COMPONENT_MISSING": "缺少 DSoftBus 运行组件",
         "RUNTIME_IDENTITY_UNAVAILABLE": "无法确认 M-Claw 运行身份",
         "RUNTIME_PROFILE_WRITE_FAILED": "无法保存 DSoftBus 本机配置",

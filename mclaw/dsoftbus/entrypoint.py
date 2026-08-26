@@ -99,9 +99,11 @@ def can_enter_discovery_only(
 
     persisted = has_persisted_provider_selection(raw_user_config, resume_snapshot)
     dsoftbus = raw_user_config.get("dsoftbus")
-    marker = isinstance(dsoftbus, Mapping) and dsoftbus.get("discovery_without_provider") is True
+    collaboration_selected = (
+        isinstance(dsoftbus, Mapping) and dsoftbus.get("enabled") == "auto"
+    )
     if error_code == "provider_required":
-        return marker or persisted
+        return collaboration_selected or persisted
     if error_code in {"missing_model", "missing_credential"}:
         return persisted
     return False

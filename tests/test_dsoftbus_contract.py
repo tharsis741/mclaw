@@ -61,7 +61,7 @@ from mclaw.dsoftbus.softbus_binding import (
 )
 
 
-_FIXTURES = Path(__file__).parent / "fixtures" / "dsoftbus_stage4"
+_FIXTURES = Path(__file__).parent / "fixtures" / "dsoftbus_contract"
 _REQUEST_ID = "12345678-1234-4234-9234-123456789abc"
 _RUNTIME_A = "11111111-1111-4111-8111-111111111111"
 _RUNTIME_B = "22222222-2222-4222-8222-222222222222"
@@ -121,6 +121,20 @@ def _card(device_id: str, *, ready: bool = True):
         provider_ready=ready,
         provider_readiness_code="" if ready else "PROVIDER_MISSING",
     )
+
+
+def _text_only_card_document(device_id: str, *, ready: bool = True) -> dict:
+    """Return the previously published Card shape without task-file support."""
+
+    document = json.loads(_card(device_id, ready=ready).canonical_bytes)
+    document["capabilities"]["extensions"] = [
+        document["capabilities"]["extensions"][0]
+    ]
+    document["skills"][0]["description"] = (
+        "Accept a text task and return a text result."
+    )
+    document["skills"][0]["tags"] = ["mclaw", "text", "device-agent"]
+    return document
 
 
 def _identity(device_id: str, runtime_id: str) -> LocalBindingIdentity:
@@ -679,6 +693,28 @@ def test_core_static_semantics_and_validation_order() -> None:
         validate_core_method("mclaw.agentCard.get", {"future": True})
     assert custom_extra.value.reason == "INVALID_PARAMS"
 
+    lease = validate_core_method(
+        "mclaw.taskLease.renew",
+        {
+            "sequence": 7,
+            "taskIds": ["00000000-0000-4000-8000-000000000007"],
+        },
+    )
+    assert isinstance(lease, CoreMethodCall)
+    assert lease.params["sequence"] == 7
+    with pytest.raises(A2AError) as duplicate_task:
+        validate_core_method(
+            "mclaw.taskLease.renew",
+            {
+                "sequence": 8,
+                "taskIds": [
+                    "00000000-0000-4000-8000-000000000007",
+                    "00000000-0000-4000-8000-000000000007",
+                ],
+            },
+        )
+    assert duplicate_task.value.reason == "INVALID_PARAMS"
+
 
 def test_send_message_validates_text_and_rejects_before_business_admission() -> None:
     request = {
@@ -727,6 +763,41 @@ def test_send_message_validates_text_and_rejects_before_business_admission() -> 
     assert push.value.reason == "PUSH_NOT_SUPPORTED"
 
 
+def test_send_message_continuation_requires_a_bound_input_request() -> None:
+    task_id = "00000000-0000-4000-8000-000000000201"
+    context_id = "00000000-0000-4000-8000-000000000202"
+    input_request_id = "00000000-0000-4000-8000-000000000203"
+    request = {
+        "message": {
+            "messageId": _REQUEST_ID,
+            "contextId": context_id,
+            "taskId": task_id,
+            "role": "ROLE_USER",
+            "parts": [{"text": "authentication"}],
+            "metadata": {"mclaw.inputRequestId": input_request_id},
+        }
+    }
+
+    call = validate_core_method("SendStreamingMessage", request)
+    assert call.params["message"]["taskId"] == task_id
+    assert call.params["message"]["contextId"] == context_id
+    assert call.params["message"]["metadata"]["mclaw.inputRequestId"] == (
+        input_request_id
+    )
+
+    missing_request = copy.deepcopy(request)
+    missing_request["message"].pop("metadata")
+    with pytest.raises(A2AError) as missing:
+        validate_core_method("SendStreamingMessage", missing_request)
+    assert missing.value.reason == "INPUT_REQUEST_MISMATCH"
+
+    initial_with_request = copy.deepcopy(request)
+    initial_with_request["message"].pop("taskId")
+    with pytest.raises(A2AError) as unbound:
+        validate_core_method("SendStreamingMessage", initial_with_request)
+    assert unbound.value.reason == "INPUT_REQUEST_MISMATCH"
+
+
 def test_agent_card_exact_outbound_forward_compatible_inbound_and_bounded() -> None:
     card = _card(_DEVICE_A, ready=False)
     assert len(card.canonical_bytes) <= protocol.AGENT_CARD_MAX
@@ -762,6 +833,85 @@ def test_agent_card_exact_outbound_forward_compatible_inbound_and_bounded() -> N
             agent_id=derive_public_agent_id(_DEVICE_B),
             provider_ready=True,
             provider_readiness_code="",
+        )
+
+
+def test_text_only_agent_card_remains_valid_without_task_file_extension() -> None:
+    card = validate_agent_card(
+        _text_only_card_document(_DEVICE_A),
+        expected_device_id=_DEVICE_A,
+        expected_agent_id=derive_public_agent_id(_DEVICE_A),
+    )
+
+    assert card.supports_extension(protocol.DEVICE_CONTEXT_EXTENSION_URI)
+    assert not card.supports_extension(protocol.TASK_FILES_EXTENSION_URI)
+    assert len(card.document["capabilities"]["extensions"]) == 1
+
+
+def test_text_only_peer_binds_but_rejects_task_file_requests_locally() -> None:
+    ids_a = iter(
+        f"aaaaaaaa-aaaa-4aaa-8aaa-{index:012x}" for index in range(1, 10)
+    )
+    ids_b = iter(
+        f"bbbbbbbb-bbbb-4bbb-8bbb-{index:012x}" for index in range(1, 10)
+    )
+    side_a = SoftBusA2ABinding(
+        local=_identity(_DEVICE_A, _RUNTIME_A),
+        local_card=_card(_DEVICE_A),
+        authenticated_peer_device_id=_DEVICE_B,
+        authenticated_peer_agent_id=derive_public_agent_id(_DEVICE_B),
+        initiator=True,
+        connection_generation=1,
+        negotiated_mtu=protocol.REMOTE_FRAME_MAX,
+        nonce_factory=lambda count: "c" * (count * 2),
+        request_id_factory=lambda: next(ids_a),
+    )
+    side_b = SoftBusA2ABinding(
+        local=_identity(_DEVICE_B, _RUNTIME_B),
+        local_card=_text_only_card_document(_DEVICE_B, ready=False),
+        authenticated_peer_device_id=_DEVICE_A,
+        authenticated_peer_agent_id=derive_public_agent_id(_DEVICE_A),
+        initiator=False,
+        connection_generation=1,
+        negotiated_mtu=protocol.REMOTE_FRAME_MAX,
+        request_id_factory=lambda: next(ids_b),
+    )
+    pending = deque((side_b, frame) for frame in side_a.start())
+    while pending:
+        receiver, frame = pending.popleft()
+        result = receiver.receive(frame.data)
+        other = side_a if receiver is side_b else side_b
+        pending.extend((other, outbound) for outbound in result.outbound)
+
+    assert side_a.ready and side_b.ready
+    assert side_a.peer_card is not None
+    assert not side_a.peer_card.supports_extension(
+        protocol.TASK_FILES_EXTENSION_URI
+    )
+    text_request = side_a.request_application(
+        "SendMessage",
+        {
+            "message": {
+                "messageId": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                "role": "ROLE_USER",
+                "parts": [{"text": "纯文本任务"}],
+            }
+        },
+    )
+    assert text_request.method == "SendMessage"
+
+    with pytest.raises(
+        SoftBusBindingError,
+        match="EXTENSION_SUPPORT_REQUIRED",
+    ):
+        side_a.request_application(
+            "mclaw.taskArtifact.open",
+            {
+                "taskId": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                "artifactId": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+                "transferId": "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            },
+            extensions=(protocol.TASK_FILES_EXTENSION_URI,),
         )
 
 

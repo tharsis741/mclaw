@@ -37,14 +37,27 @@ from prompt_toolkit.widgets import TextArea
 from prompt_toolkit.styles import Style
 
 from mclaw.cli.skill_registry import get_skill_registry
-from mclaw.cli.runtime.commands import CommandRouter, ParsedSlashCommand, SlashInputDispatcher
-from mclaw.cli.runtime.delegation import RuntimeDelegationCoordinator, RuntimeDelegationHooks
+from mclaw.cli.runtime.commands import (
+    CommandRouter,
+    ParsedSlashCommand,
+    SlashInputDispatcher,
+)
+from mclaw.cli.runtime.delegation import (
+    RuntimeDelegationCoordinator,
+    RuntimeDelegationHooks,
+)
 from mclaw.cli.runtime.events import EventType, RuntimeStatus
 from mclaw.cli.runtime.interactive import InteractiveRuntime
-from mclaw.cli.runtime.results import RuntimeTurnResultCoordinator, RuntimeTurnResultHooks
+from mclaw.cli.runtime.results import (
+    RuntimeTurnResultCoordinator,
+    RuntimeTurnResultHooks,
+)
 from mclaw.cli.runtime.session import RuntimeSessionState
 from mclaw.cli.runtime.session_commands import RESUME_LATEST_SESSION
-from mclaw.cli.runtime.session_lock import InteractiveSessionLock, InteractiveSessionLockError
+from mclaw.cli.runtime.session_lock import (
+    InteractiveSessionLock,
+    InteractiveSessionLockError,
+)
 from mclaw.cli.runtime.skill_commands import (
     RuntimeSkillCommandCoordinator,
     RuntimeSkillCommandHooks,
@@ -102,7 +115,12 @@ from mclaw.cli.tui.renderers.response import (
 from mclaw.cli.tui.renderers.runtime import RuntimeRenderer
 from mclaw.cli.tui.renderers.safety import SafetyRenderer
 from mclaw.cli.tui.renderers.skills import SkillsRenderer
-from mclaw.cli.tui.renderers.status import STATUS_ANIM_FRAME_COUNT, StatusRenderer, format_duration, fmt_tokens
+from mclaw.cli.tui.renderers.status import (
+    STATUS_ANIM_FRAME_COUNT,
+    StatusRenderer,
+    format_duration,
+    fmt_tokens,
+)
 from mclaw.cli.tui.selection_prompt import prompt_workspace_risk_confirmation
 from mclaw.cli.tui.theme import select_box
 from mclaw.constants import display_mclaw_path, get_mclaw_home
@@ -125,7 +143,7 @@ def _sanitize_text_for_utf8(text: str) -> str:
         text.encode("utf-8")
         return text
     except UnicodeEncodeError:
-        return _SURROGATE_RE.sub("\uFFFD", text)
+        return _SURROGATE_RE.sub("\ufffd", text)
 
 
 def _append_input_history_safely(history, text: str) -> None:
@@ -135,13 +153,16 @@ def _append_input_history_safely(history, text: str) -> None:
     try:
         history.append_string(safe_text)
     except Exception:
-        logger.debug("prompt history append skipped for unwriteable input", exc_info=True)
+        logger.debug(
+            "prompt history append skipped for unwriteable input", exc_info=True
+        )
 
 
 # ── Color palette (blue theme) ──
 
 _RST = Colors.RESET
 _DIM = Colors.DIM
+
 
 def _set_terminal_title(title: str) -> None:
     try:
@@ -175,7 +196,12 @@ def _windows_shift_pressed() -> bool:
 
 
 def _is_shift_enter(event) -> bool:
-    return bool(event.key_sequence and event.key_sequence[-1].data == _SHIFT_ENTER_SEQUENCE) or _windows_shift_pressed()
+    return (
+        bool(
+            event.key_sequence and event.key_sequence[-1].data == _SHIFT_ENTER_SEQUENCE
+        )
+        or _windows_shift_pressed()
+    )
 
 
 def _strip_thinking(text: str) -> str:
@@ -186,6 +212,7 @@ def _strip_thinking(text: str) -> str:
     for API context but must not be shown to users.
     """
     import re
+
     if not text:
         return ""
     # Remove <think>...</think> blocks
@@ -221,6 +248,7 @@ def _format_subagent_status(total: int, done: int, running: int) -> str:
 
 # ── Main TUI class ──
 
+
 class InteractiveChat:
     """Interactive terminal shell around one M-Claw agent session.
 
@@ -234,7 +262,8 @@ class InteractiveChat:
         runtime = getattr(self, "runtime", None)
         if not isinstance(runtime, InteractiveRuntime):
             kwargs = {
-                "session_state": getattr(self, "runtime_state", None) or RuntimeSessionState(),
+                "session_state": getattr(self, "runtime_state", None)
+                or RuntimeSessionState(),
             }
             event_bus = getattr(self, "event_bus", None)
             if event_bus is not None:
@@ -392,8 +421,12 @@ class InteractiveChat:
         self.enabled_toolsets = enabled_toolsets
         self.config = config or {}
         self.pending_provider_runtime = provider_runtime
-        display_cfg = self.config.get("display", {}) if isinstance(self.config, dict) else {}
-        self._live_status_animation = is_truthy_value(display_cfg.get("live_status_animation"), default=True)
+        display_cfg = (
+            self.config.get("display", {}) if isinstance(self.config, dict) else {}
+        )
+        self._live_status_animation = is_truthy_value(
+            display_cfg.get("live_status_animation"), default=True
+        )
         self._project_name = ""
         if self.config.get("_project_config_dir"):
             self._project_name = Path(self.config["_project_config_dir"]).resolve().name
@@ -405,7 +438,11 @@ class InteractiveChat:
 
         # Snapshot project-level terminal.env overrides so shutdown can restore
         # the process environment after the interactive session exits.
-        terminal_cfg = self.config.get("terminal", {}) if isinstance(self.config.get("terminal", {}), dict) else {}
+        terminal_cfg = (
+            self.config.get("terminal", {})
+            if isinstance(self.config.get("terminal", {}), dict)
+            else {}
+        )
         terminal_env = terminal_cfg.get("env", {})
         if terminal_env:
             for key, value in terminal_env.items():
@@ -467,8 +504,8 @@ class InteractiveChat:
         )
 
         # Animation state
-        self._spinner_idx: int = 0           # 0..3 spinner chars
-        self._anim_tick: int = 0             # global tick counter
+        self._spinner_idx: int = 0  # 0..3 spinner chars
+        self._anim_tick: int = 0  # global tick counter
 
         # Subagent state
         self.subtask_manager = None
@@ -477,6 +514,7 @@ class InteractiveChat:
 
         # Session DB
         from mclaw.state import SessionDB
+
         self._session_db = SessionDB()
 
         # Resume previous session if requested
@@ -485,20 +523,32 @@ class InteractiveChat:
         if resume_session_id and provider_runtime is not None:
             requested_resume = str(resume_session_id)
             if requested_resume == RESUME_LATEST_SESSION:
-                resolved = self._session_db.latest_session_id(source="cli", workspace=self.workspace_path)
+                resolved = self._session_db.latest_session_id(
+                    source="cli", workspace=self.workspace_path
+                )
             else:
-                resolved = self._session_db.resolve_session_id(requested_resume, workspace=self.workspace_path)
+                resolved = self._session_db.resolve_session_id(
+                    requested_resume, workspace=self.workspace_path
+                )
             if resolved:
                 self.session_id = resolved
-                self._resume_history = self._session_db.get_messages_as_conversation(resolved)
+                self._resume_history = self._session_db.get_messages_as_conversation(
+                    resolved
+                )
                 resume_resolved = True
             else:
                 if requested_resume == RESUME_LATEST_SESSION:
-                    self._get_runtime_renderer().warning("没有可恢复的历史会话，已开始新会话。")
+                    self._get_runtime_renderer().warning(
+                        "没有可恢复的历史会话，已开始新会话。"
+                    )
                 else:
-                    self._get_runtime_renderer().warning(f"未找到会话: {requested_resume}，已开始新会话。")
+                    self._get_runtime_renderer().warning(
+                        f"未找到会话: {requested_resume}，已开始新会话。"
+                    )
 
-        self._session_row_preexisting = bool(self._session_db.get_session(self.session_id))
+        self._session_row_preexisting = bool(
+            self._session_db.get_session(self.session_id)
+        )
 
         self._acquire_session_lock(self.session_id)
 
@@ -541,9 +591,12 @@ class InteractiveChat:
         # Recover detached background processes from last checkpoint
         try:
             from mclaw.tools.process_registry import process_registry
+
             recovered = process_registry.recover_from_checkpoint()
             if recovered:
-                self._get_runtime_renderer().dim(f"已从上次会话恢复 {recovered} 个后台进程。")
+                self._get_runtime_renderer().dim(
+                    f"已从上次会话恢复 {recovered} 个后台进程。"
+                )
         except Exception:
             pass
 
@@ -646,7 +699,9 @@ class InteractiveChat:
 
     @staticmethod
     def _count_user_messages(messages: list[dict]) -> int:
-        return sum(1 for msg in messages if isinstance(msg, dict) and msg.get("role") == "user")
+        return sum(
+            1 for msg in messages if isinstance(msg, dict) and msg.get("role") == "user"
+        )
 
     def _set_agent_messages(self, messages: list[dict]) -> None:
         if not self.agent:
@@ -709,12 +764,17 @@ class InteractiveChat:
     @staticmethod
     def _build_pet_file_drop_prompt(paths) -> str:
         return build_pet_file_drop_intent(paths)
+
     def _pet_should_emit(self, event_type) -> bool:
         """Apply per-event pet notification preferences before emitting."""
-        event_name = event_type.value if hasattr(event_type, "value") else str(event_type)
+        event_name = (
+            event_type.value if hasattr(event_type, "value") else str(event_type)
+        )
         config = getattr(self, "config", {})
         pet_cfg = ensure_pet_config(config if isinstance(config, dict) else {})
-        notify = pet_cfg.get("notify", {}) if isinstance(pet_cfg.get("notify"), dict) else {}
+        notify = (
+            pet_cfg.get("notify", {}) if isinstance(pet_cfg.get("notify"), dict) else {}
+        )
         if event_name == PetEventType.TURN_COMPLETED.value:
             return bool(notify.get("turn_completed", True))
         if event_name == PetEventType.BACKGROUND_PROCESS_COMPLETED.value:
@@ -751,13 +811,29 @@ class InteractiveChat:
             return
 
         if event.event_type == "started":
-            self._pet_emit(PetEventType.DELEGATION_TASK_STARTED, state=PetState.CARRYING, payload={"task_index": event.task_index, "data": event.data})
+            self._pet_emit(
+                PetEventType.DELEGATION_TASK_STARTED,
+                state=PetState.CARRYING,
+                payload={"task_index": event.task_index, "data": event.data},
+            )
         elif event.event_type == "tool_call":
-            self._pet_emit(PetEventType.DELEGATION_TASK_TOOL, state=PetState.REVIEW, payload={"task_index": event.task_index, "data": event.data})
+            self._pet_emit(
+                PetEventType.DELEGATION_TASK_TOOL,
+                state=PetState.REVIEW,
+                payload={"task_index": event.task_index, "data": event.data},
+            )
         elif event.event_type == "completed":
-            self._pet_emit(PetEventType.DELEGATION_TASK_COMPLETED, state=PetState.CARRYING, payload={"task_index": event.task_index, "data": event.data})
+            self._pet_emit(
+                PetEventType.DELEGATION_TASK_COMPLETED,
+                state=PetState.CARRYING,
+                payload={"task_index": event.task_index, "data": event.data},
+            )
         elif event.event_type == "error":
-            self._pet_emit(PetEventType.DELEGATION_TASK_FAILED, state=PetState.FAILED, payload={"task_index": event.task_index, "data": event.data})
+            self._pet_emit(
+                PetEventType.DELEGATION_TASK_FAILED,
+                state=PetState.FAILED,
+                payload={"task_index": event.task_index, "data": event.data},
+            )
 
         manager.on_progress(event)
         self._update_subagent_status_detail()
@@ -844,22 +920,40 @@ class InteractiveChat:
             return result
 
         response = self._prompt_secret_request(required_for, request_needs)
-        values = response.get("values") if isinstance(response.get("values"), dict) else {}
+        values = (
+            response.get("values") if isinstance(response.get("values"), dict) else {}
+        )
         authorized = response.get("authorized", [])
         skipped = response.get("skipped", [])
         if isinstance(authorized, str):
             authorized = [authorized]
         if isinstance(skipped, str):
             skipped = [skipped]
-        result["values"].update({str(k).strip().upper(): str(v) for k, v in values.items() if str(k).strip()})
-        result["authorized"].extend(str(item).strip().upper() for item in authorized if str(item).strip())
-        result["skipped"].extend(str(item).strip().upper() for item in skipped if str(item).strip())
+        result["values"].update(
+            {
+                str(k).strip().upper(): str(v)
+                for k, v in values.items()
+                if str(k).strip()
+            }
+        )
+        result["authorized"].extend(
+            str(item).strip().upper() for item in authorized if str(item).strip()
+        )
+        result["skipped"].extend(
+            str(item).strip().upper() for item in skipped if str(item).strip()
+        )
         return result
 
     def _prompt_secret_request(self, required_for: str, needs: list[dict]) -> dict:
         """Render one TUI batch secret request and wait for the input loop to resolve it."""
         if getattr(self, "_app", None) is None:
-            return {"values": {}, "authorized": [], "skipped": [str(item.get("env_var") or "").strip().upper() for item in needs]}
+            return {
+                "values": {},
+                "authorized": [],
+                "skipped": [
+                    str(item.get("env_var") or "").strip().upper() for item in needs
+                ],
+            }
 
         state = self._runtime_state()
         event = threading.Event()
@@ -872,8 +966,12 @@ class InteractiveChat:
             "resume_detail": state.detail,
         }
         self._pending_secret_request = pending
-        state.set_status(RuntimeStatus.WAITING_FOR_USER, f"Waiting for {required_for} credentials")
-        self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+        state.set_status(
+            RuntimeStatus.WAITING_FOR_USER, f"Waiting for {required_for} credentials"
+        )
+        self._emit_runtime_event(
+            EventType.STATUS_CHANGED, status=state.status, message=state.detail
+        )
         self._render_secret_request(pending)
         self._pet_emit_for_runtime_status(
             PetEventType.WAITING_FOR_USER,
@@ -888,7 +986,9 @@ class InteractiveChat:
         except Exception:
             prompt_cancel_event = None
         if prompt_cancel_event is None:
-            current_turn_cancel_event = getattr(self.agent, "current_turn_cancel_event", None)
+            current_turn_cancel_event = getattr(
+                self.agent, "current_turn_cancel_event", None
+            )
             try:
                 prompt_cancel_event = (
                     current_turn_cancel_event()
@@ -919,8 +1019,12 @@ class InteractiveChat:
                 self._pending_secret_request = None
                 self._last_rendered_secret_request_signature = None
                 state.set_status(pending["resume_status"], pending["resume_detail"])
-                self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
-                self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
+                self._emit_runtime_event(
+                    EventType.STATUS_CHANGED, status=state.status, message=state.detail
+                )
+                self._pet_emit_for_runtime_status(
+                    PetEventType.STATUS_CHANGED, text=state.detail
+                )
                 if self._app:
                     self._app.invalidate()
             skipped = [
@@ -957,8 +1061,12 @@ class InteractiveChat:
         """Reflect agent tool execution in status state, events, and pet signals."""
         state = self._runtime_state()
         state.begin_tools(name)
-        self._emit_runtime_event(EventType.TOOL_STARTED, name=name, args=args, status=state.status)
-        self._pet_emit_for_runtime_status(PetEventType.TOOL_STARTED, text=name, payload={"tool": name})
+        self._emit_runtime_event(
+            EventType.TOOL_STARTED, name=name, args=args, status=state.status
+        )
+        self._pet_emit_for_runtime_status(
+            PetEventType.TOOL_STARTED, text=name, payload={"tool": name}
+        )
         if self._app:
             self._app.invalidate()
 
@@ -966,7 +1074,9 @@ class InteractiveChat:
         logger.info("[TUI] _on_tool_end")
         state = self._runtime_state()
         state.finish_tools()
-        self._emit_runtime_event(EventType.TOOL_FINISHED, status=state.status, message=state.detail)
+        self._emit_runtime_event(
+            EventType.TOOL_FINISHED, status=state.status, message=state.detail
+        )
         self._pet_emit_for_runtime_status(PetEventType.TOOL_FINISHED)
         if self._app:
             logger.info("[TUI] _on_tool_end calling invalidate")
@@ -983,7 +1093,12 @@ class InteractiveChat:
             state.set_status(RuntimeStatus.TOOLS, detail)
         else:
             state.detail = detail
-        self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=msg, detail=state.detail)
+        self._emit_runtime_event(
+            EventType.STATUS_CHANGED,
+            status=state.status,
+            message=msg,
+            detail=state.detail,
+        )
         self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=msg)
         if self._app:
             self._app.invalidate()
@@ -994,7 +1109,10 @@ class InteractiveChat:
     def _on_agent_event(self, event: dict):
         """Render non-final assistant rounds that would otherwise be hidden by tools."""
         event_type = event.get("type")
-        if event_type != EventType.ASSISTANT_MESSAGE and event_type != "assistant.message":
+        if (
+            event_type != EventType.ASSISTANT_MESSAGE
+            and event_type != "assistant.message"
+        ):
             return
 
         text = _strip_thinking(event.get("content") or "").strip()
@@ -1084,7 +1202,9 @@ class InteractiveChat:
         total_tokens = 0
         api_calls = 0
         if agent is not None:
-            total_tokens = getattr(agent, "session_input_tokens", 0) + getattr(agent, "session_output_tokens", 0)
+            total_tokens = getattr(agent, "session_input_tokens", 0) + getattr(
+                agent, "session_output_tokens", 0
+            )
             api_calls = getattr(agent, "session_api_calls", 0)
         state = self._runtime_state()
         if self._agent_running and state.turn_started_at:
@@ -1093,7 +1213,9 @@ class InteractiveChat:
         elif state.last_turn_duration > 0:
             duration_label = f"last {format_duration(state.last_turn_duration)}"
         else:
-            duration_label = format_duration((datetime.now() - self.session_start).total_seconds())
+            duration_label = format_duration(
+                (datetime.now() - self.session_start).total_seconds()
+            )
         self._emit_runtime_event(
             EventType.STATUS_SNAPSHOT,
             model=self.model,
@@ -1108,7 +1230,8 @@ class InteractiveChat:
             api_calls=api_calls,
             duration_label=duration_label,
             asr_status=self._compact_asr_status(
-                getattr(self, "_asr_status_text", "") or getattr(self, "_input_mode", "keyboard")
+                getattr(self, "_asr_status_text", "")
+                or getattr(self, "_input_mode", "keyboard")
             ),
         )
 
@@ -1121,8 +1244,12 @@ class InteractiveChat:
     def _render_project_checkpoints(self, checkpoints: list, workspace: str) -> None:
         self._get_safety_renderer().render_project_checkpoints(checkpoints, workspace)
 
-    def _render_project_restore_prompt(self, checkpoint_ref: str, file_path: str = "") -> None:
-        self._get_safety_renderer().render_project_restore_prompt(checkpoint_ref, file_path)
+    def _render_project_restore_prompt(
+        self, checkpoint_ref: str, file_path: str = ""
+    ) -> None:
+        self._get_safety_renderer().render_project_restore_prompt(
+            checkpoint_ref, file_path
+        )
 
     def _render_checkpoints_status(self, status: dict) -> None:
         self._get_safety_renderer().render_checkpoints_status(status)
@@ -1152,6 +1279,7 @@ class InteractiveChat:
                 app.invalidate()
                 loop = getattr(app, "loop", None)
                 if loop and loop.is_running():
+
                     async def _run_in_ui_thread():
                         await run_in_terminal(_print_after_erase, in_executor=False)
 
@@ -1243,10 +1371,12 @@ class InteractiveChat:
                     task["status"] = "running"
                     task["started_at"] = time.time()
                 elif event.event_type == "tool_call":
-                    task["tool_calls"].append((
-                        event.data.get("tool", "unknown"),
-                        event.data.get("args_bytes", 0),
-                    ))
+                    task["tool_calls"].append(
+                        (
+                            event.data.get("tool", "unknown"),
+                            event.data.get("args_bytes", 0),
+                        )
+                    )
                 elif event.event_type == "finalizing":
                     task["status"] = "finalizing"
                     task["finalizing_reason"] = event.data.get("reason", "")
@@ -1260,9 +1390,8 @@ class InteractiveChat:
                     task["status"] = "error"
                     task["error"] = event.data.get("error", "")
                 if all(
-                    t["status"] in (
-                        "completed", "timed_out", "interrupted", "failed", "error"
-                    )
+                    t["status"]
+                    in ("completed", "timed_out", "interrupted", "failed", "error")
                     for t in self.tasks
                 ):
                     self.completion_event.set()
@@ -1301,7 +1430,9 @@ class InteractiveChat:
             logger.exception("run_conversation failed: %s", exc)
             self._last_chat_result = {"error": str(exc), "completed": False}
             state.fail_turn(str(exc))
-            self._get_runtime_renderer().error(f"处理请求时出错: {exc}", leading_newline=True)
+            self._get_runtime_renderer().error(
+                f"处理请求时出错: {exc}", leading_newline=True
+            )
             return
 
         self._get_turn_result_coordinator().handle_result(result)
@@ -1313,8 +1444,12 @@ class InteractiveChat:
     def _get_turn_result_coordinator(self) -> RuntimeTurnResultCoordinator:
         def _emit_waiting_for_skill_confirmation() -> None:
             state = self._runtime_state()
-            state.set_status(RuntimeStatus.WAITING_FOR_USER, "Waiting for skill confirmation")
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+            state.set_status(
+                RuntimeStatus.WAITING_FOR_USER, "Waiting for skill confirmation"
+            )
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message=state.detail
+            )
             self._pet_emit_for_runtime_status(
                 PetEventType.WAITING_FOR_USER,
                 text="Skill import confirmation",
@@ -1349,7 +1484,9 @@ class InteractiveChat:
 
     def _handle_pending_delegate(self, result: dict) -> bool:
         current_cancel_event = getattr(self.agent, "current_turn_cancel_event", None)
-        cancel_event = current_cancel_event() if callable(current_cancel_event) else None
+        cancel_event = (
+            current_cancel_event() if callable(current_cancel_event) else None
+        )
 
         def _invalidate() -> None:
             if self._app:
@@ -1367,19 +1504,29 @@ class InteractiveChat:
                 RuntimeStatus.DELEGATING,
                 _format_subagent_status(num_tasks, 0, num_tasks),
             )
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message=state.detail
+            )
 
         def _set_aggregating_status() -> None:
             state = self._runtime_state()
             state.set_status(RuntimeStatus.AGGREGATING, "Collecting results")
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
-            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message=state.detail
+            )
+            self._pet_emit_for_runtime_status(
+                PetEventType.STATUS_CHANGED, text=state.detail
+            )
 
         def _set_synthesis_status() -> None:
             state = self._runtime_state()
             state.set_status(RuntimeStatus.AGGREGATING, "Summarizing results")
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
-            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message=state.detail
+            )
+            self._pet_emit_for_runtime_status(
+                PetEventType.STATUS_CHANGED, text=state.detail
+            )
 
         def _clear_stream_state() -> None:
             self._reset_stream_accumulator()
@@ -1410,9 +1557,11 @@ class InteractiveChat:
 
         coordinator = RuntimeDelegationCoordinator(
             RuntimeDelegationHooks(
-                emit_delegation_started=lambda payload: self._pet_emit_for_runtime_status(
-                    PetEventType.DELEGATION_STARTED,
-                    payload=payload,
+                emit_delegation_started=lambda payload: (
+                    self._pet_emit_for_runtime_status(
+                        PetEventType.DELEGATION_STARTED,
+                        payload=payload,
+                    )
                 ),
                 make_subtask_manager=self._make_subtask_manager,
                 set_subtask_manager=_set_subtask_manager,
@@ -1423,9 +1572,11 @@ class InteractiveChat:
                 set_synthesis_status=_set_synthesis_status,
                 clear_stream_state=_clear_stream_state,
                 clear_subagent_state=_clear_subagent_state,
-                emit_delegation_completed=lambda payload: self._pet_emit_for_runtime_status(
-                    PetEventType.DELEGATION_COMPLETED,
-                    payload=payload,
+                emit_delegation_completed=lambda payload: (
+                    self._pet_emit_for_runtime_status(
+                        PetEventType.DELEGATION_COMPLETED,
+                        payload=payload,
+                    )
                 ),
                 invalidate=_invalidate,
                 sleep=time.sleep,
@@ -1441,17 +1592,21 @@ class InteractiveChat:
                 ),
                 run_synthesis=_run_synthesis,
                 render_synthesis_response=_render_synthesis_response,
-                render_synthesis_error=lambda message: self._get_runtime_renderer().error(
-                    f"综合结果时出错: {message}",
-                    leading_newline=True,
+                render_synthesis_error=lambda message: (
+                    self._get_runtime_renderer().error(
+                        f"综合结果时出错: {message}",
+                        leading_newline=True,
+                    )
                 ),
                 render_synthesis_timeout=lambda: self._get_runtime_renderer().warning(
                     f"{self._sym('⚠')} 综合结果超时",
                     leading_newline=True,
                 ),
-                render_synthesis_incomplete=lambda: self._get_runtime_renderer().warning(
-                    f"{self._sym('⚠')} 综合结果未完成：模型没有返回最终内容",
-                    leading_newline=True,
+                render_synthesis_incomplete=lambda: (
+                    self._get_runtime_renderer().warning(
+                        f"{self._sym('⚠')} 综合结果未完成：模型没有返回最终内容",
+                        leading_newline=True,
+                    )
                 ),
                 log_info=lambda message, args: logger.info(message, *args),
                 log_warning=lambda message, args: logger.warning(message, *args),
@@ -1476,14 +1631,19 @@ class InteractiveChat:
 
     def _render_skill_import_confirmation(self, confirmation: dict):
         drafting_id = confirmation.get("drafting_id") or ""
-        if drafting_id and getattr(self, "_last_rendered_skill_confirmation_id", None) == drafting_id:
+        if (
+            drafting_id
+            and getattr(self, "_last_rendered_skill_confirmation_id", None)
+            == drafting_id
+        ):
             return
         if drafting_id:
             self._last_rendered_skill_confirmation_id = drafting_id
         self._emit_runtime_event(
             EventType.CONFIRMATION_REQUESTED,
             title="Skill 安装确认",
-            message=confirmation.get("message") or "M-Claw 准备安装一个 Skill，请确认是否允许。",
+            message=confirmation.get("message")
+            or "M-Claw 准备安装一个 Skill，请确认是否允许。",
             skill_name=confirmation.get("skill_name") or confirmation.get("name") or "",
             risk_level=confirmation.get("risk_level") or "存疑",
             drafting_id=confirmation.get("drafting_id") or "",
@@ -1495,7 +1655,13 @@ class InteractiveChat:
         needs = self._secret_needs_from_request(request)
         signature = (
             required_for,
-            tuple((str(item.get("env_var") or "").strip().upper(), str(item.get("state") or "").strip()) for item in needs),
+            tuple(
+                (
+                    str(item.get("env_var") or "").strip().upper(),
+                    str(item.get("state") or "").strip(),
+                )
+                for item in needs
+            ),
         )
         if getattr(self, "_last_rendered_secret_request_signature", None) == signature:
             return
@@ -1514,7 +1680,10 @@ class InteractiveChat:
         request = getattr(self, "_pending_secret_request", None)
         if not isinstance(request, dict):
             return False
-        return any(str(item.get("state") or "").strip() != "authorize" for item in self._secret_needs_from_request(request))
+        return any(
+            str(item.get("state") or "").strip() != "authorize"
+            for item in self._secret_needs_from_request(request)
+        )
 
     @staticmethod
     def _secret_needs_from_request(request: dict) -> list[dict]:
@@ -1532,8 +1701,12 @@ class InteractiveChat:
         self._last_rendered_secret_request_signature = None
         state = self._runtime_state()
         state.set_status(pending["resume_status"], pending["resume_detail"])
-        self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
-        self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
+        self._emit_runtime_event(
+            EventType.STATUS_CHANGED, status=state.status, message=state.detail
+        )
+        self._pet_emit_for_runtime_status(
+            PetEventType.STATUS_CHANGED, text=state.detail
+        )
         pending["response"] = response
         event = pending.get("event")
         if hasattr(event, "set"):
@@ -1547,23 +1720,42 @@ class InteractiveChat:
             return False
         needs = self._secret_needs_from_request(pending)
         if not needs:
-            self._resolve_secret_request({"values": {}, "authorized": [], "skipped": []})
+            self._resolve_secret_request(
+                {"values": {}, "authorized": [], "skipped": []}
+            )
             return True
 
-        env_vars = [str(item.get("env_var") or "").strip().upper() for item in needs if str(item.get("env_var") or "").strip()]
+        env_vars = [
+            str(item.get("env_var") or "").strip().upper()
+            for item in needs
+            if str(item.get("env_var") or "").strip()
+        ]
         authorize_envs = [
             str(item.get("env_var") or "").strip().upper()
             for item in needs
-            if str(item.get("env_var") or "").strip() and str(item.get("state") or "").strip() == "authorize"
+            if str(item.get("env_var") or "").strip()
+            and str(item.get("state") or "").strip() == "authorize"
         ]
         missing_envs = [
             str(item.get("env_var") or "").strip().upper()
             for item in needs
-            if str(item.get("env_var") or "").strip() and str(item.get("state") or "").strip() != "authorize"
+            if str(item.get("env_var") or "").strip()
+            and str(item.get("state") or "").strip() != "authorize"
         ]
         text = str(user_input or "").strip()
         lowered = text.lower()
-        approve_values = {"", "y", "yes", "allow", "approve", "confirm", "授权", "允许", "确认", "是"}
+        approve_values = {
+            "",
+            "y",
+            "yes",
+            "allow",
+            "approve",
+            "confirm",
+            "授权",
+            "允许",
+            "确认",
+            "是",
+        }
         reject_values = {
             "__mclaw_confirm_esc__",
             "/skip",
@@ -1580,10 +1772,14 @@ class InteractiveChat:
 
         if not missing_envs:
             if lowered in approve_values:
-                self._resolve_secret_request({"values": {}, "authorized": env_vars, "skipped": []})
+                self._resolve_secret_request(
+                    {"values": {}, "authorized": env_vars, "skipped": []}
+                )
                 return True
             if lowered in reject_values:
-                self._resolve_secret_request({"values": {}, "authorized": [], "skipped": env_vars})
+                self._resolve_secret_request(
+                    {"values": {}, "authorized": [], "skipped": env_vars}
+                )
                 return True
             self._get_commands_renderer().line(
                 f"  {Colors.YELLOW}请输入 Y/Enter 授权，或 N/Esc 跳过。{Colors.RESET}"
@@ -1591,13 +1787,19 @@ class InteractiveChat:
             return True
 
         if lowered in reject_values or not text:
-            self._resolve_secret_request({"values": {}, "authorized": [], "skipped": env_vars})
+            self._resolve_secret_request(
+                {"values": {}, "authorized": [], "skipped": env_vars}
+            )
             return True
         values, error = self._parse_secret_batch_values(text, missing_envs)
         if error:
-            self._get_commands_renderer().line(f"  {Colors.YELLOW}{error}{Colors.RESET}")
+            self._get_commands_renderer().line(
+                f"  {Colors.YELLOW}{error}{Colors.RESET}"
+            )
             return True
-        self._resolve_secret_request({"values": values, "authorized": authorize_envs, "skipped": []})
+        self._resolve_secret_request(
+            {"values": values, "authorized": authorize_envs, "skipped": []}
+        )
         return True
 
     def _handle_interrupt_key(self, event) -> None:
@@ -1626,10 +1828,16 @@ class InteractiveChat:
             event.app.exit()
 
     @staticmethod
-    def _parse_secret_batch_values(text: str, env_vars: list[str]) -> tuple[dict[str, str], str]:
+    def _parse_secret_batch_values(
+        text: str, env_vars: list[str]
+    ) -> tuple[dict[str, str], str]:
         import json as _json
 
-        env_vars = [str(item or "").strip().upper() for item in env_vars if str(item or "").strip()]
+        env_vars = [
+            str(item or "").strip().upper()
+            for item in env_vars
+            if str(item or "").strip()
+        ]
         if not env_vars:
             return {}, ""
         raw = str(text or "").strip()
@@ -1641,12 +1849,15 @@ class InteractiveChat:
             key, separator, value = raw.partition("=")
             if not separator or key.strip().upper() != env_vars[0]:
                 return {env_vars[0]: raw}, ""
-            values[env_vars[0]] = value.strip().strip('"\'')
+            values[env_vars[0]] = value.strip().strip("\"'")
         elif raw.startswith("{"):
             try:
                 parsed = _json.loads(raw)
             except Exception:
-                return {}, "批量密钥格式错误：请输入 JSON 对象，或使用 KEY=value; KEY2=value。"
+                return (
+                    {},
+                    "批量密钥格式错误：请输入 JSON 对象，或使用 KEY=value; KEY2=value。",
+                )
             if not isinstance(parsed, dict):
                 return {}, "批量密钥格式错误：JSON 顶层必须是对象。"
             for key, value in parsed.items():
@@ -1661,16 +1872,22 @@ class InteractiveChat:
             if all("=" in part for part in parts):
                 for part in parts:
                     key, _, value = part.partition("=")
-                    values[key.strip().upper()] = value.strip().strip('"\'')
+                    values[key.strip().upper()] = value.strip().strip("\"'")
             else:
-                return {}, "批量密钥格式错误：多个 key 请使用 KEY=value; KEY2=value 或 JSON 对象。"
+                return (
+                    {},
+                    "批量密钥格式错误：多个 key 请使用 KEY=value; KEY2=value 或 JSON 对象。",
+                )
 
         unknown = sorted(set(values) - set(env_vars))
         if unknown:
             return {}, f"批量密钥包含未请求的变量：{', '.join(unknown)}。"
         missing = [env_var for env_var in env_vars if not values.get(env_var)]
         if missing:
-            return {}, f"还缺少：{', '.join(missing)}。请一次性补齐，或使用 /skip 跳过。"
+            return (
+                {},
+                f"还缺少：{', '.join(missing)}。请一次性补齐，或使用 /skip 跳过。",
+            )
         return {env_var: values[env_var] for env_var in env_vars}, ""
 
     def _get_confirm_renderer(self) -> ConfirmRenderer:
@@ -1733,6 +1950,7 @@ class InteractiveChat:
 
     def _handle_skill_import_confirmation_input(self, user_input: str) -> bool:
         """Handle Y/N input while a skill import confirmation is pending."""
+
         def _run_skill_import_action(action: str, drafting_id: str) -> str:
             from mclaw.tools.skill_tools.manage_tool import skill_manage
 
@@ -1745,14 +1963,20 @@ class InteractiveChat:
                 RuntimeStatus.TOOLS,
                 "Confirming Skill install" if approve else "Cancelling Skill import",
             )
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message=state.detail)
-            self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED, text=state.detail)
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message=state.detail
+            )
+            self._pet_emit_for_runtime_status(
+                PetEventType.STATUS_CHANGED, text=state.detail
+            )
 
         def _clear_busy() -> None:
             self._agent_running = False
             state = self._runtime_state()
             state.set_status(RuntimeStatus.DONE)
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="done")
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message="done"
+            )
             self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED)
 
         def _invalidate_skill_registry() -> None:
@@ -1767,28 +1991,36 @@ class InteractiveChat:
 
         return RuntimeSkillImportConfirmationCoordinator(
             RuntimeSkillImportConfirmationHooks(
-                get_pending_confirmation=lambda: self._pending_skill_import_confirmation,
-                clear_pending_confirmation=lambda: setattr(self, "_pending_skill_import_confirmation", None),
+                get_pending_confirmation=lambda: (
+                    self._pending_skill_import_confirmation
+                ),
+                clear_pending_confirmation=lambda: setattr(
+                    self, "_pending_skill_import_confirmation", None
+                ),
                 run_skill_import_action=_run_skill_import_action,
                 invalidate_skill_registry=_invalidate_skill_registry,
                 render_invalid_input=lambda: self._get_commands_renderer().line(
                     f"  {Colors.YELLOW}请输入 Y 允许安装，或 N/Esc 停止安装。{_RST}"
                 ),
-                render_installed=lambda name, path: self._get_commands_renderer().render_notice(
-                    "M-Claw Skill",
-                    f"Skill 已安装：{name}",
-                    detail=path or None,
-                    kind="success",
+                render_installed=lambda name, path: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw Skill",
+                        f"Skill 已安装：{name}",
+                        detail=path or None,
+                        kind="success",
+                    )
                 ),
                 render_cancelled=lambda: self._get_commands_renderer().render_notice(
                     "M-Claw Skill",
                     "已停止安装并清理暂存 Skill。",
                     kind="warning",
                 ),
-                render_failed=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw Skill",
-                    f"Skill 导入确认处理失败：{message}",
-                    kind="danger",
+                render_failed=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw Skill",
+                        f"Skill 导入确认处理失败：{message}",
+                        kind="danger",
+                    )
                 ),
                 set_busy=_set_busy,
                 clear_busy=_clear_busy,
@@ -1807,7 +2039,9 @@ class InteractiveChat:
                 "help": lambda parsed: self._show_help(),
                 "clear": lambda parsed: self._new_session(clear_screen=True),
                 "model": lambda parsed: self._handle_model_switch(parsed.args.strip()),
-                "model-update": lambda parsed: self._handle_model_update(parsed.args.strip()),
+                "model-update": lambda parsed: self._handle_model_update(
+                    parsed.args.strip()
+                ),
                 "search-backend": self._handle_search_backend_command,
                 "extract-backend": self._handle_extract_backend_command,
                 "asr-mode": lambda parsed: self._handle_asr_mode(parsed.args.strip()),
@@ -1818,8 +2052,12 @@ class InteractiveChat:
                 "doctor": self._handle_doctor_command,
                 "history": lambda parsed: self._show_history(),
                 "resume": self._handle_resume_command,
-                "rollback": lambda parsed: self._handle_rollback_command(parsed.args.strip()),
-                "checkpoints": lambda parsed: self._handle_checkpoints_command(parsed.args.strip()),
+                "rollback": lambda parsed: self._handle_rollback_command(
+                    parsed.args.strip()
+                ),
+                "checkpoints": lambda parsed: self._handle_checkpoints_command(
+                    parsed.args.strip()
+                ),
                 "title": self._handle_title_command,
                 "provider": lambda parsed: self._show_providers(parsed.args.strip()),
                 "save": self._handle_save_command,
@@ -1828,11 +2066,13 @@ class InteractiveChat:
                 "skill": self._handle_skill_command,
             }
             if getattr(self, "dsoftbus_runtime", None) is not None:
-                handlers.update({
-                    "devices": self._handle_device_management_command,
-                    "pair": self._handle_device_management_command,
-                    "unpair": self._handle_device_management_command,
-                })
+                handlers.update(
+                    {
+                        "devices": self._handle_device_management_command,
+                        "pair": self._handle_device_management_command,
+                        "unpair": self._handle_device_management_command,
+                    }
+                )
             router = CommandRouter(
                 handlers,
                 unknown_handler=self._handle_unknown_command,
@@ -1846,11 +2086,19 @@ class InteractiveChat:
 
     def _handle_unknown_command(self, parsed: ParsedSlashCommand) -> bool:
         command = f"/{parsed.name}" + (f" {parsed.args}" if parsed.args else "")
-        self._get_commands_renderer().render_notice("M-Claw 命令", f"未知命令: {command}", detail="输入 /help 查看可用命令", kind="danger")
+        self._get_commands_renderer().render_notice(
+            "M-Claw 命令",
+            f"未知命令: {command}",
+            detail="输入 /help 查看可用命令",
+            kind="danger",
+        )
         return True
 
     def _handle_search_backend_command(self, parsed: ParsedSlashCommand) -> bool:
-        from mclaw.cli.runtime.search_commands import RuntimeSearchCommandCoordinator, RuntimeSearchCommandHooks
+        from mclaw.cli.runtime.search_commands import (
+            RuntimeSearchCommandCoordinator,
+            RuntimeSearchCommandHooks,
+        )
         from mclaw.cli.search_backend_switch import (
             format_search_backend_status,
             get_search_backend_status,
@@ -1875,17 +2123,23 @@ class InteractiveChat:
                     "API 密钥尚未配置。请输入密钥（或输入 /cancel 取消）：",
                     kind="warning",
                 ),
-                render_success=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw 搜索后端",
-                    message,
-                    kind="success",
+                render_success=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw 搜索后端",
+                        message,
+                        kind="success",
+                    )
                 ),
-                render_error=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw 搜索后端",
-                    message,
-                    kind="danger",
+                render_error=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw 搜索后端",
+                        message,
+                        kind="danger",
+                    )
                 ),
-                remember_pending_key_setup=lambda setup: setattr(self, "_pending_key_setup", setup),
+                remember_pending_key_setup=lambda setup: setattr(
+                    self, "_pending_key_setup", setup
+                ),
                 sync_search_backend=self._sync_search_backend_config,
                 print_fn=_cprint,
             )
@@ -1955,6 +2209,8 @@ class InteractiveChat:
 
         renderer = self._get_commands_renderer()
         action = parsed.canonical_name
+        invocation_id = uuid.uuid4().hex[:12]
+        started_at = time.monotonic()
         if parsed.args.strip():
             renderer.render_notice(
                 "M-Claw · 可信设备",
@@ -1965,12 +2221,22 @@ class InteractiveChat:
             return True
         coordinator = self._get_device_management_coordinator()
         if coordinator is None:
+            logger.warning(
+                "[DSOFTBUS_DEVICE] unavailable id=%s action=%s reason=runtime-disabled",
+                invocation_id,
+                action,
+            )
             renderer.render_notice(
                 "M-Claw · 可信设备",
                 "当前会话未启用 Kaihong DSoftBus Runtime。",
                 kind="warning",
             )
             return True
+        logger.info(
+            "[DSOFTBUS_DEVICE] start id=%s action=%s",
+            invocation_id,
+            action,
+        )
         try:
             result = coordinator.execute(action)
         except DeviceManagementError as error:
@@ -1979,12 +2245,15 @@ class InteractiveChat:
                 "DEVICE_DISCOVERY_FAILED": "系统设备发现失败。",
                 "DEVICE_DISCOVERY_BUSY": "已有设备发现操作正在进行。",
                 "DEVICE_RUNTIME_INACTIVE": "当前 Kaihong DSoftBus Runtime 未处于可用状态。",
+                "DEVICE_RUNTIME_PROTOCOL_ERROR": "DSoftBus Runtime 返回了无效的设备管理响应。",
                 "DEVICE_MANAGER_UNAVAILABLE": "当前系统没有可用的设备管理入口。",
                 "DEVICE_MANAGER_PERMISSION_DENIED": "M-Claw 没有设备管理所需的系统权限。",
+                "DEVICE_MANAGER_TIMEOUT": "系统设备管理服务响应超时。",
                 "DEVICE_NOT_FOUND": "当前没有符合本次操作条件的设备。",
                 "DEVICE_NOT_MANAGED": "该信任关系不是由 M-Claw 创建，未执行解除配对。",
                 "DEVICE_BIND_FAILED": "系统没有完成设备配对。",
                 "DEVICE_BIND_TIMEOUT": "系统配对确认尚未完成，结果暂时未知。",
+                "DEVICE_BIND_UNCONFIRMED": "系统回调已返回，但没有建立对应的信任关系。",
                 "DEVICE_STATE_INVALID": "Runtime 返回了无效的设备状态。",
                 "DEVICE_TARGET_AMBIGUOUS": "系统返回了重复的设备标识，操作已停止。",
                 "DEVICE_UNBIND_FAILED": "系统拒绝了解除配对操作。",
@@ -1992,18 +2261,124 @@ class InteractiveChat:
                 "WORKER_DIED": "DSoftBus Worker 已退出，未继续设备操作。",
                 "WORKER_NOT_READY": "DSoftBus Worker 尚未就绪。",
             }
+            runtime_state = "UNKNOWN"
+            worker_alive: bool | str = "UNKNOWN"
+            worker_failure = "none"
+            worker_diagnostic = "none"
+            worker_exit: int | str = "none"
+            runtime = getattr(self, "dsoftbus_runtime", None)
+            if runtime is not None:
+                try:
+                    health = runtime.health()
+                    if isinstance(health, dict):
+                        runtime_state = str(health.get("state") or "UNKNOWN")
+                except Exception:
+                    pass
+                try:
+                    diagnostic = runtime.diagnostic_snapshot()
+                    resource = (
+                        diagnostic.get("resource", {})
+                        if isinstance(diagnostic, dict)
+                        else {}
+                    )
+                    if (
+                        isinstance(resource, dict)
+                        and type(resource.get("workerAlive")) is bool
+                    ):
+                        worker_alive = resource["workerAlive"]
+                    if isinstance(resource, dict):
+                        worker_failure = str(
+                            resource.get("lastFailureCode") or "none"
+                        )
+                        worker_diagnostic = str(
+                            resource.get("lastWorkerDiagnosticCode") or "none"
+                        )
+                        exit_value = resource.get("lastExitCode")
+                        if type(exit_value) is int:
+                            worker_exit = exit_value
+                except Exception:
+                    pass
+            elapsed_ms = round((time.monotonic() - started_at) * 1000)
+            logger.warning(
+                "[DSOFTBUS_DEVICE] failed id=%s action=%s phase=%s "
+                "code=%s sourceCode=%s nativeCode=%s elapsedMs=%s "
+                "runtimeState=%s workerAlive=%s workerFailure=%s "
+                "workerDiagnostic=%s workerExit=%s",
+                invocation_id,
+                action,
+                error.phase or "unknown",
+                error.code,
+                error.source_code,
+                error.native_code if error.native_code is not None else "none",
+                elapsed_ms,
+                runtime_state,
+                worker_alive,
+                worker_failure,
+                worker_diagnostic,
+                worker_exit,
+            )
+            details = [f"错误码：{error.code}"]
+            if error.source_code != error.code:
+                details.append(f"底层码：{error.source_code}")
+            if error.native_code is not None:
+                details.append(f"系统码：{error.native_code}")
             renderer.render_notice(
                 "M-Claw · 可信设备",
                 messages.get(error.code, "设备管理操作失败。"),
-                detail=f"错误码：{error.code}",
+                detail="；".join(details),
                 kind="danger",
             )
             return True
+        elapsed_ms = round((time.monotonic() - started_at) * 1000)
+        discovery_warning = result.discovery_warning
+        if discovery_warning is not None:
+            logger.warning(
+                "[DSOFTBUS_DEVICE] partial id=%s action=%s elapsedMs=%s "
+                "runtimeDevices=%s trustedDevices=%s pairableDevices=%s "
+                "phase=%s code=%s sourceCode=%s nativeCode=%s "
+                "outcomeUnknown=%s",
+                invocation_id,
+                action,
+                elapsed_ms,
+                len(result.devices),
+                len(result.trusted_devices),
+                len(result.pairable_devices),
+                discovery_warning.phase or "device_discovery",
+                discovery_warning.code,
+                discovery_warning.source_code,
+                (
+                    discovery_warning.native_code
+                    if discovery_warning.native_code is not None
+                    else "none"
+                ),
+                discovery_warning.outcome_unknown,
+            )
+        else:
+            logger.info(
+                "[DSOFTBUS_DEVICE] success id=%s action=%s elapsedMs=%s "
+                "runtimeDevices=%s trustedDevices=%s pairableDevices=%s",
+                invocation_id,
+                action,
+                elapsed_ms,
+                len(result.devices),
+                len(result.trusted_devices),
+                len(result.pairable_devices),
+            )
         if action == "devices":
             renderer.render_dsoftbus_devices(
                 [device.public_dict() for device in result.devices],
                 [device.public_dict() for device in result.trusted_devices],
                 [device.public_dict() for device in result.pairable_devices],
+                (
+                    discovery_warning.public_dict()
+                    if discovery_warning is not None
+                    else None
+                ),
+                local_device=(
+                    result.local_device.public_dict()
+                    if result.local_device is not None
+                    else None
+                ),
             )
             return True
         if action == "pair":
@@ -2123,7 +2498,9 @@ class InteractiveChat:
         from mclaw.scheduler.store import SchedulerStore
         from mclaw.tools.toolsets import get_optional_toolset_names
 
-        scheduler_cfg = self.config.get("scheduler", {}) if isinstance(self.config, dict) else {}
+        scheduler_cfg = (
+            self.config.get("scheduler", {}) if isinstance(self.config, dict) else {}
+        )
         store = SchedulerStore(self._session_db)
         dingtalk_client = self._build_scheduler_dingtalk_client()
         weixin_client, weixin_token_store = self._build_scheduler_weixin_client()
@@ -2138,7 +2515,10 @@ class InteractiveChat:
             config=self.config,
             session_db=self._session_db,
             store=store,
-            output_dir=str(scheduler_cfg.get("output_dir") or (get_mclaw_home() / "scheduler" / "output")),
+            output_dir=str(
+                scheduler_cfg.get("output_dir")
+                or (get_mclaw_home() / "scheduler" / "output")
+            ),
             print_fn=_cprint,
         )
         engine = SchedulerEngine(
@@ -2156,12 +2536,14 @@ class InteractiveChat:
             delivery=delivery,
             config=self.config,
             workspace=self.workspace_path,
-            render_notice=lambda title, message, detail=None, kind="info": self._get_commands_renderer().render_text_panel(
-                title,
-                message,
-                detail=detail,
-                kind=kind,
-                namespace="scheduler",
+            render_notice=lambda title, message, detail=None, kind="info": (
+                self._get_commands_renderer().render_text_panel(
+                    title,
+                    message,
+                    detail=detail,
+                    kind=kind,
+                    namespace="scheduler",
+                )
             ),
             available_toolsets=get_optional_toolset_names,
         )
@@ -2216,7 +2598,9 @@ class InteractiveChat:
             token_store = ContextTokenStore()
             if cfg.account_id:
                 token_store.restore(cfg.account_id)
-            return ILinkClient(base_url=cfg.base_url, token=cfg.token, timeout_ms=cfg.api_timeout_ms), token_store
+            return ILinkClient(
+                base_url=cfg.base_url, token=cfg.token, timeout_ms=cfg.api_timeout_ms
+            ), token_store
         except Exception:
             return None, None
 
@@ -2227,7 +2611,9 @@ class InteractiveChat:
         history: list[dict],
     ) -> None:
         """Atomically replace the active session after target setup succeeds."""
-        replacement_block_reason = getattr(self.agent, "_replacement_block_reason", None)
+        replacement_block_reason = getattr(
+            self.agent, "_replacement_block_reason", None
+        )
         if callable(replacement_block_reason):
             reason = replacement_block_reason()
             if reason:
@@ -2287,10 +2673,15 @@ class InteractiveChat:
             current_lock.release()
         if current_agent is not None and current_agent is not target_agent:
             if not self._close_agent_instance(current_agent, time.monotonic() + 5.0):
-                logger.warning("Replaced interactive Agent did not close before deadline")
+                logger.warning(
+                    "Replaced interactive Agent did not close before deadline"
+                )
 
     def _get_session_command_coordinator(self):
-        from mclaw.cli.runtime.session_commands import RuntimeSessionCommandCoordinator, RuntimeSessionCommandHooks
+        from mclaw.cli.runtime.session_commands import (
+            RuntimeSessionCommandCoordinator,
+            RuntimeSessionCommandHooks,
+        )
 
         def _render_notice(title: str, message: str, detail: str, kind: str) -> None:
             kwargs = {"kind": kind}
@@ -2303,7 +2694,9 @@ class InteractiveChat:
             save_path = get_mclaw_home() / "exports"
             save_path.mkdir(parents=True, exist_ok=True)
             out_file = save_path / f"{session_id}.json"
-            out_file.write_text(json.dumps(export, indent=2, default=str), encoding="utf-8")
+            out_file.write_text(
+                json.dumps(export, indent=2, default=str), encoding="utf-8"
+            )
             return str(out_file)
 
         def _restore_runtime(snapshot: dict, row_model: str) -> ProviderRuntimeContext:
@@ -2315,12 +2708,15 @@ class InteractiveChat:
                 row_model=row_model,
                 fallback_context=self.provider_runtime,
             )
+
         return RuntimeSessionCommandCoordinator(
             RuntimeSessionCommandHooks(
                 current_session_id=lambda: self.session_id,
-                resolve_session_id=lambda session_ref: self._session_db.resolve_session_id(
-                    session_ref,
-                    workspace=self.workspace_path,
+                resolve_session_id=lambda session_ref: (
+                    self._session_db.resolve_session_id(
+                        session_ref,
+                        workspace=self.workspace_path,
+                    )
                 ),
                 get_messages_as_conversation=self._session_db.get_messages_as_conversation,
                 get_model_config=self._session_db.get_model_config,
@@ -2431,10 +2827,12 @@ class InteractiveChat:
                 enqueue_user_intent=self._pending_input.put,
                 set_skip_next_prompt=lambda: setattr(self, "_skip_next_prompt", True),
                 build_base_system_prompt=lambda: self.agent._build_system_prompt(),
-                render_read_error=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw Skill",
-                    message,
-                    kind="danger",
+                render_read_error=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw Skill",
+                        message,
+                        kind="danger",
+                    )
                 ),
                 render_processing=lambda name: self._get_commands_renderer().line(
                     f"  {_DIM}{self._sym('↳')} 使用 skill '{name}' 处理请求...{_RST}"
@@ -2453,7 +2851,10 @@ class InteractiveChat:
 
     def _handle_model_switch(self, raw_args: str):
         from mclaw.cli.model_switch import parse_model_flags, switch_model
-        from mclaw.cli.runtime.model_commands import RuntimeModelCommandCoordinator, RuntimeModelCommandHooks
+        from mclaw.cli.runtime.model_commands import (
+            RuntimeModelCommandCoordinator,
+            RuntimeModelCommandHooks,
+        )
 
         RuntimeModelCommandCoordinator(
             RuntimeModelCommandHooks(
@@ -2461,20 +2862,28 @@ class InteractiveChat:
                 config=lambda: self.config,
                 switch_model=switch_model,
                 parse_model_flags=parse_model_flags,
-                render_model_status=lambda model, provider: self._get_commands_renderer().render_model_status(
-                    model=model,
-                    provider=provider,
+                render_model_status=lambda model, provider: (
+                    self._get_commands_renderer().render_model_status(
+                        model=model,
+                        provider=provider,
+                    )
                 ),
-                render_model_key_prompt=lambda provider_display_name, key_url: self._get_commands_renderer().render_model_key_prompt(
-                    provider_display_name=provider_display_name,
-                    key_url=key_url,
+                render_model_key_prompt=lambda provider_display_name, key_url: (
+                    self._get_commands_renderer().render_model_key_prompt(
+                        provider_display_name=provider_display_name,
+                        key_url=key_url,
+                    )
                 ),
-                render_model_error=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw 模型",
-                    message,
-                    kind="danger",
+                render_model_error=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw 模型",
+                        message,
+                        kind="danger",
+                    )
                 ),
-                remember_pending_key_setup=lambda setup: setattr(self, "_pending_key_setup", setup),
+                remember_pending_key_setup=lambda setup: setattr(
+                    self, "_pending_key_setup", setup
+                ),
                 apply_model_switch=self._apply_model_switch,
             )
         ).handle_model_switch(raw_args)
@@ -2522,25 +2931,41 @@ class InteractiveChat:
                     kind="danger",
                 )
                 return
-            self._get_commands_renderer().render_notice("M-Claw 模型", f"{result.info_message}（已保存至配置）", kind="success")
+            self._get_commands_renderer().render_notice(
+                "M-Claw 模型", f"{result.info_message}（已保存至配置）", kind="success"
+            )
         else:
-            self._get_commands_renderer().render_notice("M-Claw 模型", result.info_message, kind="success")
+            self._get_commands_renderer().render_notice(
+                "M-Claw 模型", result.info_message, kind="success"
+            )
 
     def _complete_key_setup(self, api_key: str):
         """Save the collected API key and retry the pending operation."""
         from mclaw.cli.config import save_env_value
-        from mclaw.cli.runtime.key_setup import RuntimeKeySetupCoordinator, RuntimeKeySetupHooks
+        from mclaw.cli.runtime.key_setup import (
+            RuntimeKeySetupCoordinator,
+            RuntimeKeySetupHooks,
+        )
 
         setup = self._pending_key_setup
         self._pending_key_setup = None
         backend_switch = str((setup or {}).get("_backend_switch") or "")
-        backend_title = "M-Claw 网页提取后端" if backend_switch == "extract" else "M-Claw 搜索后端"
+        backend_title = (
+            "M-Claw 网页提取后端" if backend_switch == "extract" else "M-Claw 搜索后端"
+        )
 
         def _retry_search_backend():
-            from mclaw.cli.search_backend_switch import switch_extract_backend, switch_search_backend
+            from mclaw.cli.search_backend_switch import (
+                switch_extract_backend,
+                switch_search_backend,
+            )
 
             backend = str((setup or {}).get("backend") or "tavily")
-            switch_fn = switch_extract_backend if backend_switch == "extract" else switch_search_backend
+            switch_fn = (
+                switch_extract_backend
+                if backend_switch == "extract"
+                else switch_search_backend
+            )
             return switch_fn(raw_input=backend, print_fn=_cprint)
 
         def _retry_model_switch(pending_setup: dict):
@@ -2562,32 +2987,40 @@ class InteractiveChat:
                     "未提供密钥，切换已取消。",
                     kind="danger",
                 ),
-                render_key_saved=lambda env_var, masked: self._get_commands_renderer().render_notice(
-                    "M-Claw 密钥配置",
-                    f"密钥已保存至 {display_mclaw_path('.env')} ({env_var}={masked})",
-                    kind="success",
+                render_key_saved=lambda env_var, masked: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw 密钥配置",
+                        f"密钥已保存至 {display_mclaw_path('.env')} ({env_var}={masked})",
+                        kind="success",
+                    )
                 ),
                 retry_search_backend=_retry_search_backend,
-                render_search_error=lambda message: self._get_commands_renderer().render_notice(
-                    backend_title,
-                    message,
-                    kind="danger",
+                render_search_error=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        backend_title,
+                        message,
+                        kind="danger",
+                    )
                 ),
                 sync_search_backend=(
                     self._sync_extract_backend_config
                     if backend_switch == "extract"
                     else self._sync_search_backend_config
                 ),
-                render_search_success=lambda message: self._get_commands_renderer().render_notice(
-                    backend_title,
-                    message,
-                    kind="success",
+                render_search_success=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        backend_title,
+                        message,
+                        kind="success",
+                    )
                 ),
                 retry_model_switch=_retry_model_switch,
-                render_model_error=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw 模型",
-                    message,
-                    kind="danger",
+                render_model_error=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw 模型",
+                        message,
+                        kind="danger",
+                    )
                 ),
                 apply_model_switch=self._apply_model_switch,
             )
@@ -2604,7 +3037,10 @@ class InteractiveChat:
             get_provider_profiles,
             search_models_dev_provider_ids,
         )
-        from mclaw.cli.runtime.model_library_commands import RuntimeModelLibraryCommandCoordinator, RuntimeModelLibraryHooks
+        from mclaw.cli.runtime.model_library_commands import (
+            RuntimeModelLibraryCommandCoordinator,
+            RuntimeModelLibraryHooks,
+        )
 
         def _render_notice(title: str, message: str, detail: str, kind: str) -> None:
             kwargs = {"kind": kind}
@@ -2614,7 +3050,11 @@ class InteractiveChat:
 
         return RuntimeModelLibraryCommandCoordinator(
             RuntimeModelLibraryHooks(
-                user_providers=lambda: self.config.get("providers", {}) if isinstance(self.config, dict) else {},
+                user_providers=lambda: (
+                    self.config.get("providers", {})
+                    if isinstance(self.config, dict)
+                    else {}
+                ),
                 current_model=lambda: self.model,
                 current_provider=lambda: self.provider,
                 current_base_url=lambda: self.base_url,
@@ -2629,7 +3069,9 @@ class InteractiveChat:
                 get_provider_profiles=get_provider_profiles,
                 list_provider_models=models_dev.list_provider_models,
                 list_models_dev_provider_ids=models_dev.list_models_dev_provider_ids,
-                search_models_dev_provider_ids=lambda query, provider_ids: search_models_dev_provider_ids(query, provider_ids, limit=20),
+                search_models_dev_provider_ids=lambda query, provider_ids: (
+                    search_models_dev_provider_ids(query, provider_ids, limit=20)
+                ),
                 render_notice=_render_notice,
                 render_providers=self._get_commands_renderer().render_providers,
             )
@@ -2689,17 +3131,36 @@ class InteractiveChat:
     def _resolve_push_to_talk_key(self) -> str:
         """Return the configured prompt_toolkit key name for push-to-talk."""
         try:
-            auxiliary = self.config.get("auxiliary", {}) if isinstance(self.config, dict) else {}
+            auxiliary = (
+                self.config.get("auxiliary", {})
+                if isinstance(self.config, dict)
+                else {}
+            )
             asr = auxiliary.get("asr", {}) if isinstance(auxiliary, dict) else {}
             key = str(asr.get("push_to_talk_key") or "f8").strip().lower()
         except Exception:
             key = "f8"
         allowed = {
-            "f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10", "f11", "f12",
-            "c-space", "c-f8", "c-p",
+            "f1",
+            "f2",
+            "f3",
+            "f4",
+            "f5",
+            "f6",
+            "f7",
+            "f8",
+            "f9",
+            "f10",
+            "f11",
+            "f12",
+            "c-space",
+            "c-f8",
+            "c-p",
         }
         if key not in allowed:
-            logger.warning("Unsupported ASR push_to_talk_key=%s; falling back to f8", key)
+            logger.warning(
+                "Unsupported ASR push_to_talk_key=%s; falling back to f8", key
+            )
             return "f8"
         return key
 
@@ -2760,13 +3221,18 @@ class InteractiveChat:
                 with self._asr_ptt_lock:
                     self._asr_ptt_inflight = False
 
-        threading.Thread(target=_run_push_to_talk, name="mclaw-asr-ptt", daemon=True).start()
+        threading.Thread(
+            target=_run_push_to_talk, name="mclaw-asr-ptt", daemon=True
+        ).start()
 
     def _show_asr_status(self):
         self._get_asr_command_coordinator().show_status()
 
     def _get_asr_command_coordinator(self):
-        from mclaw.cli.runtime.asr_commands import RuntimeAsrCommandCoordinator, RuntimeAsrCommandHooks
+        from mclaw.cli.runtime.asr_commands import (
+            RuntimeAsrCommandCoordinator,
+            RuntimeAsrCommandHooks,
+        )
         from mclaw.voice.config import mask_asr_status, resolve_asr_config
 
         def _stop_asr_service() -> None:
@@ -2784,26 +3250,38 @@ class InteractiveChat:
                 set_input_mode=lambda mode: setattr(self, "_input_mode", mode),
                 set_asr_status_text=self._set_asr_status,
                 push_to_talk_label=self._push_to_talk_label,
-                resolve_status_config=lambda: mask_asr_status(resolve_asr_config(config=self.config)),
-                get_service_status=lambda: self._asr_service.status() if self._asr_service is not None else {},
-                render_notice=lambda message, kind: self._get_commands_renderer().render_notice(
-                    "M-Claw ASR",
-                    message,
-                    kind=kind,
+                resolve_status_config=lambda: mask_asr_status(
+                    resolve_asr_config(config=self.config)
                 ),
-                render_success=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw ASR",
-                    message,
-                    kind="success",
+                get_service_status=lambda: (
+                    self._asr_service.status() if self._asr_service is not None else {}
                 ),
-                render_error=lambda message: self._get_commands_renderer().render_notice(
-                    "M-Claw ASR",
-                    message,
-                    kind="danger",
+                render_notice=lambda message, kind: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw ASR",
+                        message,
+                        kind=kind,
+                    )
                 ),
-                render_asr_status=lambda cfg, service_status: self._get_commands_renderer().render_asr_status(
-                    cfg=cfg,
-                    service_status=service_status,
+                render_success=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw ASR",
+                        message,
+                        kind="success",
+                    )
+                ),
+                render_error=lambda message: (
+                    self._get_commands_renderer().render_notice(
+                        "M-Claw ASR",
+                        message,
+                        kind="danger",
+                    )
+                ),
+                render_asr_status=lambda cfg, service_status: (
+                    self._get_commands_renderer().render_asr_status(
+                        cfg=cfg,
+                        service_status=service_status,
+                    )
                 ),
             )
         )
@@ -2843,7 +3321,9 @@ class InteractiveChat:
             save_config(user_config)
             return True
         except Exception as exc:
-            self._get_commands_renderer().render_pet_notice(f"桌面宠物配置保存失败: {exc}")
+            self._get_commands_renderer().render_pet_notice(
+                f"桌面宠物配置保存失败: {exc}"
+            )
             return False
 
     def _handle_pet_command(self, raw_args: str = ""):
@@ -2860,9 +3340,13 @@ class InteractiveChat:
         renderer = self._get_commands_renderer()
 
         def _start_pet_from_config() -> RuntimePetStartResult:
-            self.pet = PetController.from_config(self.config, session_id=self.session_id)
+            self.pet = PetController.from_config(
+                self.config, session_id=self.session_id
+            )
             ok = self.pet.start()
-            return RuntimePetStartResult(ok=bool(ok), last_error=self.pet.last_error or "")
+            return RuntimePetStartResult(
+                ok=bool(ok), last_error=self.pet.last_error or ""
+            )
 
         def _stop_pet() -> None:
             if getattr(self, "pet", None) is not None:
@@ -2873,9 +3357,13 @@ class InteractiveChat:
             _stop_pet()
             if not was_enabled:
                 return None
-            self.pet = PetController.from_config(self.config, session_id=self.session_id)
+            self.pet = PetController.from_config(
+                self.config, session_id=self.session_id
+            )
             ok = self.pet.start()
-            return RuntimePetStartResult(ok=bool(ok), last_error=self.pet.last_error or "")
+            return RuntimePetStartResult(
+                ok=bool(ok), last_error=self.pet.last_error or ""
+            )
 
         def _get_pet_status() -> RuntimePetStatus:
             pet_cfg = ensure_pet_config(self.config)
@@ -2915,10 +3403,12 @@ class InteractiveChat:
                 get_pet_status=_get_pet_status,
                 emit_test_event=_emit_test_event,
                 render_pet_notice=renderer.render_pet_notice,
-                render_pet_status=lambda pet_cfg, running, last_error: renderer.render_pet_status(
-                    pet_cfg=pet_cfg,
-                    running=running,
-                    last_error=last_error,
+                render_pet_status=lambda pet_cfg, running, last_error: (
+                    renderer.render_pet_status(
+                        pet_cfg=pet_cfg,
+                        running=running,
+                        last_error=last_error,
+                    )
                 ),
                 render_pet_usage=renderer.render_pet_usage,
             )
@@ -2935,7 +3425,10 @@ class InteractiveChat:
 
     def _get_info_command_coordinator(self):
         from mclaw.agent.skill_commands import handle_skills_command
-        from mclaw.cli.runtime.info_commands import RuntimeInfoCommandCoordinator, RuntimeInfoCommandHooks
+        from mclaw.cli.runtime.info_commands import (
+            RuntimeInfoCommandCoordinator,
+            RuntimeInfoCommandHooks,
+        )
         from mclaw.doctor import format_doctor, run_doctor
 
         return RuntimeInfoCommandCoordinator(
@@ -2951,17 +3444,23 @@ class InteractiveChat:
                     limit=15,
                     workspace=self.workspace_path,
                 ),
-                handle_skills_command=lambda args: handle_skills_command(args, format_output=True),
-                render_help=lambda push_to_talk_label: self._get_commands_renderer().render_help(
-                    push_to_talk_label=push_to_talk_label,
-                    dsoftbus_enabled=getattr(self, "dsoftbus_runtime", None)
-                    is not None,
+                handle_skills_command=lambda args: handle_skills_command(
+                    args, format_output=True
+                ),
+                render_help=lambda push_to_talk_label: (
+                    self._get_commands_renderer().render_help(
+                        push_to_talk_label=push_to_talk_label,
+                        dsoftbus_enabled=getattr(self, "dsoftbus_runtime", None)
+                        is not None,
+                    )
                 ),
                 render_doctor=self._get_commands_renderer().render_doctor,
-                render_usage=lambda agent, model, session_start: self._get_commands_renderer().render_usage(
-                    agent=agent,
-                    model=model,
-                    session_start=session_start,
+                render_usage=lambda agent, model, session_start: (
+                    self._get_commands_renderer().render_usage(
+                        agent=agent,
+                        model=model,
+                        session_start=session_start,
+                    )
                 ),
                 render_history=self._get_commands_renderer().render_history,
                 render_skills_output=self._render_skills_output,
@@ -2970,10 +3469,22 @@ class InteractiveChat:
 
     def _checkpoint_cwd(self) -> str:
         """Resolve the workspace used by checkpoint and rollback commands."""
-        recent = getattr(self.agent, "_last_checkpoint_work_dir", None) if self.agent else None
-        terminal_cfg = self.config.get("terminal", {}) if isinstance(self.config, dict) else {}
-        configured_cwd = terminal_cfg.get("cwd") if isinstance(terminal_cfg, dict) else None
-        launch_cfg = str(self.config.get("_launch_cwd") or "").strip() if isinstance(self.config, dict) else ""
+        recent = (
+            getattr(self.agent, "_last_checkpoint_work_dir", None)
+            if self.agent
+            else None
+        )
+        terminal_cfg = (
+            self.config.get("terminal", {}) if isinstance(self.config, dict) else {}
+        )
+        configured_cwd = (
+            terminal_cfg.get("cwd") if isinstance(terminal_cfg, dict) else None
+        )
+        launch_cfg = (
+            str(self.config.get("_launch_cwd") or "").strip()
+            if isinstance(self.config, dict)
+            else ""
+        )
         terminal_cwd = None
         try:
             from mclaw.tools.terminal_tool import get_session_cwd
@@ -2983,7 +3494,11 @@ class InteractiveChat:
             pass
         launch_cwd = getattr(self, "workspace_path", "")
         for candidate in (recent, configured_cwd, launch_cfg, terminal_cwd, launch_cwd):
-            if candidate and str(candidate) != "." and not is_mclaw_runtime_path(candidate):
+            if (
+                candidate
+                and str(candidate) != "."
+                and not is_mclaw_runtime_path(candidate)
+            ):
                 return str(candidate)
         return ""
 
@@ -2992,7 +3507,11 @@ class InteractiveChat:
             idx = int(ref) - 1
             if 0 <= idx < len(checkpoints):
                 return checkpoints[idx]["hash"]
-            self._get_safety_renderer().render_notice("Checkpoint", f"无效 checkpoint 编号。请使用 1-{len(checkpoints)}。", kind="warning")
+            self._get_safety_renderer().render_notice(
+                "Checkpoint",
+                f"无效 checkpoint 编号。请使用 1-{len(checkpoints)}。",
+                kind="warning",
+            )
             return None
         except ValueError:
             return ref
@@ -3002,20 +3521,32 @@ class InteractiveChat:
             return str(Path(options["dir"]).expanduser().resolve()), None
         if options.get("path"):
             path = Path(options["path"]).expanduser().resolve()
-            return str(path.parent if not path.is_dir() else path), path.name if not path.is_dir() else None
+            return str(
+                path.parent if not path.is_dir() else path
+            ), path.name if not path.is_dir() else None
         return self._checkpoint_cwd(), None
 
-    def _restore_chat_context_after_rollback(self, metadata: dict, mode: str = "soft") -> None:
+    def _restore_chat_context_after_rollback(
+        self, metadata: dict, mode: str = "soft"
+    ) -> None:
         """Apply checkpoint metadata to the chat history after filesystem rollback."""
-        cp_cfg = self.config.get("checkpoints", {}) if isinstance(self.config, dict) else {}
+        cp_cfg = (
+            self.config.get("checkpoints", {}) if isinstance(self.config, dict) else {}
+        )
         if isinstance(cp_cfg, dict) and not cp_cfg.get("restore_chat_context", True):
             return
         mode = (mode or "soft").lower()
         if mode in {"off", "fs-only"}:
-            self._get_safety_renderer().render_notice("上下文回滚", "已跳过聊天上下文回滚。")
+            self._get_safety_renderer().render_notice(
+                "上下文回滚", "已跳过聊天上下文回滚。"
+            )
             return
         if mode not in {"soft", "strict"}:
-            self._get_safety_renderer().render_notice("上下文回滚", f"未知上下文回滚模式：{mode}，已跳过聊天上下文回滚。", kind="warning")
+            self._get_safety_renderer().render_notice(
+                "上下文回滚",
+                f"未知上下文回滚模式：{mode}，已跳过聊天上下文回滚。",
+                kind="warning",
+            )
             return
         if not metadata:
             return
@@ -3028,13 +3559,17 @@ class InteractiveChat:
         except (TypeError, ValueError):
             marker_id = None
         if marker_id is None:
-            self._get_safety_renderer().render_notice("上下文回滚", "未找到上下文边界，已跳过聊天上下文回滚。", kind="warning")
+            self._get_safety_renderer().render_notice(
+                "上下文回滚", "未找到上下文边界，已跳过聊天上下文回滚。", kind="warning"
+            )
             return
         checkpoint_hash = metadata.get("commit") or metadata.get("rollback_target")
         operation_id = metadata.get("operation_id")
         from mclaw.safety.context_rollback import ContextRollbackManager
 
-        result = ContextRollbackManager(session_db=self._session_db, agent=self.agent).apply(
+        result = ContextRollbackManager(
+            session_db=self._session_db, agent=self.agent
+        ).apply(
             session_id=self.session_id,
             marker_message_id=marker_id,
             mode=mode,
@@ -3046,9 +3581,17 @@ class InteractiveChat:
         deleted = int(result.get("invalidated", 0) or 0)
         rollback_id = result.get("rollback_id")
         if rollback_id:
-            self._get_safety_renderer().render_notice("上下文回滚", f"已同步回退聊天上下文：软失效 {deleted} 条消息（{rollback_id}）。", kind="success")
+            self._get_safety_renderer().render_notice(
+                "上下文回滚",
+                f"已同步回退聊天上下文：软失效 {deleted} 条消息（{rollback_id}）。",
+                kind="success",
+            )
         else:
-            self._get_safety_renderer().render_notice("上下文回滚", f"已同步回退聊天上下文：软失效 {deleted} 条消息。", kind="success")
+            self._get_safety_renderer().render_notice(
+                "上下文回滚",
+                f"已同步回退聊天上下文：软失效 {deleted} 条消息。",
+                kind="success",
+            )
 
     def _handle_rollback_command(self, raw_args: str = "") -> None:
         self._get_file_safety_command_coordinator().handle_rollback(raw_args)
@@ -3057,9 +3600,16 @@ class InteractiveChat:
         self._get_file_safety_command_coordinator().handle_checkpoints(raw_args)
 
     def _get_file_safety_command_coordinator(self):
-        from mclaw.cli.runtime.file_safety_commands import RuntimeFileSafetyCommandCoordinator, RuntimeFileSafetyCommandHooks
+        from mclaw.cli.runtime.file_safety_commands import (
+            RuntimeFileSafetyCommandCoordinator,
+            RuntimeFileSafetyCommandHooks,
+        )
         from mclaw.safety.rollback_coordinator import RollbackCoordinator
-        from mclaw.tools.checkpoint_manager import clear_all, maybe_auto_prune_checkpoints, store_status
+        from mclaw.tools.checkpoint_manager import (
+            clear_all,
+            maybe_auto_prune_checkpoints,
+            store_status,
+        )
 
         def _render_notice(title: str, message: str, detail: str, kind: str) -> None:
             kwargs = {"kind": kind}
@@ -3069,7 +3619,9 @@ class InteractiveChat:
 
         return RuntimeFileSafetyCommandCoordinator(
             RuntimeFileSafetyCommandHooks(
-                get_checkpoint_manager=lambda: getattr(self.agent, "_checkpoint_mgr", None) if self.agent else None,
+                get_checkpoint_manager=lambda: (
+                    getattr(self.agent, "_checkpoint_mgr", None) if self.agent else None
+                ),
                 create_rollback_coordinator=lambda mgr: RollbackCoordinator(
                     checkpoint_manager=mgr,
                     session_db=self._session_db,
@@ -3078,12 +3630,18 @@ class InteractiveChat:
                 ),
                 resolve_rollback_workspace=self._rollback_cwd_from_options,
                 resolve_checkpoint_ref=self._resolve_checkpoint_ref,
-                checkpoint_config=lambda: self.config.get("checkpoints", {}) if isinstance(self.config, dict) else {},
+                checkpoint_config=lambda: (
+                    self.config.get("checkpoints", {})
+                    if isinstance(self.config, dict)
+                    else {}
+                ),
                 store_status=store_status,
-                prune_checkpoints=lambda retention_days, delete_orphans: maybe_auto_prune_checkpoints(
-                    retention_days=retention_days,
-                    delete_orphans=delete_orphans,
-                    min_interval_hours=0,
+                prune_checkpoints=lambda retention_days, delete_orphans: (
+                    maybe_auto_prune_checkpoints(
+                        retention_days=retention_days,
+                        delete_orphans=delete_orphans,
+                        min_interval_hours=0,
+                    )
                 ),
                 clear_checkpoints=clear_all,
                 restore_chat_context=self._restore_chat_context_after_rollback,
@@ -3094,9 +3652,11 @@ class InteractiveChat:
                 render_rollback_operations=self._render_rollback_operations,
                 render_project_checkpoints=self._render_project_checkpoints,
                 render_project_restore_prompt=self._render_project_restore_prompt,
-                render_project_restore_result=lambda result, file_path: self._get_safety_renderer().render_project_restore_result(
-                    result,
-                    file_path=file_path,
+                render_project_restore_result=lambda result, file_path: (
+                    self._get_safety_renderer().render_project_restore_result(
+                        result,
+                        file_path=file_path,
+                    )
                 ),
                 render_checkpoints_status=self._render_checkpoints_status,
                 render_checkpoints_prune=self._render_checkpoints_prune,
@@ -3137,6 +3697,7 @@ class InteractiveChat:
         # Kill all background processes started in this session
         try:
             from mclaw.tools.process_registry import process_registry
+
             killed = process_registry.kill_all(task_id=self.session_id)
             if killed > 0:
                 self._get_runtime_renderer().background_processes_stopped(killed)
@@ -3162,7 +3723,9 @@ class InteractiveChat:
                 out.flush()
             self._show_banner()
             return
-        replacement_block_reason = getattr(self.agent, "_replacement_block_reason", None)
+        replacement_block_reason = getattr(
+            self.agent, "_replacement_block_reason", None
+        )
         if callable(replacement_block_reason):
             reason = replacement_block_reason()
             if reason:
@@ -3202,7 +3765,9 @@ class InteractiveChat:
             if target_agent is not None:
                 self._close_agent_instance(target_agent, time.monotonic() + 5.0)
             new_lock.release()
-            self._get_commands_renderer().render_notice("M-Claw 会话", str(exc), kind="danger")
+            self._get_commands_renderer().render_notice(
+                "M-Claw 会话", str(exc), kind="danger"
+            )
             return
         except BaseException as exc:
             if target_agent is not None:
@@ -3239,7 +3804,9 @@ class InteractiveChat:
             out.erase_screen()
             out.cursor_goto(0, 0)
             out.flush()
-        self._get_commands_renderer().render_notice("M-Claw 会话", f"新会话已开启: {self.session_id[:16]}", kind="success")
+        self._get_commands_renderer().render_notice(
+            "M-Claw 会话", f"新会话已开启: {self.session_id[:16]}", kind="success"
+        )
 
     def _cleanup_replaced_session_runtime(self, session_id: str) -> None:
         """Clean terminal/process state only after the replacement DB commit."""
@@ -3313,7 +3880,10 @@ class InteractiveChat:
 
     def build_runtime_worker_hooks(self, *, invalidate, exit_ui, is_ui_running):
         """Build worker hooks that isolate prompt_toolkit from turn execution."""
-        from mclaw.cli.runtime.background import RuntimeBackgroundCoordinator, RuntimeBackgroundHooks
+        from mclaw.cli.runtime.background import (
+            RuntimeBackgroundCoordinator,
+            RuntimeBackgroundHooks,
+        )
         from mclaw.cli.runtime.turns import RuntimeTurnCoordinator, RuntimeTurnHooks
         from mclaw.cli.runtime.workers import RuntimeWorkerHooks
 
@@ -3356,6 +3926,7 @@ class InteractiveChat:
                 return
             try:
                 from mclaw.tools.process_registry import process_registry
+
                 process_registry.pump_due_watchers()
             except Exception:
                 pass
@@ -3380,8 +3951,12 @@ class InteractiveChat:
             self._agent_running = True
             state = self._runtime_state()
             state.begin_turn()
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="requesting")
-            self._pet_emit_for_runtime_status(PetEventType.TURN_STARTED, text="background process event")
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message="requesting"
+            )
+            self._pet_emit_for_runtime_status(
+                PetEventType.TURN_STARTED, text="background process event"
+            )
             _begin_dsoftbus_local_turn()
             _safe_invalidate()
 
@@ -3413,12 +3988,17 @@ class InteractiveChat:
             if state.status == RuntimeStatus.INTERRUPTED:
                 self._pet_emit_for_runtime_status(PetEventType.TURN_INTERRUPTED)
             elif state.status == RuntimeStatus.ERROR:
-                self._pet_emit_for_runtime_status(PetEventType.TURN_FAILED, text=state.detail)
+                self._pet_emit_for_runtime_status(
+                    PetEventType.TURN_FAILED, text=state.detail
+                )
             elif state.status == RuntimeStatus.DONE and result.get("completed"):
-                self._pet_emit_for_runtime_status(PetEventType.TURN_COMPLETED, payload={
-                    "duration": duration,
-                    "api_calls": result.get("api_calls", 0),
-                })
+                self._pet_emit_for_runtime_status(
+                    PetEventType.TURN_COMPLETED,
+                    payload={
+                        "duration": duration,
+                        "api_calls": result.get("api_calls", 0),
+                    },
+                )
             elif state.status == RuntimeStatus.DONE:
                 self._pet_emit_for_runtime_status(PetEventType.STATUS_CHANGED)
             _safe_invalidate()
@@ -3444,13 +4024,17 @@ class InteractiveChat:
                     text=cmd,
                     payload=event,
                 ),
-                render_watcher_notice=lambda notice: self._get_runtime_renderer().watcher_notice(
-                    self._sym("🔔"),
-                    notice,
+                render_watcher_notice=lambda notice: (
+                    self._get_runtime_renderer().watcher_notice(
+                        self._sym("🔔"),
+                        notice,
+                    )
                 ),
                 begin_background_turn=_begin_background_turn,
                 run_background_turn=_run_background_turn,
-                finish_background_turn=lambda: _finish_agent_turn(emit_done_status=False),
+                finish_background_turn=lambda: _finish_agent_turn(
+                    emit_done_status=False
+                ),
             )
         )
 
@@ -3469,8 +4053,12 @@ class InteractiveChat:
             self._agent_running = True
             state = self._runtime_state()
             state.begin_turn()
-            self._emit_runtime_event(EventType.STATUS_CHANGED, status=state.status, message="requesting")
-            self._pet_emit_for_runtime_status(PetEventType.TURN_STARTED, text=user_input[:80])
+            self._emit_runtime_event(
+                EventType.STATUS_CHANGED, status=state.status, message="requesting"
+            )
+            self._pet_emit_for_runtime_status(
+                PetEventType.TURN_STARTED, text=user_input[:80]
+            )
             _begin_dsoftbus_local_turn()
             _safe_invalidate()
 
@@ -3502,22 +4090,34 @@ class InteractiveChat:
                 drain_pet_commands=self._drain_pet_commands,
                 pump_background_watchers=_pump_watchers,
                 drain_background_completions=_drain_completion_queue,
-                pump_scheduler=lambda: self._get_scheduler_coordinator().pump()
-                if self.agent is not None
-                else None,
-                has_pending_scheduler_input=lambda: self.agent is not None
-                and self._get_scheduler_coordinator().has_pending_input(),
-                handle_scheduler_input=lambda text: self._get_scheduler_coordinator().handle_input(text),
+                pump_scheduler=lambda: (
+                    self._get_scheduler_coordinator().pump()
+                    if self.agent is not None
+                    else None
+                ),
+                has_pending_scheduler_input=lambda: (
+                    self.agent is not None
+                    and self._get_scheduler_coordinator().has_pending_input()
+                ),
+                handle_scheduler_input=lambda text: (
+                    self._get_scheduler_coordinator().handle_input(text)
+                ),
                 has_pending_secret_request=lambda: bool(self._pending_secret_request),
                 handle_secret_request=self._handle_secret_request_input,
-                has_pending_skill_import_confirmation=lambda: bool(self._pending_skill_import_confirmation),
+                has_pending_skill_import_confirmation=lambda: bool(
+                    self._pending_skill_import_confirmation
+                ),
                 handle_skill_import_confirmation=self._handle_skill_import_confirmation_input,
                 has_pending_key_setup=lambda: bool(self._pending_key_setup),
                 cancel_key_setup=lambda: setattr(self, "_pending_key_setup", None),
                 complete_key_setup=self._complete_key_setup,
                 render_key_input_cancelled=self._get_runtime_renderer().key_input_cancelled,
-                should_skip_next_prompt=lambda: bool(getattr(self, "_skip_next_prompt", False)),
-                consume_skip_next_prompt=lambda: setattr(self, "_skip_next_prompt", False),
+                should_skip_next_prompt=lambda: bool(
+                    getattr(self, "_skip_next_prompt", False)
+                ),
+                consume_skip_next_prompt=lambda: setattr(
+                    self, "_skip_next_prompt", False
+                ),
                 echo_user_message=self._echo_user_message,
                 echo_command=_echo_command,
                 dispatch_slash=self._dispatch_slash_input,
@@ -3549,7 +4149,10 @@ class InteractiveChat:
 
     def _shutdown_runtime_threads(self, process_thread, anim_thread) -> None:
         """Stop shared runtime workers and close session resources."""
-        from mclaw.cli.runtime.lifecycle import RuntimeShutdownCoordinator, RuntimeShutdownHooks
+        from mclaw.cli.runtime.lifecycle import (
+            RuntimeShutdownCoordinator,
+            RuntimeShutdownHooks,
+        )
 
         def _stop_asr_service() -> None:
             if self._asr_service is not None:
@@ -3654,25 +4257,53 @@ class InteractiveChat:
             style="class:input-area",
             multiline=True,
             dont_extend_height=True,
-            password=Condition(lambda: bool(cli_ref._pending_key_setup) or cli_ref._secret_input_is_password()),
+            password=Condition(
+                lambda: (
+                    bool(cli_ref._pending_key_setup)
+                    or cli_ref._secret_input_is_password()
+                )
+            ),
             wrap_lines=True,
-            read_only=Condition(lambda: bool(cli_ref._agent_running and not cli_ref._pending_secret_request)),
+            read_only=Condition(
+                lambda: bool(
+                    cli_ref._agent_running and not cli_ref._pending_secret_request
+                )
+            ),
             history=FileHistory(str(self._history_file)),
             auto_suggest=ConditionalAutoSuggest(
                 AutoSuggestFromHistory(),
-                Condition(lambda: not bool(cli_ref._pending_key_setup or cli_ref._pending_secret_request)),
+                Condition(
+                    lambda: (
+                        not bool(
+                            cli_ref._pending_key_setup
+                            or cli_ref._pending_secret_request
+                        )
+                    )
+                ),
             ),
             completer=ConditionalCompleter(
                 SlashCompleter(
                     self.skill_registry,
-                    include_dsoftbus=lambda: getattr(
-                        self, "dsoftbus_runtime", None
-                    )
-                    is not None,
+                    include_dsoftbus=lambda: (
+                        getattr(self, "dsoftbus_runtime", None) is not None
+                    ),
                 ),
-                Condition(lambda: not bool(cli_ref._pending_key_setup or cli_ref._pending_secret_request)),
+                Condition(
+                    lambda: (
+                        not bool(
+                            cli_ref._pending_key_setup
+                            or cli_ref._pending_secret_request
+                        )
+                    )
+                ),
             ),
-            complete_while_typing=Condition(lambda: not bool(cli_ref._pending_key_setup or cli_ref._pending_secret_request)),
+            complete_while_typing=Condition(
+                lambda: (
+                    not bool(
+                        cli_ref._pending_key_setup or cli_ref._pending_secret_request
+                    )
+                )
+            ),
         )
         input_area.buffer.on_text_changed += history_state.on_text_changed
 
@@ -3688,7 +4319,11 @@ class InteractiveChat:
 
         def _slash_completion_active() -> bool:
             state = input_area.buffer.complete_state
-            active = bool(state and state.completions and slash_token_before_cursor(input_area.buffer.document))
+            active = bool(
+                state
+                and state.completions
+                and slash_token_before_cursor(input_area.buffer.document)
+            )
             if active:
                 state.complete_index = None
                 _sync_slash_completion_index()
@@ -3701,12 +4336,18 @@ class InteractiveChat:
                 return
             state.complete_index = None
             _sync_slash_completion_index()
-            slash_completion["index"] = (slash_completion["index"] + delta) % len(state.completions)
+            slash_completion["index"] = (slash_completion["index"] + delta) % len(
+                state.completions
+            )
 
         def _accept_slash_completion() -> bool:
             buffer = input_area.buffer
             state = buffer.complete_state
-            if not state or not state.completions or slash_token_before_cursor(buffer.document) is None:
+            if (
+                not state
+                or not state.completions
+                or slash_token_before_cursor(buffer.document) is None
+            ):
                 return False
             _sync_slash_completion_index()
             index = max(0, min(slash_completion["index"], len(state.completions) - 1))
@@ -3751,7 +4392,15 @@ class InteractiveChat:
             history_state.deactivate()
             self._pending_input.put(text)
 
-        @kb.add("escape", filter=Condition(lambda: bool(self._pending_skill_import_confirmation or self._pending_secret_request)))
+        @kb.add(
+            "escape",
+            filter=Condition(
+                lambda: bool(
+                    self._pending_skill_import_confirmation
+                    or self._pending_secret_request
+                )
+            ),
+        )
         def _(event):
             event.app.current_buffer.reset()
             paste_store.clear()
@@ -3792,7 +4441,9 @@ class InteractiveChat:
         def _(event):
             """Leave history browsing and move to the end of the input."""
             history_state.deactivate()
-            event.app.current_buffer.cursor_position = len(event.app.current_buffer.text)
+            event.app.current_buffer.cursor_position = len(
+                event.app.current_buffer.text
+            )
 
         @kb.add("c-u")
         def _(event):
@@ -3816,7 +4467,9 @@ class InteractiveChat:
             _move_slash_completion(-1)
             event.app.invalidate()
 
-        @kb.add("down", filter=Condition(lambda: not _slash_completion_active()), eager=True)
+        @kb.add(
+            "down", filter=Condition(lambda: not _slash_completion_active()), eager=True
+        )
         def _(event):
             """Move inside edited input; keep browsing history previews."""
             move_cursor_or_history_down(
@@ -3825,7 +4478,9 @@ class InteractiveChat:
                 history_state=history_state,
             )
 
-        @kb.add("up", filter=Condition(lambda: not _slash_completion_active()), eager=True)
+        @kb.add(
+            "up", filter=Condition(lambda: not _slash_completion_active()), eager=True
+        )
         def _(event):
             """Move inside edited input; keep browsing history previews."""
             move_cursor_or_history_up(
@@ -3848,30 +4503,32 @@ class InteractiveChat:
             )
         )
 
-        style = Style.from_dict({
-            "input-area": "#e0e0e0",
-            "prompt": "bold #4A90D9",
-            "prompt-dim": "#6688aa",
-            "prompt-key": "bold #e0a030",
-            "status-bar": "#8ab4d6",
-            "status-bar-model": "bold #6CB4EE",
-            "status-bar-active": "bold #90caf9",
-            "status-bar-done": "bold #50c878",
-            "status-bar-warning": "bold #fcd34d",
-            "status-bar-error": "bold #f87171",
-            "status-bar-ctx": "#ffcc00",
-            "status-bar-subagent-running": "bold #90caf9",
-            "status-bar-subagent-done": "bold #50c878",
-            "status-bar-subagent-error": "bold #d95a5a",
-            "status-bar-subagent-pending": "#5a6b7d",
-            "status-bar-subagent-goal": "#e0e0e0",
-            "status-bar-subagent-badge": "bold #c084fc",
-            "completion-menu": "bg:#1e293b #e2e8f0",
-            "completion-menu.completion": "",
-            "completion-menu.completion.current": "bg:#334155 #ffffff",
-            "completion-menu.meta": "#94a3b8",
-            "completion-menu.meta.current": "#94a3b8",
-        })
+        style = Style.from_dict(
+            {
+                "input-area": "#e0e0e0",
+                "prompt": "bold #4A90D9",
+                "prompt-dim": "#6688aa",
+                "prompt-key": "bold #e0a030",
+                "status-bar": "#8ab4d6",
+                "status-bar-model": "bold #6CB4EE",
+                "status-bar-active": "bold #90caf9",
+                "status-bar-done": "bold #50c878",
+                "status-bar-warning": "bold #fcd34d",
+                "status-bar-error": "bold #f87171",
+                "status-bar-ctx": "#ffcc00",
+                "status-bar-subagent-running": "bold #90caf9",
+                "status-bar-subagent-done": "bold #50c878",
+                "status-bar-subagent-error": "bold #d95a5a",
+                "status-bar-subagent-pending": "#5a6b7d",
+                "status-bar-subagent-goal": "#e0e0e0",
+                "status-bar-subagent-badge": "bold #c084fc",
+                "completion-menu": "bg:#1e293b #e2e8f0",
+                "completion-menu.completion": "",
+                "completion-menu.completion.current": "bg:#334155 #ffffff",
+                "completion-menu.meta": "#94a3b8",
+                "completion-menu.meta.current": "#94a3b8",
+            }
+        )
 
         app = Application(
             layout=layout,
@@ -3888,7 +4545,9 @@ class InteractiveChat:
             self._runtime(),
             self.build_runtime_worker_hooks(
                 invalidate=lambda: getattr(app, "invalidate", lambda: None)(),
-                exit_ui=lambda: app.exit() if getattr(app, "is_running", False) else None,
+                exit_ui=lambda: (
+                    app.exit() if getattr(app, "is_running", False) else None
+                ),
                 is_ui_running=lambda: bool(getattr(app, "is_running", False)),
             ),
         )
@@ -3971,7 +4630,9 @@ def run_interactive(
             prompt=prompt_workspace_risk_confirmation,
         )
     except ConfigError as exc:
-        RuntimeRenderer(printer=_cprint).warning(f"配置错误: {exc}", leading_newline=True)
+        RuntimeRenderer(printer=_cprint).warning(
+            f"配置错误: {exc}", leading_newline=True
+        )
         return
     if not trusted:
         return

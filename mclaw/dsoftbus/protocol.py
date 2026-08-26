@@ -28,6 +28,7 @@ PROTOCOL_BINDING = "https://gitcode.com/m-robots/mclaw/specs/a2a-softbus/v1"
 DEVICE_CONTEXT_EXTENSION_URI = (
     "https://gitcode.com/m-robots/mclaw/specs/device-context/v1"
 )
+TASK_FILES_EXTENSION_URI = "https://gitcode.com/m-robots/mclaw/specs/task-files"
 A2A_PROTOCOL_VERSION = "1.0"
 A2A_REFERENCE_SCHEMA_RELEASE = "1.0.1"
 BINDING_VERSION = 1
@@ -95,20 +96,57 @@ TASK_HISTORY_MAX = 128
 TASK_ARTIFACT_MAX = 32
 TASK_JSON_BYTES_MAX = 262_144
 TASK_ARTIFACT_BYTES_MAX = 16_777_216
-# Current Artifact updates are one SoftBus frame.  Keep model-produced JSON or
-# file bytes below this smaller bound so Base64 and A2A envelope overhead still
-# fit the negotiated frame; chunk/append transfer remains deliberately closed.
+# Structured JSON supplied directly in a model tool call remains bounded by one
+# event. File Artifacts use the verified chunk transport and the larger
+# TASK_ARTIFACT_BYTES_MAX limit instead.
 TASK_SINGLE_FRAME_ARTIFACT_BYTES_MAX = 16_384
+TASK_INPUT_FILE_BYTES_MAX = 16_777_216
+TASK_INPUT_TASK_BYTES_MAX = 67_108_864
+# One A2A Message allows 32 Parts.  Reserve one Part for the task text; the
+# remaining paths encode as file Parts or one bounded directory-manifest Part.
+TASK_INPUT_PATH_MAX = 31
+TASK_SOURCE_FILE_MAX = 256
+TASK_SOURCE_FETCH_MAX = 32
+TASK_SOURCE_PAGE_MAX = 256
+TASK_SOURCE_DEPTH_MAX = 3
+TASK_SOURCE_SEARCH_RESULT_MAX = 100
+TASK_SOURCE_SCAN_ENTRY_MAX = 4_096
+TASK_SOURCE_SEARCH_BYTES_MAX = 16_777_216
+TASK_SOURCE_TOOL_RESULT_BYTES_MAX = 24_576
+# Raw bytes are Base64-wrapped inside one application frame.  This conservative
+# payload leaves room for the binding and JSON-RPC envelope at the 32 KiB MTU.
+TASK_TRANSFER_CHUNK_BYTES_MAX = 12_288
 TASK_STREAM_QUEUE_MAX = 64
 TASK_STREAM_ITEM_BYTES_MAX = REMOTE_FRAME_MAX
+# Active Tasks are owned by the authenticated peer Runtime instance, not by a
+# particular SoftBus socket generation.  The owner renews all of its live
+# Tasks in bounded batches.  A short transport interruption therefore does
+# not cancel work, while a silently disappeared Runtime cannot retain remote
+# execution resources forever.
+TASK_OWNER_LEASE_RENEW_INTERVAL_S = 30
+TASK_OWNER_LEASE_TIMEOUT_S = 300
+TASK_OWNER_LEASE_BATCH_MAX = 64
 CONTROL_TIMEOUT_S = 5
 # Runtime startup performs several individually bounded Worker and SoftBus
 # control operations.  Its outer budget must cover the sequence rather than
 # reuse the five-second budget of one control request.
 RUNTIME_START_TIMEOUT_S = 30
-DEVICE_DISCOVERY_WINDOW_S = 5.0
+DEVICE_DISCOVERY_WINDOW_S = 10.0
+# DeviceManager can legitimately spend longer inside the product service than
+# an A2A control RPC.  Keep its native service budget separate so extending
+# device enumeration never changes GetTask/CancelTask timing.  The parent
+# Worker allowance includes one second for IPC response routing.
+DEVICE_MANAGER_OPERATION_TIMEOUT_S = 10.0
+DEVICE_MANAGER_WORKER_TIMEOUT_S = 11.0
 DEVICE_BIND_TIMEOUT_S = 120.0
+DEVICE_BIND_CONFIRM_TIMEOUT_S = 10.0
 DEVICE_BIND_POLL_INTERVAL_S = 0.25
+# Unbind returns before every DeviceManager/DeviceAuth view is guaranteed to
+# have converged.  Require several consecutive absent snapshots before M-Claw
+# removes its local ownership record and reports success to the user.
+DEVICE_UNBIND_CONFIRM_TIMEOUT_S = 3.0
+DEVICE_UNBIND_POLL_INTERVAL_S = 0.25
+DEVICE_UNBIND_STABLE_SNAPSHOT_COUNT = 3
 DSOFTBUS_SHUTDOWN_TIMEOUT_S = 40
 DSOFTBUS_EVIDENCE_HDC_GRACE_MS = 30_000
 HDC_MERGED_PREFIX_BYTES_MAX = 65_536
@@ -173,6 +211,24 @@ RPC_ERROR_CODES: Mapping[str, int] = MappingProxyType(
         "REMOTE_PROVIDER_UNAVAILABLE": -32024,
         "PROVIDER_ERROR": -32025,
         "AGENT_TOOLS_FORBIDDEN": -32026,
+        "TASK_INPUT_INVALID": -32027,
+        "TASK_INPUT_TOO_LARGE": -32028,
+        "TASK_INPUT_IO_ERROR": -32029,
+        "TASK_INPUT_HASH_MISMATCH": -32030,
+        "TRANSFER_CONFLICT": -32031,
+        "SOURCE_SCOPE_NOT_FOUND": -32032,
+        "SOURCE_PATH_FORBIDDEN": -32033,
+        "SOURCE_CHANGED": -32034,
+        "SOURCE_QUOTA_EXCEEDED": -32035,
+        "ARTIFACT_NOT_FOUND": -32036,
+        "ARTIFACT_IO_ERROR": -32037,
+        "ARTIFACT_HASH_MISMATCH": -32038,
+        "ARTIFACT_TOO_LARGE": -32039,
+        "ARTIFACT_CHANGED": -32040,
+        "TASK_NOT_INPUT_REQUIRED": -32041,
+        "INPUT_REQUEST_MISMATCH": -32042,
+        "OWNER_RUNTIME_REPLACED": -32043,
+        "OWNER_LEASE_EXPIRED": -32044,
     }
 )
 
@@ -223,7 +279,9 @@ def canonical_json_bytes(value: Any) -> bytes:
         )
         return (rendered + "\n").encode("utf-8")
     except (TypeError, UnicodeEncodeError, ValueError) as error:
-        raise ProtocolError("INVALID_JSON_VALUE", "value is not canonical JSON") from error
+        raise ProtocolError(
+            "INVALID_JSON_VALUE", "value is not canonical JSON"
+        ) from error
 
 
 def canonical_digest(value: Any) -> str:
@@ -316,9 +374,7 @@ def bounded_utf8(value: Any, label: str, minimum: int, maximum: int) -> str:
     return value
 
 
-def bounded_integer(
-    value: Any, label: str, minimum: int, maximum: int
-) -> int:
+def bounded_integer(value: Any, label: str, minimum: int, maximum: int) -> int:
     if type(value) is not int or value < minimum or value > maximum:
         _invalid(f"{label} must be an integer in {minimum}..{maximum}")
     return value
@@ -330,7 +386,9 @@ def decode_strict_base64(value: Any, *, maximum: int = REMOTE_FRAME_MAX) -> byte
         encoded = text.encode("ascii")
         decoded = base64.b64decode(encoded, validate=True)
     except (UnicodeEncodeError, binascii.Error, ValueError) as error:
-        raise ProtocolError("INVALID_REQUEST", "args.data is not strict base64") from error
+        raise ProtocolError(
+            "INVALID_REQUEST", "args.data is not strict base64"
+        ) from error
     if not decoded or len(decoded) > maximum or base64.b64encode(decoded) != encoded:
         _invalid("args.data is not canonical padded base64")
     return decoded
@@ -360,9 +418,7 @@ def _validate_command_args(op: str, value: Any) -> None:
         bounded_utf8(args["networkId"], "get_node_udid.args.networkId", 1, 64)
         return
     if op in {"begin_device_bind", "get_device_bind_status"}:
-        args = exact_object(
-            value, frozenset({"deviceIdSha256"}), f"{op}.args"
-        )
+        args = exact_object(value, frozenset({"deviceIdSha256"}), f"{op}.args")
         digest = bounded_utf8(
             args["deviceIdSha256"], f"{op}.args.deviceIdSha256", 64, 64
         )
@@ -481,6 +537,19 @@ __all__ = [
     "RPC_ERROR_CODES",
     "SERVICE_NAME",
     "SOFTBUS_PACKAGE_NAME",
+    "TASK_FILES_EXTENSION_URI",
+    "TASK_INPUT_FILE_BYTES_MAX",
+    "TASK_INPUT_PATH_MAX",
+    "TASK_INPUT_TASK_BYTES_MAX",
+    "TASK_SOURCE_DEPTH_MAX",
+    "TASK_SOURCE_FETCH_MAX",
+    "TASK_SOURCE_FILE_MAX",
+    "TASK_SOURCE_PAGE_MAX",
+    "TASK_SOURCE_SCAN_ENTRY_MAX",
+    "TASK_SOURCE_SEARCH_BYTES_MAX",
+    "TASK_SOURCE_SEARCH_RESULT_MAX",
+    "TASK_SOURCE_TOOL_RESULT_BYTES_MAX",
+    "TASK_TRANSFER_CHUNK_BYTES_MAX",
     "WorkerCommand",
     "WORKER_OPERATIONS",
     "canonical_digest",

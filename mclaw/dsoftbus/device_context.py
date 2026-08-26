@@ -345,7 +345,6 @@ class LocalDeviceStateService:
             or not callable(utc_now)
         ):
             raise TypeError("State service callbacks must be callable")
-        self._template = template
         self._manifest = manifest
         self._health_snapshot = health_snapshot
         self._monotonic = monotonic
@@ -878,12 +877,6 @@ class RemoteDeviceContextStore:
                 "ifRevision": record.manifest.descriptor.revision,
                 "ifDigest": record.manifest.descriptor.digest,
             }
-        )
-
-    def has_manifest(self, device_id: str) -> bool:
-        record = self._records.get(device_id)
-        return bool(
-            record is not None and record.manifest is not None and record.connected
         )
 
     def state_fresh_count(self) -> int:

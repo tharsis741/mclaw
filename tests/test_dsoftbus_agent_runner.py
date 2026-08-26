@@ -6,12 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import threading
 import time
 from collections import OrderedDict
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import pytest
@@ -28,10 +30,17 @@ from mclaw.dsoftbus.agent_message import (
 )
 from mclaw.dsoftbus.task_artifact import (
     TaskArtifactCollector,
+    artifact_transfer_parts,
     bind_task_artifact_collector,
     reset_task_artifact_collector,
 )
+from mclaw.dsoftbus.task_input_request import (
+    TaskInputRequestCollector,
+    bind_task_input_request_collector,
+    reset_task_input_request_collector,
+)
 from mclaw.dsoftbus.tools import return_artifact_handler
+from mclaw.dsoftbus.workspace import DsoftbusWorkspace
 from mclaw.providers.base import RuntimeProviderProfile
 from mclaw.providers.runtime import ProviderRuntimeContext
 from mclaw.tools import dispatch as tool_dispatch
@@ -104,14 +113,16 @@ def _model_result(
     )
 
 
-def test_remote_tool_policy_is_closed_unless_all_three_gates_are_true() -> None:
+def test_remote_tool_policy_keeps_only_task_control_when_local_tools_are_closed() -> None:
     config = _remote_tools_config(allow=False)
 
     policy = _prepare_remote_agent_policy(config)
 
-    assert policy.disable_tools is True
-    assert policy.enabled_toolsets == ("dsoftbus-remote",)
-    assert policy.tool_definitions == ()
+    assert policy.disable_tools is False
+    assert policy.enabled_toolsets == ("dsoftbus-task-control",)
+    assert {
+        value["function"]["name"] for value in policy.tool_definitions
+    } == {"request_task_input"}
     assert config["checkpoints"]["enabled"] is True
     assert policy.config["checkpoints"]["enabled"] is False
     assert policy.config["compression"]["enabled"] is False
@@ -123,7 +134,12 @@ def test_remote_tool_policy_is_closed_unless_all_three_gates_are_true() -> None:
     ):
         candidate = _remote_tools_config(allow=True)
         candidate["dsoftbus"][field] = value
-        assert _prepare_remote_agent_policy(candidate).disable_tools is True
+        candidate_policy = _prepare_remote_agent_policy(candidate)
+        assert candidate_policy.disable_tools is False
+        assert {
+            item["function"]["name"]
+            for item in candidate_policy.tool_definitions
+        } == {"request_task_input"}
 
 
 def test_remote_tool_policy_copies_local_tools_and_removes_dsoftbus() -> None:
@@ -135,13 +151,98 @@ def test_remote_tool_policy_copies_local_tools_and_removes_dsoftbus() -> None:
     }
 
     assert policy.disable_tools is False
-    assert policy.enabled_toolsets == ("terminal", "file", "dsoftbus-artifact")
+    assert policy.enabled_toolsets == (
+        "terminal",
+        "file",
+        "dsoftbus-artifact",
+        "dsoftbus-source",
+        "dsoftbus-task-control",
+    )
     assert "terminal" in schema_names
     assert "read_file" in schema_names
     assert "return_artifact" in schema_names
+    assert "request_task_input" in schema_names
+    assert {
+        "dsoft_bus_source_list",
+        "dsoft_bus_source_search",
+        "dsoft_bus_source_fetch",
+    } <= schema_names
     assert "process" not in schema_names
     assert schema_names.isdisjoint(DSOFTBUS_TOOLS)
     assert set(DSOFTBUS_TOOLS).issubset(policy.config["tools"]["disabled"])
+
+
+def test_remote_agent_requests_structured_input_and_stops_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport_calls: list[dict[str, Any]] = []
+
+    class FakeTransport:
+        def call(self, **kwargs: Any) -> ModelCallResult:
+            transport_calls.append(kwargs)
+            return _model_result(
+                tool_calls=[
+                    {
+                        "id": "call-input-1",
+                        "type": "function",
+                        "function": {
+                            "name": "request_task_input",
+                            "arguments": json.dumps(
+                                {
+                                    "message": "请提供配置文件或项目目录",
+                                    "accepts": ["file", "directory"],
+                                },
+                                ensure_ascii=False,
+                            ),
+                        },
+                    }
+                ]
+            )
+
+        @staticmethod
+        def close() -> bool:
+            return True
+
+    monkeypatch.setattr(
+        "mclaw.agent.core.create_transport",
+        lambda _context: FakeTransport(),
+    )
+    agent = MClaw(
+        provider_runtime=_context(),
+        session_db=None,
+        enabled_toolsets=["dsoftbus-task-control"],
+        platform="dsoftbus",
+        system_prompt="remote prompt",
+        skip_memory=True,
+        config={
+            "checkpoints": {"enabled": False},
+            "compression": {"enabled": False},
+            "prompt_cache": {"enabled": False},
+        },
+    )
+    collector = TaskInputRequestCollector()
+    token = bind_task_input_request_collector(collector)
+    try:
+        result = agent.run_conversation(
+            "检查项目",
+            disable_tools=False,
+            advance_background_review=False,
+            call_source="dsoftbus",
+            deadline_monotonic=time.monotonic() + 5.0,
+        )
+    finally:
+        reset_task_input_request_collector(token)
+
+    assert len(transport_calls) == 1
+    assert result["pending_task_input"] is True
+    assert result["completed"] is False
+    assert result["stop_reason"] == "task_input_required"
+    assert result["input_request"]["message"] == "请提供配置文件或项目目录"
+    assert result["input_request"]["accepts"] == ["file", "directory"]
+    assert collector.snapshot() == {
+        "message": "请提供配置文件或项目目录",
+        "accepts": ["file", "directory"],
+    }
 
 
 def test_remote_executor_applies_the_prepared_tool_policy(
@@ -166,6 +267,8 @@ def test_remote_executor_applies_the_prepared_tool_policy(
         "terminal",
         "file",
         "dsoftbus-artifact",
+        "dsoftbus-source",
+        "dsoftbus-task-control",
     ]
     assert captured["disable_tools"] is False
     assert captured["call_source"] == "dsoftbus"
@@ -174,12 +277,100 @@ def test_remote_executor_applies_the_prepared_tool_policy(
     assert set(DSOFTBUS_TOOLS).issubset(captured["config"]["tools"]["disabled"])
 
 
-def test_return_artifact_collects_json_and_bounded_file_without_remote_path(
+@pytest.mark.asyncio
+async def test_remote_executor_resumes_frozen_tool_history(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    from mclaw.channels.base import AgentTurnResult
+
+    captured: dict[str, Any] = {}
+
+    class FakeRunner:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def handle_message(self, **kwargs: Any) -> AgentTurnResult:
+            captured.update(kwargs)
+            return AgentTurnResult(
+                session_id=kwargs["session_id"],
+                final_response="resumed",
+                raw_result={"completed": True, "messages": []},
+            )
+
+        def update_provider_runtime(self, _context: Any) -> None:
+            pass
+
+    monkeypatch.setattr("mclaw.channels.runner.AgentRunner", FakeRunner)
+    executor = AgentRunnerTurnExecutor(
+        provider_runtime=_context(),
+        config=_remote_tools_config(allow=True),
+        workspace_root=tmp_path,
+    )
+    history = (
+        MappingProxyType(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": (
+                    MappingProxyType(
+                        {
+                            "id": "call-input",
+                            "type": "function",
+                            "function": MappingProxyType(
+                                {
+                                    "name": "request_task_input",
+                                    "arguments": "{}",
+                                }
+                            ),
+                        }
+                    ),
+                ),
+            }
+        ),
+        MappingProxyType(
+            {
+                "role": "tool",
+                "tool_call_id": "call-input",
+                "content": "input required",
+            }
+        ),
+    )
+    request = RemoteTurnRequest(
+        conversation_key=ConversationKey(
+            peer_device_id="urn:mclaw:device:oh:" + "a" * 64,
+            peer_runtime_instance_id="00000000-0000-4000-8000-000000000021",
+            context_id="00000000-0000-4000-8000-000000000022",
+        ),
+        deadline_monotonic=None,
+        history=history,
+        message_id="00000000-0000-4000-8000-000000000023",
+        provider_runtime=_context(),
+        text="input supplied",
+        task_id="00000000-0000-4000-8000-000000000024",
+    )
+
+    assert executor.estimate_budget(request) > 0
+    result = await executor.execute(request)
+
+    assert result["final_response"] == "resumed"
+    assert type(captured["conversation_history"][0]) is dict
+    assert type(captured["conversation_history"][0]["tool_calls"]) is list
+    assert type(
+        captured["conversation_history"][0]["tool_calls"][0]["function"]
+    ) is dict
+
+
+def test_return_artifact_collects_json_and_chunked_file_without_remote_path(
+    tmp_path: Path,
+) -> None:
+    peer_device_id = "urn:mclaw:device:oh:" + "a" * 64
+    workspace = DsoftbusWorkspace(tmp_path / "collaboration")
     collector = TaskArtifactCollector(
         task_id="00000000-0000-4000-8000-000000000011",
         context_id="00000000-0000-4000-8000-000000000012",
+        peer_device_id=peer_device_id,
+        workspace=workspace,
     )
     token = bind_task_artifact_collector(collector)
     try:
@@ -215,7 +406,15 @@ def test_return_artifact_collects_json_and_bounded_file_without_remote_path(
     assert file_result["success"] is True
     artifacts = collector.snapshot()
     assert artifacts[0]["parts"][0]["data"] == {"count": 2, "ok": True}
-    assert base64.b64decode(artifacts[1]["parts"][0]["raw"]) == b"artifact-bytes"
+    descriptor = artifact_transfer_parts(artifacts[1])[0][2]
+    assert descriptor["byteLength"] == len(b"artifact-bytes")
+    assert descriptor["sha256"] == hashlib.sha256(b"artifact-bytes").hexdigest()
+    assert artifacts[1]["parts"][0]["url"].startswith(
+        "softbus://mclaw/task-artifact/"
+    )
+    produced = tuple((tmp_path / "collaboration").rglob("01-result.bin"))
+    assert len(produced) == 1
+    assert produced[0].read_bytes() == b"artifact-bytes"
     assert str(local_file) not in json.dumps(artifacts, ensure_ascii=False)
     assert artifacts[1]["parts"][0]["filename"] == "result.bin"
 
@@ -406,6 +605,60 @@ async def test_remote_task_id_crosses_agent_and_tool_thread_context(
 
     assert observed == [task_id, task_id]
     assert get_current_task_id() == ""
+
+
+@pytest.mark.asyncio
+async def test_task_source_client_crosses_agent_and_tool_thread_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from mclaw.channels.base import AgentTurnResult
+    from mclaw.dsoftbus.task_source import get_task_source_client
+
+    source_client = object()
+    observed: list[Any] = []
+
+    class FakeRunner:
+        def __init__(self, **_kwargs: Any) -> None:
+            pass
+
+        async def handle_message(self, **kwargs: Any) -> AgentTurnResult:
+            observed.append(get_task_source_client())
+            observed.append(await asyncio.to_thread(get_task_source_client))
+            return AgentTurnResult(
+                session_id=kwargs["session_id"],
+                final_response="done",
+                raw_result={"completed": True, "messages": []},
+            )
+
+        def update_provider_runtime(self, _context: Any) -> None:
+            pass
+
+    monkeypatch.setattr("mclaw.channels.runner.AgentRunner", FakeRunner)
+    executor = AgentRunnerTurnExecutor(
+        provider_runtime=_context(),
+        config=_remote_tools_config(allow=True),
+        workspace_root=tmp_path,
+    )
+    await executor.execute(
+        RemoteTurnRequest(
+            conversation_key=ConversationKey(
+                peer_device_id="urn:mclaw:device:oh:" + "d" * 64,
+                peer_runtime_instance_id="00000000-0000-4000-8000-000000000091",
+                context_id="00000000-0000-4000-8000-000000000092",
+            ),
+            deadline_monotonic=None,
+            history=(),
+            message_id="00000000-0000-4000-8000-000000000093",
+            provider_runtime=_context(),
+            text="run",
+            task_id="00000000-0000-4000-8000-000000000094",
+            source_client=source_client,
+        )
+    )
+
+    assert observed == [source_client, source_client]
+    assert get_task_source_client() is None
 
 
 @pytest.mark.asyncio

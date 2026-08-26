@@ -619,8 +619,8 @@ def _append_dsoftbus_checks(results: list[CheckResult], cfg: dict | None) -> Non
                 CheckResult(
                     "dsoftbus runtime",
                     False,
-                    "requested; current host is not an authenticated OpenHarmony 6.1 candidate",
-                    "Run M-Claw on the target Kaihong OS/OpenHarmony 6.1 device.",
+                    "requested; current host has no supported OpenHarmony DSoftBus ABI",
+                    "Run M-Claw on a supported Kaihong OS/OpenHarmony device.",
                     severity="warn",
                 )
             )

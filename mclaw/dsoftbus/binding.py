@@ -150,7 +150,6 @@ class InMemoryBinding:
         self._peer_agent_id = peer_agent
         self._initiator = initiator
         self._generation = connection_generation
-        self._nonce_factory = nonce_factory
         self._phase = BindingPhase.BINDING
         self._connection_nonce: str | None = None
         self._peer_identity: PeerBindingIdentity | None = None

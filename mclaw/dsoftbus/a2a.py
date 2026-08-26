@@ -75,6 +75,19 @@ _METHODS = frozenset(
         "ListTasks",
         "CancelTask",
         "SubscribeToTask",
+        "mclaw.taskLease.renew",
+        "mclaw.taskResult.ack",
+        "mclaw.taskInput.begin",
+        "mclaw.taskInput.chunk",
+        "mclaw.taskInput.commit",
+        "mclaw.taskInput.abort",
+        "mclaw.taskInput.finish",
+        "mclaw.taskSource.list",
+        "mclaw.taskSource.search",
+        "mclaw.taskSource.open",
+        "mclaw.taskSource.read",
+        "mclaw.taskArtifact.open",
+        "mclaw.taskArtifact.read",
         "CreateTaskPushNotificationConfig",
         "GetTaskPushNotificationConfig",
         "ListTaskPushNotificationConfigs",
@@ -120,6 +133,24 @@ _ERROR_MESSAGES: Mapping[str, str] = MappingProxyType(
         "REMOTE_PROVIDER_UNAVAILABLE": "Remote provider is unavailable",
         "PROVIDER_ERROR": "Provider error",
         "AGENT_TOOLS_FORBIDDEN": "Agent tools are forbidden",
+        "TASK_INPUT_INVALID": "Task input is invalid",
+        "TASK_INPUT_TOO_LARGE": "Task input is too large",
+        "TASK_INPUT_IO_ERROR": "Task input storage failed",
+        "TASK_INPUT_HASH_MISMATCH": "Task input hash does not match",
+        "TRANSFER_CONFLICT": "File transfer conflicts with existing state",
+        "SOURCE_SCOPE_NOT_FOUND": "Task source scope was not found",
+        "SOURCE_PATH_FORBIDDEN": "Task source path is forbidden",
+        "SOURCE_CHANGED": "Task source changed while it was read",
+        "SOURCE_QUOTA_EXCEEDED": "Task source quota was exceeded",
+        "ARTIFACT_NOT_FOUND": "Task artifact was not found",
+        "ARTIFACT_IO_ERROR": "Task artifact storage failed",
+        "ARTIFACT_HASH_MISMATCH": "Task artifact hash does not match",
+        "ARTIFACT_TOO_LARGE": "Task artifact is too large",
+        "ARTIFACT_CHANGED": "Task artifact changed while it was read",
+        "TASK_NOT_INPUT_REQUIRED": "Task is not waiting for additional input",
+        "INPUT_REQUEST_MISMATCH": "Task input request does not match",
+        "OWNER_RUNTIME_REPLACED": "Task owner Runtime was replaced",
+        "OWNER_LEASE_EXPIRED": "Task owner lease expired",
     }
 )
 
@@ -1034,17 +1065,6 @@ class _TaskArtifactUpdateEvent(_A2AModel):
         return self
 
 
-class _SendMessageResponse(_A2AModel):
-    task: _Task | None = None
-    message: _Message | None = None
-
-    @model_validator(mode="after")
-    def validate_payload(self) -> "_SendMessageResponse":
-        if len({"task", "message"} & self.model_fields_set) != 1:
-            raise ValueError("send response payload oneof")
-        return self
-
-
 class _StreamResponse(_A2AModel):
     task: _Task | None = None
     message: _Message | None = None
@@ -1199,6 +1219,18 @@ class _SubscribeRequest(_A2AModel):
         if self.tenant is not None:
             _empty_tenant(self.tenant)
         _bounded_text(self.id, "id")
+        return self
+
+
+class _TaskResultAckRequest(_A2AModel):
+    tenant: str | None = None
+    id: str
+
+    @model_validator(mode="after")
+    def validate_request(self) -> "_TaskResultAckRequest":
+        if self.tenant is not None:
+            _empty_tenant(self.tenant)
+        _canonical_uuid4(self.id)
         return self
 
 
@@ -1360,25 +1392,109 @@ def validate_core_method(method: str, params: Any) -> CoreMethodCall | Mapping[s
         message = request.message
         if message.role != "ROLE_USER":
             _fail("INVALID_PARAMS")
-        if message.taskId not in {None, ""} or message.referenceTaskIds:
+        if message.referenceTaskIds:
             _fail("TASK_NOT_FOUND")
+        continuation = message.taskId not in {None, ""}
+        if continuation:
+            assert message.taskId is not None
+            _canonical_uuid4(message.taskId)
+            if message.contextId in {None, ""}:
+                _fail("INVALID_PARAMS")
+            metadata = message.metadata
+            if not isinstance(metadata, dict):
+                _fail("INPUT_REQUEST_MISMATCH")
+            try:
+                _canonical_uuid4(metadata.get("mclaw.inputRequestId"))
+            except (A2AError, TypeError, ValueError):
+                _fail("INPUT_REQUEST_MISMATCH")
+        elif isinstance(message.metadata, dict) and (
+            "mclaw.inputRequestId" in message.metadata
+        ):
+            _fail("INPUT_REQUEST_MISMATCH")
         text_parts: list[str] = []
+        task_inputs_seen = False
+        manifest_seen = False
+        normalized_parts: list[dict[str, Any]] = []
         for part in message.parts:
+            if "text" in part.model_fields_set:
+                if (
+                    part.filename is not None
+                    or part.mediaType not in {None, "", "text/plain"}
+                ):
+                    _fail("CONTENT_TYPE_NOT_SUPPORTED")
+                assert part.text is not None
+                text_parts.append(part.text)
+                normalized_parts.append(part.model_dump(exclude_none=True))
+                continue
+            if "url" in part.model_fields_set:
+                try:
+                    from .a2a_media import task_input_descriptor_from_part
+
+                    task_input_descriptor_from_part(
+                        part.model_dump(exclude_none=True)
+                    )
+                except Exception as error:
+                    code = str(getattr(error, "code", "TASK_INPUT_INVALID"))
+                    _fail(
+                        code
+                        if code in protocol.RPC_ERROR_CODES
+                        else "TASK_INPUT_INVALID"
+                    )
+                task_inputs_seen = True
+                normalized_parts.append(part.model_dump(exclude_none=True))
+                continue
             if (
-                "text" not in part.model_fields_set
+                "data" not in part.model_fields_set
+                or manifest_seen
                 or part.filename is not None
-                or part.mediaType not in {None, "", "text/plain"}
+                or part.mediaType
+                != "application/vnd.mclaw.task-input+json"
             ):
                 _fail("CONTENT_TYPE_NOT_SUPPORTED")
-            assert part.text is not None
-            text_parts.append(part.text)
+            try:
+                from .task_files import normalize_task_input_manifest
+
+                manifest = normalize_task_input_manifest(part.data)
+            except Exception as error:
+                code = str(getattr(error, "code", "TASK_INPUT_INVALID"))
+                _fail(code if code in protocol.RPC_ERROR_CODES else "TASK_INPUT_INVALID")
+            manifest_seen = True
+            task_inputs_seen = True
+            normalized_part = part.model_dump(exclude_none=True)
+            normalized_part["data"] = _plain(manifest)
+            normalized_parts.append(normalized_part)
+        if task_inputs_seen:
+            try:
+                from .a2a_media import task_input_manifest_from_parts
+
+                task_input_manifest_from_parts(normalized_parts)
+            except Exception as error:
+                code = str(getattr(error, "code", "TASK_INPUT_INVALID"))
+                _fail(
+                    code
+                    if code in protocol.RPC_ERROR_CODES
+                    else "TASK_INPUT_INVALID"
+                )
         combined = "\n".join(text_parts)
-        _bounded_text(combined, "message text", maximum=24_576)
+        _bounded_text(
+            combined,
+            "message text",
+            minimum=0 if continuation else 1,
+            maximum=24_576,
+        )
+        if continuation and not combined and not task_inputs_seen:
+            _fail("INVALID_PARAMS")
+        if task_inputs_seen and (
+            message.extensions is None
+            or protocol.TASK_FILES_EXTENSION_URI not in message.extensions
+        ):
+            _fail("EXTENSION_SUPPORT_REQUIRED")
         configuration = request.configuration
         if configuration is not None:
             if configuration.taskPushNotificationConfig is not None:
                 _fail("PUSH_NOT_SUPPORTED")
         normalized_params = request.model_dump(exclude_none=True)
+        normalized_params["message"]["parts"] = normalized_parts
         normalized_configuration = dict(normalized_params.get("configuration", {}))
         normalized_configuration["acceptedOutputModes"] = ["text/plain"]
         normalized_params["configuration"] = normalized_configuration
@@ -1416,6 +1532,183 @@ def validate_core_method(method: str, params: Any) -> CoreMethodCall | Mapping[s
             method,
             _freeze(request.model_dump(exclude_none=True)),
         )
+    if method == "mclaw.taskLease.renew":
+        value = _exact(
+            params,
+            frozenset({"sequence", "taskIds"}),
+            "INVALID_PARAMS",
+        )
+        sequence = value["sequence"]
+        task_ids = value["taskIds"]
+        if type(sequence) is not int or not 1 <= sequence <= 2**63 - 1:
+            _fail("INVALID_PARAMS")
+        if (
+            not isinstance(task_ids, list)
+            or not 1 <= len(task_ids) <= protocol.TASK_OWNER_LEASE_BATCH_MAX
+        ):
+            _fail("INVALID_PARAMS")
+        normalized_ids: list[str] = []
+        for task_id in task_ids:
+            try:
+                normalized_ids.append(_canonical_uuid4(task_id))
+            except (A2AError, TypeError, ValueError):
+                _fail("INVALID_PARAMS")
+        if len(set(normalized_ids)) != len(normalized_ids):
+            _fail("INVALID_PARAMS")
+        return CoreMethodCall(
+            method,
+            _freeze({"sequence": sequence, "taskIds": normalized_ids}),
+        )
+    if method == "mclaw.taskResult.ack":
+        request = _model(_TaskResultAckRequest, params)
+        assert isinstance(request, _TaskResultAckRequest)
+        return CoreMethodCall(
+            method,
+            _freeze(request.model_dump(exclude_none=True)),
+        )
+    if method in {"mclaw.taskInput.begin", "mclaw.taskInput.commit", "mclaw.taskInput.abort"}:
+        value = _exact(params, frozenset({"taskId", "inputId"}), "INVALID_PARAMS")
+        try:
+            normalized = {
+                "taskId": protocol.canonical_uuid4(value["taskId"], "taskId"),
+                "inputId": protocol.canonical_uuid4(value["inputId"], "inputId"),
+            }
+        except protocol.ProtocolError as error:
+            raise A2AError("INVALID_PARAMS") from error
+        return CoreMethodCall(method, _freeze(normalized))
+    if method == "mclaw.taskInput.chunk":
+        value = _exact(
+            params,
+            frozenset({"taskId", "inputId", "offset", "data"}),
+            "INVALID_PARAMS",
+        )
+        try:
+            normalized = {
+                "taskId": protocol.canonical_uuid4(value["taskId"], "taskId"),
+                "inputId": protocol.canonical_uuid4(value["inputId"], "inputId"),
+                "offset": value["offset"],
+                "data": value["data"],
+            }
+            if type(normalized["offset"]) is not int or normalized["offset"] < 0:
+                raise protocol.ProtocolError("INVALID_PARAMS", "offset")
+            protocol.decode_strict_base64(
+                normalized["data"],
+                maximum=protocol.TASK_TRANSFER_CHUNK_BYTES_MAX,
+            )
+        except protocol.ProtocolError as error:
+            raise A2AError("INVALID_PARAMS") from error
+        return CoreMethodCall(method, _freeze(normalized))
+    if method == "mclaw.taskInput.finish":
+        value = _exact(params, frozenset({"taskId"}), "INVALID_PARAMS")
+        try:
+            task_id = protocol.canonical_uuid4(value["taskId"], "taskId")
+        except protocol.ProtocolError as error:
+            raise A2AError("INVALID_PARAMS") from error
+        return CoreMethodCall(method, _freeze({"taskId": task_id}))
+    if method in {
+        "mclaw.taskSource.list",
+        "mclaw.taskSource.search",
+        "mclaw.taskSource.open",
+        "mclaw.taskSource.read",
+    }:
+        from .task_files import TaskFileError, safe_relative_path
+
+        required_by_method = {
+            "mclaw.taskSource.list": frozenset(
+                {"taskId", "scopeId", "path", "depth", "pageSize", "pageToken"}
+            ),
+            "mclaw.taskSource.search": frozenset(
+                {"taskId", "scopeId", "path", "query", "mode", "maxResults"}
+            ),
+            "mclaw.taskSource.open": frozenset(
+                {"taskId", "scopeId", "path", "transferId"}
+            ),
+            "mclaw.taskSource.read": frozenset(
+                {"taskId", "transferId", "offset"}
+            ),
+        }
+        value = _exact(params, required_by_method[method], "INVALID_PARAMS")
+        try:
+            normalized = {
+                "taskId": protocol.canonical_uuid4(value["taskId"], "taskId")
+            }
+            if "scopeId" in value:
+                normalized["scopeId"] = protocol.canonical_uuid4(
+                    value["scopeId"], "scopeId"
+                )
+            if "transferId" in value:
+                normalized["transferId"] = protocol.canonical_uuid4(
+                    value["transferId"], "transferId"
+                )
+            if "path" in value:
+                normalized["path"] = (
+                    "" if value["path"] == "" else safe_relative_path(value["path"])
+                )
+            if "pageToken" in value:
+                normalized["pageToken"] = (
+                    ""
+                    if value["pageToken"] == ""
+                    else safe_relative_path(value["pageToken"])
+                )
+        except (protocol.ProtocolError, TaskFileError) as error:
+            raise A2AError("INVALID_PARAMS") from error
+        if method == "mclaw.taskSource.list":
+            normalized["depth"] = _strict_int(
+                value["depth"], 1, protocol.TASK_SOURCE_DEPTH_MAX
+            )
+            normalized["pageSize"] = _strict_int(
+                value["pageSize"], 1, protocol.TASK_SOURCE_PAGE_MAX
+            )
+        elif method == "mclaw.taskSource.search":
+            normalized["query"] = _bounded_text(
+                value["query"], "query", maximum=256
+            )
+            if value["mode"] not in {"filename", "content"}:
+                _fail("INVALID_PARAMS")
+            normalized["mode"] = value["mode"]
+            normalized["maxResults"] = _strict_int(
+                value["maxResults"],
+                1,
+                protocol.TASK_SOURCE_SEARCH_RESULT_MAX,
+            )
+        elif method == "mclaw.taskSource.read":
+            normalized["offset"] = _strict_int(
+                value["offset"], 0, protocol.TASK_INPUT_FILE_BYTES_MAX - 1
+            )
+        return CoreMethodCall(method, _freeze(normalized))
+    if method == "mclaw.taskArtifact.open":
+        value = _exact(
+            params,
+            frozenset({"taskId", "artifactId", "transferId"}),
+            "INVALID_PARAMS",
+        )
+        try:
+            normalized = {
+                name: protocol.canonical_uuid4(value[name], name)
+                for name in ("taskId", "artifactId", "transferId")
+            }
+        except protocol.ProtocolError as error:
+            raise A2AError("INVALID_PARAMS") from error
+        return CoreMethodCall(method, _freeze(normalized))
+    if method == "mclaw.taskArtifact.read":
+        value = _exact(
+            params,
+            frozenset({"taskId", "transferId", "offset"}),
+            "INVALID_PARAMS",
+        )
+        try:
+            normalized = {
+                "taskId": protocol.canonical_uuid4(value["taskId"], "taskId"),
+                "transferId": protocol.canonical_uuid4(
+                    value["transferId"], "transferId"
+                ),
+                "offset": _strict_int(
+                    value["offset"], 0, protocol.TASK_ARTIFACT_BYTES_MAX - 1
+                ),
+            }
+        except protocol.ProtocolError as error:
+            raise A2AError("INVALID_PARAMS") from error
+        return CoreMethodCall(method, _freeze(normalized))
     if method == "CreateTaskPushNotificationConfig":
         _model(_TaskPushNotificationConfig, params)
         _fail("PUSH_NOT_SUPPORTED")
@@ -1435,9 +1728,18 @@ def validate_core_method(method: str, params: Any) -> CoreMethodCall | Mapping[s
 
 
 def task_state_is_terminal(state: Any) -> bool:
-    """Return whether an A2A Task state closes a streaming response."""
+    """Return whether an A2A Task can no longer be continued."""
 
     return isinstance(state, str) and state in _TERMINAL_TASK_STATES
+
+
+def task_state_closes_stream(state: Any) -> bool:
+    """Return whether one streaming turn has reached a response boundary."""
+
+    return task_state_is_terminal(state) or state in {
+        "TASK_STATE_INPUT_REQUIRED",
+        "TASK_STATE_AUTH_REQUIRED",
+    }
 
 
 def utc_timestamp() -> str:
@@ -1486,26 +1788,6 @@ def validate_task(
         if task.contextId != expected_context_id:
             _fail("INVALID_AGENT_RESPONSE")
     return _freeze(task.model_dump(exclude_none=True))
-
-
-def validate_send_task_result(
-    result: Any,
-    *,
-    expected_task_id: str | None = None,
-    expected_context_id: str | None = None,
-) -> Mapping[str, Any]:
-    """Validate the Task-only M-Claw profile of ``SendMessageResponse``."""
-
-    response = _response_model(_SendMessageResponse, result)
-    assert isinstance(response, _SendMessageResponse)
-    if response.task is None or response.message is not None:
-        _fail("INVALID_AGENT_RESPONSE")
-    task = validate_task(
-        response.task.model_dump(exclude_none=True),
-        expected_task_id=expected_task_id,
-        expected_context_id=expected_context_id,
-    )
-    return MappingProxyType({"task": task})
 
 
 def validate_stream_response(
@@ -1645,6 +1927,20 @@ class AgentCard:
     device_id: str
     agent_id: str
 
+    def supports_extension(self, uri: str) -> bool:
+        """Return whether this verified Card advertises one extension URI."""
+
+        capabilities = self.document.get("capabilities", {})
+        extensions = (
+            capabilities.get("extensions", ())
+            if isinstance(capabilities, Mapping)
+            else ()
+        )
+        return any(
+            isinstance(extension, Mapping) and extension.get("uri") == uri
+            for extension in extensions
+        )
+
 
 def parse_softbus_url(value: Any) -> str:
     if not isinstance(value, str) or _SOFTBUS_URL.fullmatch(value) is None:
@@ -1660,6 +1956,11 @@ def build_agent_card(
     provider_readiness_code: str,
     mclaw_version: str = MCLAW_VERSION,
 ) -> AgentCard:
+    from .a2a_media import (
+        TASK_ARTIFACT_REFERENCE_PREFIX,
+        TASK_INPUT_REFERENCE_PREFIX,
+    )
+
     device_match = _DEVICE_ID.fullmatch(device_id) if isinstance(device_id, str) else None
     agent_match = _AGENT_ID.fullmatch(agent_id) if isinstance(agent_id, str) else None
     if (
@@ -1715,7 +2016,51 @@ def build_agent_card(
                         "manifestMethod": "mclaw.deviceManifest.get",
                         "stateMethod": "mclaw.deviceState.get",
                     },
-                }
+                },
+                {
+                    "uri": protocol.TASK_FILES_EXTENSION_URI,
+                    "description": (
+                        "Task-scoped A2A media references backed by verified "
+                        "DSoftBus transfers, source browsing and artifacts."
+                    ),
+                    "required": False,
+                    "params": {
+                        "inputManifestMediaType": (
+                            "application/vnd.mclaw.task-input+json"
+                        ),
+                        "inputReferencePrefix": TASK_INPUT_REFERENCE_PREFIX,
+                        "inputMethods": [
+                            "mclaw.taskInput.begin",
+                            "mclaw.taskInput.chunk",
+                            "mclaw.taskInput.commit",
+                            "mclaw.taskInput.abort",
+                            "mclaw.taskInput.finish",
+                        ],
+                        "sourceMethods": [
+                            "mclaw.taskSource.list",
+                            "mclaw.taskSource.search",
+                            "mclaw.taskSource.open",
+                            "mclaw.taskSource.read",
+                        ],
+                        "artifactDescriptorMediaType": (
+                            "application/vnd.mclaw.task-artifact+json"
+                        ),
+                        "artifactReferencePrefix": (
+                            TASK_ARTIFACT_REFERENCE_PREFIX
+                        ),
+                        "artifactMethods": [
+                            "mclaw.taskArtifact.open",
+                            "mclaw.taskArtifact.read",
+                        ],
+                        "resultAckMethod": "mclaw.taskResult.ack",
+                        "artifactBytesMax": protocol.TASK_ARTIFACT_BYTES_MAX,
+                        "singleFileBytesMax": protocol.TASK_INPUT_FILE_BYTES_MAX,
+                        "taskInputBytesMax": protocol.TASK_INPUT_TASK_BYTES_MAX,
+                        "transferChunkBytesMax": (
+                            protocol.TASK_TRANSFER_CHUNK_BYTES_MAX
+                        ),
+                    },
+                },
             ],
         },
         "defaultInputModes": ["text/plain"],
@@ -1724,8 +2069,11 @@ def build_agent_card(
             {
                 "id": "mclaw.general",
                 "name": "M-Claw general agent",
-                "description": "Accept a text task and return a text result.",
-                "tags": ["mclaw", "text", "device-agent"],
+                "description": (
+                    "Accept a task with optional task-scoped media or file "
+                    "references and return text or declared artifacts."
+                ),
+                "tags": ["mclaw", "media", "device-agent"],
             }
         ],
     }
@@ -1809,11 +2157,36 @@ def validate_agent_card(
         or capabilities["pushNotifications"] is not False
         or capabilities["extendedAgentCard"] is not False
         or not isinstance(capabilities["extensions"], list)
-        or len(capabilities["extensions"]) != 1
     ):
         _fail("BINDING_INCOMPATIBLE")
+    raw_extensions = capabilities["extensions"]
+    if not 1 <= len(raw_extensions) <= 2 or any(
+        not isinstance(item, dict) or not isinstance(item.get("uri"), str)
+        for item in raw_extensions
+    ):
+        _fail("BINDING_INCOMPATIBLE")
+    extensions_by_uri = {
+        item.get("uri"): item
+        for item in raw_extensions
+    }
+    extension_uris = frozenset(extensions_by_uri)
+    if len(extensions_by_uri) != len(raw_extensions) or extension_uris not in {
+        frozenset({protocol.DEVICE_CONTEXT_EXTENSION_URI}),
+        frozenset(
+            {
+                protocol.DEVICE_CONTEXT_EXTENSION_URI,
+                protocol.TASK_FILES_EXTENSION_URI,
+            }
+        ),
+    }:
+        _fail("BINDING_INCOMPATIBLE")
+    if require_exact and extension_uris != {
+        protocol.DEVICE_CONTEXT_EXTENSION_URI,
+        protocol.TASK_FILES_EXTENSION_URI,
+    }:
+        _fail("BINDING_INCOMPATIBLE")
     extension = _recognized(
-        capabilities["extensions"][0],
+        extensions_by_uri[protocol.DEVICE_CONTEXT_EXTENSION_URI],
         frozenset({"uri", "description", "required", "params"}),
         require_exact=require_exact,
     )
@@ -1822,6 +2195,83 @@ def validate_agent_card(
         or extension["required"] is not False
     ):
         _fail("BINDING_INCOMPATIBLE")
+    task_files_extension: dict[str, Any] | None = None
+    task_file_params: dict[str, Any] | None = None
+    raw_task_files_extension = extensions_by_uri.get(
+        protocol.TASK_FILES_EXTENSION_URI
+    )
+    if raw_task_files_extension is not None:
+        task_files_extension = _recognized(
+            raw_task_files_extension,
+            frozenset({"uri", "description", "required", "params"}),
+            require_exact=require_exact,
+        )
+        if task_files_extension["required"] is not False:
+            _fail("BINDING_INCOMPATIBLE")
+        _bounded_text(
+            task_files_extension["description"],
+            "extension.description",
+            maximum=1_024,
+        )
+        task_file_params = _exact(
+            task_files_extension["params"],
+            frozenset(
+                {
+                    "inputManifestMediaType",
+                    "inputReferencePrefix",
+                    "inputMethods",
+                    "sourceMethods",
+                    "artifactDescriptorMediaType",
+                    "artifactReferencePrefix",
+                    "artifactMethods",
+                    "resultAckMethod",
+                    "artifactBytesMax",
+                    "singleFileBytesMax",
+                    "taskInputBytesMax",
+                    "transferChunkBytesMax",
+                }
+            ),
+        )
+        if (
+            task_file_params["inputManifestMediaType"]
+            != "application/vnd.mclaw.task-input+json"
+            or task_file_params["inputReferencePrefix"]
+            != "softbus://mclaw/task-input/"
+            or task_file_params["inputMethods"]
+            != [
+                "mclaw.taskInput.begin",
+                "mclaw.taskInput.chunk",
+                "mclaw.taskInput.commit",
+                "mclaw.taskInput.abort",
+                "mclaw.taskInput.finish",
+            ]
+            or task_file_params["sourceMethods"]
+            != [
+                "mclaw.taskSource.list",
+                "mclaw.taskSource.search",
+                "mclaw.taskSource.open",
+                "mclaw.taskSource.read",
+            ]
+            or task_file_params["artifactDescriptorMediaType"]
+            != "application/vnd.mclaw.task-artifact+json"
+            or task_file_params["artifactReferencePrefix"]
+            != "softbus://mclaw/task-artifact/"
+            or task_file_params["artifactMethods"]
+            != [
+                "mclaw.taskArtifact.open",
+                "mclaw.taskArtifact.read",
+            ]
+            or task_file_params["resultAckMethod"] != "mclaw.taskResult.ack"
+            or task_file_params["artifactBytesMax"]
+            != protocol.TASK_ARTIFACT_BYTES_MAX
+            or task_file_params["singleFileBytesMax"]
+            != protocol.TASK_INPUT_FILE_BYTES_MAX
+            or task_file_params["taskInputBytesMax"]
+            != protocol.TASK_INPUT_TASK_BYTES_MAX
+            or task_file_params["transferChunkBytesMax"]
+            != protocol.TASK_TRANSFER_CHUNK_BYTES_MAX
+        ):
+            _fail("BINDING_INCOMPATIBLE")
     _bounded_text(extension["description"], "extension.description", maximum=1_024)
     params = _exact(
         extension["params"],
@@ -1865,16 +2315,32 @@ def validate_agent_card(
         frozenset({"id", "name", "description", "tags"}),
         require_exact=require_exact,
     )
+    expected_skill_tags = (
+        ["mclaw", "media", "device-agent"]
+        if task_files_extension is not None
+        else ["mclaw", "text", "device-agent"]
+    )
     if (
         skill["id"] != "mclaw.general"
         or not isinstance(skill["tags"], list)
-        or skill["tags"] != ["mclaw", "text", "device-agent"]
+        or skill["tags"] != expected_skill_tags
     ):
         _fail("INVALID_REQUEST")
     _bounded_text(skill["name"], "skill.name", maximum=128)
     _bounded_text(skill["description"], "skill.description", maximum=1_024)
     extension = {**extension, "params": copy.deepcopy(params)}
-    capabilities = {**capabilities, "extensions": [extension]}
+    normalized_extensions = [extension]
+    if task_files_extension is not None and task_file_params is not None:
+        normalized_extensions.append(
+            {
+                **task_files_extension,
+                "params": copy.deepcopy(task_file_params),
+            }
+        )
+    capabilities = {
+        **capabilities,
+        "extensions": normalized_extensions,
+    }
     card = {
         **card,
         "supportedInterfaces": [copy.deepcopy(interface)],
@@ -1915,10 +2381,10 @@ __all__ = [
     "parse_softbus_url",
     "validate_agent_card",
     "validate_core_method",
-    "validate_send_task_result",
     "validate_service_parameters",
     "validate_stream_response",
     "validate_task",
     "task_state_is_terminal",
+    "task_state_closes_stream",
     "utc_timestamp",
 ]

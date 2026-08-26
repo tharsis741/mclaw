@@ -94,8 +94,8 @@ class BannerRenderer:
                 logo_table.add_row(RichText.from_markup(logo_line))
 
             cc.print(logo_table)
-            cc.print(f"  [{ACCENT_LIGHT} bold]自进化空间智能体[/]")
-            cc.print(f"  [{ACCENT_DIM}]Self-Evolving Robot Intelligence[/]")
+            cc.print(f"  [{ACCENT_LIGHT} bold]自进化具身智能体运行时[/]")
+            cc.print(f"  [{ACCENT_DIM}]Self-Evolving Embodied Agent Harness[/]")
             cc.print("")
 
         content = Table.grid(pad_edge=False)

@@ -57,8 +57,10 @@ _DSOFTBUS_REMOTE_DATA_TOOLS = frozenset(
         "dsoftbus_get_device_context",
         "dsoftbus_list_peers",
         "dsoftbus_run_agent_task",
+        "dsoftbus_continue_agent_task",
     }
 )
+_DSOFTBUS_TASK_INPUT_TOOL = "request_task_input"
 
 
 def _close_transport_once(transport: Any) -> bool:
@@ -2449,6 +2451,36 @@ class MClaw:
                     for tool_call in tool_calls
                 )
             )
+            task_input_calls = [
+                tool_call
+                for tool_call in tool_calls or ()
+                if isinstance(tool_call, dict)
+                and str((tool_call.get("function") or {}).get("name") or "")
+                == _DSOFTBUS_TASK_INPUT_TOOL
+            ]
+            if (
+                call_source == "dsoftbus"
+                and task_input_calls
+                and (
+                    len(task_input_calls) != 1
+                    or len(tool_calls or ()) != 1
+                )
+            ):
+                self._clear_unconfirmed_context_display()
+                self.messages = messages
+                return {
+                    "final_response": "",
+                    "messages": messages,
+                    "model": self.model,
+                    "session_id": self.session_id,
+                    "api_calls": api_call_count,
+                    "error": "INVALID_AGENT_RESPONSE",
+                    "interrupted": False,
+                    "stop_reason": "invalid_task_input_batch",
+                    "completed": False,
+                    "assistant_rounds": assistant_rounds,
+                    "token_usage": self._finish_turn_usage(),
+                }
             if tool_calls and (disable_tools or forged_dsoftbus_call):
                 self._clear_unconfirmed_context_display()
                 self.messages = messages
@@ -2872,6 +2904,7 @@ class MClaw:
 
         pending_delegate_data = None
         pending_skill_import_confirmation = None
+        pending_task_input_request = None
         skill_prompt_changed = False
 
         # Append tool results in call order.
@@ -2909,6 +2942,16 @@ class MClaw:
                         pending_skill_import_confirmation = result_data
                 except Exception:
                     pass
+            elif name == _DSOFTBUS_TASK_INPUT_TOOL:
+                try:
+                    result_data = json.loads(result)
+                    if (
+                        result_data.get("success") is True
+                        and result_data.get("input_required") is True
+                    ):
+                        pending_task_input_request = result_data
+                except Exception:
+                    pass
 
             if self._session_db:
                 self._session_db.append_message(
@@ -2938,6 +2981,24 @@ class MClaw:
                 "pending_delegate": True,
                 "pending_data": pending_delegate_data,
                 "skills_changed": bool(getattr(self, "_skills_changed_in_turn", False)),
+            }
+
+        if pending_task_input_request:
+            self.messages = messages
+            return {
+                "final_response": None,
+                "messages": messages,
+                "model": self.model,
+                "session_id": self.session_id,
+                "api_calls": getattr(self, "session_api_calls", 0),
+                "interrupted": False,
+                "pending_task_input": True,
+                "input_request": pending_task_input_request,
+                "completed": False,
+                "stop_reason": "task_input_required",
+                "skills_changed": bool(
+                    getattr(self, "_skills_changed_in_turn", False)
+                ),
             }
 
         if pending_skill_import_confirmation:

@@ -368,11 +368,6 @@ class DsoftbusEndpointLock:
     def holder(self) -> Mapping[str, Any]:
         return MappingProxyType(dict(self._holder))
 
-    @property
-    def is_held(self) -> bool:
-        with self._mutex:
-            return self._lock_fd is not None
-
     def verify_current_path(self) -> None:
         """Revalidate path identity and exact holder bytes on held descriptors."""
         with self._mutex:

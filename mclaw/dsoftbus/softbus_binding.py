@@ -31,7 +31,7 @@ from .a2a import (
     encode_success_frame,
     parse_request_frame,
     parse_response_frame,
-    task_state_is_terminal,
+    task_state_closes_stream,
     validate_agent_card,
     validate_core_method,
     validate_stream_response,
@@ -499,11 +499,11 @@ class SoftBusA2ABinding:
                 self.close()
                 return BindingReceiveResult(close_generation=True)
             if "statusUpdate" in normalized_result:
-                stream_end = task_state_is_terminal(
+                stream_end = task_state_closes_stream(
                     normalized_result["statusUpdate"]["status"]["state"]
                 )
             elif "task" in normalized_result:
-                stream_end = task_state_is_terminal(
+                stream_end = task_state_closes_stream(
                     normalized_result["task"]["status"]["state"]
                 )
             else:
@@ -668,6 +668,16 @@ class SoftBusA2ABinding:
 
         if not self.ready:
             _fail("PEER_NOT_READY")
+        peer_card = self._binding.peer_card
+        if extensions and (
+            peer_card is None
+            or any(
+                not self._local_card.supports_extension(uri)
+                or not peer_card.supports_extension(uri)
+                for uri in extensions
+            )
+        ):
+            _fail("EXTENSION_SUPPORT_REQUIRED")
         try:
             call = validate_core_method(method, params)
         except A2AError as error:
@@ -685,13 +695,22 @@ class SoftBusA2ABinding:
     def device_context_extension_allowed(self, request: RequestEnvelope) -> bool:
         """Check the per-request extension gate after both Cards are verified."""
 
+        return self.extension_allowed(
+            request,
+            protocol.DEVICE_CONTEXT_EXTENSION_URI,
+        )
+
+    def extension_allowed(self, request: RequestEnvelope, uri: str) -> bool:
+        """Check one per-request extension gate after both Cards are verified."""
+
         return (
             isinstance(request, RequestEnvelope)
+            and isinstance(uri, str)
             and self.ready
+            and self._local_card.supports_extension(uri)
             and self._binding.peer_card is not None
-            and request.service_parameters.advertises(
-                protocol.DEVICE_CONTEXT_EXTENSION_URI
-            )
+            and self._binding.peer_card.supports_extension(uri)
+            and request.service_parameters.advertises(uri)
         )
 
     def close(self) -> None:
@@ -714,7 +733,6 @@ class SendCompletion:
     socket: int
     generation: int
     close_after_send: bool
-    sent_bytes: int
 
 
 @dataclass(slots=True)
@@ -963,7 +981,7 @@ class SoftBusSendScheduler:
                 self.unregister(socket, generation)
             elif state.business or state.control:
                 self._activate(socket)
-            return SendCompletion(socket, generation, frame.close_after_send, sent)
+            return SendCompletion(socket, generation, frame.close_after_send)
         return None
 
     def unregister(self, socket: int, generation: int) -> bool:

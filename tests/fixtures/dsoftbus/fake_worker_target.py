@@ -66,7 +66,10 @@ def run(args: argparse.Namespace) -> int:
         "workerEpoch": args.epoch,
     }
     if args.mode == "startup-error":
-        _write(sys.stderr.buffer, {"code": "NATIVE_LOAD_FAILED", "kind": "worker-diagnostic"})
+        _write(
+            sys.stderr.buffer,
+            {"code": "NATIVE_LOAD_FAILED", "kind": "worker-diagnostic"},
+        )
         return 78
     if args.mode == "early-stdout":
         _write(sys.stdout.buffer, {"early": True})
@@ -164,7 +167,11 @@ def run(args: argparse.Namespace) -> int:
                     },
                 )
             continue
-        if operation == "snapshot_nodes" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "snapshot_nodes"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             continuation = bool(command.get("args"))
             _write(
                 sys.stdout.buffer,
@@ -192,7 +199,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "get_node_udid" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "get_node_udid"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             _write(
                 sys.stdout.buffer,
                 {
@@ -203,7 +214,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "start_device_discovery" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "start_device_discovery"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             if discovery_active:
                 return 64
             discovery_active = True
@@ -217,10 +232,28 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "stop_device_discovery" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "stop_device_discovery"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             if not discovery_active:
                 return 64
             discovery_active = False
+            if args.mode == "phase-b-device-discovery-error":
+                _write(
+                    sys.stdout.buffer,
+                    {
+                        "error": {
+                            "code": "NATIVE_ERROR",
+                            "nativeCode": -902,
+                        },
+                        "id": command_id,
+                        "ok": False,
+                        "v": 1,
+                    },
+                )
+                continue
             _write(
                 sys.stdout.buffer,
                 {
@@ -232,21 +265,36 @@ def run(args: argparse.Namespace) -> int:
                                 "deviceIdSha256": "e" * 64,
                                 "deviceName": "Candidate device",
                                 "deviceTypeId": 533,
+                                "networkIdSha256": (
+                                    hashlib.sha256(b"peer-network").hexdigest()
+                                    if args.mode
+                                    == "phase-b-connected-candidate"
+                                    else ""
+                                ),
+                                "publicDeviceId": "",
                             }
                         ],
-                        "failureNativeCode": None,
+                        "failureNativeCode": (
+                            -903
+                            if args.mode == "phase-b-device-discovery-partial"
+                            else None
+                        ),
                         "stopped": True,
                     },
                     "v": 1,
                 },
             )
             continue
-        if operation == "begin_device_bind" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "begin_device_bind"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             digest = command["args"]["deviceIdSha256"]
             if digest != "e" * 64:
                 return 64
             bind_status[digest] = ("bound", 0)
-            trusted_device_present = True
+            trusted_device_present = args.mode != "phase-b-bind-unconfirmed"
             trusted_device_digest = digest
             _write(
                 sys.stdout.buffer,
@@ -258,7 +306,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "get_device_bind_status" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "get_device_bind_status"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             digest = command["args"]["deviceIdSha256"]
             if digest not in bind_status:
                 return 64
@@ -277,7 +329,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "list_trusted_devices" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "list_trusted_devices"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             devices = []
             if trusted_device_present:
                 devices.append(
@@ -298,10 +354,18 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "unbind_device" and native_started and args.mode.startswith("phase-b"):
-            if command["args"]["networkId"] != "peer-network" or not trusted_device_present:
+        if (
+            operation == "unbind_device"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
+            if (
+                command["args"]["networkId"] != "peer-network"
+                or not trusted_device_present
+            ):
                 return 64
-            trusted_device_present = False
+            if args.mode != "phase-b-unbind-unconfirmed":
+                trusted_device_present = False
             _write(
                 sys.stdout.buffer,
                 {
@@ -326,7 +390,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "connect" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "connect"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             _write(
                 sys.stdout.buffer,
                 {
@@ -337,7 +405,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "send_bytes" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "send_bytes"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             sent = len(base64.b64decode(command["args"]["data"], validate=True))
             _write(
                 sys.stdout.buffer,
@@ -349,7 +421,11 @@ def run(args: argparse.Namespace) -> int:
                 },
             )
             continue
-        if operation == "close_socket" and native_started and args.mode.startswith("phase-b"):
+        if (
+            operation == "close_socket"
+            and native_started
+            and args.mode.startswith("phase-b")
+        ):
             _write(
                 sys.stdout.buffer,
                 {

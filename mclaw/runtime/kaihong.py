@@ -9,11 +9,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import platform as host_platform
-import re
 import shutil
 from pathlib import Path
 
 from mclaw.constants import get_mclaw_home
+from mclaw.dsoftbus.platform_adapter import select_openharmony_adapter
 from mclaw.runtime.base import Runtime
 from mclaw.runtime.bootstrap import BootstrapPathResolver
 from mclaw.runtime.features import FeatureState, runtime_features
@@ -45,12 +45,13 @@ _DSOFTBUS_IDENTITY_KEYS = (
     "const.ohos.version",
     "const.ohos.fullname",
     "const.product.software.version",
+    "const.ohos.apiversion",
+    "const.product.cpu.abilist",
 )
-_OH61_VERSION = re.compile(r"(?<!\d)6\.1(?!\d)")
 
 
 def _dsoftbus_feature() -> tuple[FeatureState, str]:
-    """Resolve the strict OH 6.1 DSoftBus candidate without loading Native code."""
+    """Resolve a supported OpenHarmony ABI without loading Native code."""
     if host_platform.machine().strip().lower() not in {"aarch64", "arm64"}:
         return FeatureState.DISABLED, "OH_ARCH_UNSUPPORTED"
 
@@ -68,12 +69,21 @@ def _dsoftbus_feature() -> tuple[FeatureState, str]:
                 if value:
                     parameters[key] = value
 
-    values = [str(parameters.get(key) or "").strip() for key in _DSOFTBUS_IDENTITY_KEYS]
-    if any(not value for value in values):
+    if any(not str(parameters.get(key) or "").strip() for key in _DSOFTBUS_IDENTITY_KEYS):
         return FeatureState.DISABLED, "OH_IDENTITY_INCOMPLETE"
-    if any(_OH61_VERSION.search(value) is None for value in values):
+
+    api_text = str(parameters["const.ohos.apiversion"]).strip()
+    if not api_text.isdecimal():
         return FeatureState.DISABLED, "OH_IDENTITY_CONFLICT"
-    return FeatureState.ENABLED, "OH61_CANDIDATE"
+    adapter = select_openharmony_adapter(
+        api_level=int(api_text),
+        fullname=str(parameters["const.ohos.fullname"]),
+        abi_values=tuple(str(parameters["const.product.cpu.abilist"]).split(",")),
+        machine=host_platform.machine(),
+    )
+    if adapter is None:
+        return FeatureState.DISABLED, "OH_RUNTIME_UNSUPPORTED"
+    return FeatureState.ENABLED, "OH_DSOFTBUS_CANDIDATE"
 
 
 class KaihongRuntime(Runtime):

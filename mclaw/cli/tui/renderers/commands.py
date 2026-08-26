@@ -7,8 +7,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from datetime import datetime
-from typing import Callable
 
 from mclaw.cli.runtime.panels import (
     PanelColumn,
@@ -24,7 +24,22 @@ from mclaw.cli.runtime.panels import (
 )
 from mclaw.cli.tui.panel_renderer import render_panel_model
 from mclaw.cli.tui.renderers.status import format_duration
-from mclaw.tools.extract.profiles import EXTRACT_BACKEND_PROFILES, VALID_EXTRACT_BACKENDS
+from mclaw.tools.extract.profiles import (
+    EXTRACT_BACKEND_PROFILES,
+    VALID_EXTRACT_BACKENDS,
+)
+
+
+def _short_device_code(value: object) -> str:
+    """Format the first 48 identity bits as a compact, readable code."""
+
+    identity = str(value or "").rsplit(":", 1)[-1]
+    prefix = identity[:12].upper()
+    if len(prefix) != 12 or any(
+        character not in "0123456789ABCDEF" for character in prefix
+    ):
+        return "未知"
+    return "-".join(prefix[index : index + 4] for index in range(0, 12, 4))
 
 
 class CommandsRenderer:
@@ -46,7 +61,9 @@ class CommandsRenderer:
     def line(self, text: str = "") -> None:
         self._printer(text)
 
-    def _panel_model(self, panel: PanelModel, *, border_style: str | None = None) -> None:
+    def _panel_model(
+        self, panel: PanelModel, *, border_style: str | None = None
+    ) -> None:
         """Route panels through injected sinks before falling back to classic Rich output."""
         if self._panel_sink is not None:
             self._panel_sink(panel)
@@ -72,7 +89,9 @@ class CommandsRenderer:
                 title,
                 message,
                 detail=detail,
-                tone=kind if kind in {"success", "warning", "danger", "info"} else "info",
+                tone=kind
+                if kind in {"success", "warning", "danger", "info"}
+                else "info",
             )
         )
 
@@ -88,12 +107,16 @@ class CommandsRenderer:
         blocks = [text_block(message or "")]
         if detail:
             blocks.extend([spacer_block(), section_block("提示"), text_block(detail)])
-        self._panel_model(PanelModel(
-            title=title,
-            blocks=tuple(blocks),
-            tone=kind if kind in {"success", "warning", "danger", "info"} else "info",
-            namespace=namespace,
-        ))
+        self._panel_model(
+            PanelModel(
+                title=title,
+                blocks=tuple(blocks),
+                tone=kind
+                if kind in {"success", "warning", "danger", "info"}
+                else "info",
+                namespace=namespace,
+            )
+        )
 
     def render_help(
         self,
@@ -103,195 +126,305 @@ class CommandsRenderer:
     ) -> None:
         blocks = [
             section_block("常用命令"),
-            command_block([
-                ("/help", "显示命令列表"),
-                ("/model <名称>", "切换模型，缺少密钥时提示配置"),
-                ("/model-update", "刷新和查看 models.dev 模型库缓存"),
-                ("/provider", "查看供应商和密钥状态"),
-                ("/search-backend", "查看或切换联网搜索后端"),
-                ("/extract-backend", "查看或切换网页提取后端"),
-                ("/schedule", "打开本地任务中心"),
-                ("/skills", "查看和使用技能"),
-                ("/usage", "查看本次会话 Token 用量"),
-                ("/doctor", "检查运行环境和工具可用性"),
-                ("/history", "查看历史会话"),
-                ("/resume <id>", "恢复历史会话"),
-                ("/title <名称>", "设置会话标题"),
-                ("/clear", "清屏并开启新会话"),
-                ("/save", "导出会话 JSON"),
-                ("/quit", "退出 M-Claw"),
-            ]),
+            command_block(
+                [
+                    ("/help", "显示命令列表"),
+                    ("/model <名称>", "切换模型，缺少密钥时提示配置"),
+                    ("/model-update", "刷新和查看 models.dev 模型库缓存"),
+                    ("/provider", "查看供应商和密钥状态"),
+                    ("/search-backend", "查看或切换联网搜索后端"),
+                    ("/extract-backend", "查看或切换网页提取后端"),
+                    ("/schedule", "打开本地任务中心"),
+                    ("/skills", "查看和使用技能"),
+                    ("/usage", "查看本次会话 Token 用量"),
+                    ("/doctor", "检查运行环境和工具可用性"),
+                    ("/history", "查看历史会话"),
+                    ("/resume <id>", "恢复历史会话"),
+                    ("/title <名称>", "设置会话标题"),
+                    ("/clear", "清屏并开启新会话"),
+                    ("/save", "导出会话 JSON"),
+                    ("/quit", "退出 M-Claw"),
+                ]
+            ),
         ]
         if dsoftbus_enabled:
-            blocks.extend([
+            blocks.extend(
+                [
+                    spacer_block(),
+                    section_block("可信设备"),
+                    command_block(
+                        [
+                            ("/devices", "打开可信设备与可配对设备界面"),
+                            ("/pair", "打开设备配对界面"),
+                            ("/unpair", "打开解除配对界面"),
+                        ]
+                    ),
+                ]
+            )
+        blocks.extend(
+            [
                 spacer_block(),
-                section_block("可信设备"),
-                command_block([
-                    ("/devices", "打开可信设备与可配对设备界面"),
-                    ("/pair", "打开设备配对界面"),
-                    ("/unpair", "打开解除配对界面"),
-                ]),
-            ])
-        blocks.extend([
-            spacer_block(),
-            section_block("文件安全层"),
-            command_block([
-                ("/rollback", "查看最近可撤销文件变更"),
-                ("/rollback 1", "撤销第 1 条变更"),
-                ("/rollback undo", "恢复最近一条已撤销变更"),
-                ("/checkpoints status", "查看 checkpoint 存储状态"),
-                ("/checkpoints prune", "清理过期或孤儿 checkpoint"),
-            ]),
-            spacer_block(),
-            section_block("语音与桌面宠物"),
-            command_block([
-                ("/asr-mode [wake_word|push_to_talk]", "启用语音输入"),
-                ("/asr-status", "查看 ASR 状态"),
-                ("/keyboard-mode", "关闭 ASR，切回键盘输入"),
-                ("/pet [on|off|status|save|test]", "控制桌面宠物"),
-            ]),
-            spacer_block(),
-            section_block("快捷键"),
-            key_value_block([
-                ("发送", "Enter"),
-                ("换行", "Shift+Enter"),
-                ("中断", "Ctrl+C"),
-                ("退出", "Ctrl+D"),
-                ("清空输入", "Ctrl+U"),
-                ("光标/历史/补全", "Up/Down, Right, Tab"),
-                ("ASR 按键说话", push_to_talk_label),
-            ]),
-            spacer_block(),
-            text_block(
-                "Ctrl+U = 清空当前输入 · Right = 接受历史建议 · Tab = 接受命令补全 · Up/Down = 光标/历史/补全导航",
-                muted=True,
-            ),
-        ])
-        self._panel_model(PanelModel(
-            title="M-Claw 命令中心",
-            namespace="help",
-            blocks=tuple(blocks),
-        ))
+                section_block("文件安全层"),
+                command_block(
+                    [
+                        ("/rollback", "查看最近可撤销文件变更"),
+                        ("/rollback 1", "撤销第 1 条变更"),
+                        ("/rollback undo", "恢复最近一条已撤销变更"),
+                        ("/checkpoints status", "查看 checkpoint 存储状态"),
+                        ("/checkpoints prune", "清理过期或孤儿 checkpoint"),
+                    ]
+                ),
+                spacer_block(),
+                section_block("语音与桌面宠物"),
+                command_block(
+                    [
+                        ("/asr-mode [wake_word|push_to_talk]", "启用语音输入"),
+                        ("/asr-status", "查看 ASR 状态"),
+                        ("/keyboard-mode", "关闭 ASR，切回键盘输入"),
+                        ("/pet [on|off|status|save|test]", "控制桌面宠物"),
+                    ]
+                ),
+                spacer_block(),
+                section_block("快捷键"),
+                key_value_block(
+                    [
+                        ("发送", "Enter"),
+                        ("换行", "Shift+Enter"),
+                        ("中断", "Ctrl+C"),
+                        ("退出", "Ctrl+D"),
+                        ("清空输入", "Ctrl+U"),
+                        ("光标/历史/补全", "Up/Down, Right, Tab"),
+                        ("ASR 按键说话", push_to_talk_label),
+                    ]
+                ),
+                spacer_block(),
+                text_block(
+                    "Ctrl+U = 清空当前输入 · Right = 接受历史建议 · Tab = 接受命令补全 · Up/Down = 光标/历史/补全导航",
+                    muted=True,
+                ),
+            ]
+        )
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 命令中心",
+                namespace="help",
+                blocks=tuple(blocks),
+            )
+        )
 
     def render_dsoftbus_devices(
         self,
         devices: list[dict[str, str]],
         trusted_devices: list[dict] | None = None,
         pairable_devices: list[dict] | None = None,
+        discovery_warning: dict | None = None,
+        local_device: dict | None = None,
     ) -> None:
-        """Render Runtime peers and redacted system DeviceManager targets."""
+        """Render local identity, connected peers, and pairable targets."""
 
         blocks = []
-        if devices:
+        blocks.append(section_block("当前设备"))
+        if local_device:
+            local_id = str(local_device.get("deviceId") or "")
+            blocks.append(
+                key_value_block(
+                    [
+                        ("设备", str(local_device.get("deviceName") or "未命名设备")),
+                        (
+                            "型号",
+                            " ".join(
+                                value
+                                for value in (
+                                    str(local_device.get("manufacturer") or ""),
+                                    str(local_device.get("model") or ""),
+                                )
+                                if value
+                            )
+                            or "未知",
+                        ),
+                        (
+                            "系统",
+                            (
+                                f"{local_device.get('osName') or '未知'} "
+                                f"{local_device.get('osVersion') or ''} · "
+                                f"API {local_device.get('apiLevel', '未知')} · "
+                                f"{local_device.get('arch') or '未知'}"
+                            ),
+                        ),
+                        ("M-Claw 短标识", _short_device_code(local_id)),
+                    ]
+                )
+            )
+        else:
+            blocks.append(key_value_block([("Runtime", "当前设备身份尚未就绪")]))
+
+        blocks.extend([spacer_block(), section_block("已连接设备")])
+        trusted_devices = trusted_devices or []
+        if devices or trusted_devices:
             rows = []
+            represented_trusted_ids: set[str] = set()
+            trusted_by_public_id = {
+                str(device.get("publicDeviceId") or ""): device
+                for device in trusted_devices
+                if device.get("publicDeviceId")
+            }
             for device in devices:
                 device_id = str(device.get("deviceId") or "")
-                short_id = device_id.rsplit(":", 1)[-1][:12]
+                trusted = trusted_by_public_id.get(device_id)
+                if trusted is not None:
+                    represented_trusted_ids.add(
+                        str(trusted.get("deviceIdSha256") or "")
+                    )
+                short_id = _short_device_code(device_id)
                 connection = str(device.get("connectionState") or "CLOSED")
                 agent = str(device.get("agentAvailability") or "UNAVAILABLE")
-                rows.append((
-                    device.get("deviceName") or "未命名设备",
-                    "在线" if device.get("devicePresence") == "ONLINE" else "离线",
-                    "可用" if agent == "READY" else "未就绪",
-                    connection,
-                    short_id,
-                ))
-            blocks.append(table_block(
-                (
-                    PanelColumn("设备", role="primary"),
-                    PanelColumn("信任网络", role="success", no_wrap=True),
-                    PanelColumn("Agent", role="accent", no_wrap=True),
-                    PanelColumn("连接", role="muted", no_wrap=True),
-                    PanelColumn("设备标识", role="muted", no_wrap=True),
-                ),
-                rows,
-            ))
-        else:
-            blocks.append(key_value_block([("Runtime 设备", "当前没有已验证的在线可信设备")]))
-        trusted_devices = trusted_devices or []
-        blocks.extend([spacer_block(), section_block("系统可信设备")])
-        if trusted_devices:
+                connection_label = {
+                    "OPEN": "已建立",
+                    "CONNECTING": "连接中",
+                    "RECONNECTING": "重连中",
+                    "CLOSED": "未建立",
+                }.get(connection, connection)
+                rows.append(
+                    (
+                        device.get("deviceName") or "未命名设备",
+                        "在线" if device.get("devicePresence") == "ONLINE" else "离线",
+                        "可通信" if agent == "READY" else "未就绪",
+                        connection_label,
+                        short_id,
+                    )
+                )
+            for device in trusted_devices:
+                trusted_id = str(device.get("deviceIdSha256") or "")
+                if trusted_id in represented_trusted_ids:
+                    continue
+                public_id = str(device.get("publicDeviceId") or "")
+                rows.append(
+                    (
+                        device.get("deviceName") or "未命名设备",
+                        "在线" if device.get("online") else "离线",
+                        "未就绪",
+                        "未建立",
+                        _short_device_code(public_id) if public_id else "—",
+                    )
+                )
             blocks.append(
                 table_block(
                     (
                         PanelColumn("设备", role="primary"),
-                        PanelColumn("状态", role="success", no_wrap=True),
-                        PanelColumn("设备类型", role="muted", no_wrap=True),
-                        PanelColumn("管理标识", role="muted", no_wrap=True),
+                        PanelColumn("SoftBus", role="success", no_wrap=True),
+                        PanelColumn("Agent 通信", role="accent", no_wrap=True),
+                        PanelColumn("连接", role="muted", no_wrap=True),
+                        PanelColumn("M-Claw 短标识", role="muted", no_wrap=True),
                     ),
-                    [
-                        (
-                            str(device.get("deviceName") or "未命名设备"),
-                            "在线" if device.get("online") else "当前不可用",
-                            str(device.get("deviceTypeId", "")),
-                            str(device.get("deviceIdSha256") or "")[:12],
-                        )
-                        for device in trusted_devices
-                    ],
+                    rows,
                 )
             )
         else:
-            blocks.append(key_value_block([("DeviceManager", "当前没有可管理的可信设备")]))
+            blocks.append(key_value_block([("SoftBus", "当前没有已配对的 M-Claw 设备")]))
         pairable_devices = pairable_devices or []
-        blocks.extend([spacer_block(), section_block("可配对设备")])
+        blocks.extend([spacer_block(), section_block("可连接设备")])
         if pairable_devices:
             blocks.append(
                 table_block(
                     (
                         PanelColumn("设备", role="primary"),
                         PanelColumn("设备类型", role="muted", no_wrap=True),
-                        PanelColumn("候选标识", role="muted", no_wrap=True),
+                        PanelColumn("扫描候选码", role="muted", no_wrap=True),
                     ),
                     [
                         (
                             str(device.get("deviceName") or "未命名设备"),
                             str(device.get("deviceTypeId", "")),
-                            str(device.get("deviceIdSha256") or "")[:12],
+                            _short_device_code(device.get("deviceIdSha256")),
                         )
                         for device in pairable_devices
                     ],
                 )
             )
         else:
-            blocks.append(key_value_block([("DeviceManager", "当前没有扫描到可配对设备")]))
-        blocks.extend([
-            spacer_block(),
-            text_block(
-                "输入 /pair 后由 M-Claw 选择候选；PIN、对端确认和系统授权仍由系统处理。",
-                muted=True,
-            ),
-        ])
-        self._panel_model(PanelModel(
-            title="M-Claw · 可信设备",
-            namespace="dsoftbus_devices",
-            blocks=tuple(blocks),
-            tone="info",
-        ))
+            pairable_status = (
+                "本次扫描失败，当前无法判断可连接设备"
+                if discovery_warning
+                else "当前没有扫描到可配对设备"
+            )
+            blocks.append(key_value_block([("DeviceManager", pairable_status)]))
+        if discovery_warning:
+            blocks.extend(
+                [
+                    spacer_block(),
+                    key_value_block(
+                        [
+                            ("扫描状态", "本次扫描未完整完成，以上候选列表可能不完整"),
+                            (
+                                "错误码",
+                                str(
+                                    discovery_warning.get("sourceCode")
+                                    or discovery_warning.get("code")
+                                    or "DEVICE_DISCOVERY_FAILED"
+                                ),
+                            ),
+                            (
+                                "系统码",
+                                str(discovery_warning.get("nativeCode", "未知")),
+                            ),
+                        ]
+                    ),
+                ]
+            )
+        blocks.extend(
+            [
+                spacer_block(),
+                text_block(
+                    "输入 /pair 选择设备并建立系统信任；只有显示“可通信”的设备才能执行 Agent 任务。",
+                    muted=True,
+                ),
+            ]
+        )
+        self._panel_model(
+            PanelModel(
+                title="M-Claw · 设备",
+                namespace="dsoftbus_devices",
+                blocks=tuple(blocks),
+                tone="warning" if discovery_warning else "info",
+            )
+        )
 
     def render_doctor(self, text: str) -> None:
         """Render the plain doctor report through the structured panel parser below."""
         self._panel_model(_doctor_panel_model(text or "无输出"))
 
     def render_model_status(self, *, model: str, provider: str) -> None:
-        self._panel_model(PanelModel(
-            title="M-Claw 模型",
-            blocks=(
-                key_value_block([
-                    ("当前模型", model),
-                    ("供应商", provider),
-                ]),
-                spacer_block(),
-                section_block("命令"),
-                command_block([
-                    ("/model <模型名> --provider <供应商>", "临时切换"),
-                    ("/model <模型名> --provider <供应商> --profile <接口>", "指定接口类型"),
-                    ("/model <模型名> --provider <供应商> --global", "全局保存"),
-                    ("/model-update provider <供应商>", "查看接口类型和模型库"),
-                    ("/provider", "查看内置/自定义供应商及密钥状态"),
-                ]),
-            ),
-            tone="info",
-        ))
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 模型",
+                blocks=(
+                    key_value_block(
+                        [
+                            ("当前模型", model),
+                            ("供应商", provider),
+                        ]
+                    ),
+                    spacer_block(),
+                    section_block("命令"),
+                    command_block(
+                        [
+                            ("/model <模型名> --provider <供应商>", "临时切换"),
+                            (
+                                "/model <模型名> --provider <供应商> --profile <接口>",
+                                "指定接口类型",
+                            ),
+                            (
+                                "/model <模型名> --provider <供应商> --global",
+                                "全局保存",
+                            ),
+                            ("/model-update provider <供应商>", "查看接口类型和模型库"),
+                            ("/provider", "查看内置/自定义供应商及密钥状态"),
+                        ]
+                    ),
+                ),
+                tone="info",
+            )
+        )
 
     def render_extract_backend_status(
         self,
@@ -306,37 +439,60 @@ class CommandsRenderer:
             available = availability.get(name, False)
             selected = name == current
             missing = "未安装" if name == "trafilatura" else "未配置"
-            state = "当前" if selected and available else (
-                f"当前 · {missing}" if selected else ("可用" if available else missing)
+            state = (
+                "当前"
+                if selected and available
+                else (
+                    f"当前 · {missing}"
+                    if selected
+                    else ("可用" if available else missing)
+                )
             )
-            rows.append((
-                panel_cell(profile.display_name, "accent" if selected else "primary"),
-                panel_cell(state, "accent" if selected and available else ("success" if available else "warning")),
-                panel_cell(profile.status_description_zh, "muted"),
-            ))
-
-        self._panel_model(PanelModel(
-            title="M-Claw · 网页提取",
-            namespace="extract_backend",
-            blocks=(
-                table_block(
-                    (
-                        PanelColumn("后端", no_wrap=True),
-                        PanelColumn("状态", no_wrap=True),
-                        PanelColumn("行为"),
+            rows.append(
+                (
+                    panel_cell(
+                        profile.display_name, "accent" if selected else "primary"
                     ),
-                    rows,
-                ),
-                spacer_block(),
-                command_block([(
-                    f"/extract-backend <{'|'.join(VALID_EXTRACT_BACKENDS)}>",
-                    "切换后端",
-                )]),
-            ),
-            tone="info",
-        ))
+                    panel_cell(
+                        state,
+                        "accent"
+                        if selected and available
+                        else ("success" if available else "warning"),
+                    ),
+                    panel_cell(profile.status_description_zh, "muted"),
+                )
+            )
 
-    def render_model_key_prompt(self, *, provider_display_name: str, key_url: str | None = None) -> None:
+        self._panel_model(
+            PanelModel(
+                title="M-Claw · 网页提取",
+                namespace="extract_backend",
+                blocks=(
+                    table_block(
+                        (
+                            PanelColumn("后端", no_wrap=True),
+                            PanelColumn("状态", no_wrap=True),
+                            PanelColumn("行为"),
+                        ),
+                        rows,
+                    ),
+                    spacer_block(),
+                    command_block(
+                        [
+                            (
+                                f"/extract-backend <{'|'.join(VALID_EXTRACT_BACKENDS)}>",
+                                "切换后端",
+                            )
+                        ]
+                    ),
+                ),
+                tone="info",
+            )
+        )
+
+    def render_model_key_prompt(
+        self, *, provider_display_name: str, key_url: str | None = None
+    ) -> None:
         rows = [
             ("供应商", provider_display_name),
             ("状态", "API Key 尚未配置"),
@@ -345,11 +501,13 @@ class CommandsRenderer:
         ]
         if key_url:
             rows.insert(2, ("获取密钥", key_url))
-        self._panel_model(PanelModel(
-            title="M-Claw 密钥配置",
-            blocks=(key_value_block(rows),),
-            tone="warning",
-        ))
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 密钥配置",
+                blocks=(key_value_block(rows),),
+                tone="warning",
+            )
+        )
 
     def render_usage(self, *, agent, model: str, session_start: datetime) -> None:
         elapsed = (datetime.now() - session_start).total_seconds()
@@ -357,54 +515,68 @@ class CommandsRenderer:
         cache_read = getattr(agent, "session_cache_read_tokens", 0)
         cache_write = getattr(agent, "session_cache_write_tokens", 0)
         reasoning = getattr(agent, "session_reasoning_tokens", 0)
-        self._panel_model(PanelModel(
-            title="M-Claw 会话用量",
-            namespace="usage",
-            blocks=(key_value_block([
-                ("时长", format_duration(elapsed)),
-                ("模型", model),
-                ("API 调用", agent.session_api_calls),
-                ("输入", f"{agent.session_input_tokens:,} tokens"),
-                ("输出", f"{agent.session_output_tokens:,} tokens"),
-                ("缓存读取", f"{cache_read:,} tokens"),
-                ("缓存写入", f"{cache_write:,} tokens"),
-                ("推理", f"{reasoning:,} tokens"),
-                ("合计", f"{total:,} tokens"),
-            ]),),
-        ))
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 会话用量",
+                namespace="usage",
+                blocks=(
+                    key_value_block(
+                        [
+                            ("时长", format_duration(elapsed)),
+                            ("模型", model),
+                            ("API 调用", agent.session_api_calls),
+                            ("输入", f"{agent.session_input_tokens:,} tokens"),
+                            ("输出", f"{agent.session_output_tokens:,} tokens"),
+                            ("缓存读取", f"{cache_read:,} tokens"),
+                            ("缓存写入", f"{cache_write:,} tokens"),
+                            ("推理", f"{reasoning:,} tokens"),
+                            ("合计", f"{total:,} tokens"),
+                        ]
+                    ),
+                ),
+            )
+        )
 
     def render_history(self, sessions: list[dict]) -> None:
         if not sessions:
-            self._panel_model(PanelModel(
-                title="M-Claw 历史会话",
-                namespace="history",
-                blocks=(key_value_block([("状态", "暂无会话记录")]),),
-            ))
+            self._panel_model(
+                PanelModel(
+                    title="M-Claw 历史会话",
+                    namespace="history",
+                    blocks=(key_value_block([("状态", "暂无会话记录")]),),
+                )
+            )
             return
         rows = []
         for session in sessions:
             sid = session["id"][:16]
             title = session.get("title") or session.get("preview", "")
             model = session.get("model", "?")
-            user_messages = session.get("user_message_count", session.get("message_count", 0))
+            user_messages = session.get(
+                "user_message_count", session.get("message_count", 0)
+            )
             rows.append((sid, model, str(user_messages), title))
-        self._panel_model(PanelModel(
-            title="M-Claw 历史会话",
-            namespace="history",
-            blocks=(
-                table_block(
-                    (
-                        PanelColumn("会话", role="accent", no_wrap=True),
-                        PanelColumn("模型", role="muted", no_wrap=True),
-                        PanelColumn("用户消息", role="muted", justify="right", no_wrap=True),
-                        PanelColumn("标题", role="primary"),
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 历史会话",
+                namespace="history",
+                blocks=(
+                    table_block(
+                        (
+                            PanelColumn("会话", role="accent", no_wrap=True),
+                            PanelColumn("模型", role="muted", no_wrap=True),
+                            PanelColumn(
+                                "用户消息", role="muted", justify="right", no_wrap=True
+                            ),
+                            PanelColumn("标题", role="primary"),
+                        ),
+                        rows,
                     ),
-                    rows,
+                    spacer_block(),
+                    text_block("使用 /resume <id> 恢复会话", muted=True),
                 ),
-                spacer_block(),
-                text_block("使用 /resume <id> 恢复会话", muted=True),
-            ),
-        ))
+            )
+        )
 
     def render_providers(
         self,
@@ -418,12 +590,14 @@ class CommandsRenderer:
     ) -> None:
         blocks = [
             section_block("当前接入"),
-            key_value_block([
-                ("当前模型", model),
-                ("当前接入方", provider),
-                ("接口地址", base_url or "(默认)"),
-                ("调用模式", api_mode),
-            ]),
+            key_value_block(
+                [
+                    ("当前模型", model),
+                    ("当前接入方", provider),
+                    ("接口地址", base_url or "(默认)"),
+                    ("调用模式", api_mode),
+                ]
+            ),
         ]
 
         if configured:
@@ -432,36 +606,48 @@ class CommandsRenderer:
                 is_active = item["name"] == provider
                 configured_model = str(item.get("model") or "").strip()
                 display_model = model if is_active else (configured_model or "未记录")
-                marker = "当前" if is_active else ("已配置" if configured_model else "仅密钥")
+                marker = (
+                    "当前"
+                    if is_active
+                    else ("已配置" if configured_model else "仅密钥")
+                )
                 rows.append((item["display_name"], display_model, marker))
-            blocks.extend([
-                spacer_block(),
-                section_block("已启用接入方"),
-                table_block(
-                    (
-                        PanelColumn("接入方", role="primary"),
-                        PanelColumn("模型", role="muted"),
-                        PanelColumn("状态", role="accent", no_wrap=True),
+            blocks.extend(
+                [
+                    spacer_block(),
+                    section_block("已启用接入方"),
+                    table_block(
+                        (
+                            PanelColumn("接入方", role="primary"),
+                            PanelColumn("模型", role="muted"),
+                            PanelColumn("状态", role="accent", no_wrap=True),
+                        ),
+                        rows,
                     ),
-                    rows,
-                ),
-            ])
+                ]
+            )
         else:
             blocks.extend([spacer_block(), key_value_block([("已启用接入方", "暂无")])])
 
-        blocks.extend([
-            spacer_block(),
-            section_block("常用命令示例"),
-            command_block(_provider_command_rows()),
-            spacer_block(),
-            text_block("模型库负责识别模型信息；接入方负责实际调用模型。", muted=True),
-        ])
-        self._panel_model(PanelModel(
-            title="M-Claw · 大模型接入",
-            blocks=tuple(blocks),
-            tone="info",
-            namespace="provider",
-        ))
+        blocks.extend(
+            [
+                spacer_block(),
+                section_block("常用命令示例"),
+                command_block(_provider_command_rows()),
+                spacer_block(),
+                text_block(
+                    "模型库负责识别模型信息；接入方负责实际调用模型。", muted=True
+                ),
+            ]
+        )
+        self._panel_model(
+            PanelModel(
+                title="M-Claw · 大模型接入",
+                blocks=tuple(blocks),
+                tone="info",
+                namespace="provider",
+            )
+        )
 
     def render_asr_status(self, *, cfg: dict, service_status: dict) -> None:
         rows = [
@@ -473,19 +659,31 @@ class CommandsRenderer:
             ("Model", cfg.get("model")),
             ("Recorder", cfg.get("recorder_backend")),
             ("arecord device", cfg.get("arecord_device")),
-            ("Key", f"{cfg.get('api_key')} ({cfg.get('key_source') or 'not configured'})"),
-            ("PTT key", f"{cfg.get('push_to_talk_key')} ({cfg.get('push_to_talk_behavior')})"),
+            (
+                "Key",
+                f"{cfg.get('api_key')} ({cfg.get('key_source') or 'not configured'})",
+            ),
+            (
+                "PTT key",
+                f"{cfg.get('push_to_talk_key')} ({cfg.get('push_to_talk_behavior')})",
+            ),
         ]
         if service_status.get("last_error"):
             rows.append(("Error", service_status["last_error"]))
-        self._panel_model(PanelModel(
-            title="M-Claw ASR 状态",
-            namespace="asr",
-            blocks=(key_value_block(rows),),
-        ))
+        self._panel_model(
+            PanelModel(
+                title="M-Claw ASR 状态",
+                namespace="asr",
+                blocks=(key_value_block(rows),),
+            )
+        )
 
-    def render_pet_status(self, *, pet_cfg: dict, running: bool, last_error: str | None = None) -> None:
-        notify = pet_cfg.get("notify", {}) if isinstance(pet_cfg.get("notify"), dict) else {}
+    def render_pet_status(
+        self, *, pet_cfg: dict, running: bool, last_error: str | None = None
+    ) -> None:
+        notify = (
+            pet_cfg.get("notify", {}) if isinstance(pet_cfg.get("notify"), dict) else {}
+        )
         rows = [
             ("启用 / Pet enabled", bool(pet_cfg.get("enabled"))),
             ("运行 / Pet running", running),
@@ -494,38 +692,54 @@ class CommandsRenderer:
             ("气泡 / Pet bubble", bool(pet_cfg.get("show_bubble", True))),
             (
                 "通知",
-                "，".join([
-                    f"回合={bool(notify.get('turn_completed', True))}",
-                    f"后台={bool(notify.get('background_completed', True))}",
-                    f"子代理={bool(notify.get('delegation_completed', True))}",
-                    f"工具={bool(notify.get('tool_finished', False))}",
-                ]),
+                "，".join(
+                    [
+                        f"回合={bool(notify.get('turn_completed', True))}",
+                        f"后台={bool(notify.get('background_completed', True))}",
+                        f"子代理={bool(notify.get('delegation_completed', True))}",
+                        f"工具={bool(notify.get('tool_finished', False))}",
+                    ]
+                ),
             ),
         ]
         if last_error:
             rows.append(("错误", last_error))
-        self._panel_model(PanelModel(
-            title="M-Claw 桌面宠物",
-            namespace="pet",
-            blocks=(key_value_block(rows),),
-        ))
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 桌面宠物",
+                namespace="pet",
+                blocks=(key_value_block(rows),),
+            )
+        )
 
     def render_pet_notice(self, message: str) -> None:
         self._printer(f"  {message}")
 
     def render_pet_usage(self) -> None:
-        self._panel_model(PanelModel(
-            title="M-Claw 桌面宠物命令",
-            namespace="pet",
-            blocks=(command_block([
-                ("/pet [on|off|status|save|restart|test]", "基础控制"),
-                ("/pet scale <数字>", "设置缩放"),
-                ("/pet position <bottom_right|bottom_left|top_right|top_left|reset>", "设置或重置位置"),
-                ("/pet bubble <on|off>", "开关气泡"),
-                ("/pet notify <turn|background|delegation|tool> <on|off>", "开关事件通知"),
-                ("/pet asset <名称或路径>", "切换资源"),
-            ]),),
-        ))
+        self._panel_model(
+            PanelModel(
+                title="M-Claw 桌面宠物命令",
+                namespace="pet",
+                blocks=(
+                    command_block(
+                        [
+                            ("/pet [on|off|status|save|restart|test]", "基础控制"),
+                            ("/pet scale <数字>", "设置缩放"),
+                            (
+                                "/pet position <bottom_right|bottom_left|top_right|top_left|reset>",
+                                "设置或重置位置",
+                            ),
+                            ("/pet bubble <on|off>", "开关气泡"),
+                            (
+                                "/pet notify <turn|background|delegation|tool> <on|off>",
+                                "开关事件通知",
+                            ),
+                            ("/pet asset <名称或路径>", "切换资源"),
+                        ]
+                    ),
+                ),
+            )
+        )
 
 
 def _doctor_panel_model(text: str) -> PanelModel:
@@ -563,7 +777,7 @@ def _doctor_panel_model(text: str) -> PanelModel:
             continue
 
         if stripped.startswith("修复:"):
-            detail_rows.append(("修复建议", stripped[len("修复:"):].strip()))
+            detail_rows.append(("修复建议", stripped[len("修复:") :].strip()))
             continue
 
         overview_row = _parse_doctor_key_value(stripped)
@@ -576,18 +790,20 @@ def _doctor_panel_model(text: str) -> PanelModel:
     if check_rows:
         if blocks:
             blocks.append(spacer_block())
-        blocks.extend([
-            section_block("检查项"),
-            table_block(
-                (
-                    PanelColumn("分组", role="muted", no_wrap=True),
-                    PanelColumn("状态", role="accent", no_wrap=True),
-                    PanelColumn("项目", role="primary"),
-                    PanelColumn("详情", role="muted"),
+        blocks.extend(
+            [
+                section_block("检查项"),
+                table_block(
+                    (
+                        PanelColumn("分组", role="muted", no_wrap=True),
+                        PanelColumn("状态", role="accent", no_wrap=True),
+                        PanelColumn("项目", role="primary"),
+                        PanelColumn("详情", role="muted"),
+                    ),
+                    check_rows,
                 ),
-                check_rows,
-            ),
-        ])
+            ]
+        )
 
     if detail_rows:
         if blocks:

@@ -963,7 +963,10 @@ def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -
     if not isinstance(args, dict):
         args = {}
 
-    if tool_name == "dsoftbus_run_agent_task":
+    if tool_name in {
+        "dsoftbus_run_agent_task",
+        "dsoftbus_continue_agent_task",
+    }:
         # The Task lifecycle is terminated by completion, explicit CancelTask,
         # operation-specific limits, or Runtime shutdown.  The serial worker
         # remains cancellation-aware while deliberately having no total cap.

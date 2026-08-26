@@ -429,7 +429,6 @@ def _first_run_check() -> bool:
     if (
         isinstance(dsoftbus, dict)
         and dsoftbus.get("enabled") == "auto"
-        and dsoftbus.get("discovery_without_provider") is True
     ):
         try:
             from mclaw.dsoftbus.entrypoint import is_discovery_only_candidate
@@ -593,11 +592,7 @@ def _run_chat(args):
             from mclaw.dsoftbus.entrypoint import is_discovery_only_candidate
 
             setup_config = load_config(strict=True)
-            dsoftbus = setup_config.get("dsoftbus", {})
-            marker = isinstance(dsoftbus, dict) and dsoftbus.get(
-                "discovery_without_provider"
-            ) is True
-            if not marker or not is_discovery_only_candidate(setup_config):
+            if not is_discovery_only_candidate(setup_config):
                 print_plain(color("  未配置任何供应商，退出。\n", Colors.RED))
                 sys.exit(1)
 
@@ -1351,7 +1346,6 @@ def _run_setup_impl(args):
             dsoftbus_selected
             and isinstance(dsoftbus, dict)
             and dsoftbus.get("enabled") == "auto"
-            and dsoftbus.get("discovery_without_provider") is True
         ):
             save_config(config)
             print_plain(color("\n  设置完成：已启用可信设备发现与配对。", Colors.GREEN, Colors.BOLD))
@@ -1478,7 +1472,6 @@ def _apply_setup_dsoftbus_selection(config: dict, *, selected: bool) -> None:
         for key, value in default_dsoftbus.items()
     }
     updated["enabled"] = "auto" if selected else False
-    updated["discovery_without_provider"] = selected
     updated["accept_remote_messages"] = selected
     updated["allow_remote_tools"] = selected
     config["dsoftbus"] = updated

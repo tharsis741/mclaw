@@ -55,11 +55,34 @@ class DsoftbusRuntimeError(RuntimeError):
         *,
         outcome_unknown: bool = False,
         interrupted: bool = False,
+        native_code: int | None = None,
+        phase: str = "",
     ) -> None:
         super().__init__(code)
         self.code = code
         self.outcome_unknown = outcome_unknown
         self.interrupted = interrupted
+        self.native_code = native_code
+        self.phase = phase
+
+
+def _propagated_runtime_error(
+    error: BaseException,
+    fallback_code: str,
+    *,
+    outcome_unknown: bool | None = None,
+) -> DsoftbusRuntimeError:
+    return DsoftbusRuntimeError(
+        str(getattr(error, "code", fallback_code)),
+        outcome_unknown=(
+            bool(getattr(error, "outcome_unknown", False))
+            if outcome_unknown is None
+            else outcome_unknown
+        ),
+        interrupted=bool(getattr(error, "interrupted", False)),
+        native_code=getattr(error, "native_code", None),
+        phase=str(getattr(error, "phase", "")),
+    )
 
 
 def _plain_copy(value: Any) -> Any:
@@ -89,9 +112,11 @@ class RuntimeDriver(Protocol):
 
     def local_turn_finished(self, token: str) -> None: ...
 
+    def local_device_snapshot(self) -> Mapping[str, Any]: ...
+
     def list_trusted_devices(self) -> tuple[Mapping[str, Any], ...]: ...
 
-    def discover_devices(self) -> tuple[Mapping[str, Any], ...]: ...
+    def discover_devices(self) -> Mapping[str, Any]: ...
 
     def pair_device(self, device_id_sha256: str) -> Mapping[str, Any]: ...
 
@@ -101,9 +126,7 @@ class RuntimeDriver(Protocol):
 class _AdmissionOnlyDriver:
     """Current safe default until the bounded Worker supervisor is attached."""
 
-    def start(
-        self, runtime_instance_id: str, endpoint_lock: Any
-    ) -> Mapping[str, Any]:
+    def start(self, runtime_instance_id: str, endpoint_lock: Any) -> Mapping[str, Any]:
         return MappingProxyType(
             {
                 "degradedReasons": ("PRODUCT_INTEGRATION_UNVERIFIED",),
@@ -126,10 +149,13 @@ class _AdmissionOnlyDriver:
     def local_turn_finished(self, token: str) -> None:
         return None
 
+    def local_device_snapshot(self) -> Mapping[str, Any]:
+        return MappingProxyType({})
+
     def list_trusted_devices(self) -> tuple[Mapping[str, Any], ...]:
         raise DsoftbusRuntimeError("WORKER_NOT_READY")
 
-    def discover_devices(self) -> tuple[Mapping[str, Any], ...]:
+    def discover_devices(self) -> Mapping[str, Any]:
         raise DsoftbusRuntimeError("WORKER_NOT_READY")
 
     def pair_device(self, device_id_sha256: str) -> Mapping[str, Any]:
@@ -161,9 +187,7 @@ def _validate_start_outcome(value: Mapping[str, Any]) -> tuple[str, tuple[str, .
     if (
         len(normalized) != len(set(normalized))
         or any(reason not in _DEGRADED_REASONS for reason in normalized)
-        or tuple(
-            reason for reason in _DEGRADED_REASON_PRIORITY if reason in normalized
-        )
+        or tuple(reason for reason in _DEGRADED_REASON_PRIORITY if reason in normalized)
         != normalized
     ):
         raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
@@ -313,10 +337,67 @@ class DsoftbusRuntime:
             result = [
                 peer for peer in result if peer.get("agentAvailability") == "READY"
             ]
-        result.sort(key=lambda peer: str(peer.get("device_id", peer.get("deviceId", ""))))
+        result.sort(
+            key=lambda peer: str(peer.get("device_id", peer.get("deviceId", "")))
+        )
         return result
 
-    def discover_devices(self) -> list[dict[str, Any]]:
+    def local_device(self) -> dict[str, Any]:
+        """Return this Runtime's verified, non-secret public device identity."""
+
+        with self._condition:
+            state = self._state
+            use_driver_snapshot = self._driver_start_called
+        if state in {RuntimeState.STOPPING, RuntimeState.STOPPED}:
+            raise DsoftbusRuntimeError("RUNTIME_STOPPING")
+        if state in {RuntimeState.NEW, RuntimeState.STARTING}:
+            raise DsoftbusRuntimeError("WORKER_NOT_READY")
+        accessor = getattr(self._driver, "local_device_snapshot", None)
+        value: Any = (
+            accessor()
+            if use_driver_snapshot and callable(accessor)
+            else MappingProxyType({})
+        )
+        required = frozenset(
+            {
+                "apiLevel",
+                "arch",
+                "deviceId",
+                "deviceName",
+                "manufacturer",
+                "model",
+                "osName",
+                "osVersion",
+            }
+        )
+        if not isinstance(value, Mapping) or frozenset(value) != required:
+            raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
+        if (
+            not isinstance(value["deviceId"], str)
+            or _DEVICE_ID.fullmatch(value["deviceId"]) is None
+            or type(value["apiLevel"]) is not int
+            or not 1 <= value["apiLevel"] <= 2**16 - 1
+        ):
+            raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
+        for field, maximum in (
+            ("arch", 32),
+            ("deviceName", 127),
+            ("manufacturer", 127),
+            ("model", 127),
+            ("osName", 63),
+            ("osVersion", 127),
+        ):
+            item = value[field]
+            if (
+                not isinstance(item, str)
+                or "\x00" in item
+                or not item
+                or len(item.encode("utf-8")) > maximum
+            ):
+                raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
+        return _plain_copy(value)
+
+    def discover_devices(self) -> dict[str, Any]:
         """Run one bounded M-Claw DeviceManager scan for pairable devices."""
 
         with self._condition:
@@ -334,21 +415,37 @@ class DsoftbusRuntime:
         except DsoftbusRuntimeError:
             raise
         except Exception as error:
-            raise DsoftbusRuntimeError(
-                str(getattr(error, "code", "INTERNAL_ERROR")),
-                outcome_unknown=bool(getattr(error, "outcome_unknown", False)),
-            ) from error
-        if not isinstance(values, (list, tuple)):
+            raise _propagated_runtime_error(error, "INTERNAL_ERROR") from error
+        if not isinstance(values, Mapping) or frozenset(values) != frozenset(
+            {"devices", "failureNativeCode"}
+        ):
+            raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
+        failure_native_code = values["failureNativeCode"]
+        raw_devices = values["devices"]
+        if not isinstance(raw_devices, (list, tuple)) or (
+            failure_native_code is not None
+            and (
+                type(failure_native_code) is not int
+                or failure_native_code == 0
+                or not -(2**31) <= failure_native_code <= 2**31 - 1
+            )
+        ):
             raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
         result: list[dict[str, Any]] = []
-        for value in values:
+        for value in raw_devices:
             if not isinstance(value, Mapping) or frozenset(value) != frozenset(
-                {"deviceIdSha256", "deviceName", "deviceTypeId"}
+                {
+                    "deviceIdSha256",
+                    "deviceName",
+                    "deviceTypeId",
+                    "publicDeviceId",
+                }
             ):
                 raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
             digest = value["deviceIdSha256"]
             name = value["deviceName"]
             device_type = value["deviceTypeId"]
+            public_device_id = value["publicDeviceId"]
             if (
                 not isinstance(digest, str)
                 or _DEVICE_ID_SHA256.fullmatch(digest) is None
@@ -357,13 +454,21 @@ class DsoftbusRuntime:
                 or len(name.encode("utf-8")) > 127
                 or type(device_type) is not int
                 or not 0 <= device_type <= 2**16 - 1
+                or not isinstance(public_device_id, str)
+                or (
+                    public_device_id != ""
+                    and _DEVICE_ID.fullmatch(public_device_id) is None
+                )
             ):
                 raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
             result.append(_plain_copy(value))
         if len({item["deviceIdSha256"] for item in result}) != len(result):
             raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
         result.sort(key=lambda item: item["deviceIdSha256"])
-        return result
+        return {
+            "devices": result,
+            "failureNativeCode": failure_native_code,
+        }
 
     def pair_device(self, device_id_sha256: str) -> dict[str, Any]:
         """Bind one explicitly selected candidate without command replay."""
@@ -429,9 +534,7 @@ class DsoftbusRuntime:
         except DsoftbusRuntimeError:
             raise
         except Exception as error:
-            raise DsoftbusRuntimeError(
-                str(getattr(error, "code", "INTERNAL_ERROR"))
-            ) from error
+            raise _propagated_runtime_error(error, "INTERNAL_ERROR") from error
         if not isinstance(values, (list, tuple)):
             raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
         result: list[dict[str, Any]] = []
@@ -630,6 +733,7 @@ class DsoftbusRuntime:
         context_id: str | None = None,
         message_id: str | None = None,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> dict[str, Any]:
         (
             device_id,
@@ -642,6 +746,7 @@ class DsoftbusRuntime:
             context_id=context_id,
             message_id=message_id,
         )
+        normalized_input_paths = self._normalize_agent_task_input_paths(input_paths)
         with self._condition:
             state = self._state
             use_driver = self._driver_start_called
@@ -659,6 +764,7 @@ class DsoftbusRuntime:
                 context_id=normalized_context_id,
                 message_id=normalized_message_id,
                 event_sink=event_sink,
+                input_paths=normalized_input_paths,
             )
         except DsoftbusRuntimeError:
             raise
@@ -668,9 +774,69 @@ class DsoftbusRuntime:
                 code = "INTERNAL_ERROR"
             raise DsoftbusRuntimeError(
                 code,
-                outcome_unknown=bool(
-                    getattr(error, "outcome_unknown", False)
-                ),
+                outcome_unknown=bool(getattr(error, "outcome_unknown", False)),
+                interrupted=code == "AGENT_INTERRUPTED",
+            ) from error
+        if not isinstance(value, Mapping):
+            raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
+        return _plain_copy(value)
+
+    async def acontinue_agent_task(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str = "",
+        message_id: str | None = None,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> dict[str, Any]:
+        (
+            device_id,
+            task_id,
+            input_request_id,
+            text,
+            normalized_message_id,
+        ) = self._normalize_agent_task_continuation(
+            device_id,
+            task_id,
+            input_request_id,
+            text=text,
+            message_id=message_id,
+        )
+        normalized_input_paths = self._normalize_agent_task_input_paths(input_paths)
+        if not text and not normalized_input_paths:
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        with self._condition:
+            state = self._state
+            use_driver = self._driver_start_called
+        if state in {RuntimeState.STOPPING, RuntimeState.STOPPED}:
+            raise DsoftbusRuntimeError("RUNTIME_STOPPING")
+        if state in {RuntimeState.NEW, RuntimeState.STARTING}:
+            raise DsoftbusRuntimeError("PEER_NOT_READY")
+        accessor = getattr(self._driver, "continue_agent_task_async", None)
+        if not use_driver or not callable(accessor):
+            raise DsoftbusRuntimeError("PEER_NOT_READY")
+        try:
+            value = await accessor(
+                device_id,
+                task_id,
+                input_request_id,
+                text=text,
+                message_id=normalized_message_id,
+                event_sink=event_sink,
+                input_paths=normalized_input_paths,
+            )
+        except DsoftbusRuntimeError:
+            raise
+        except Exception as error:
+            code = str(getattr(error, "code", "INTERNAL_ERROR"))
+            if code not in protocol.RPC_ERROR_CODES:
+                code = "INTERNAL_ERROR"
+            raise DsoftbusRuntimeError(
+                code,
+                outcome_unknown=bool(getattr(error, "outcome_unknown", False)),
                 interrupted=code == "AGENT_INTERRUPTED",
             ) from error
         if not isinstance(value, Mapping):
@@ -711,6 +877,59 @@ class DsoftbusRuntime:
             raise DsoftbusRuntimeError("INVALID_PARAMS") from error
         return device_id, text, normalized_context_id, normalized_message_id
 
+    def _normalize_agent_task_continuation(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str,
+        message_id: str | None,
+    ) -> tuple[str, str, str, str, str]:
+        if (
+            not isinstance(device_id, str)
+            or _DEVICE_ID.fullmatch(device_id) is None
+            or not isinstance(text, str)
+        ):
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        try:
+            text_bytes = text.encode("utf-8")
+            normalized_task_id = protocol.canonical_uuid4(task_id, "taskId")
+            normalized_request_id = protocol.canonical_uuid4(
+                input_request_id,
+                "inputRequestId",
+            )
+            normalized_message_id = protocol.canonical_uuid4(
+                str(self._uuid_factory()) if message_id is None else message_id,
+                "messageId",
+            )
+        except (UnicodeEncodeError, protocol.ProtocolError) as error:
+            raise DsoftbusRuntimeError("INVALID_PARAMS") from error
+        if len(text_bytes) > 24_576:
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        return (
+            device_id,
+            normalized_task_id,
+            normalized_request_id,
+            text,
+            normalized_message_id,
+        )
+
+    @staticmethod
+    def _normalize_agent_task_input_paths(
+        input_paths: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if (
+            not isinstance(input_paths, tuple)
+            or len(input_paths) > protocol.TASK_INPUT_PATH_MAX
+            or any(
+                not isinstance(path, str) or not path or "\x00" in path
+                for path in input_paths
+            )
+        ):
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        return input_paths
+
     def prepare_run_agent_task_outbound(
         self,
         device_id: str,
@@ -719,6 +938,7 @@ class DsoftbusRuntime:
         context_id: str | None = None,
         message_id: str | None = None,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> tuple[asyncio.AbstractEventLoop, Any, str | None, str]:
         """Build one owner-loop coroutine for the common outbound fence."""
 
@@ -733,6 +953,7 @@ class DsoftbusRuntime:
             context_id=context_id,
             message_id=message_id,
         )
+        normalized_input_paths = self._normalize_agent_task_input_paths(input_paths)
         with self._condition:
             state = self._state
             use_driver = self._driver_start_called
@@ -741,9 +962,7 @@ class DsoftbusRuntime:
         if state in {RuntimeState.NEW, RuntimeState.STARTING}:
             raise DsoftbusRuntimeError("PEER_NOT_READY")
         loop_accessor = getattr(self._driver, "outbound_loop", None)
-        operation_accessor = getattr(
-            self._driver, "run_agent_task_on_owner", None
-        )
+        operation_accessor = getattr(self._driver, "run_agent_task_on_owner", None)
         if (
             not use_driver
             or not callable(loop_accessor)
@@ -758,6 +977,7 @@ class DsoftbusRuntime:
                 context_id=normalized_context_id,
                 message_id=normalized_message_id,
                 event_sink=event_sink,
+                input_paths=normalized_input_paths,
             )
         except Exception as error:
             code = str(getattr(error, "code", "INTERNAL_ERROR"))
@@ -780,6 +1000,80 @@ class DsoftbusRuntime:
             normalized_message_id,
         )
 
+    def prepare_continue_agent_task_outbound(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str = "",
+        message_id: str | None = None,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> tuple[asyncio.AbstractEventLoop, Any, str]:
+        """Build one owner-loop continuation coroutine for the outbound fence."""
+
+        (
+            device_id,
+            task_id,
+            input_request_id,
+            text,
+            normalized_message_id,
+        ) = self._normalize_agent_task_continuation(
+            device_id,
+            task_id,
+            input_request_id,
+            text=text,
+            message_id=message_id,
+        )
+        normalized_input_paths = self._normalize_agent_task_input_paths(input_paths)
+        if not text and not normalized_input_paths:
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        with self._condition:
+            state = self._state
+            use_driver = self._driver_start_called
+        if state in {RuntimeState.STOPPING, RuntimeState.STOPPED}:
+            raise DsoftbusRuntimeError("RUNTIME_STOPPING")
+        if state in {RuntimeState.NEW, RuntimeState.STARTING}:
+            raise DsoftbusRuntimeError("PEER_NOT_READY")
+        loop_accessor = getattr(self._driver, "outbound_loop", None)
+        operation_accessor = getattr(
+            self._driver,
+            "continue_agent_task_on_owner",
+            None,
+        )
+        if (
+            not use_driver
+            or not callable(loop_accessor)
+            or not callable(operation_accessor)
+        ):
+            raise DsoftbusRuntimeError("PEER_NOT_READY")
+        try:
+            loop = loop_accessor()
+            operation = operation_accessor(
+                device_id,
+                task_id,
+                input_request_id,
+                text=text,
+                message_id=normalized_message_id,
+                event_sink=event_sink,
+                input_paths=normalized_input_paths,
+            )
+        except Exception as error:
+            code = str(getattr(error, "code", "INTERNAL_ERROR"))
+            if code not in protocol.RPC_ERROR_CODES:
+                code = "INTERNAL_ERROR"
+            raise DsoftbusRuntimeError(code) from error
+        if not isinstance(loop, asyncio.AbstractEventLoop) or not hasattr(
+            operation,
+            "__await__",
+        ):
+            close = getattr(operation, "close", None)
+            if callable(close):
+                close()
+            raise DsoftbusRuntimeError("RUNTIME_DRIVER_INVALID")
+        return loop, operation, normalized_message_id
+
     def _release_endpoint(self) -> BaseException | None:
         with self._condition:
             endpoint = self._endpoint_lock
@@ -800,9 +1094,7 @@ class DsoftbusRuntime:
             except BaseException as error:
                 errors.append(error)
             try:
-                rollback_deadline = (
-                    self._monotonic() + DSOFTBUS_SHUTDOWN_TIMEOUT_S
-                )
+                rollback_deadline = self._monotonic() + DSOFTBUS_SHUTDOWN_TIMEOUT_S
                 self._driver.stop(lambda: rollback_deadline)
             except BaseException as error:
                 errors.append(error)

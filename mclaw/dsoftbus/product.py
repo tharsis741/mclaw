@@ -214,6 +214,7 @@ class ProductDiscoveryOwnerResources:
         self._profile_loader = profile_loader
         self._manifest_loader = manifest_loader
         if discovery_factory is None:
+
             def _default_discovery_factory(
                 profile: Any,
                 raw_token_id: str,
@@ -324,25 +325,17 @@ class ProductDiscoveryOwnerResources:
             diagnostic = {
                 "activeThreadCount": current["activeThreadCount"],
                 "agentSessionTaskCount": current.get("agentSessionTaskCount", 0),
-                "dispatchExecutionCount": current.get(
-                    "dispatchExecutionCount", 0
-                ),
+                "dispatchExecutionCount": current.get("dispatchExecutionCount", 0),
                 "dispatchQueueBytes": current.get("dispatchQueueBytes", 0),
                 "dispatchQueueCount": current.get("dispatchQueueCount", 0),
                 "inflightMessageCount": current.get("inflightMessageCount", 0),
                 "localTurnCount": current.get("localTurnCount", 0),
-                "agentCardGenerationCount": publication[
-                    "agentCardGenerationCount"
-                ],
-                "listenerGenerationCount": publication[
-                    "listenerGenerationCount"
-                ],
+                "agentCardGenerationCount": publication["agentCardGenerationCount"],
+                "listenerGenerationCount": publication["listenerGenerationCount"],
                 "manifestDescriptorGenerationCount": publication[
                     "manifestDescriptorGenerationCount"
                 ],
-                "manifestPhaseBComplete": publication[
-                    "manifestPhaseBComplete"
-                ],
+                "manifestPhaseBComplete": publication["manifestPhaseBComplete"],
                 "manifestTemplateLoaded": manifest_loaded,
                 "manifestTemplateReadCount": manifest_read_count,
                 "operationCounts": dict(current["operationCounts"]),
@@ -354,9 +347,7 @@ class ProductDiscoveryOwnerResources:
                 ],
                 "remoteAccepted": current.get("remoteAccepted", 0),
                 "remoteBudgetUsed": current.get("remoteBudgetUsed", 0),
-                "remoteRejectedByCode": dict(
-                    current.get("remoteRejectedByCode", {})
-                ),
+                "remoteRejectedByCode": dict(current.get("remoteRejectedByCode", {})),
                 "responseCacheCount": current.get("responseCacheCount", 0),
                 "stateEpochFrozen": publication["stateEpochFrozen"],
                 "tokenReserved": current.get("tokenReserved", 0),
@@ -421,9 +412,9 @@ class ProductDiscoveryOwnerResources:
                 profile.sha256 != self._inputs.profile_sha256
                 or profile.document["runtimeClosure"]["softbusSocketCap"]
                 != self._inputs.socket_cap
-                or profile.document["runtimeClosure"]["python"][
-                    "dynamicLibpython"
-                ]["path"]
+                or profile.document["runtimeClosure"]["python"]["dynamicLibpython"][
+                    "path"
+                ]
                 != self._inputs.python_preload_path
             ):
                 raise ProductActivationError("PRODUCT_INPUT_MISMATCH")
@@ -479,7 +470,9 @@ class ProductDiscoveryOwnerResources:
         self._update_cache()
         return result
 
-    async def update_provider_runtime(self, context: Any | None) -> Mapping[str, Any] | None:
+    async def update_provider_runtime(
+        self, context: Any | None
+    ) -> Mapping[str, Any] | None:
         self._require_owner()
         self._provider_runtime = context
         if self._delegate is None:
@@ -550,9 +543,7 @@ class ProductDiscoveryOwnerResources:
                 "peerCount": current.get("peerCount", value["peerCount"]),
                 "productInputCode": value["productInputCode"],
                 "profileConfigured": value["profileConfigured"],
-                "publicManifestGenerationCount": value[
-                    "publicManifestGenerationCount"
-                ],
+                "publicManifestGenerationCount": value["publicManifestGenerationCount"],
                 "remoteAccepted": current.get(
                     "remoteAccepted", value["remoteAccepted"]
                 ),
@@ -571,9 +562,7 @@ class ProductDiscoveryOwnerResources:
                     "responseCacheCount", value["responseCacheCount"]
                 ),
                 "stateEpochFrozen": value["stateEpochFrozen"],
-                "tokenReserved": current.get(
-                    "tokenReserved", value["tokenReserved"]
-                ),
+                "tokenReserved": current.get("tokenReserved", value["tokenReserved"]),
                 "workerAlive": current.get("workerAlive", value["workerAlive"]),
             }
         )
@@ -586,6 +575,14 @@ class ProductDiscoveryOwnerResources:
             return ()
         return delegate.cached_public_peers()
 
+    def cached_local_device(self) -> Mapping[str, Any]:
+        """Expose the delegate's verified public identity without owner I/O."""
+
+        delegate = self._delegate
+        if delegate is None:
+            return MappingProxyType({})
+        return delegate.cached_local_device()
+
     def list_trusted_devices(self) -> tuple[Mapping[str, Any], ...]:
         """Enumerate redacted DeviceManager targets on the owner thread."""
 
@@ -595,7 +592,7 @@ class ProductDiscoveryOwnerResources:
             raise WorkerSupervisorError("WORKER_NOT_READY")
         return delegate.list_trusted_devices()
 
-    async def discover_devices(self) -> tuple[Mapping[str, Any], ...]:
+    async def discover_devices(self) -> Mapping[str, Any]:
         """Run one M-Claw DeviceManager scan through the active Worker."""
 
         self._require_owner()
@@ -647,6 +644,7 @@ class ProductDiscoveryOwnerResources:
         context_id: str | None,
         message_id: str,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> Mapping[str, Any]:
         """Route one streamed Task through the existing product owner."""
 
@@ -660,10 +658,38 @@ class ProductDiscoveryOwnerResources:
             context_id=context_id,
             message_id=message_id,
             event_sink=event_sink,
+            input_paths=input_paths,
+        )
+
+    async def continue_agent_task(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str,
+        message_id: str,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> Mapping[str, Any]:
+        """Resume one INPUT_REQUIRED Task through the product owner."""
+
+        self._require_owner()
+        delegate = self._delegate
+        if delegate is None:
+            raise AgentMessageError("PEER_NOT_READY")
+        return await delegate.continue_agent_task(
+            device_id,
+            task_id,
+            input_request_id,
+            text=text,
+            message_id=message_id,
+            event_sink=event_sink,
+            input_paths=input_paths,
         )
 
     def manifest_phase_snapshot(self) -> Mapping[str, Any]:
-        """Expose non-sensitive Stage 4 construction counters for tests/Doctor."""
+        """Expose non-sensitive construction counters for tests and Doctor."""
 
         with self._cache_lock:
             loaded = self._manifest_template is not None
@@ -712,6 +738,9 @@ def create_product_runtime(
 
         state_root = get_mclaw_home() / "dsoftbus"
     state_root_path = Path(state_root)
+    from .workspace import default_workspace_root
+
+    collaboration_workspace_root = default_workspace_root(state_root_path)
     inputs = ProductRuntimeInputs.from_local_state(state_root_path)
     if require_activation and not inputs.ready:
         raise ProductActivationError(inputs.status_code)
@@ -733,7 +762,7 @@ def create_product_runtime(
             manifest_template,
             current_provider_runtime,
             config=config,
-            agent_workspace_root=state_root_path / "agent-contexts",
+            agent_workspace_root=collaboration_workspace_root,
             pairing_state_path=state_root_path / "paired-devices.json",
             task_state_root=state_root_path,
             current_boot_id=inputs.current_boot_id or None,

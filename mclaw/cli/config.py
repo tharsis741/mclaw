@@ -284,12 +284,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "dsoftbus": {
         "enabled": False,
-        "discovery_without_provider": False,
         "accept_remote_messages": False,
         "allow_remote_tools": False,
         "per_peer_requests_per_minute": 6,
         "global_requests_per_minute": 12,
-        "remote_token_budget_per_hour": 100_000,
+        "remote_token_budget_per_hour": None,
     },
     "terminal": {
         "cwd": ".",
@@ -525,7 +524,6 @@ def _deep_merge(base: dict, override: dict) -> dict:
 _DSOFTBUS_CONFIG_KEYS = frozenset(
     {
         "enabled",
-        "discovery_without_provider",
         "accept_remote_messages",
         "allow_remote_tools",
         "per_peer_requests_per_minute",
@@ -565,18 +563,12 @@ def _validate_config(config: Mapping[str, Any]) -> None:
     enabled = dsoftbus.get("enabled")
     if enabled is not False and enabled != "auto":
         _raise_dsoftbus_config("enabled")
-    discovery_only = dsoftbus.get("discovery_without_provider")
-    if type(discovery_only) is not bool:
-        _raise_dsoftbus_config("discovery_without_provider")
     accept_remote = dsoftbus.get("accept_remote_messages")
     if type(accept_remote) is not bool:
         _raise_dsoftbus_config("accept_remote_messages")
     allow_remote_tools = dsoftbus.get("allow_remote_tools")
     if type(allow_remote_tools) is not bool:
         _raise_dsoftbus_config("allow_remote_tools")
-    if discovery_only and enabled is False:
-        _raise_dsoftbus_config("discovery_without_provider")
-
     per_peer = dsoftbus.get("per_peer_requests_per_minute")
     global_rate = dsoftbus.get("global_requests_per_minute")
     token_budget = dsoftbus.get("remote_token_budget_per_hour")
@@ -584,7 +576,10 @@ def _validate_config(config: Mapping[str, Any]) -> None:
         _raise_dsoftbus_config("per_peer_requests_per_minute")
     if type(global_rate) is not int or not per_peer <= global_rate <= 240:
         _raise_dsoftbus_config("global_requests_per_minute")
-    if type(token_budget) is not int or not 1_000 <= token_budget <= 10_000_000:
+    if token_budget is not None and (
+        type(token_budget) is not int
+        or not 1_000 <= token_budget <= 10_000_000
+    ):
         _raise_dsoftbus_config("remote_token_budget_per_hour")
 
     _validate_toolset_list(config.get("toolsets"), "toolsets")

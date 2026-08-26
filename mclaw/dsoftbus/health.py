@@ -401,6 +401,7 @@ def validate_runtime_health(value: Mapping[str, Any]) -> None:
         "workerEpoch",
         "degradedReasons",
         "remoteRejectedByCode",
+        "remoteBudgetLimit",
     }
     for field in _KEY_SET - excluded:
         _strict_integer(value[field])
@@ -457,10 +458,14 @@ def validate_runtime_health(value: Mapping[str, Any]) -> None:
     ):
         _fail("RUNTIME_HEALTH_INVALID")
 
-    if not 1_000 <= value["remoteBudgetLimit"] <= 10_000_000:
-        _fail("RUNTIME_HEALTH_INVALID")
-    if value["remoteBudgetUsed"] > value["remoteBudgetLimit"]:
-        _fail("RUNTIME_HEALTH_INVALID")
+    remote_budget_limit = value["remoteBudgetLimit"]
+    if remote_budget_limit is not None:
+        if (
+            type(remote_budget_limit) is not int
+            or not 1_000 <= remote_budget_limit <= 10_000_000
+            or value["remoteBudgetUsed"] > remote_budget_limit
+        ):
+            _fail("RUNTIME_HEALTH_INVALID")
     if value["remoteRejected"] != rejected_sum:
         _fail("RUNTIME_HEALTH_INVALID")
     if value["remoteRateLimited"] != rejected.get("RATE_LIMITED", 0):
@@ -514,7 +519,7 @@ def _initial_values(
     main_start_time_ticks: int,
     socket_cap: int,
     remote_inference_enabled: bool,
-    remote_budget_limit: int,
+    remote_budget_limit: int | None,
     provider_ready: bool,
     provider_readiness_code: str,
 ) -> dict[str, Any]:
@@ -578,7 +583,8 @@ class RuntimeHealthPublisher:
         remote_budget = dsoftbus.get("remote_token_budget_per_hour")
         if type(remote_enabled) is not bool:
             _fail("RUNTIME_HEALTH_CONFIG_INVALID")
-        _strict_integer(remote_budget, positive=True)
+        if remote_budget is not None:
+            _strict_integer(remote_budget, positive=True)
         _strict_integer(socket_cap, positive=True, maximum=_MAX_UINT32)
         if socket_cap < 1 + TRANSIENT_SOCKET_CAP + 1:
             _fail("RUNTIME_HEALTH_CONFIG_INVALID")
@@ -614,10 +620,6 @@ class RuntimeHealthPublisher:
     @property
     def owner_thread_id(self) -> int:
         return self._owner_thread_id
-
-    @property
-    def broken(self) -> bool:
-        return self._broken
 
     def _require_owner(self) -> None:
         if threading.get_ident() != self._owner_thread_id:

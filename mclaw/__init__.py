@@ -4,4 +4,4 @@
 
 """M-Claw robot agent runtime for M-Robots OS."""
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"

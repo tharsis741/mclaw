@@ -4,5 +4,8 @@
 # POSIX scripts must stay LF-only, including on Windows checkouts.
 *.sh text eol=lf
 
+# Protocol golden frames are byte-for-byte fixtures on every host OS.
+tests/fixtures/dsoftbus_contract/*.json text eol=lf
+
 # Skills are bundled assets rather than core MClaw source.
 mclaw/skills/** linguist-vendored

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import os
 from pathlib import Path, PurePosixPath
@@ -84,6 +85,47 @@ def test_device_identity_is_derived_from_board_parameters_without_sample_default
 
 
 @pytest.mark.parametrize(
+    ("fullname", "product_version", "api_level", "adapter_id"),
+    [
+        ("OpenHarmony-4.1-Release", "KaihongOS 4.1", "11", "openharmony-api11"),
+        (
+            "OpenHarmony-5.0.2.123",
+            "KaihongOS 5.0.1.52",
+            "14",
+            "openharmony-api14",
+        ),
+        (
+            "OpenHarmony-6.1.0.31",
+            "M-Robots OS 6.1.0.04Stan",
+            "23",
+            "openharmony-api23",
+        ),
+    ],
+)
+def test_device_identity_selects_native_abi_independently_of_product_version(
+    fullname: str,
+    product_version: str,
+    api_level: str,
+    adapter_id: str,
+) -> None:
+    parameters = {
+        **_BOARD_PARAMETERS,
+        "const.ohos.fullname": fullname,
+        "const.ohos.version": product_version,
+        "const.ohos.apiversion": api_level,
+        "const.product.software.version": product_version,
+    }
+
+    identity = runtime_profile._device_identity_from_parameters(
+        parameters,
+        machine="aarch64",
+    )
+
+    assert identity.adapter.adapter_id == adapter_id
+    assert identity.api_level == int(api_level)
+
+
+@pytest.mark.parametrize(
     ("overrides", "machine", "code"),
     [
         (
@@ -99,14 +141,14 @@ def test_device_identity_is_derived_from_board_parameters_without_sample_default
         (
             {"const.ohos.apiversion": "22"},
             "aarch64",
-            "OH61_RUNTIME_UNSUPPORTED",
+            "OH_RUNTIME_UNSUPPORTED",
         ),
         (
             {"const.product.cpu.abilist": "armeabi-v7a"},
             "aarch64",
-            "OH61_RUNTIME_UNSUPPORTED",
+            "OH_RUNTIME_UNSUPPORTED",
         ),
-        ({}, "x86_64", "OH61_RUNTIME_UNSUPPORTED"),
+        ({}, "x86_64", "OH_RUNTIME_UNSUPPORTED"),
     ],
 )
 def test_device_identity_fails_closed_on_missing_or_unsupported_facts(
@@ -246,6 +288,7 @@ def _document() -> dict[str, object]:
     softbus = _artifact(baseline.REMOTE_SOFTBUS_LIBRARY, "softbus")
     target = {
         "abi": "arm64-v8a",
+        "adapterId": "openharmony-api23",
         "apiLevel": 23,
         "capabilitySet": [],
         "gid": 0,
@@ -276,10 +319,9 @@ def _document() -> dict[str, object]:
         },
         "libraries": {
             "bundledLibcxx": _artifact(baseline.BUNDLED_LIBCXX_LIBRARY, "bundled"),
-            "cjBindFfi": _artifact(baseline.CJ_BIND_FFI_LIBRARY, "cj-ffi"),
-            "cjBindNative": _artifact(baseline.CJ_BIND_NATIVE_LIBRARY, "cj-native"),
-            "deviceManagerFfi": _artifact(
-                baseline.DEVICE_MANAGER_FFI_LIBRARY, "device-manager"
+            "deviceManagerSdk": _artifact(
+                "/system/lib64/platformsdk/libdevicemanagersdk.z.so",
+                "device-manager-sdk",
             ),
             "permission": _artifact(baseline.PERMISSION_LIBRARY, "permission"),
             "releaseLibcxx": _artifact(baseline.RELEASE_LIBCXX_LIBRARY, "release"),
@@ -305,6 +347,13 @@ def _document() -> dict[str, object]:
         },
         "softbus": softbus,
         "softbusSocketCap": 16,
+        "systemParameterTool": _artifact(
+            baseline.SYSTEM_PARAMETER_TOOL, "system-parameter-tool"
+        ),
+        "deviceManagerBridge": _artifact(
+            baseline.OPENHARMONY_ADAPTERS[23].device_manager_bridge,
+            "device-manager-bridge",
+        ),
     }
     fingerprint_source = {
         "runtimeClosure": closure,
@@ -336,6 +385,98 @@ def _document() -> dict[str, object]:
     }
 
 
+def test_isolated_worker_bundle_contains_every_relative_import() -> None:
+    repository = Path(__file__).resolve().parents[1]
+    bundled = frozenset(baseline.WORKER_MODULE_RELATIVE_PATHS)
+    for relative in bundled:
+        source_path = repository / PurePosixPath(relative)
+        tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=relative)
+        package = list(PurePosixPath(relative).parent.parts)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or node.level == 0:
+                continue
+            target = package[: len(package) - (node.level - 1)]
+            if node.module:
+                target.extend(node.module.split("."))
+            candidate = "/".join((*target, "__init__.py"))
+            module_file = "/".join(target) + ".py"
+            assert candidate in bundled or module_file in bundled, (
+                f"{relative} imports an unbundled module: {node.module!r}"
+            )
+
+
+def _document_for_native_bridge(api_level: int) -> dict[str, object]:
+    document = _document()
+    adapter = baseline.OPENHARMONY_ADAPTERS[api_level]
+    target = document["target"]
+    closure = document["runtimeClosure"]
+    assert isinstance(target, dict)
+    assert isinstance(closure, dict)
+    libraries = closure["libraries"]
+    assert isinstance(libraries, dict)
+
+    target["adapterId"] = adapter.adapter_id
+    target["apiLevel"] = api_level
+    versions = {
+        11: (
+            "OpenHarmony-4.1-Release",
+            "KaihongOS 4.1",
+            "KaihongOS 4.1",
+        ),
+        14: (
+            "OpenHarmony-5.0.2.123",
+            "KaihongOS 5.0.1.52",
+            "KaihongOS 5.0.1.52",
+        ),
+        23: (
+            "OpenHarmony-6.1.0.31",
+            "KaihongOS 6.1.0.04",
+            "M-Robots OS 6.1.0.04Stan",
+        ),
+    }[api_level]
+    target["versions"] = {
+        "const.ohos.fullname": versions[0],
+        "const.ohos.version": versions[1],
+        "const.product.software.version": versions[2],
+    }
+    libraries.clear()
+    libraries.update(
+        {
+            "bundledLibcxx": _artifact(
+                baseline.BUNDLED_LIBCXX_LIBRARY, "bundled"
+            ),
+            "deviceManagerSdk": _artifact(
+                "/system/lib64/platformsdk/libdevicemanagersdk.z.so",
+                "device-manager-sdk",
+            ),
+            "releaseLibcxx": _artifact(
+                baseline.RELEASE_LIBCXX_LIBRARY, "release"
+            ),
+            "shim": _artifact(adapter.shim_library, "shim"),
+            "systemLibcxx": _artifact(
+                adapter.system_libcxx_candidates[0], "system"
+            ),
+        }
+    )
+    if adapter.permission_strategy == "ability-access-control":
+        libraries["permission"] = _artifact(
+            baseline.PERMISSION_LIBRARY, "permission"
+        )
+    assert adapter.device_manager_bridge is not None
+    closure["deviceManagerBridge"] = _artifact(
+        adapter.device_manager_bridge, "device-manager-bridge"
+    )
+    fingerprint_source = {
+        "runtimeClosure": closure,
+        "softbus": document["softbus"],
+        "target": target,
+    }
+    document["systemFingerprint"] = "sha256:" + hashlib.sha256(
+        protocol.canonical_json_bytes(fingerprint_source)
+    ).hexdigest()
+    return document
+
+
 def _write_profile(root: Path, document: dict[str, object] | None = None) -> Path:
     path = root / baseline.RUNTIME_PROFILE_FILENAME
     path.write_bytes(protocol.canonical_json_bytes(_document() if document is None else document))
@@ -355,6 +496,46 @@ def test_local_profile_is_canonical_internal_state_without_raw_identity(
     assert "bootId" not in raw
     assert "networkId" not in raw
     assert "descriptor" not in raw.casefold()
+
+
+@pytest.mark.parametrize("api_level", [11, 14, 23])
+def test_native_bridge_profiles_require_exact_protected_bridge_artifact(
+    tmp_path: Path, api_level: int
+) -> None:
+    document = _document_for_native_bridge(api_level)
+    profile = baseline.load_runtime_profile(_write_profile(tmp_path, document))
+
+    adapter = baseline.OPENHARMONY_ADAPTERS[api_level]
+    bridge = profile.document["runtimeClosure"]["deviceManagerBridge"]
+    assert bridge["path"] == adapter.device_manager_bridge
+    assert bridge["mode"] == "0555"
+    assert bridge["uid"] == bridge["gid"] == 0
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("mode", "0775"), ("mode", "0444"), ("uid", 2000), ("gid", 2000)],
+)
+def test_native_bridge_profile_rejects_writable_non_executable_or_non_root_artifact(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    document = _document_for_native_bridge(14)
+    closure = document["runtimeClosure"]
+    assert isinstance(closure, dict)
+    bridge = closure["deviceManagerBridge"]
+    assert isinstance(bridge, dict)
+    bridge[field] = value
+    fingerprint_source = {
+        "runtimeClosure": closure,
+        "softbus": document["softbus"],
+        "target": document["target"],
+    }
+    document["systemFingerprint"] = "sha256:" + hashlib.sha256(
+        protocol.canonical_json_bytes(fingerprint_source)
+    ).hexdigest()
+
+    with pytest.raises(baseline.BaselineError, match="protected executable"):
+        baseline.load_runtime_profile(_write_profile(tmp_path, document))
 
 
 def test_local_profile_rejects_fingerprint_or_unknown_fields(tmp_path: Path) -> None:

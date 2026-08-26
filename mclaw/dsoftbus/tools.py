@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import re
+import traceback
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
@@ -21,7 +23,18 @@ from mclaw.tools.registry import registry
 from . import protocol
 from .active import get_active_runtime
 from .runtime import DsoftbusRuntimeError
-from .task_artifact import TaskArtifactError, get_task_artifact_collector
+from .task_artifact import (
+    TaskArtifactError,
+    artifact_transfer_parts,
+    get_task_artifact_collector,
+)
+from .task_input_request import (
+    TaskInputRequestError,
+    get_task_input_request_collector,
+)
+from .task_source import get_task_source_client
+
+logger = logging.getLogger(__name__)
 
 _DEVICE_ID = re.compile(r"^urn:mclaw:device:oh:[0-9a-f]{64}$")
 _STABLE_CODES = frozenset(protocol.RPC_ERROR_CODES)
@@ -123,8 +136,27 @@ def _canonical_uuid(value: Any, *, optional: bool) -> str | None:
 def _handle_error(error: Exception, **extra: Any) -> str:
     if getattr(error, "termination_fence", None) is not None:
         raise error
+    code = getattr(error, "code", "INTERNAL_ERROR")
+    if code == "INTERNAL_ERROR" or code not in _STABLE_CODES:
+        traces: list[str] = []
+        current: BaseException | None = error
+        visited: set[int] = set()
+        while current is not None and id(current) not in visited and len(traces) < 4:
+            visited.add(id(current))
+            frames = traceback.extract_tb(current.__traceback__)
+            location = " <- ".join(
+                f"{Path(frame.filename).name}:{frame.lineno}:{frame.name}"
+                for frame in frames[-8:]
+            )
+            traces.append(f"{type(current).__name__}@{location or 'unavailable'}")
+            current = current.__cause__ or current.__context__
+        logger.error(
+            "DSoftBus tool failure mapped to INTERNAL_ERROR "
+            "trace_chain=%s",
+            " | caused_by=".join(traces),
+        )
     return _failure(
-        getattr(error, "code", "INTERNAL_ERROR"),
+        code,
         interrupted=bool(getattr(error, "interrupted", False)),
         completion_unknown=bool(getattr(error, "outcome_unknown", False)),
         **extra,
@@ -200,7 +232,7 @@ def diagnose_dsoftbus_tools(config: dict | None = None) -> dict[str, Any]:
     if runtime is None:
         return {
             "available": False,
-            "fix": "Start interactive M-Claw on an authenticated OpenHarmony 6.1 device.",
+            "fix": "Start interactive M-Claw on a supported OpenHarmony device.",
             "reason": "runtime-not-active",
         }
     try:
@@ -297,6 +329,35 @@ async def get_device_context_handler(
         return _handle_error(error, device_id=device_id)
 
 
+def _resolve_task_input_paths(
+    raw_input_paths: Any,
+    parent_agent: Any,
+) -> tuple[str, ...]:
+    if not isinstance(raw_input_paths, (tuple, list)) or len(
+        raw_input_paths
+    ) > protocol.TASK_INPUT_PATH_MAX:
+        raise DsoftbusRuntimeError("INVALID_PARAMS")
+    if not raw_input_paths:
+        return ()
+    from mclaw.runtime.manager import RuntimeManager
+    from mclaw.tools.file_tools import _resolve_agent_path
+
+    path_policy = RuntimeManager.current().paths
+    result: list[str] = []
+    for raw_path in raw_input_paths:
+        if not isinstance(raw_path, str) or not raw_path.strip():
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        resolved = Path(_resolve_agent_path(raw_path, parent_agent)).expanduser()
+        decision = path_policy.check("read", resolved)
+        if (
+            not decision.allowed
+            or path_policy.is_runtime_internal_path(decision.resolved)
+        ):
+            raise DsoftbusRuntimeError("SOURCE_PATH_FORBIDDEN")
+        result.append(str(decision.resolved))
+    return tuple(result)
+
+
 async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
     device_id = ""
     context_id: str | None = None
@@ -305,7 +366,7 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
         values = _validate_exact_args(
             args,
             required=frozenset({"device_id", "text"}),
-            optional=frozenset({"context_id", "message_id"}),
+            optional=frozenset({"context_id", "message_id", "input_paths"}),
         )
         device_id = _device_id(values["device_id"])
         text = values["text"]
@@ -319,6 +380,10 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
         if runtime is None:
             raise DsoftbusRuntimeError("PEER_NOT_READY")
         parent_agent = kwargs.get("parent_agent")
+        input_paths = _resolve_task_input_paths(
+            values.get("input_paths", []),
+            parent_agent,
+        )
 
         def _event_sink(event: Mapping[str, Any]) -> None:
             emit = getattr(parent_agent, "_emit_event", None)
@@ -326,13 +391,18 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
                 emit(_plain(event))
 
         prepare = getattr(runtime, "prepare_run_agent_task_outbound", None)
+        task_options: dict[str, Any] = {
+            "context_id": context_id,
+            "message_id": message_id,
+            "event_sink": _event_sink,
+        }
+        if input_paths:
+            task_options["input_paths"] = input_paths
         if callable(prepare):
             loop, operation, context_id, message_id = prepare(
                 device_id,
                 text,
-                context_id=context_id,
-                message_id=message_id,
-                event_sink=_event_sink,
+                **task_options,
             )
             succeeded, value = _run_runtime_outbound(
                 operation,
@@ -348,9 +418,7 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
             result = await runtime.arun_agent_task(
                 device_id,
                 text,
-                context_id=context_id,
-                message_id=message_id,
-                event_sink=_event_sink,
+                **task_options,
             )
         if not isinstance(result, Mapping):
             raise DsoftbusRuntimeError("INTERNAL_ERROR")
@@ -418,28 +486,22 @@ def return_artifact_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
             ):
                 raise TaskArtifactError("INVALID_PARAMS")
             from mclaw.tools.file_tools import _resolve_agent_path
+            from mclaw.runtime.manager import RuntimeManager
 
             resolved = Path(_resolve_agent_path(path, parent_agent)).expanduser()
-            try:
-                if not resolved.is_file():
-                    raise TaskArtifactError("ARTIFACT_IO_ERROR")
-                if resolved.stat().st_size > protocol.TASK_SINGLE_FRAME_ARTIFACT_BYTES_MAX:
-                    raise TaskArtifactError("ARTIFACT_TOO_LARGE")
-                with resolved.open("rb") as stream:
-                    raw = stream.read(protocol.TASK_SINGLE_FRAME_ARTIFACT_BYTES_MAX + 1)
-            except TaskArtifactError:
-                raise
-            except OSError as error:
-                raise TaskArtifactError("ARTIFACT_IO_ERROR") from error
-            if len(raw) > protocol.TASK_SINGLE_FRAME_ARTIFACT_BYTES_MAX:
-                raise TaskArtifactError("ARTIFACT_TOO_LARGE")
-            artifact = collector.add_raw(
+            decision = RuntimeManager.current().paths.check("read", resolved)
+            if not decision.allowed:
+                raise TaskArtifactError("AGENT_TOOLS_FORBIDDEN")
+            artifact = collector.add_file(
                 name=name,
-                raw=raw,
+                path=decision.resolved,
                 media_type=media_type,
                 description=description,
             )
-            byte_length = len(raw)
+            transfers = artifact_transfer_parts(artifact)
+            if len(transfers) != 1:
+                raise TaskArtifactError("ARTIFACT_INVALID")
+            byte_length = int(transfers[0][2]["byteLength"])
         return _encode(
             {
                 "success": True,
@@ -473,6 +535,191 @@ def return_artifact_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
                 "_untrustedRemoteData": False,
             }
         )
+
+
+async def continue_agent_task_handler(
+    args: Mapping[str, Any], **kwargs: Any
+) -> str:
+    device_id = ""
+    task_id: str | None = None
+    input_request_id: str | None = None
+    message_id: str | None = None
+    try:
+        values = _validate_exact_args(
+            args,
+            required=frozenset(
+                {"device_id", "task_id", "input_request_id"}
+            ),
+            optional=frozenset({"text", "message_id", "input_paths"}),
+        )
+        device_id = _device_id(values["device_id"])
+        task_id = _canonical_uuid(values["task_id"], optional=False)
+        input_request_id = _canonical_uuid(
+            values["input_request_id"], optional=False
+        )
+        message_id = _canonical_uuid(values.get("message_id"), optional=True)
+        if message_id is None:
+            message_id = str(uuid.uuid4())
+        text = values.get("text", "")
+        if not isinstance(text, str) or len(text.encode("utf-8")) > 24_576:
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        parent_agent = kwargs.get("parent_agent")
+        input_paths = _resolve_task_input_paths(
+            values.get("input_paths", []),
+            parent_agent,
+        )
+        if not text and not input_paths:
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        runtime = _runtime_or_failure()
+        if runtime is None:
+            raise DsoftbusRuntimeError("PEER_NOT_READY")
+
+        def _event_sink(event: Mapping[str, Any]) -> None:
+            emit = getattr(parent_agent, "_emit_event", None)
+            if callable(emit):
+                emit(_plain(event))
+
+        options: dict[str, Any] = {
+            "text": text,
+            "message_id": message_id,
+            "event_sink": _event_sink,
+        }
+        if input_paths:
+            options["input_paths"] = input_paths
+        prepare = getattr(
+            runtime,
+            "prepare_continue_agent_task_outbound",
+            None,
+        )
+        if callable(prepare):
+            loop, operation, message_id = prepare(
+                device_id,
+                task_id,
+                input_request_id,
+                **options,
+            )
+            succeeded, value = _run_runtime_outbound(
+                operation,
+                loop=loop,
+                timeout=math.inf,
+                label="agent-task-continuation",
+                parent_agent=parent_agent,
+            )
+            if not succeeded:
+                raise value
+            result = value
+        else:
+            result = await runtime.acontinue_agent_task(
+                device_id,
+                task_id,
+                input_request_id,
+                **options,
+            )
+        if not isinstance(result, Mapping):
+            raise DsoftbusRuntimeError("INTERNAL_ERROR")
+        return _encode(dict(result))
+    except Exception as error:
+        logger.warning(
+            "DSoftBus Task continuation failed code=%s task_id=%s "
+            "input_request_id=%s",
+            getattr(error, "code", "INTERNAL_ERROR"),
+            task_id or "",
+            input_request_id or "",
+            exc_info=True,
+        )
+        return _handle_error(
+            error,
+            device_id=device_id,
+            task_id=task_id,
+            input_request_id=input_request_id,
+            message_id=message_id,
+        )
+
+
+async def source_list_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
+    try:
+        values = _validate_exact_args(
+            args,
+            required=frozenset({"scope_id"}),
+            optional=frozenset({"path", "depth", "page_size", "page_token"}),
+        )
+        client = get_task_source_client()
+        if client is None:
+            raise DsoftbusRuntimeError("SOURCE_SCOPE_NOT_FOUND")
+        result = await client.list_entries(
+            {
+                "scopeId": _canonical_uuid(values["scope_id"], optional=False),
+                "path": values.get("path", ""),
+                "depth": values.get("depth", 1),
+                "pageSize": values.get("page_size", 100),
+                "pageToken": values.get("page_token", ""),
+            }
+        )
+        return _encode(
+            {
+                "success": True,
+                **dict(result),
+                "_untrustedRemoteData": True,
+            }
+        )
+    except Exception as error:
+        return _handle_error(error)
+
+
+async def source_search_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
+    try:
+        values = _validate_exact_args(
+            args,
+            required=frozenset({"scope_id", "query"}),
+            optional=frozenset({"path", "mode", "max_results"}),
+        )
+        client = get_task_source_client()
+        if client is None:
+            raise DsoftbusRuntimeError("SOURCE_SCOPE_NOT_FOUND")
+        result = await client.search(
+            {
+                "scopeId": _canonical_uuid(values["scope_id"], optional=False),
+                "path": values.get("path", ""),
+                "query": values["query"],
+                "mode": values.get("mode", "filename"),
+                "maxResults": values.get("max_results", 20),
+            }
+        )
+        return _encode(
+            {
+                "success": True,
+                **dict(result),
+                "_untrustedRemoteData": True,
+            }
+        )
+    except Exception as error:
+        return _handle_error(error)
+
+
+async def source_fetch_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
+    try:
+        values = _validate_exact_args(
+            args,
+            required=frozenset({"scope_id", "paths"}),
+            optional=frozenset(),
+        )
+        client = get_task_source_client()
+        if client is None:
+            raise DsoftbusRuntimeError("SOURCE_SCOPE_NOT_FOUND")
+        scope_id = _canonical_uuid(values["scope_id"], optional=False)
+        paths = values["paths"]
+        if not isinstance(paths, (tuple, list)):
+            raise DsoftbusRuntimeError("INVALID_PARAMS")
+        result = await client.fetch(scope_id=scope_id, paths=paths)
+        return _encode(
+            {
+                "success": True,
+                **dict(result),
+                "_untrustedRemoteData": True,
+            }
+        )
+    except Exception as error:
+        return _handle_error(error)
 
 
 LIST_PEERS_SCHEMA = {
@@ -517,8 +764,146 @@ RUN_AGENT_TASK_SCHEMA = {
                 "text": {"type": "string", "minLength": 1},
                 "context_id": {"type": "string", "format": "uuid"},
                 "message_id": {"type": "string", "format": "uuid"},
+                "input_paths": {
+                    "type": "array",
+                    "description": (
+                        "Exact local files or directories explicitly in scope for this task. "
+                        "Files are sent as verified task copies; directories remain read-only "
+                        "sources that the remote Agent browses and fetches only as needed."
+                    ),
+                    "items": {"type": "string", "minLength": 1},
+                    "maxItems": protocol.TASK_INPUT_PATH_MAX,
+                },
             },
             "required": ["device_id", "text"],
+            "additionalProperties": False,
+        },
+    }
+}
+
+CONTINUE_AGENT_TASK_SCHEMA = {
+    "function": {
+        "description": (
+            "Continue the same remote Agent Task after it requested additional "
+            "input. Text, explicit files, and read-only directory scopes are "
+            "delivered only to the matching pending request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "device_id": {
+                    "type": "string",
+                    "pattern": r"^urn:mclaw:device:oh:[0-9a-f]{64}$",
+                },
+                "task_id": {"type": "string", "format": "uuid"},
+                "input_request_id": {
+                    "type": "string",
+                    "format": "uuid",
+                },
+                "text": {"type": "string", "maxLength": 24_576},
+                "message_id": {"type": "string", "format": "uuid"},
+                "input_paths": {
+                    "type": "array",
+                    "description": (
+                        "Explicit local files or directories supplied for the "
+                        "pending request. Files are copied in verified chunks; "
+                        "directories become read-only source scopes."
+                    ),
+                    "items": {"type": "string", "minLength": 1},
+                    "maxItems": protocol.TASK_INPUT_PATH_MAX,
+                },
+            },
+            "required": ["device_id", "task_id", "input_request_id"],
+            "anyOf": [
+                {"required": ["text"]},
+                {"required": ["input_paths"]},
+            ],
+            "additionalProperties": False,
+        },
+    }
+}
+
+SOURCE_LIST_SCHEMA = {
+    "function": {
+        "description": (
+            "Browse a caller-shared read-only directory scope. Results are paginated; "
+            "increase depth only when the current task needs nested structure."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope_id": {"type": "string", "format": "uuid"},
+                "path": {"type": "string", "default": ""},
+                "depth": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": protocol.TASK_SOURCE_DEPTH_MAX,
+                    "default": 1,
+                },
+                "page_size": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": protocol.TASK_SOURCE_PAGE_MAX,
+                    "default": 100,
+                },
+                "page_token": {"type": "string", "default": ""},
+            },
+            "required": ["scope_id"],
+            "additionalProperties": False,
+        },
+    }
+}
+
+SOURCE_SEARCH_SCHEMA = {
+    "function": {
+        "description": (
+            "Search file names or bounded UTF-8 text inside a caller-shared read-only "
+            "directory scope. Returns paths and short matches, not full files. "
+            "When scanLimited is true, narrow the path or query before treating an "
+            "empty result as definitive."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope_id": {"type": "string", "format": "uuid"},
+                "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                "path": {"type": "string", "default": ""},
+                "mode": {
+                    "type": "string",
+                    "enum": ["filename", "content"],
+                    "default": "filename",
+                },
+                "max_results": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": protocol.TASK_SOURCE_SEARCH_RESULT_MAX,
+                    "default": 20,
+                },
+            },
+            "required": ["scope_id", "query"],
+            "additionalProperties": False,
+        },
+    }
+}
+
+SOURCE_FETCH_SCHEMA = {
+    "function": {
+        "description": (
+            "Fetch explicitly selected files from a caller-shared read-only scope into "
+            "this Task's local work directory. Returns absolute local working-copy paths."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "scope_id": {"type": "string", "format": "uuid"},
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string", "minLength": 1},
+                    "minItems": 1,
+                    "maxItems": protocol.TASK_SOURCE_FETCH_MAX,
+                },
+            },
+            "required": ["scope_id", "paths"],
             "additionalProperties": False,
         },
     }
@@ -527,9 +912,10 @@ RUN_AGENT_TASK_SCHEMA = {
 RETURN_ARTIFACT_SCHEMA = {
     "function": {
         "description": (
-            "Attach structured JSON or one small local file to the current remote "
-            "Task. A file path is accepted only when read_file is also available. "
-            "The peer receives verified local Artifact metadata, never this device's path."
+            "Attach structured JSON or one local file up to 16 MiB to the current "
+            "remote Task. A file path is accepted only when read_file is also "
+            "available. The framework snapshots and transfers the file in verified "
+            "chunks; the peer never receives this device's path."
         ),
         "parameters": {
             "type": "object",
@@ -549,6 +935,76 @@ RETURN_ARTIFACT_SCHEMA = {
         },
     }
 }
+
+REQUEST_TASK_INPUT_SCHEMA = {
+    "function": {
+        "description": (
+            "Pause the current remote Task and ask its authenticated caller for "
+            "missing text, files, or a read-only directory scope. Call this as the "
+            "only tool in the current tool-call batch."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "message": {"type": "string", "minLength": 1, "maxLength": 4096},
+                "accepts": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["text", "file", "directory"]},
+                    "minItems": 1,
+                    "maxItems": 3,
+                    "uniqueItems": True,
+                },
+            },
+            "required": ["message", "accepts"],
+            "additionalProperties": False,
+        },
+    }
+}
+
+
+def request_task_input_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
+    """Register one structured input request for the current inbound Task."""
+
+    try:
+        values = _validate_exact_args(
+            args,
+            required=frozenset({"message", "accepts"}),
+            optional=frozenset(),
+        )
+        collector = get_task_input_request_collector()
+        if collector is None:
+            raise TaskInputRequestError("TASK_NOT_INPUT_REQUIRED")
+        accepts = values["accepts"]
+        if not isinstance(accepts, (tuple, list)):
+            raise TaskInputRequestError("INVALID_PARAMS")
+        request = collector.request(
+            message=values["message"],
+            accepts=accepts,
+        )
+        return _encode(
+            {
+                "success": True,
+                "input_required": True,
+                **dict(request),
+                "_untrustedRemoteData": False,
+            }
+        )
+    except TaskInputRequestError as error:
+        return _encode(
+            {
+                "success": False,
+                "code": error.code,
+                "_untrustedRemoteData": False,
+            }
+        )
+    except Exception:
+        return _encode(
+            {
+                "success": False,
+                "code": "INTERNAL_ERROR",
+                "_untrustedRemoteData": False,
+            }
+        )
 
 
 registry.register(
@@ -591,17 +1047,77 @@ registry.register(
     handler=return_artifact_handler,
     max_result_size_chars=4_096,
 )
+registry.register(
+    name="dsoftbus_continue_agent_task",
+    toolset="dsoftbus",
+    schema=CONTINUE_AGENT_TASK_SCHEMA,
+    handler=continue_agent_task_handler,
+    check_fn=dsoftbus_tools_available,
+    diagnose_fn=diagnose_dsoftbus_tools,
+    is_async=True,
+    emoji="✉",
+    async_timeout_seconds=math.inf,
+    max_result_size_chars=protocol.TOOL_RESULT_MAX,
+)
+registry.register(
+    name="request_task_input",
+    toolset="dsoftbus-task-control",
+    schema=REQUEST_TASK_INPUT_SCHEMA,
+    handler=request_task_input_handler,
+    emoji="✉",
+    max_result_size_chars=4_096,
+)
+registry.register(
+    name="dsoft_bus_source_list",
+    toolset="dsoftbus-source",
+    schema=SOURCE_LIST_SCHEMA,
+    handler=source_list_handler,
+    is_async=True,
+    emoji="✉",
+    async_timeout_seconds=math.inf,
+    max_result_size_chars=protocol.TASK_SOURCE_TOOL_RESULT_BYTES_MAX,
+)
+registry.register(
+    name="dsoft_bus_source_search",
+    toolset="dsoftbus-source",
+    schema=SOURCE_SEARCH_SCHEMA,
+    handler=source_search_handler,
+    is_async=True,
+    emoji="✉",
+    async_timeout_seconds=math.inf,
+    max_result_size_chars=protocol.TASK_SOURCE_TOOL_RESULT_BYTES_MAX,
+)
+registry.register(
+    name="dsoft_bus_source_fetch",
+    toolset="dsoftbus-source",
+    schema=SOURCE_FETCH_SCHEMA,
+    handler=source_fetch_handler,
+    is_async=True,
+    emoji="✉",
+    async_timeout_seconds=math.inf,
+    max_result_size_chars=protocol.TASK_SOURCE_TOOL_RESULT_BYTES_MAX,
+)
 
 
 __all__ = [
+    "CONTINUE_AGENT_TASK_SCHEMA",
     "GET_DEVICE_CONTEXT_SCHEMA",
     "LIST_PEERS_SCHEMA",
     "RUN_AGENT_TASK_SCHEMA",
+    "SOURCE_FETCH_SCHEMA",
+    "SOURCE_LIST_SCHEMA",
+    "SOURCE_SEARCH_SCHEMA",
     "RETURN_ARTIFACT_SCHEMA",
+    "REQUEST_TASK_INPUT_SCHEMA",
     "diagnose_dsoftbus_tools",
     "dsoftbus_tools_available",
+    "continue_agent_task_handler",
     "get_device_context_handler",
     "list_peers_handler",
     "run_agent_task_handler",
+    "source_fetch_handler",
+    "source_list_handler",
+    "source_search_handler",
     "return_artifact_handler",
+    "request_task_input_handler",
 ]

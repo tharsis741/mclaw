@@ -7,14 +7,18 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from pathlib import Path
 from types import MappingProxyType, SimpleNamespace
 from typing import Any
 
 from mclaw.dsoftbus.active import clear_active_runtime, install_active_runtime
 from mclaw.dsoftbus.tools import (
+    continue_agent_task_handler,
     get_device_context_handler,
     run_agent_task_handler,
 )
+from mclaw.runtime.manager import RuntimeManager
+from mclaw.runtime.paths import PathPolicy
 from mclaw.tools.registry import registry
 from mclaw.tools.toolsets import DSOFTBUS_TOOLS, TOOLSETS
 from mclaw.cli.tui.renderers.banner import BannerRenderer
@@ -46,6 +50,170 @@ def _start_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
     thread = threading.Thread(target=loop.run_forever, daemon=True)
     thread.start()
     return loop, thread
+
+
+def test_agent_task_inputs_use_the_real_path_decision_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    loop, thread = _start_loop()
+    source = tmp_path / "input.txt"
+    source.write_text("payload", encoding="utf-8")
+    captured: list[tuple[str, ...]] = []
+
+    class Runtime:
+        @staticmethod
+        def prepare_run_agent_task_outbound(
+            device_id: str,
+            text: str,
+            *,
+            context_id: str | None,
+            message_id: str,
+            event_sink=None,
+            input_paths: tuple[str, ...] = (),
+        ) -> tuple[Any, Any, str | None, str]:
+            captured.append(input_paths)
+
+            async def operation() -> dict[str, Any]:
+                return {
+                    "success": True,
+                    "device_id": device_id,
+                    "context_id": context_id or _CONTEXT,
+                    "message_id": message_id,
+                    "task_id": _MESSAGE,
+                    "task_state": "TASK_STATE_COMPLETED",
+                    "text": text,
+                    "artifacts": (),
+                }
+
+            return loop, operation(), context_id, message_id
+
+    class Agent:
+        workspace_path = str(tmp_path)
+
+        @staticmethod
+        def current_turn_cancel_event() -> threading.Event:
+            return threading.Event()
+
+    runtime = Runtime()
+    monkeypatch.setattr(
+        RuntimeManager,
+        "_current",
+        SimpleNamespace(paths=PathPolicy(mclaw_home=tmp_path / ".mclaw")),
+    )
+    install_active_runtime(runtime)
+    try:
+        result = json.loads(
+            asyncio.run(
+                run_agent_task_handler(
+                    {
+                        "device_id": _DEVICE,
+                        "text": "process the file",
+                        "message_id": _MESSAGE,
+                        "input_paths": [str(source)],
+                    },
+                    parent_agent=Agent(),
+                )
+            )
+        )
+    finally:
+        clear_active_runtime(runtime)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(2)
+        loop.close()
+
+    assert result["success"] is True
+    assert captured == [(str(source.resolve()),)]
+
+
+def test_agent_task_continuation_uses_the_same_task_and_path_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    loop, thread = _start_loop()
+    source = tmp_path / "supplement.txt"
+    source.write_text("additional input", encoding="utf-8")
+    task_id = "00000000-0000-4000-8000-000000000104"
+    request_id = "00000000-0000-4000-8000-000000000105"
+    captured: list[tuple[str, str, str, str, tuple[str, ...]]] = []
+
+    class Runtime:
+        @staticmethod
+        def prepare_continue_agent_task_outbound(
+            device_id: str,
+            task_id: str,
+            input_request_id: str,
+            *,
+            text: str,
+            message_id: str,
+            event_sink=None,
+            input_paths: tuple[str, ...] = (),
+        ) -> tuple[Any, Any, str]:
+            captured.append(
+                (device_id, task_id, input_request_id, text, input_paths)
+            )
+
+            async def operation() -> dict[str, Any]:
+                return {
+                    "success": True,
+                    "device_id": device_id,
+                    "context_id": _CONTEXT,
+                    "message_id": message_id,
+                    "task_id": task_id,
+                    "task_state": "TASK_STATE_COMPLETED",
+                    "text": "continued",
+                    "artifacts": (),
+                }
+
+            return loop, operation(), message_id
+
+    class Agent:
+        workspace_path = str(tmp_path)
+
+        @staticmethod
+        def current_turn_cancel_event() -> threading.Event:
+            return threading.Event()
+
+    runtime = Runtime()
+    monkeypatch.setattr(
+        RuntimeManager,
+        "_current",
+        SimpleNamespace(paths=PathPolicy(mclaw_home=tmp_path / ".mclaw")),
+    )
+    install_active_runtime(runtime)
+    try:
+        result = json.loads(
+            asyncio.run(
+                continue_agent_task_handler(
+                    {
+                        "device_id": _DEVICE,
+                        "task_id": task_id,
+                        "input_request_id": request_id,
+                        "text": "请继续",
+                        "message_id": _MESSAGE,
+                        "input_paths": [str(source)],
+                    },
+                    parent_agent=Agent(),
+                )
+            )
+        )
+    finally:
+        clear_active_runtime(runtime)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(2)
+        loop.close()
+
+    assert result["success"] is True
+    assert result["task_id"] == task_id
+    assert captured == [
+        (
+            _DEVICE,
+            task_id,
+            request_id,
+            "请继续",
+            (str(source.resolve()),),
+        )
+    ]
 
 
 def test_agent_tools_use_the_runtime_owner_loop_and_turn_fence() -> None:

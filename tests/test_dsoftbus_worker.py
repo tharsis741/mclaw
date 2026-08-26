@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import tempfile
 import threading
@@ -24,6 +25,183 @@ from mclaw.dsoftbus import protocol, worker
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_observed_api_level_skips_link_alias_and_reads_product_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    alias = tmp_path / "ohos.para.alias"
+    product = tmp_path / "ohos.para"
+    alias.write_text('const.ohos.apiversion=99\n', encoding="utf-8")
+    product.write_text('const.ohos.apiversion=14\n', encoding="utf-8")
+    original_is_symlink = Path.is_symlink
+
+    monkeypatch.setattr(
+        Path,
+        "is_symlink",
+        lambda path: path == alias or original_is_symlink(path),
+    )
+    monkeypatch.setattr(worker, "_OHOS_PARAMETER_FILES", (alias, product))
+
+    assert worker._observed_api_level(object()) == 14  # type: ignore[arg-type]
+
+
+def test_observed_api_level_falls_back_to_verified_parameter_tool(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    missing = tmp_path / "missing.para"
+    profile = object()
+    monkeypatch.setattr(worker, "_OHOS_PARAMETER_FILES", (missing,))
+    monkeypatch.setattr(
+        worker,
+        "_read_live_api_level",
+        lambda candidate: "14" if candidate is profile else "",
+    )
+
+    assert worker._observed_api_level(profile) == 14  # type: ignore[arg-type]
+
+
+def test_mapped_files_ignores_non_utf8_kernel_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        worker,
+        "_read_small_bytes",
+        lambda *_args, **_kwargs: b"1000-2000 r--p 0 00:00 1 /invalid-\xee\n",
+    )
+
+    assert worker._mapped_files() == {}
+
+
+def _bridge_string(value: str) -> bytes:
+    raw = value.encode("utf-8")
+    return struct.pack("<I", len(raw)) + raw
+
+
+def test_device_manager_bridge_parser_accepts_one_bounded_device() -> None:
+    payload = (
+        _bridge_string("device-01")
+        + _bridge_string("Kaihong BotBook")
+        + _bridge_string("network-01")
+        + struct.pack("<H", 533)
+    )
+
+    device, offset = worker._DeviceManagerBridgeClient._take_device(  # type: ignore[attr-defined]
+        payload, 0, trusted=True
+    )
+
+    assert offset == len(payload)
+    assert device == worker.NativeTrustedDevice(
+        "device-01",
+        "Kaihong BotBook",
+        533,
+        "network-01",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"\x01\x00",
+        struct.pack("<I", 2) + b"\xff\xff",
+        struct.pack("<I", 1) + b"\x00",
+        struct.pack("<I", 97) + b"x" * 97,
+    ],
+)
+def test_device_manager_bridge_parser_rejects_malformed_strings(payload: bytes) -> None:
+    with pytest.raises(worker.WorkerFailure, match="DEVICE_MANAGER_DATA_INVALID"):
+        worker._DeviceManagerBridgeClient._take_string(  # type: ignore[attr-defined]
+            payload, 0, minimum=1, maximum=96
+        )
+
+
+def test_device_manager_bridge_event_queue_accepts_only_unsolicited_events() -> None:
+    client = object.__new__(worker._DeviceManagerBridgeClient)  # type: ignore[attr-defined]
+    client._condition = threading.Condition()
+    client._reader_failure = None
+    client._frames = deque(
+        [
+            (
+                worker._DEVICE_MANAGER_BRIDGE_DISCOVERY_FAILED,  # type: ignore[attr-defined]
+                0,
+                -7,
+                b"",
+            )
+        ]
+    )
+    client._pending_events = deque()
+
+    assert client.drain_events() == (
+        (
+            worker._DEVICE_MANAGER_BRIDGE_DISCOVERY_FAILED,  # type: ignore[attr-defined]
+            -7,
+            b"",
+        ),
+    )
+
+    client._frames.append(
+        (
+            worker._DEVICE_MANAGER_BRIDGE_DEVICE_FOUND,  # type: ignore[attr-defined]
+            1,
+            0,
+            b"",
+        )
+    )
+    with pytest.raises(
+        worker.WorkerFailure, match="DEVICE_MANAGER_BRIDGE_PROTOCOL_ERROR"
+    ):
+        client.drain_events()
+
+
+def test_device_manager_bridge_drains_final_device_before_closing_scan() -> None:
+    payload = (
+        _bridge_string("device-final")
+        + _bridge_string("Kaihong Final")
+        + _bridge_string("")
+        + struct.pack("<H", 533)
+    )
+
+    class Bridge:
+        def __init__(self) -> None:
+            self.events: list[tuple[int, int, bytes]] = []
+
+        def stop_discovery(self) -> None:
+            self.events.append(
+                (
+                    worker._DEVICE_MANAGER_BRIDGE_DEVICE_FOUND,  # type: ignore[attr-defined]
+                    0,
+                    payload,
+                )
+            )
+
+        def drain_events(self) -> tuple[tuple[int, int, bytes], ...]:
+            events = tuple(self.events)
+            self.events.clear()
+            return events
+
+        _take_device = worker._DeviceManagerBridgeClient._take_device  # type: ignore[attr-defined]
+
+    bridge = Bridge()
+    backend = object.__new__(worker.RealNativeBackend)
+    backend._device_manager_bridge = bridge
+    backend._device_discovery_active = True
+    backend._device_discovery_failure = None
+    backend._discovered_devices = {}
+    backend._require_active = lambda **_kwargs: None
+    backend._uses_device_manager_bridge = lambda: True
+    backend._get_device_manager_bridge = lambda: bridge
+
+    devices, failure = backend.stop_device_discovery()
+
+    assert failure == 0
+    assert devices == (
+        worker.NativeTrustedDevice(
+            "device-final", "Kaihong Final", 533, "", ""
+        ),
+    )
+    assert backend._device_discovery_active is False
 
 
 class _FakeBackend:
@@ -51,7 +229,7 @@ class _FakeBackend:
         )
         self.discovered_devices = (
             worker.NativeTrustedDevice(
-                "raw-discovered-b", "Kaihong B", 533, ""
+                "raw-discovered-b", "Kaihong B", 533, "network-b"
             ),
         )
         self.discovery_failure = 0
@@ -285,6 +463,8 @@ def test_worker_device_discovery_and_bind_operations_redact_raw_device_id() -> N
                 "deviceIdSha256": digest,
                 "deviceName": "Kaihong B",
                 "deviceTypeId": 533,
+                "networkIdSha256": hashlib.sha256(b"network-b").hexdigest(),
+                "publicDeviceId": "",
             }
         ],
         "failureNativeCode": None,

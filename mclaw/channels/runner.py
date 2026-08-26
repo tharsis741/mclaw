@@ -543,10 +543,15 @@ class AgentRunner:
         ingress_reservation: IngressReservation | None = None,
         deadline_monotonic: float | None = None,
         enqueue_if_busy: bool = True,
+        workspace_path: str | None = None,
     ) -> AgentTurnResult:
         """Serialize turns per session and drain its bounded pending FIFO."""
         if type(enqueue_if_busy) is not bool:
             raise TypeError("enqueue_if_busy must be a bool")
+        if workspace_path is not None and (
+            not isinstance(workspace_path, str) or not workspace_path.strip()
+        ):
+            raise TypeError("workspace_path must be a non-empty string or None")
         if deadline_monotonic is not None and (
             isinstance(deadline_monotonic, bool)
             or not isinstance(deadline_monotonic, (int, float))
@@ -679,6 +684,7 @@ class AgentRunner:
                     conversation_history=history,
                     extra_system=extra_system,
                     deadline_monotonic=deadline_monotonic,
+                    workspace_path=workspace_path,
                 )
                 if session_id in self._cancelled_sessions:
                     self._cancelled_sessions.discard(session_id)
@@ -710,6 +716,7 @@ class AgentRunner:
         conversation_history: list[dict] | None,
         extra_system: str = "",
         deadline_monotonic: float | None = None,
+        workspace_path: str | None = None,
     ) -> AgentTurnResult:
         """Run one MClaw conversation turn on a worker thread."""
         agent: MClaw | None = None
@@ -732,7 +739,14 @@ class AgentRunner:
                     error="DEADLINE_EXCEEDED",
                     raw_result={"deadline_exceeded": True},
                 )
-            agent = self._get_or_create_agent(session_id=session_id)
+            agent = (
+                self._get_or_create_agent(session_id=session_id)
+                if workspace_path is None
+                else self._get_or_create_agent(
+                    session_id=session_id,
+                    workspace_path=workspace_path,
+                )
+            )
             begin_turn = getattr(agent, "begin_turn", None)
             if callable(begin_turn):
                 cancel_event = begin_turn()
@@ -980,17 +994,40 @@ class AgentRunner:
         if session_id in self._retiring_session_set():
             self._try_retire_session(session_id)
 
-    def _get_or_create_agent(self, *, session_id: str) -> "MClaw":
+    def _get_or_create_agent(
+        self,
+        *,
+        session_id: str,
+        workspace_path: str | None = None,
+    ) -> "MClaw":
         """Return an existing session agent or create one bound to channel config."""
         from mclaw.agent.core import MClaw
 
         now = time.time()
         self._evict_idle(now)
         provider_runtime = self._runtime_for_session(session_id)
+        requested_workspace = (
+            None
+            if workspace_path is None
+            else str(Path(workspace_path).expanduser().resolve())
+        )
         cached = self._agents.get(session_id)
         if cached:
             agent, _ = cached
-            if agent.provider_runtime.fingerprint() == provider_runtime.fingerprint():
+            cached_workspace = str(
+                Path(str(getattr(agent, "workspace_path", "") or "."))
+                .expanduser()
+                .resolve()
+            )
+            workspace_matches = (
+                requested_workspace is None
+                or cached_workspace == requested_workspace
+            )
+            if (
+                workspace_matches
+                and agent.provider_runtime.fingerprint()
+                == provider_runtime.fingerprint()
+            ):
                 self._agents.move_to_end(session_id)
                 self._agents[session_id] = (agent, now)
                 return agent
@@ -1004,7 +1041,11 @@ class AgentRunner:
             enabled_toolsets=self.enabled_toolsets,
             platform=self.platform,
             system_prompt=self.agent_system_prompt,
-            workspace=self._workspace_for_session(session_id),
+            workspace=(
+                requested_workspace
+                if requested_workspace is not None
+                else self._workspace_for_session(session_id)
+            ),
             skip_memory=self.skip_memory,
             config=self.config,
             event_callback=lambda event, _session_id=session_id: self._emit_agent_event(_session_id, event),

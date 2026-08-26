@@ -34,8 +34,15 @@ DSOFTBUS_TOOLS = [
     "dsoftbus_list_peers",
     "dsoftbus_get_device_context",
     "dsoftbus_run_agent_task",
+    "dsoftbus_continue_agent_task",
 ]
 DSOFTBUS_ARTIFACT_TOOLS = ["return_artifact"]
+DSOFTBUS_TASK_CONTROL_TOOLS = ["request_task_input"]
+DSOFTBUS_SOURCE_TOOLS = [
+    "dsoft_bus_source_list",
+    "dsoft_bus_source_search",
+    "dsoft_bus_source_fetch",
+]
 
 REQUIRED_TOOLSETS = ["credentials", "terminal", "file", "memory", "skills", "session_search", "delegation"]
 OPTIONAL_TOOLSETS = ["web", "vision", "browser", "weixin", "dingtalk"]
@@ -146,6 +153,16 @@ TOOLSETS: dict[str, dict[str, Any]] = {
     "dsoftbus-artifact": {
         "description": "Internal Task-output adapter for inbound DSoftBus turns",
         "tools": DSOFTBUS_ARTIFACT_TOOLS,
+        "kind": "scoped",
+    },
+    "dsoftbus-task-control": {
+        "description": "Internal continuation control for inbound DSoftBus Tasks",
+        "tools": DSOFTBUS_TASK_CONTROL_TOOLS,
+        "kind": "scoped",
+    },
+    "dsoftbus-source": {
+        "description": "Internal read-only source scopes for inbound DSoftBus Tasks",
+        "tools": DSOFTBUS_SOURCE_TOOLS,
         "kind": "scoped",
     },
     "minimal": {

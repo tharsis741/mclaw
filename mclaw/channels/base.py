@@ -41,6 +41,7 @@ class AttachmentOrigin(str, Enum):
     FILE_UPLOAD = "file_upload"
     WEIXIN = "weixin"
     DINGTALK = "dingtalk"
+    DSOFTBUS = "dsoftbus"
 
 
 @dataclass(frozen=True)

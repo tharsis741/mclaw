@@ -29,7 +29,9 @@ from mclaw.tools.toolsets import (
 OH61_PARAMETERS = {
     "const.ohos.version": "KaihongOS 6.1.0.04",
     "const.ohos.fullname": "OpenHarmony-6.1.0.31",
+    "const.ohos.apiversion": "23",
     "const.product.software.version": "M-Robots OS 6.1.0.04Stan",
+    "const.product.cpu.abilist": "arm64-v8a",
 }
 
 def _make_kaihong_runtime(
@@ -70,7 +72,7 @@ def test_kaihong_oh61_identity_enables_dsoftbus_candidate(
     runtime = _make_kaihong_runtime(monkeypatch, tmp_path, OH61_PARAMETERS)
 
     assert runtime.features.is_enabled("dsoftbus")
-    assert runtime.features.get("dsoftbus").reason == "OH61_CANDIDATE"
+    assert runtime.features.get("dsoftbus").reason == "OH_DSOFTBUS_CANDIDATE"
 
 
 @pytest.mark.parametrize(
@@ -82,15 +84,15 @@ def test_kaihong_oh61_identity_enables_dsoftbus_candidate(
                 "const.ohos.fullname": "OpenHarmony-6.10.0.1",
             },
             "aarch64",
-            "OH_IDENTITY_CONFLICT",
+            "OH_RUNTIME_UNSUPPORTED",
         ),
         (
             {
                 **OH61_PARAMETERS,
-                "const.product.software.version": "M-Robots OS 5.0",
+                "const.ohos.apiversion": "14",
             },
             "arm64",
-            "OH_IDENTITY_CONFLICT",
+            "OH_RUNTIME_UNSUPPORTED",
         ),
         (
             {"const.ohos.version": "KaihongOS 6.1.0.04"},
@@ -152,6 +154,8 @@ def test_missing_identity_keys_use_sanitized_live_parameter_probe(
     assert calls == [
         ("/bin/param", "const.ohos.fullname"),
         ("/bin/param", "const.product.software.version"),
+        ("/bin/param", "const.ohos.apiversion"),
+        ("/bin/param", "const.product.cpu.abilist"),
     ]
 
 
@@ -161,32 +165,12 @@ def test_dsoftbus_default_config_requires_all_three_user_opt_ins() -> None:
     cli_config._validate_config(config)
     assert config["dsoftbus"] == {
         "enabled": False,
-        "discovery_without_provider": False,
         "accept_remote_messages": False,
         "allow_remote_tools": False,
         "per_peer_requests_per_minute": 6,
         "global_requests_per_minute": 12,
-        "remote_token_budget_per_hour": 100_000,
+        "remote_token_budget_per_hour": None,
     }
-
-
-def test_product_launcher_sets_the_release_python_environment() -> None:
-    repository_root = Path(__file__).resolve().parents[1]
-    assert not (repository_root / "mclaw" / "dsoftbus" / "native").exists()
-    source = (
-        repository_root
-        / "mclaw"
-        / "dsoftbus"
-        / "resources"
-        / "mclaw_product_launcher.sh"
-    ).read_text(encoding="utf-8")
-
-    assert source.startswith("#!/system/bin/sh\n# Copyright © 2026 ")
-    assert "MCLAW_DSOFTBUS_PRODUCT_ENTRY" not in source
-    assert "MCLAW_DSOFTBUS_PROFILE" not in source
-    assert 'export LD_PRELOAD="${MCLAW_PYTHON_PRELOAD}"' in source
-    assert source.rstrip().endswith('exec python3 -m mclaw.cli.main "$@"')
-    assert "eval " not in source
 
 
 @pytest.mark.parametrize(
@@ -194,7 +178,6 @@ def test_product_launcher_sets_the_release_python_environment() -> None:
     [
         ("enabled", True),
         ("enabled", "on"),
-        ("discovery_without_provider", 1),
         ("accept_remote_messages", "false"),
         ("allow_remote_tools", "false"),
         ("allow_remote_tools", 1),
@@ -213,17 +196,6 @@ def test_dsoftbus_config_rejects_unknown_types_and_out_of_range_values(
 ) -> None:
     config = copy.deepcopy(cli_config.DEFAULT_CONFIG)
     config["dsoftbus"][field] = value
-
-    with pytest.raises(cli_config.ConfigError) as caught:
-        cli_config._validate_config(config)
-
-    assert caught.value.code == "DSOFTBUS_CONFIG_INVALID"
-
-
-def test_discovery_marker_conflicts_with_disabled_runtime() -> None:
-    config = copy.deepcopy(cli_config.DEFAULT_CONFIG)
-    config["dsoftbus"]["enabled"] = False
-    config["dsoftbus"]["discovery_without_provider"] = True
 
     with pytest.raises(cli_config.ConfigError) as caught:
         cli_config._validate_config(config)
@@ -254,7 +226,6 @@ def test_dsoftbus_setup_uses_one_optional_capability_selection(
         features=SimpleNamespace(is_enabled=lambda name: name == "dsoftbus")
     )
     config = copy.deepcopy(cli_config.DEFAULT_CONFIG)
-    config["dsoftbus"]["discovery_without_provider"] = False
     prompts: list[tuple[str, list[dict], dict]] = []
 
     def choose(title, items, **kwargs):
@@ -278,7 +249,6 @@ def test_dsoftbus_setup_uses_one_optional_capability_selection(
     ]
     assert prompts[0][2]["default_selected"] == []
     assert config["dsoftbus"]["enabled"] == "auto"
-    assert config["dsoftbus"]["discovery_without_provider"] is True
     assert config["dsoftbus"]["accept_remote_messages"] is True
     assert config["dsoftbus"]["allow_remote_tools"] is True
     cli_config._validate_config(config)
@@ -346,7 +316,6 @@ def test_setup_capability_flow_persists_dsoftbus_answers_for_oh61_candidate(
         "M-Claw 语音输入",
     ]
     assert config["dsoftbus"]["enabled"] == "auto"
-    assert config["dsoftbus"]["discovery_without_provider"] is True
     assert config["dsoftbus"]["accept_remote_messages"] is True
     assert config["dsoftbus"]["allow_remote_tools"] is True
     cli_config._validate_config(config)
@@ -364,7 +333,6 @@ def test_product_discovery_only_config_does_not_repeat_first_run_setup(
     config["dsoftbus"].update(
         {
             "enabled": "auto",
-            "discovery_without_provider": True,
         }
     )
     monkeypatch.setattr(constants, "get_mclaw_home", lambda: tmp_path)
@@ -377,7 +345,7 @@ def test_product_discovery_only_config_does_not_repeat_first_run_setup(
     assert cli_main._first_run_check() is True
 
 
-def test_fresh_product_setup_can_enable_discovery_without_a_provider(
+def test_fresh_product_setup_can_enable_trusted_device_collaboration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from mclaw.cli import main as cli_main
@@ -408,7 +376,6 @@ def test_fresh_product_setup_can_enable_discovery_without_a_provider(
 
     assert len(saved) == 1
     assert saved[0]["dsoftbus"]["enabled"] == "auto"
-    assert saved[0]["dsoftbus"]["discovery_without_provider"] is True
     assert saved[0]["dsoftbus"]["accept_remote_messages"] is True
     assert saved[0]["dsoftbus"]["allow_remote_tools"] is True
     cli_config._validate_config(saved[0])
@@ -685,14 +652,14 @@ def test_persisted_provider_selection_uses_only_exact_allowed_shapes() -> None:
     )
 
 
-def test_discovery_only_downgrade_requires_candidate_and_persisted_evidence(
+def test_collaboration_entry_requires_candidate_and_persisted_provider_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(entrypoint, "is_discovery_only_candidate", lambda _config: True)
     base = {
         "resume_snapshot": None,
         "cli_values": {key: "" for key in ("model", "provider", "api_key", "base_url")},
-        "raw_user_config": {"dsoftbus": {"discovery_without_provider": True}},
+        "raw_user_config": {"dsoftbus": {"enabled": "auto"}},
         "raw_project_config": {},
         "merged_config": copy.deepcopy(cli_config.DEFAULT_CONFIG),
     }

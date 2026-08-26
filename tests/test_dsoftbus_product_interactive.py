@@ -71,6 +71,62 @@ def test_product_resource_routes_streamed_agent_task_to_delegate() -> None:
     ]
 
 
+def test_product_resource_routes_same_task_continuation_to_delegate() -> None:
+    resources = ProductDiscoveryOwnerResources(inputs=ProductRuntimeInputs())
+    resources._owner_thread_id = threading.get_ident()
+    calls: list[dict] = []
+
+    class Delegate:
+        async def continue_agent_task(
+            self,
+            device_id,
+            task_id,
+            input_request_id,
+            **kwargs,
+        ):
+            calls.append(
+                {
+                    "device_id": device_id,
+                    "task_id": task_id,
+                    "input_request_id": input_request_id,
+                    **kwargs,
+                }
+            )
+            return {
+                "success": True,
+                "device_id": device_id,
+                "task_id": task_id,
+                "task_state": "TASK_STATE_COMPLETED",
+            }
+
+    resources._delegate = Delegate()  # type: ignore[assignment]
+    sink = lambda event: None
+    result = asyncio.run(
+        resources.continue_agent_task(
+            "urn:mclaw:device:oh:" + "a" * 64,
+            "0e4ba172-c081-48e9-a9d9-7b5714c98a42",
+            "b07eca54-7c35-4c27-833c-c578395cc13e",
+            text="",
+            message_id="c3e36fe1-e09b-486b-8e03-e8254ce5cf3c",
+            event_sink=sink,
+            input_paths=("/data/local/tmp/config.txt",),
+        )
+    )
+
+    assert result["task_state"] == "TASK_STATE_COMPLETED"
+    assert calls == [
+        {
+            "device_id": "urn:mclaw:device:oh:" + "a" * 64,
+            "task_id": "0e4ba172-c081-48e9-a9d9-7b5714c98a42",
+            "input_request_id": "b07eca54-7c35-4c27-833c-c578395cc13e",
+            "text": "",
+            "message_id": "c3e36fe1-e09b-486b-8e03-e8254ce5cf3c",
+            "event_sink": sink,
+            "input_paths": ("/data/local/tmp/config.txt",),
+        }
+    ]
+
+
 def test_runtime_shutdown_uses_one_deadline_and_order() -> None:
     from mclaw.cli.runtime.lifecycle import RuntimeShutdownCoordinator, RuntimeShutdownHooks
 

@@ -16,13 +16,20 @@ import stat
 from types import MappingProxyType
 from typing import Any, Mapping, NoReturn, Sequence
 
+from .platform_adapter import (
+    DEPLOYMENT_ROOT,
+    OPENHARMONY_ADAPTERS,
+    PERMISSION_LIBRARY,
+    REMOTE_SOFTBUS_LIBRARY,
+    REQUIRED_SOFTBUS_EXPORTS,
+    SYSTEM_PARAMETER_TOOL,
+    select_openharmony_adapter,
+)
 from .protocol import ProtocolError, canonical_json_bytes, strict_json_loads
 
 RUNTIME_PROFILE_FILENAME = "runtime-profile.json"
 RUNTIME_PROFILE_SCHEMA = "mclaw.dsoftbus.runtime-profile"
 RUNTIME_PROFILE_BYTES_MAX = 262_144
-REMOTE_SOFTBUS_LIBRARY = "/system/lib64/platformsdk/libsoftbus_client.z.so"
-DEPLOYMENT_ROOT = "/data/local/release/opt/mclaw-dsoftbus"
 PYTHON_EXECUTABLE = "/data/local/release/bin/python3"
 PYTHON_RELEASE_LIBRARY_DIRS = (
     "/data/local/release/usr/lib",
@@ -30,10 +37,9 @@ PYTHON_RELEASE_LIBRARY_DIRS = (
 )
 PYTHON_DYNAMIC_LIBRARY = "/data/local/release/usr/lib/libpython3.12.so.1.0"
 RELEASE_LIBCXX_LIBRARY = "/data/local/release/usr/lib/libc++.so.1.0"
-SHIM_LIBRARY = f"{DEPLOYMENT_ROOT}/current/lib/libmclaw_dsoftbus_oh61.so"
+SHIM_LIBRARY = OPENHARMONY_ADAPTERS[23].shim_library
 BUNDLED_LIBCXX_LIBRARY = f"{DEPLOYMENT_ROOT}/current/lib/libc++_shared.so"
-SYSTEM_LIBCXX_LIBRARY = "/system/lib64/chipset-sdk-sp/libc++.so"
-PERMISSION_LIBRARY = "/system/lib64/ndk/libability_access_control.so"
+SYSTEM_LIBCXX_LIBRARY = OPENHARMONY_ADAPTERS[23].system_libcxx_candidates[0]
 DEVICE_MANAGER_FFI_LIBRARY = (
     "/system/lib64/platformsdk/libcj_distributed_device_manager_ffi.z.so"
 )
@@ -52,6 +58,7 @@ WORKER_MODULE_RELATIVE_PATHS = (
     "mclaw/__init__.py",
     "mclaw/dsoftbus/__init__.py",
     "mclaw/dsoftbus/baseline.py",
+    "mclaw/dsoftbus/platform_adapter.py",
     "mclaw/dsoftbus/protocol.py",
     "mclaw/dsoftbus/worker.py",
     WORKER_BOOTSTRAP_RELATIVE_PATH,
@@ -99,23 +106,6 @@ LINUX_CAPABILITY_NAMES = (
     "CAP_PERFMON",
     "CAP_BPF",
     "CAP_CHECKPOINT_RESTORE",
-)
-
-REQUIRED_SOFTBUS_EXPORTS = (
-    "Bind",
-    "BindAsync",
-    "FreeNodeInfo",
-    "GetAllNodeDeviceInfo",
-    "GetLocalNodeDeviceInfo",
-    "GetMtuSize",
-    "GetNodeKeyInfo",
-    "Listen",
-    "RegNodeDeviceStateCb",
-    "SendBytes",
-    "SendBytesAsync",
-    "Shutdown",
-    "Socket",
-    "UnregNodeDeviceStateCb",
 )
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
@@ -397,6 +387,7 @@ def _validate_runtime_profile_document(profile: dict[str, Any]) -> None:
         frozenset(
             {
                 "abi",
+                "adapterId",
                 "apiLevel",
                 "capabilitySet",
                 "gid",
@@ -410,15 +401,14 @@ def _validate_runtime_profile_document(profile: dict[str, Any]) -> None:
         ),
         "runtime profile target",
     )
-    if (
-        _integer(target["apiLevel"], "target.apiLevel", 1, 10_000) != 23
-        or _string(target["abi"], "target.abi", maximum=32) != "arm64-v8a"
-        or _string(target["machine"], "target.machine", maximum=32) != "aarch64"
-        or not _string(
-            target["pythonVersion"], "target.pythonVersion", maximum=32
-        ).startswith("3.12.")
-    ):
-        _fail("runtime profile target is not the supported OH 6.1 runtime")
+    api_level = _integer(target["apiLevel"], "target.apiLevel", 1, 10_000)
+    adapter_id = _string(target["adapterId"], "target.adapterId", maximum=64)
+    abi = _string(target["abi"], "target.abi", maximum=32)
+    machine = _string(target["machine"], "target.machine", maximum=32)
+    if not _string(
+        target["pythonVersion"], "target.pythonVersion", maximum=32
+    ).startswith("3.12."):
+        _fail("runtime profile Python runtime is unsupported")
     _integer(target["uid"], "target.uid", 0, 2**32 - 1)
     _integer(target["gid"], "target.gid", 0, 2**32 - 1)
     target_groups = _runtime_integer_list(
@@ -444,10 +434,28 @@ def _validate_runtime_profile_document(profile: dict[str, Any]) -> None:
     )
     for key in sorted(versions):
         _string(versions[key], f"target.versions.{key}", maximum=256)
+    adapter = select_openharmony_adapter(
+        api_level=api_level,
+        fullname=versions["const.ohos.fullname"],
+        abi_values=(abi,),
+        machine=machine,
+    )
+    if adapter is None or adapter.adapter_id != adapter_id:
+        _fail("runtime profile target does not select a supported OpenHarmony ABI")
 
+    closure_keys = {
+        "identity",
+        "libraries",
+        "python",
+        "softbus",
+        "softbusSocketCap",
+        "systemParameterTool",
+    }
+    if adapter.device_manager_bridge is not None:
+        closure_keys.add("deviceManagerBridge")
     closure = _exact_object(
         profile["runtimeClosure"],
-        frozenset({"identity", "libraries", "python", "softbus", "softbusSocketCap"}),
+        frozenset(closure_keys),
         "runtimeClosure",
     )
     socket_cap = _integer(
@@ -490,38 +498,49 @@ def _validate_runtime_profile_document(profile: dict[str, Any]) -> None:
     if identity["launcher"]["path"] != TOKEN_LAUNCHER:
         _fail("runtime profile token launcher path is not the product value")
 
-    libraries = _exact_object(
-        closure["libraries"],
-        frozenset(
-            {
-                "bundledLibcxx",
-                "cjBindFfi",
-                "cjBindNative",
-                "deviceManagerFfi",
-                "permission",
-                "releaseLibcxx",
-                "shim",
-                "systemLibcxx",
-            }
-        ),
-        "runtimeClosure.libraries",
-    )
     expected_libraries = {
         "bundledLibcxx": BUNDLED_LIBCXX_LIBRARY,
-        "cjBindFfi": CJ_BIND_FFI_LIBRARY,
-        "cjBindNative": CJ_BIND_NATIVE_LIBRARY,
-        "deviceManagerFfi": DEVICE_MANAGER_FFI_LIBRARY,
-        "permission": PERMISSION_LIBRARY,
         "releaseLibcxx": RELEASE_LIBCXX_LIBRARY,
-        "shim": SHIM_LIBRARY,
-        "systemLibcxx": SYSTEM_LIBCXX_LIBRARY,
+        "shim": adapter.shim_library,
     }
+    expected_libraries.update(adapter.device_manager_libraries)
+    if adapter.permission_strategy == "ability-access-control":
+        expected_libraries["permission"] = PERMISSION_LIBRARY
+    libraries = _exact_object(
+        closure["libraries"],
+        frozenset((*expected_libraries, "systemLibcxx")),
+        "runtimeClosure.libraries",
+    )
     for name, expected_path in expected_libraries.items():
         artifact = _validate_local_runtime_artifact(
             libraries[name], f"runtimeClosure.libraries.{name}"
         )
         if artifact["path"] != expected_path:
             _fail(f"runtimeClosure.libraries.{name}.path is not the product value")
+    system_libcxx = _validate_local_runtime_artifact(
+        libraries["systemLibcxx"], "runtimeClosure.libraries.systemLibcxx"
+    )
+    if system_libcxx["path"] not in adapter.system_libcxx_candidates:
+        _fail("runtimeClosure.libraries.systemLibcxx.path is not supported")
+    parameter_tool = _validate_local_runtime_artifact(
+        closure["systemParameterTool"], "runtimeClosure.systemParameterTool"
+    )
+    if parameter_tool["path"] != SYSTEM_PARAMETER_TOOL:
+        _fail("runtimeClosure.systemParameterTool.path is not the product value")
+    if adapter.device_manager_bridge is not None:
+        bridge = _validate_local_runtime_artifact(
+            closure["deviceManagerBridge"], "runtimeClosure.deviceManagerBridge"
+        )
+        if bridge["path"] != adapter.device_manager_bridge:
+            _fail("runtimeClosure.deviceManagerBridge.path is not the product value")
+        bridge_mode = int(bridge["mode"], 8)
+        if (
+            bridge["uid"] != 0
+            or bridge["gid"] != 0
+            or bridge_mode & 0o022
+            or not bridge_mode & 0o111
+        ):
+            _fail("runtimeClosure.deviceManagerBridge is not a protected executable")
 
     python = _exact_object(
         closure["python"],
@@ -770,7 +789,10 @@ def preflight_runtime_profile(
         ("Python executable", closure["python"]["executable"]),
         ("dynamic libpython", closure["python"]["dynamicLibpython"]),
         ("token launcher", closure["identity"]["launcher"]),
+        ("system parameter tool", closure["systemParameterTool"]),
     ]
+    if "deviceManagerBridge" in closure:
+        records.append(("DeviceManager bridge", closure["deviceManagerBridge"]))
     records.extend(
         (f"runtime library {name}", record)
         for name, record in closure["libraries"].items()
@@ -844,6 +866,7 @@ __all__ = [
     "RuntimeProfile",
     "SHIM_LIBRARY",
     "SYSTEM_LIBCXX_LIBRARY",
+    "SYSTEM_PARAMETER_TOOL",
     "TOKEN_LAUNCHER",
     "WORKER_BOOTSTRAP_RELATIVE_PATH",
     "WORKER_CODE_MANIFEST_FILENAME",

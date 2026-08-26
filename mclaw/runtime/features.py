@@ -64,6 +64,7 @@ _TOOL_TO_FEATURE = {
     "dsoftbus_list_peers": "dsoftbus",
     "dsoftbus_get_device_context": "dsoftbus",
     "dsoftbus_run_agent_task": "dsoftbus",
+    "dsoftbus_continue_agent_task": "dsoftbus",
 }
 
 _TOOLSET_TO_FEATURE = {

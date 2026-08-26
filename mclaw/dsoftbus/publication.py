@@ -63,10 +63,6 @@ class LocalPublications:
     manifest: PublicManifest
     card_preflight: AgentCard
 
-    @property
-    def state_epoch(self) -> str:
-        return self.runtime_instance_id
-
     def build_agent_card(
         self, *, provider_ready: bool, provider_readiness_code: str
     ) -> AgentCard:

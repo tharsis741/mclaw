@@ -219,10 +219,36 @@ def _validate_device_digest(value: Any, label: str) -> str:
 def _validate_discovered_device(value: Any, label: str) -> None:
     device = protocol.exact_object(
         value,
-        frozenset({"deviceIdSha256", "deviceName", "deviceTypeId"}),
+        frozenset(
+            {
+                "deviceIdSha256",
+                "deviceName",
+                "deviceTypeId",
+                "networkIdSha256",
+                "publicDeviceId",
+            }
+        ),
         label,
     )
     _validate_device_digest(device["deviceIdSha256"], f"{label}.deviceIdSha256")
+    network_digest = device["networkIdSha256"]
+    if network_digest != "":
+        _validate_device_digest(network_digest, f"{label}.networkIdSha256")
+    public_device_id = device["publicDeviceId"]
+    if public_device_id != "":
+        prefix = "urn:mclaw:device:oh:"
+        if (
+            not isinstance(public_device_id, str)
+            or not public_device_id.startswith(prefix)
+            or len(public_device_id) != len(prefix) + 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in public_device_id[len(prefix) :]
+            )
+        ):
+            raise protocol.ProtocolError(
+                "INVALID_REQUEST", f"{label}.publicDeviceId is invalid"
+            )
     protocol.bounded_utf8(device["deviceName"], f"{label}.deviceName", 0, 127)
     protocol.bounded_integer(
         device["deviceTypeId"], f"{label}.deviceTypeId", 0, 2**16 - 1

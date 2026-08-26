@@ -4,11 +4,10 @@
 
 """Persistent A2A Task and Artifact state for the DSoftBus Runtime.
 
-The store is deliberately synchronous and owner-loop confined.  SQLite owns
-the small protocol objects while artifact bytes live below the same
-``MCLAW_HOME/dsoftbus`` state root.  Remote paths are never reused as local
-paths: received bytes are written to a temporary sibling, verified, and then
-atomically published.
+The store is deliberately synchronous and owner-loop confined. SQLite owns
+the small protocol objects while product Artifact bytes live in the separate
+DSoftBus collaboration workspace. Remote paths are never reused as local
+paths: received bytes are verified before an absolute local receipt is stored.
 """
 
 from __future__ import annotations
@@ -28,6 +27,12 @@ from typing import Any, Literal, Mapping
 import uuid
 
 from . import protocol
+from .task_artifact import (
+    TaskArtifactError,
+    artifact_part_local_filename,
+    artifact_transfer_parts,
+)
+from .workspace import DsoftbusWorkspace, RemoteWorkspaceError
 
 
 TaskDirection = Literal["owned", "received"]
@@ -66,7 +71,6 @@ _TASK_STATE_TRANSITIONS: Mapping[str, frozenset[str]] = MappingProxyType(
 
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9._~-]{1,128}$")
-_SAFE_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
 class TaskStoreError(RuntimeError):
     """Stable local persistence fault."""
 
@@ -139,26 +143,6 @@ def _peer(value: Any) -> str:
     return value
 
 
-def _safe_filename(value: Any, fallback: str) -> str:
-    name = value if isinstance(value, str) else ""
-    # A remote filename is display metadata, never a path.  Keeping only the
-    # final component also prevents Windows and POSIX separator ambiguity.
-    name = name.replace("\\", "/").rsplit("/", 1)[-1].strip()
-    name = _SAFE_FILENAME.sub("_", name).strip(" ._")
-    if not name:
-        name = fallback
-    raw = name.encode("utf-8")
-    if len(raw) > 160:
-        stem, dot, suffix = name.rpartition(".")
-        suffix = suffix[:32] if dot else ""
-        budget = 155 - len(suffix.encode("utf-8"))
-        head = (stem if dot else name).encode("utf-8")[: max(1, budget)]
-        name = head.decode("utf-8", errors="ignore") or fallback
-        if suffix:
-            name = f"{name}.{suffix}"
-    return name
-
-
 def _set_private_mode(path: Path, mode: int) -> None:
     try:
         os.chmod(path, mode)
@@ -173,7 +157,20 @@ class DsoftbusTaskStore:
     filesystem.  Product construction always supplies the Runtime state root.
     """
 
-    def __init__(self, state_root: str | Path | None = None) -> None:
+    def __init__(
+        self,
+        state_root: str | Path | None = None,
+        *,
+        artifact_workspace: DsoftbusWorkspace | None = None,
+    ) -> None:
+        if artifact_workspace is not None and not isinstance(
+            artifact_workspace, DsoftbusWorkspace
+        ):
+            raise TypeError("artifact_workspace must be a DsoftbusWorkspace or None")
+        self._artifact_workspace = artifact_workspace
+        self._artifact_transfer_cache: dict[
+            tuple[str, str, str, str], Mapping[str, Any]
+        ] = {}
         self._root: Path | None = None
         database = ":memory:"
         if state_root is not None:
@@ -224,6 +221,7 @@ class DsoftbusTaskStore:
                     request_message_id TEXT NOT NULL DEFAULT '',
                     peer_runtime_instance_id TEXT NOT NULL DEFAULT '',
                     request_digest TEXT NOT NULL DEFAULT '',
+                    result_ack_state INTEGER NOT NULL DEFAULT 0,
                     task_json BLOB NOT NULL,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -248,6 +246,20 @@ class DsoftbusTaskStore:
                         REFERENCES tasks(direction, peer_device_id, task_id)
                         ON DELETE CASCADE
                 );
+                CREATE TABLE IF NOT EXISTS task_input_waits (
+                    direction TEXT NOT NULL DEFAULT 'owned'
+                        CHECK(direction='owned'),
+                    peer_device_id TEXT NOT NULL,
+                    task_id TEXT NOT NULL,
+                    request_id TEXT NOT NULL,
+                    wait_json BLOB NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (peer_device_id, task_id),
+                    FOREIGN KEY (direction, peer_device_id, task_id)
+                        REFERENCES tasks(direction, peer_device_id, task_id)
+                        ON DELETE CASCADE
+                );
                 """
             )
             columns = {
@@ -266,6 +278,11 @@ class DsoftbusTaskStore:
                         f"ALTER TABLE tasks ADD COLUMN {name} "
                         "TEXT NOT NULL DEFAULT ''"
                     )
+            if "result_ack_state" not in columns:
+                self._connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN result_ack_state "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
             self._connection.execute(
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS tasks_request_identity
@@ -437,6 +454,200 @@ class DsoftbusTaskStore:
         except (json.JSONDecodeError, TypeError, ValueError) as error:
             raise TaskStoreError("TASK_STATE_CORRUPT") from error
 
+    def put_input_wait(
+        self,
+        peer_device_id: str,
+        task_id: str,
+        request_id: str,
+        value: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        """Persist private resume state for one INPUT_REQUIRED owned Task."""
+
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        request_id = _identifier(request_id, "TASK_REQUEST_INVALID")
+        if not isinstance(value, Mapping):
+            raise TaskStoreError("TASK_STATE_INVALID")
+        encoded = _canonical_json(value)
+        now = _timestamp()
+        try:
+            with self._connection:
+                task = self._connection.execute(
+                    """
+                    SELECT state FROM tasks
+                    WHERE direction='owned' AND peer_device_id=? AND task_id=?
+                    """,
+                    (peer_device_id, task_id),
+                ).fetchone()
+                if task is None or str(task["state"]) != "TASK_STATE_INPUT_REQUIRED":
+                    raise TaskStoreError("TASK_NOT_INPUT_REQUIRED")
+                self._connection.execute(
+                    """
+                    INSERT INTO task_input_waits(
+                        peer_device_id, task_id, request_id, wait_json,
+                        created_at, updated_at
+                    ) VALUES(?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(peer_device_id, task_id) DO UPDATE SET
+                        request_id=excluded.request_id,
+                        wait_json=excluded.wait_json,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        peer_device_id,
+                        task_id,
+                        request_id,
+                        encoded,
+                        now,
+                        now,
+                    ),
+                )
+        except TaskStoreError:
+            raise
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+        return _freeze(_plain(value))
+
+    def get_input_wait(
+        self,
+        peer_device_id: str,
+        task_id: str,
+    ) -> Mapping[str, Any] | None:
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        try:
+            row = self._connection.execute(
+                """
+                SELECT request_id, wait_json FROM task_input_waits
+                WHERE peer_device_id=? AND task_id=?
+                """,
+                (peer_device_id, task_id),
+            ).fetchone()
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+        if row is None:
+            return None
+        try:
+            value = json.loads(bytes(row["wait_json"]))
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise TaskStoreError("TASK_STATE_CORRUPT") from error
+        if not isinstance(value, dict):
+            raise TaskStoreError("TASK_STATE_CORRUPT")
+        value["requestId"] = str(row["request_id"])
+        return _freeze(value)
+
+    def delete_input_wait(
+        self,
+        peer_device_id: str,
+        task_id: str,
+    ) -> bool:
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        try:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    DELETE FROM task_input_waits
+                    WHERE peer_device_id=? AND task_id=?
+                    """,
+                    (peer_device_id, task_id),
+                )
+            return cursor.rowcount > 0
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+
+    def mark_result_ack_pending(
+        self,
+        peer_device_id: str,
+        task_id: str,
+    ) -> None:
+        """Make one fully received terminal Task eligible for cleanup acknowledgement."""
+
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        try:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET result_ack_state=1
+                    WHERE direction='received' AND peer_device_id=? AND task_id=?
+                      AND state IN (
+                        'TASK_STATE_COMPLETED', 'TASK_STATE_FAILED',
+                        'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED'
+                      ) AND result_ack_state=0
+                    """,
+                    (peer_device_id, task_id),
+                )
+            if cursor.rowcount == 0:
+                row = self._connection.execute(
+                    """
+                    SELECT state, result_ack_state FROM tasks
+                    WHERE direction='received' AND peer_device_id=? AND task_id=?
+                    """,
+                    (peer_device_id, task_id),
+                ).fetchone()
+                if row is None or str(row["state"]) not in TERMINAL_TASK_STATES:
+                    raise TaskStoreError("TASK_NOT_FOUND")
+        except TaskStoreError:
+            raise
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+
+    def mark_result_acknowledged(
+        self,
+        peer_device_id: str,
+        task_id: str,
+    ) -> None:
+        """Persist successful peer cleanup acknowledgement idempotently."""
+
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        try:
+            with self._connection:
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET result_ack_state=2
+                    WHERE direction='received' AND peer_device_id=? AND task_id=?
+                      AND result_ack_state IN (1, 2)
+                    """,
+                    (peer_device_id, task_id),
+                )
+            if cursor.rowcount == 0:
+                raise TaskStoreError("TASK_NOT_FOUND")
+        except TaskStoreError:
+            raise
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+
+    def list_pending_result_acks(
+        self,
+        peer_device_id: str,
+        *,
+        limit: int = 100,
+    ) -> tuple[Mapping[str, Any], ...]:
+        """Return terminal Tasks whose local results are complete but unacknowledged."""
+
+        peer_device_id = _peer(peer_device_id)
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise TaskStoreError("TASK_LIST_LIMIT_INVALID")
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT task_json FROM tasks
+                WHERE direction='received' AND peer_device_id=?
+                  AND result_ack_state=1
+                ORDER BY updated_at ASC, task_id ASC LIMIT ?
+                """,
+                (peer_device_id, limit),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+        try:
+            return tuple(
+                _freeze(json.loads(bytes(row["task_json"]))) for row in rows
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise TaskStoreError("TASK_STATE_CORRUPT") from error
+
     def list_tasks(
         self,
         direction: TaskDirection,
@@ -480,6 +691,122 @@ class DsoftbusTaskStore:
             raise TaskStoreError("TASK_STATE_CORRUPT") from error
         return tuple(result)
 
+    def list_owned_nonterminal_tasks(
+        self,
+    ) -> tuple[tuple[str, Mapping[str, Any]], ...]:
+        """Return every persisted Task that still has a live owner lease.
+
+        SUBMITTED and WORKING Tasks are converted to FAILED during Runtime
+        recovery before this query is used.  Persisted INPUT_REQUIRED Tasks
+        remain resumable and therefore need the same bounded owner lifetime as
+        in-memory execution records.
+        """
+
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT peer_device_id, task_json FROM tasks
+                WHERE direction='owned' AND state NOT IN (
+                    'TASK_STATE_COMPLETED', 'TASK_STATE_FAILED',
+                    'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED'
+                )
+                ORDER BY updated_at ASC, task_id ASC
+                """
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+        try:
+            return tuple(
+                (
+                    str(row["peer_device_id"]),
+                    _freeze(json.loads(bytes(row["task_json"]))),
+                )
+                for row in rows
+            )
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            raise TaskStoreError("TASK_STATE_CORRUPT") from error
+
+    def cancel_owned_nonterminal_task(
+        self,
+        peer_device_id: str,
+        peer_runtime_instance_id: str,
+        task_id: str,
+        failure_reason: str,
+    ) -> Mapping[str, Any] | None:
+        """Atomically terminalize a persisted owner Task without an executor.
+
+        This path is used for a resumable INPUT_REQUIRED Task restored after a
+        local Runtime restart.  Active executions continue to use the normal
+        dispatcher cancellation path so their complete OS process tree is
+        interrupted and reaped before a terminal state is published.
+        """
+
+        peer_device_id = _peer(peer_device_id)
+        peer_runtime_instance_id = _identifier(
+            peer_runtime_instance_id, "TASK_RUNTIME_INVALID"
+        )
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        if failure_reason not in protocol.RPC_ERROR_CODES:
+            raise TaskStoreError("TASK_STATE_INVALID")
+        try:
+            with self._connection:
+                row = self._connection.execute(
+                    """
+                    SELECT state, task_json FROM tasks
+                    WHERE direction='owned' AND peer_device_id=?
+                      AND peer_runtime_instance_id=? AND task_id=?
+                    """,
+                    (peer_device_id, peer_runtime_instance_id, task_id),
+                ).fetchone()
+                if row is None or str(row["state"]) in TERMINAL_TASK_STATES:
+                    return None
+                task = json.loads(bytes(row["task_json"]))
+                metadata = task.get("metadata", {})
+                if not isinstance(metadata, dict):
+                    raise TaskStoreError("TASK_STATE_CORRUPT")
+                metadata["mclaw.failureReason"] = failure_reason
+                task["metadata"] = metadata
+                now = _timestamp()
+                task["status"] = {
+                    "state": "TASK_STATE_CANCELED",
+                    "timestamp": now,
+                }
+                value = self._validate_task(task)
+                encoded = _canonical_json(value)
+                cursor = self._connection.execute(
+                    """
+                    UPDATE tasks SET state='TASK_STATE_CANCELED',
+                        task_json=?, updated_at=?
+                    WHERE direction='owned' AND peer_device_id=?
+                      AND peer_runtime_instance_id=? AND task_id=?
+                      AND state NOT IN (
+                        'TASK_STATE_COMPLETED', 'TASK_STATE_FAILED',
+                        'TASK_STATE_CANCELED', 'TASK_STATE_REJECTED'
+                      )
+                    """,
+                    (
+                        encoded,
+                        now,
+                        peer_device_id,
+                        peer_runtime_instance_id,
+                        task_id,
+                    ),
+                )
+                if cursor.rowcount == 0:
+                    return None
+                self._connection.execute(
+                    """
+                    DELETE FROM task_input_waits
+                    WHERE peer_device_id=? AND task_id=?
+                    """,
+                    (peer_device_id, task_id),
+                )
+            return _freeze(value)
+        except TaskStoreError:
+            raise
+        except (json.JSONDecodeError, sqlite3.Error, TypeError, ValueError) as error:
+            raise TaskStoreError("TASK_STATE_CORRUPT") from error
+
     def _artifact_directory(
         self,
         direction: TaskDirection,
@@ -487,6 +814,16 @@ class DsoftbusTaskStore:
         task_id: str,
         artifact_id: str,
     ) -> Path | None:
+        if self._artifact_workspace is not None:
+            try:
+                return self._artifact_workspace.ensure_artifact_directory(
+                    "produced" if direction == "owned" else "received",
+                    peer_device_id,
+                    task_id,
+                    artifact_id,
+                )
+            except RemoteWorkspaceError as error:
+                raise TaskStoreError("ARTIFACT_IO_ERROR") from error
         root = self._root
         if root is None:
             return None
@@ -520,7 +857,7 @@ class DsoftbusTaskStore:
         return directory
 
     @staticmethod
-    def _part_bytes(part: Mapping[str, Any]) -> tuple[bytes, str]:
+    def _part_bytes(part: Mapping[str, Any]) -> bytes:
         choices = [name for name in ("text", "raw", "data") if name in part]
         if len(choices) != 1 or "url" in part:
             raise TaskStoreError("ARTIFACT_PART_UNSUPPORTED")
@@ -530,7 +867,7 @@ class DsoftbusTaskStore:
             if not isinstance(text, str):
                 raise TaskStoreError("ARTIFACT_INVALID")
             try:
-                return text.encode("utf-8"), ".txt"
+                return text.encode("utf-8")
             except UnicodeEncodeError as error:
                 raise TaskStoreError("ARTIFACT_INVALID") from error
         if choice == "raw":
@@ -544,8 +881,8 @@ class DsoftbusTaskStore:
                 raise TaskStoreError("ARTIFACT_INVALID") from error
             if base64.b64encode(decoded) != encoded:
                 raise TaskStoreError("ARTIFACT_INVALID")
-            return decoded, ".bin"
-        return _canonical_json(part["data"]), ".json"
+            return decoded
+        return _canonical_json(part["data"])
 
     @staticmethod
     def _atomic_write(path: Path, raw: bytes) -> None:
@@ -610,6 +947,13 @@ class DsoftbusTaskStore:
             raise TaskStoreError("ARTIFACT_INVALID")
         if self.get_task(direction, peer_device_id, task_id) is None:
             raise TaskStoreError("TASK_NOT_FOUND")
+        try:
+            transferred = {
+                index: descriptor
+                for index, _part, descriptor in artifact_transfer_parts(value)
+            }
+        except TaskArtifactError as error:
+            raise TaskStoreError(error.code) from error
         artifact_json = _canonical_json(value)
         try:
             existing = self._connection.execute(
@@ -636,39 +980,76 @@ class DsoftbusTaskStore:
             if not isinstance(part_value, Mapping):
                 raise TaskStoreError("ARTIFACT_INVALID")
             part = _plain(part_value)
-            raw, fallback_suffix = self._part_bytes(part)
-            total += len(raw)
+            descriptor = transferred.get(index)
+            if descriptor is None:
+                raw = self._part_bytes(part)
+                byte_length = len(raw)
+                sha256 = hashlib.sha256(raw).hexdigest()
+            else:
+                raw = None
+                byte_length = int(descriptor["byteLength"])
+                sha256 = str(descriptor["sha256"])
+            total += byte_length
             if total > protocol.TASK_ARTIFACT_BYTES_MAX:
                 raise TaskStoreError("ARTIFACT_TOO_LARGE")
-            base = _safe_filename(
-                part.get("filename") or value.get("name"),
-                f"part-{index + 1}{fallback_suffix}",
-            )
-            if "." not in base and fallback_suffix:
-                base += fallback_suffix
-            filename = f"{index + 1:02d}-{base}"
-            sha256 = hashlib.sha256(raw).hexdigest()
+            try:
+                filename = artifact_part_local_filename(value, index)
+            except TaskArtifactError as error:
+                raise TaskStoreError(error.code) from error
             local_path = ""
             if directory is not None:
                 path = directory / filename
-                self._atomic_write(path, raw)
-                if path.stat().st_size != len(raw):
+                if raw is not None:
+                    self._atomic_write(path, raw)
+                try:
+                    metadata = path.lstat()
+                except OSError as error:
+                    raise TaskStoreError("ARTIFACT_IO_ERROR") from error
+                if (
+                    path.is_symlink()
+                    or not path.is_file()
+                    or metadata.st_size != byte_length
+                ):
                     raise TaskStoreError("ARTIFACT_IO_ERROR")
-                with path.open("rb") as stream:
-                    actual = hashlib.sha256(stream.read()).hexdigest()
-                if actual != sha256:
-                    raise TaskStoreError("ARTIFACT_HASH_MISMATCH")
+                if raw is not None:
+                    with path.open("rb") as stream:
+                        actual = hashlib.sha256(stream.read()).hexdigest()
+                    if actual != sha256:
+                        raise TaskStoreError("ARTIFACT_HASH_MISMATCH")
                 local_path = str(path.resolve())
+            elif descriptor is not None:
+                raise TaskStoreError("ARTIFACT_IO_ERROR")
             local_parts.append(
                 {
                     "index": index,
                     "filename": filename,
                     "localPath": local_path,
-                    "mediaType": str(part.get("mediaType") or ""),
-                    "byteLength": len(raw),
+                    "mediaType": str(
+                        descriptor["contentMediaType"]
+                        if descriptor is not None
+                        else part.get("mediaType") or ""
+                    ),
+                    "byteLength": byte_length,
                     "sha256": sha256,
                 }
             )
+            if descriptor is not None:
+                self._artifact_transfer_cache[
+                    (
+                        direction,
+                        peer_device_id,
+                        task_id,
+                        str(descriptor["transferId"]),
+                    )
+                ] = _freeze(
+                    {
+                        **dict(descriptor),
+                        "artifactId": artifact_id,
+                        "index": index,
+                        "filename": filename,
+                        "localPath": local_path,
+                    }
+                )
         local = {
             "artifactId": artifact_id,
             "parts": local_parts,
@@ -702,6 +1083,156 @@ class DsoftbusTaskStore:
         except sqlite3.Error as error:
             raise TaskStoreError("TASK_STATE_IO_ERROR") from error
         return _freeze(local)
+
+    def get_artifact_transfer(
+        self,
+        direction: TaskDirection,
+        peer_device_id: str,
+        task_id: str,
+        transfer_id: str,
+        *,
+        artifact_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        """Return one private transfer record, rebuilding its cache after restart."""
+
+        direction = _direction(direction)
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        transfer_id = _identifier(transfer_id, "ARTIFACT_ID_INVALID")
+        if artifact_id is not None:
+            artifact_id = _identifier(artifact_id, "ARTIFACT_ID_INVALID")
+        key = (direction, peer_device_id, task_id, transfer_id)
+        cached = self._artifact_transfer_cache.get(key)
+        if cached is not None:
+            if artifact_id is not None and cached["artifactId"] != artifact_id:
+                raise TaskStoreError("ARTIFACT_NOT_FOUND")
+            return cached
+        try:
+            rows = self._connection.execute(
+                """
+                SELECT artifact_json, local_json FROM artifact_receipts
+                WHERE direction=? AND peer_device_id=? AND task_id=?
+                """,
+                (direction, peer_device_id, task_id),
+            ).fetchall()
+        except sqlite3.Error as error:
+            raise TaskStoreError("TASK_STATE_IO_ERROR") from error
+        for row in rows:
+            try:
+                artifact = json.loads(bytes(row["artifact_json"]))
+                local = json.loads(bytes(row["local_json"]))
+                transfers = artifact_transfer_parts(artifact)
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+                TaskArtifactError,
+            ) as error:
+                raise TaskStoreError("TASK_STATE_CORRUPT") from error
+            candidate_artifact_id = str(artifact.get("artifactId") or "")
+            for index, _part, descriptor in transfers:
+                if descriptor["transferId"] != transfer_id:
+                    continue
+                try:
+                    local_part = local["parts"][index]
+                    local_path = str(local_part["localPath"])
+                    filename = str(local_part["filename"])
+                except (IndexError, KeyError, TypeError) as error:
+                    raise TaskStoreError("TASK_STATE_CORRUPT") from error
+                directory = self._artifact_directory(
+                    direction,
+                    peer_device_id,
+                    task_id,
+                    candidate_artifact_id,
+                )
+                if directory is None:
+                    raise TaskStoreError("ARTIFACT_IO_ERROR")
+                expected_path = str((directory / filename).resolve())
+                if local_path != expected_path:
+                    raise TaskStoreError("TASK_STATE_CORRUPT")
+                record = _freeze(
+                    {
+                        **dict(descriptor),
+                        "artifactId": candidate_artifact_id,
+                        "index": index,
+                        "filename": filename,
+                        "localPath": local_path,
+                    }
+                )
+                self._artifact_transfer_cache[key] = record
+                if artifact_id is not None and candidate_artifact_id != artifact_id:
+                    raise TaskStoreError("ARTIFACT_NOT_FOUND")
+                return record
+        raise TaskStoreError("ARTIFACT_NOT_FOUND")
+
+    def read_artifact_transfer(
+        self,
+        direction: TaskDirection,
+        peer_device_id: str,
+        task_id: str,
+        transfer_id: str,
+        offset: int,
+    ) -> tuple[Mapping[str, Any], bytes]:
+        """Read one bounded chunk from an already verified private Artifact file."""
+
+        record = self.get_artifact_transfer(
+            direction, peer_device_id, task_id, transfer_id
+        )
+        byte_length = int(record["byteLength"])
+        if type(offset) is not int or not 0 <= offset < byte_length:
+            raise TaskStoreError("INVALID_PARAMS")
+        path = Path(str(record["localPath"]))
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_BINARY", 0)
+        )
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor: int | None = None
+        try:
+            before = path.lstat()
+            if path.is_symlink() or not path.is_file() or before.st_size != byte_length:
+                raise TaskStoreError("ARTIFACT_CHANGED")
+            descriptor = os.open(path, flags)
+            opened = os.fstat(descriptor)
+            if (
+                opened.st_dev != before.st_dev
+                or opened.st_ino != before.st_ino
+                or opened.st_size != byte_length
+            ):
+                raise TaskStoreError("ARTIFACT_CHANGED")
+            os.lseek(descriptor, offset, os.SEEK_SET)
+            amount = min(
+                protocol.TASK_TRANSFER_CHUNK_BYTES_MAX,
+                byte_length - offset,
+            )
+            raw = os.read(descriptor, amount)
+            if len(raw) != amount:
+                raise TaskStoreError("ARTIFACT_CHANGED")
+            return record, raw
+        except TaskStoreError:
+            raise
+        except OSError as error:
+            raise TaskStoreError("ARTIFACT_IO_ERROR") from error
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+
+    def forget_artifact_transfers(
+        self,
+        direction: TaskDirection,
+        peer_device_id: str,
+        task_id: str,
+    ) -> None:
+        """Forget open-by-identity cache entries after their files are retired."""
+
+        direction = _direction(direction)
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        for key in tuple(self._artifact_transfer_cache):
+            if key[:3] == (direction, peer_device_id, task_id):
+                self._artifact_transfer_cache.pop(key, None)
 
     def get_artifact_receipt(
         self,
@@ -777,6 +1308,7 @@ class DsoftbusTaskStore:
             raise TaskStoreError("TASK_STATE_CORRUPT") from error
 
     def close(self) -> None:
+        self._artifact_transfer_cache.clear()
         try:
             self._connection.close()
         except sqlite3.Error as error:

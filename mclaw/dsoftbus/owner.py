@@ -68,9 +68,7 @@ class OwnerResources(Protocol):
 
     async def begin_shutdown(self) -> Mapping[str, Any] | None: ...
 
-    async def stop(
-        self, deadline: Callable[[], float]
-    ) -> Mapping[str, Any] | None: ...
+    async def stop(self, deadline: Callable[[], float]) -> Mapping[str, Any] | None: ...
 
     async def update_provider_runtime(
         self, context: Any | None
@@ -84,19 +82,28 @@ class OwnerResources(Protocol):
         context_id: str | None,
         message_id: str,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> Mapping[str, Any]: ...
+
+    async def continue_agent_task(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str,
+        message_id: str,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> Mapping[str, Any]: ...
 
     def list_trusted_devices(self) -> tuple[Mapping[str, Any], ...]: ...
 
-    async def discover_devices(self) -> tuple[Mapping[str, Any], ...]: ...
+    async def discover_devices(self) -> Mapping[str, Any]: ...
 
-    async def pair_device(
-        self, device_id_sha256: str
-    ) -> Mapping[str, Any]: ...
+    async def pair_device(self, device_id_sha256: str) -> Mapping[str, Any]: ...
 
-    async def unbind_device(
-        self, device_id_sha256: str
-    ) -> Mapping[str, Any]: ...
+    async def unbind_device(self, device_id_sha256: str) -> Mapping[str, Any]: ...
 
     def local_turn_started(self, token: str) -> None: ...
 
@@ -120,9 +127,7 @@ class AdmissionOnlyOwnerResources:
     async def begin_shutdown(self) -> Mapping[str, Any] | None:
         return MappingProxyType({})
 
-    async def stop(
-        self, deadline: Callable[[], float]
-    ) -> Mapping[str, Any] | None:
+    async def stop(self, deadline: Callable[[], float]) -> Mapping[str, Any] | None:
         return MappingProxyType({})
 
     async def update_provider_runtime(
@@ -138,23 +143,33 @@ class AdmissionOnlyOwnerResources:
         context_id: str | None,
         message_id: str,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> Mapping[str, Any]:
+        _fail("PEER_NOT_READY")
+
+    async def continue_agent_task(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str,
+        message_id: str,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> Mapping[str, Any]:
         _fail("PEER_NOT_READY")
 
     def list_trusted_devices(self) -> tuple[Mapping[str, Any], ...]:
         _fail("WORKER_NOT_READY")
 
-    async def discover_devices(self) -> tuple[Mapping[str, Any], ...]:
+    async def discover_devices(self) -> Mapping[str, Any]:
         _fail("WORKER_NOT_READY")
 
-    async def pair_device(
-        self, device_id_sha256: str
-    ) -> Mapping[str, Any]:
+    async def pair_device(self, device_id_sha256: str) -> Mapping[str, Any]:
         _fail("WORKER_NOT_READY")
 
-    async def unbind_device(
-        self, device_id_sha256: str
-    ) -> Mapping[str, Any]:
+    async def unbind_device(self, device_id_sha256: str) -> Mapping[str, Any]:
         _fail("WORKER_NOT_READY")
 
     def local_turn_started(self, token: str) -> None:
@@ -240,7 +255,9 @@ class DsoftbusOwnerLoopDriver:
     ) -> None:
         if not isinstance(config, Mapping):
             raise TypeError("config must be a mapping")
-        if isinstance(start_timeout, bool) or not isinstance(start_timeout, (int, float)):
+        if isinstance(start_timeout, bool) or not isinstance(
+            start_timeout, (int, float)
+        ):
             raise TypeError("start_timeout must be a finite positive number")
         normalized_timeout = float(start_timeout)
         if not math.isfinite(normalized_timeout) or normalized_timeout <= 0:
@@ -474,6 +491,7 @@ class DsoftbusOwnerLoopDriver:
         context_id: str | None,
         message_id: str,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> Mapping[str, Any]:
         if threading.get_ident() != self._owner_thread_id:
             _fail("OWNER_RESOURCE_THREAD_INVALID")
@@ -486,6 +504,36 @@ class DsoftbusOwnerLoopDriver:
             context_id=context_id,
             message_id=message_id,
             event_sink=event_sink,
+            input_paths=input_paths,
+        )
+        if not isinstance(value, Mapping):
+            _fail("OWNER_RESOURCE_RESULT_INVALID")
+        return _frozen(value)
+
+    async def continue_agent_task_on_owner(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str,
+        message_id: str,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> Mapping[str, Any]:
+        if threading.get_ident() != self._owner_thread_id:
+            _fail("OWNER_RESOURCE_THREAD_INVALID")
+        accessor = getattr(self._resources, "continue_agent_task", None)
+        if not callable(accessor):
+            _fail("PEER_NOT_READY")
+        value = await accessor(
+            device_id,
+            task_id,
+            input_request_id,
+            text=text,
+            message_id=message_id,
+            event_sink=event_sink,
+            input_paths=input_paths,
         )
         if not isinstance(value, Mapping):
             _fail("OWNER_RESOURCE_RESULT_INVALID")
@@ -617,13 +665,9 @@ class DsoftbusOwnerLoopDriver:
         with self._condition:
             if self._stop_complete or self._begin_complete:
                 return
-        self._marshal(
-            self._begin_shutdown_on_owner(), timeout=self._start_timeout
-        )
+        self._marshal(self._begin_shutdown_on_owner(), timeout=self._start_timeout)
 
-    async def _stop_on_owner(
-        self, deadline: Callable[[], float]
-    ) -> Mapping[str, Any]:
+    async def _stop_on_owner(self, deadline: Callable[[], float]) -> Mapping[str, Any]:
         if self._stop_complete:
             assert self._health_snapshot is not None
             return self._health_snapshot
@@ -668,9 +712,7 @@ class DsoftbusOwnerLoopDriver:
         except OwnerLoopError:
             self._emergency_reap()
             raise
-        future = asyncio.run_coroutine_threadsafe(
-            self._stop_on_owner(deadline), loop
-        )
+        future = asyncio.run_coroutine_threadsafe(self._stop_on_owner(deadline), loop)
         try:
             self._wait_future_until_deadline(future, deadline)
         except BaseException:
@@ -726,9 +768,7 @@ class DsoftbusOwnerLoopDriver:
         self._require_host_thread()
         provider_ready, provider_code = self._provider_readiness(context)
         self._marshal(
-            self._update_provider_on_owner(
-                context, provider_ready, provider_code
-            ),
+            self._update_provider_on_owner(context, provider_ready, provider_code),
             timeout=self._start_timeout,
         )
 
@@ -794,6 +834,17 @@ class DsoftbusOwnerLoopDriver:
             _fail("OWNER_RESOURCE_RESULT_INVALID")
         return tuple(_frozen(item) for item in value)
 
+    def local_device_snapshot(self) -> Mapping[str, Any]:
+        """Return the verified public identity of the local Runtime device."""
+
+        accessor = getattr(self._resources, "cached_local_device", None)
+        if not callable(accessor):
+            return MappingProxyType({})
+        value = accessor()
+        if not isinstance(value, Mapping):
+            _fail("OWNER_RESOURCE_RESULT_INVALID")
+        return _frozen(value)
+
     async def _list_trusted_devices_on_owner(
         self,
     ) -> tuple[Mapping[str, Any], ...]:
@@ -814,39 +865,57 @@ class DsoftbusOwnerLoopDriver:
 
         return self._marshal(
             self._list_trusted_devices_on_owner(),
-            timeout=float(protocol.CONTROL_TIMEOUT_S) + 0.5,
+            timeout=float(protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S) + 0.5,
         )
 
     async def _discover_devices_on_owner(
         self,
-    ) -> tuple[Mapping[str, Any], ...]:
+    ) -> Mapping[str, Any]:
         accessor = getattr(self._resources, "discover_devices", None)
         if not callable(accessor):
             _fail("WORKER_NOT_READY")
         value = accessor()
         if hasattr(value, "__await__"):
             value = await value
-        if not isinstance(value, (list, tuple)) or any(
-            not isinstance(item, Mapping) for item in value
+        if not isinstance(value, Mapping) or frozenset(value) != frozenset(
+            {"devices", "failureNativeCode"}
         ):
             _fail("OWNER_RESOURCE_RESULT_INVALID")
-        return tuple(_frozen(item) for item in value)
+        devices = value["devices"]
+        failure_native_code = value["failureNativeCode"]
+        if (
+            not isinstance(devices, (list, tuple))
+            or any(not isinstance(item, Mapping) for item in devices)
+            or (
+                failure_native_code is not None
+                and (
+                    type(failure_native_code) is not int
+                    or failure_native_code == 0
+                    or not -(2**31) <= failure_native_code <= 2**31 - 1
+                )
+            )
+        ):
+            _fail("OWNER_RESOURCE_RESULT_INVALID")
+        return MappingProxyType(
+            {
+                "devices": tuple(_frozen(item) for item in devices),
+                "failureNativeCode": failure_native_code,
+            }
+        )
 
-    def discover_devices(self) -> tuple[Mapping[str, Any], ...]:
+    def discover_devices(self) -> Mapping[str, Any]:
         """Run one bounded DeviceManager discovery on the owner loop."""
 
         return self._marshal(
             self._discover_devices_on_owner(),
             timeout=(
                 float(protocol.DEVICE_DISCOVERY_WINDOW_S)
-                + float(protocol.CONTROL_TIMEOUT_S) * 2
+                + float(protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S) * 2
                 + 0.5
             ),
         )
 
-    async def _pair_device_on_owner(
-        self, device_id_sha256: str
-    ) -> Mapping[str, Any]:
+    async def _pair_device_on_owner(self, device_id_sha256: str) -> Mapping[str, Any]:
         accessor = getattr(self._resources, "pair_device", None)
         if not callable(accessor):
             _fail("WORKER_NOT_READY")
@@ -864,14 +933,12 @@ class DsoftbusOwnerLoopDriver:
             self._pair_device_on_owner(device_id_sha256),
             timeout=(
                 float(protocol.DEVICE_BIND_TIMEOUT_S)
-                + float(protocol.CONTROL_TIMEOUT_S) * 2
+                + float(protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S) * 2
                 + 0.5
             ),
         )
 
-    async def _unbind_device_on_owner(
-        self, device_id_sha256: str
-    ) -> Mapping[str, Any]:
+    async def _unbind_device_on_owner(self, device_id_sha256: str) -> Mapping[str, Any]:
         accessor = getattr(self._resources, "unbind_device", None)
         if not callable(accessor):
             _fail("WORKER_NOT_READY")
@@ -887,7 +954,7 @@ class DsoftbusOwnerLoopDriver:
 
         return self._marshal(
             self._unbind_device_on_owner(device_id_sha256),
-            timeout=float(protocol.CONTROL_TIMEOUT_S) * 3 + 0.5,
+            timeout=float(protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S) * 3 + 0.5,
         )
 
     def cached_device_context(self, device_id: str) -> Mapping[str, Any]:
@@ -901,9 +968,7 @@ class DsoftbusOwnerLoopDriver:
             _fail("OWNER_RESOURCE_RESULT_INVALID")
         return _frozen(value)
 
-    async def refresh_device_context_async(
-        self, device_id: str
-    ) -> Mapping[str, Any]:
+    async def refresh_device_context_async(self, device_id: str) -> Mapping[str, Any]:
         """Await a bounded owner-loop refresh without creating a helper thread."""
 
         self._require_host_thread()
@@ -935,6 +1000,7 @@ class DsoftbusOwnerLoopDriver:
         context_id: str | None,
         message_id: str,
         event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
     ) -> Mapping[str, Any]:
         """Await one Task without imposing an owner-side wall-clock limit."""
 
@@ -949,6 +1015,7 @@ class DsoftbusOwnerLoopDriver:
             context_id=context_id,
             message_id=message_id,
             event_sink=event_sink,
+            input_paths=input_paths,
         )
         if not hasattr(operation, "__await__"):
             _fail("OWNER_RESOURCE_RESULT_INVALID")
@@ -957,6 +1024,42 @@ class DsoftbusOwnerLoopDriver:
         if not isinstance(value, Mapping):
             _fail("OWNER_RESOURCE_RESULT_INVALID")
         return _frozen(value)
+
+    async def continue_agent_task_async(
+        self,
+        device_id: str,
+        task_id: str,
+        input_request_id: str,
+        *,
+        text: str,
+        message_id: str,
+        event_sink: Callable[[Mapping[str, Any]], Any] | None = None,
+        input_paths: tuple[str, ...] = (),
+    ) -> Mapping[str, Any]:
+        """Await one same-Task continuation without a wall-clock limit."""
+
+        self._require_host_thread()
+        accessor = getattr(self._resources, "continue_agent_task", None)
+        if not callable(accessor):
+            _fail("PEER_NOT_READY")
+        loop = self._live_loop()
+        operation = accessor(
+            device_id,
+            task_id,
+            input_request_id,
+            text=text,
+            message_id=message_id,
+            event_sink=event_sink,
+            input_paths=input_paths,
+        )
+        if not hasattr(operation, "__await__"):
+            _fail("OWNER_RESOURCE_RESULT_INVALID")
+        future = asyncio.run_coroutine_threadsafe(operation, loop)
+        value = await asyncio.wrap_future(future)
+        if not isinstance(value, Mapping):
+            _fail("OWNER_RESOURCE_RESULT_INVALID")
+        return _frozen(value)
+
 
 __all__ = [
     "AdmissionOnlyOwnerResources",

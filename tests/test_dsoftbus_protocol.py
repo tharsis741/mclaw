@@ -18,6 +18,18 @@ def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
+def test_device_discovery_uses_ten_second_scan_window() -> None:
+    assert protocol.DEVICE_DISCOVERY_WINDOW_S == 10.0
+    assert protocol.CONTROL_TIMEOUT_S == 5
+    assert protocol.DEVICE_MANAGER_OPERATION_TIMEOUT_S == 10.0
+    assert protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S == 11.0
+    assert (
+        protocol.DEVICE_MANAGER_WORKER_TIMEOUT_S
+        > protocol.DEVICE_MANAGER_OPERATION_TIMEOUT_S
+        > protocol.CONTROL_TIMEOUT_S
+    )
+
+
 def test_canonical_json_and_digest_are_stable() -> None:
     value = {"z": 1, "é": "utf8", "a": [True, None]}
     expected = '{"a":[true,null],"z":1,"é":"utf8"}\n'.encode()
