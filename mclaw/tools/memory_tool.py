@@ -253,8 +253,8 @@ class MemoryStore:
             return {"success": False, "error": "Content cannot be empty."}
 
         with file_lock(self._path_for(target).with_suffix(self._path_for(target).suffix + ".lock")):
-            # Scan inside the lock to avoid TOCTOU bypasses between validation
-            # and the write that persists the memory entry.
+            # Keep validation, disk reload, and persistence in the same locked
+            # read-modify-write sequence so concurrent sessions retain updates.
             scan_error = _scan_memory_content(content)
             if scan_error:
                 return {"success": False, "error": scan_error}

@@ -367,7 +367,7 @@ public static class EditContentCommand
         var runs = paragraph.Elements<Run>().ToList();
         if (runs.Count == 0) return 0;
 
-        // Build the full paragraph text and a map from character index to (run, position within run)
+        // Concatenate direct run text for the cross-run fallback; no position map is retained.
         var fullText = string.Concat(runs.SelectMany(r => r.Elements<Text>().Select(t => t.Text)));
         if (string.IsNullOrEmpty(fullText)) return 0;
 

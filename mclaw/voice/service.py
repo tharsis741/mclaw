@@ -4,8 +4,8 @@
 
 """Voice input service lifecycle.
 
-The service is intentionally conservative: it exposes the CLI lifecycle now,
-while recorder and backend implementations are initialized only when ASR starts.
+Recorder and backend instances are created when capture starts. Transcripts
+pass through the voice policy before entering the normal CLI input queue.
 """
 
 from __future__ import annotations

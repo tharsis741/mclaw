@@ -31,7 +31,7 @@ class RoutedSession:
 
 
 class WeixinSessionRouter:
-    """Map Weixin chat/user identities to stable M-Claw session ids."""
+    """Map peers to stable ids, with process-local new-session overrides."""
 
     def __init__(self, *, account_id: str, session_db: SessionDB, scope: str = "user") -> None:
         self.account_id = account_id

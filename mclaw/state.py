@@ -9,9 +9,9 @@ Provides persistent session storage with FTS5 full-text search.
 Stores session metadata, full message history, and model configuration.
 
 Key design decisions:
-- WAL mode for concurrent readers + one writer
+- WAL mode for readers on separate connections to coexist with a writer
 - FTS5 virtual table for fast text search across all session messages
-- Batch writes with jitter retry to avoid convoy effects
+- Atomic write transactions with jitter retry on SQLite lock contention
 """
 
 import json
@@ -249,7 +249,8 @@ END;
 class SessionDB:
     """SQLite-backed session storage with FTS5 search.
 
-    Thread-safe: multiple reader threads, single writer via WAL mode.
+    The instance lock serializes access to its shared connection. WAL permits
+    readers on other connections to coexist with the active writer.
     """
 
     _WRITE_MAX_RETRIES = 15

@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 DELEGATE_BLOCKED_TOOLS = frozenset([
     "delegate_task",    # prevent recursive delegation
-    "memory_read",      # children must not mutate persistent memory
+    "memory_read",      # children do not inherit the persistent memory subsystem
     "memory_add",
     "memory_replace",
     "memory_remove",
@@ -258,9 +258,9 @@ def _resolve_child_toolsets(
 ) -> List[str]:
     """Resolve the effective child toolsets.
 
-    Priority:
-      1. Explicit requested toolsets, limited to ALLOWED_DELEGATE_TOOLSETS.
-      2. DEFAULT_DELEGATE_TOOLSETS when no explicit toolsets are requested.
+    Start with DEFAULT_DELEGATE_TOOLSETS, then append explicitly requested
+    extras. Deduplicate and intersect with the delegation allowlist and the
+    parent's available toolsets.
     """
     from mclaw.tools.toolsets import validate_toolset
 

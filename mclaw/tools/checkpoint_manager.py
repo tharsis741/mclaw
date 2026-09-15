@@ -8,8 +8,8 @@ shadow git store.
 
 Creates automatic snapshots of working directories before file-mutating
 operations (``write_file``, ``patch``, ``terminal`` with destructive flags),
-triggered once per conversation turn.  Provides rollback to any previous
-checkpoint.
+deduplicated within each tool-dispatch batch. The agent resets this scope
+before executing the next model-emitted batch. Provides checkpoint restoration.
 
 This is NOT a tool — the LLM never sees it.  It is transparent runtime
 infrastructure controlled by the ``checkpoints`` configuration.
@@ -1001,10 +1001,10 @@ def _dir_size_bytes(path: Path) -> int:
 class CheckpointManager:
     """Manages automatic filesystem checkpoints.
 
-    Designed to be owned by the M-Claw agent runtime.  Call ``new_turn()``
-    at the start of each conversation turn and ``ensure_checkpoint(dir,
-    reason)`` before any file-mutating tool call.  The manager deduplicates
-    so at most one snapshot is taken per directory per turn.
+    Owned by the M-Claw agent runtime. The core calls ``new_turn()`` before
+    each tool-dispatch batch, then ``ensure_checkpoint(dir, reason)`` before
+    file mutations. Full-directory snapshots are deduplicated within that
+    scope; targeted snapshots also track which paths have been captured.
 
     Parameters
     ----------
@@ -1042,7 +1042,7 @@ class CheckpointManager:
     # ------------------------------------------------------------------
 
     def new_turn(self) -> None:
-        """Reset per-turn dedup.  Call at the start of each agent iteration."""
+        """Reset snapshot deduplication before one model-emitted tool batch."""
         self._checkpointed_dirs.clear()
         self._checkpointed_targets.clear()
         self._checkpointed_missing_targets.clear()

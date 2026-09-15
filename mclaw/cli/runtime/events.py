@@ -88,7 +88,7 @@ class EventBus:
         return unsubscribe
 
     def emit(self, event_type: EventType | str, **payload: Any) -> MClawEvent:
-        """Synchronously publish an immutable event snapshot to current handlers."""
+        """Publish one event to a handler snapshot; handlers share its payload dict."""
         event = MClawEvent(type=event_type, payload=payload)
         with self._lock:
             handlers = list(self._handlers)

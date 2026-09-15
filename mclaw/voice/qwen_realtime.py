@@ -62,7 +62,7 @@ def _configure_ca_bundle(config: dict) -> None:
 
 
 def _ensure_dashscope_address_family(config: dict) -> None:
-    """Force DashScope DNS resolution to IPv4 on runtimes with weak IPv6 paths."""
+    """Install a process-wide IPv4 DNS override for the configured ASR runtime."""
     global _FORCED_IPV4_GETADDRINFO, _ORIGINAL_GETADDRINFO
 
     force_ipv4 = _truthy(config.get("force_ipv4"), default=_is_kaihong_runtime())

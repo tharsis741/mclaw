@@ -793,8 +793,9 @@ class MClaw:
         Args:
             messages: conversation messages to include in the flush context.
                       Defaults to self.messages if not provided.
-            timeout: Maximum seconds to wait for the API call. If None, wait
-                     until the provider returns.
+            timeout: When positive, bound the caller's wait with a worker thread
+                     and use the same SDK request timeout. Otherwise run inline
+                     with the default 30-second transport request timeout.
         """
         if not self._memory_manager or not self._memory_store:
             return
@@ -2886,8 +2887,8 @@ class MClaw:
             except (json.JSONDecodeError, TypeError, AttributeError) as exc:
                 logger.debug("Memory write result could not be parsed: %s", exc)
 
-        # Reset the Skill review counter only after skill_manage truly succeeds.
-        # The counter may have been pre-reset before execution; this is the final correction.
+        # A successful Skill write resets the review interval. Read-only actions
+        # and failed writes leave the completed-turn counter unchanged.
         if getattr(self, "_evolution_review_round", 0) > 0 and "skill_manage" in self.valid_tool_names:
             for tc, result in zip(tool_calls, results):
                 fn = tc.get("function", {})
@@ -2898,7 +2899,7 @@ class MClaw:
                     action = str(result_data.get("action") or "").strip()
                     if result_data.get("success") and action in SKILL_WRITE_ACTIONS:
                         self._turns_since_evolution_review = 0
-                        break  # only one skill_manage per batch
+                        break  # One successful write is enough to reset the counter.
                 except (json.JSONDecodeError, TypeError) as exc:
                     logger.debug("Memory write result could not be parsed: %s", exc)
 

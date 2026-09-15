@@ -28,7 +28,7 @@ class RoutedSession:
 
 
 class DingTalkSessionRouter:
-    """Map DingTalk chat/user scope into durable M-Claw session ids."""
+    """Map chat/user scope to stable ids, with process-local new-session overrides."""
 
     def __init__(self, *, account_id: str, session_db: SessionDB, scope: str = "chat_user") -> None:
         self.account_id = account_id

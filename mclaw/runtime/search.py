@@ -4,9 +4,9 @@
 
 """Runtime-aware file search providers.
 
-SearchProfile selects the fastest available provider for the active host and
-falls back through ripgrep, shell tools, and Python scanning with consistent
-result shaping.
+SearchProfile chooses one available backend in priority order: ripgrep,
+PowerShell on Windows, grep/find, then Python. If the selected native backend
+cannot produce a result, the call falls back directly to Python scanning.
 """
 
 from __future__ import annotations

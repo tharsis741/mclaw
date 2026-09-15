@@ -127,7 +127,7 @@ class QwenFileTranscriber:
         return self._client
 
     def _prepare_request(self, request: TranscriptionRequest) -> tuple[str, str, dict[str, Any]]:
-        """Read and encode the bounded local file without blocking the event loop."""
+        """Synchronously read and encode the bounded local file for one request."""
 
         mime_type = str(request.mime_type or "").partition(";")[0].strip().casefold()
         if self.model.casefold().startswith("qwen3-asr-flash") and (

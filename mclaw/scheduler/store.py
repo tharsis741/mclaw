@@ -304,7 +304,7 @@ class SchedulerStore:
         return self._execute_write(_do)
 
     def cancel_active_runs(self, job_id: str, *, reason: str, now: float) -> int:
-        """Cancel running or queued attempts for a job without deleting history."""
+        """Mark running/queued rows cancelled; this does not stop worker execution."""
         def _do(conn: sqlite3.Connection) -> int:
             cursor = conn.execute(
                 """

@@ -977,8 +977,8 @@ def _serial_tool_timeout(tool_name: str, func: dict, parent_agent: Any = None) -
             from mclaw.tools.terminal_tool import _resolve_timeout
         except ImportError:
             return timeout
-        # Runtime cleanup can include taskkill(10s), pipe drain(5s), and the
-        # bounded parent fallback(1.2s). Keep the outer dispatcher beyond it.
+        # Leave cleanup headroom beyond the command timeout. The runtime owns
+        # process-tree termination and pipe-drain bounds; this is an outer cap.
         return _resolve_timeout(args.get("timeout"), cfg) + 18
 
     if tool_name == "process" and args.get("action") == "wait":

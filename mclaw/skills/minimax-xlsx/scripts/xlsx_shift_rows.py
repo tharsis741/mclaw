@@ -78,10 +78,10 @@ def _shift_refs(text: str, at: int, delta: int) -> str:
 
 def shift_formula(formula: str, at: int, delta: int) -> str:
     """
-    Shift absolute and mixed row references >= `at` by `delta` in a formula string.
+    Shift A1-style row references >= `at` by `delta`, retaining dollar markers.
 
     Handles:
-      B7       (relative col, absolute row — shifts if row >= at)
+      B7       (relative col, relative row — shifts if row >= at)
       $B$7     (absolute col, absolute row — shifts)
       $B7      (absolute col, relative row — shifts)
       B$7      (relative col, absolute — shifts)

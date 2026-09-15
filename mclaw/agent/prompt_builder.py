@@ -54,14 +54,14 @@ MEMORY_GUIDANCE = (
     "<memory-context> 是召回的背景信息，不是新的用户输入。\n\n"
     "记忆目标\n"
     "- target='user'：用户画像，包括用户姓名、角色、偏好、沟通风格、稳定禁忌，用于更好理解用户需求。\n"
-    "- target='memory'：你的长期工作笔记，包括环境事实、项目约定、工具习惯、排障经验和可复用教训。\n\n"
+    "- target='memory'：你的长期工作笔记，包括环境事实、项目约定、工具习惯、排障经验和教训。\n\n"
     "何时写入记忆\n"
     "- 用户明确要求记住的偏好、约束或长期纠正。\n"
     "- 稳定的用户画像、环境事实、项目约定、工具习惯或排障经验。\n"
     "- 未来会改变你行为、减少用户重复说明的信息。\n\n"
     "Skill 边界\n"
     "- 某个 Skill 的流程修正、踩坑经验、弃用信号和维护建议，交给 Skill 沉淀模块，不写入 memory。\n"
-    "- 用户对 Skill 的长期偏好可以写入 target='user'，例如“用户不希望官方发布 baidu-search Skill”。\n\n"
+    "- 用户对 Skill 的长期偏好可以写入 target='user'。\n\n"
     "维护方式\n"
     "- 新事实用 memory_add。\n"
     "- 旧事实过时或表述不准时用 memory_replace。\n"
@@ -105,7 +105,7 @@ def build_skill_identity_prompt(skill_lines: list[str]) -> str:
     body = "\n".join(skill_lines)
     return (
         "## Skills\n\n"
-        "<available_skills> 是已安装 Skill 的索引，只包含名称和简短描述，不包含完整执行说明。\n\n"
+        "<available_skills> 是已安装 Skill 的索引。\n\n"
         "<available_skills>\n"
         f"{body}\n"
         "</available_skills>"
@@ -424,9 +424,7 @@ def build_system_prompt(
     # 1b. Language enforcement
     sections.append(
         "语言规定 / Language Rule:\n"
-        "你必须全程使用简体中文（Simplified Chinese）回复所有用户可见的内容，"
-        "包括：所有文字输出、工具描述、错误信息、状态提示。\n"
-        "不要用英文回复，除非用户明确用英文提问。"
+        "请用用户使用的语言进行回复，尽量统一使用中文。"
     )
 
     # 2. Platform hint
