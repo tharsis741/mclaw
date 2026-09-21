@@ -64,6 +64,9 @@ def _render_qr(scan_data: str, print_fn: Callable[[str], None]) -> None:
 
 def _save_credentials(account_store: WeixinAccountStore, credentials: WeixinLoginCredentials) -> None:
     """Persist confirmed login credentials through the account store."""
+    from mclaw.application.setup_interaction import check_setup_cancelled
+
+    check_setup_cancelled()
     account_store.save_account(
         credentials.account_id,
         {
@@ -109,6 +112,8 @@ async def qr_login(
         refresh_count = 0
 
         while time.monotonic() < deadline:
+            from mclaw.application.setup_interaction import check_setup_cancelled
+            check_setup_cancelled()
             try:
                 status_response = await client.get_qrcode_status(
                     qrcode=qrcode_value,
@@ -173,7 +178,14 @@ def _show_qr(
     render_qr: bool,
 ) -> None:
     """Print the scan URL and optional terminal QR representation."""
+    from mclaw.application.setup_interaction import current_setup_interaction
+
     scan_data = qrcode_url or qrcode_value
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        interaction.show_qr(scan_data)
+        print_fn("请使用微信扫描二维码并确认登录。")
+        return
     print_fn("请使用微信扫描二维码并确认登录:")
     if qrcode_url:
         print_fn(qrcode_url)

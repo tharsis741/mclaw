@@ -337,13 +337,14 @@ class WeixinAdapter:
                 await self.send(chat_id, command.text)
             elif command.action == "stop":
                 interrupted = self.runner.interrupt(routed.session_id)
+                control_error = getattr(self.runner, "control_error", lambda _sid: "")(routed.session_id)
                 await self.send(
                     chat_id,
                     (
-                        "Cancellation requested. Cleanup continues in the background; "
+                        control_error or ("Cancellation requested. Cleanup continues in the background; "
                         "if process termination cannot be confirmed, restart the runtime."
                         if interrupted
-                        else "No running turn."
+                        else "No running turn.")
                     ),
                 )
             else:
@@ -511,15 +512,14 @@ class WeixinAdapter:
 
         return _callback
 
-    async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> None:
+    async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> SendResult | None:
         """Send the final agent result or error back to the originating chat."""
         if result.error:
             safe_text = result.final_response.strip() or f"Error: {result.error}"
-            await self.send(message.source.chat_id, safe_text)
-            return
+            return await self.send(message.source.chat_id, safe_text)
         text = result.final_response.strip()
         if text:
-            await self.send(message.source.chat_id, text)
+            return await self.send(message.source.chat_id, text)
 
     def _session_context_text(self, source: ChannelSource) -> str:
         """Build the channel-specific system context for this Weixin turn."""

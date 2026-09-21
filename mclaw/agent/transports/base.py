@@ -114,6 +114,11 @@ class ModelCallOptions:
         repr=False,
         compare=False,
     )
+    stream_reasoning_callback: Callable[[str], None] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
     deadline_monotonic: float | None = None
     response_utf8_max_bytes: int | None = None
     stream_queue_max_items: int | None = None

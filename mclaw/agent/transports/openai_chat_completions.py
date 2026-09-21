@@ -748,6 +748,8 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     incoming_reasoning,
                     reasoning_mode,
                 )
+                if reasoning_delta and options.stream_reasoning_callback is not None:
+                    options.stream_reasoning_callback(reasoning_text)
                 meaningful = meaningful or bool(reasoning_delta) or _has_payload(details)
                 if not visible_delta and (reasoning_delta or _has_payload(details)):
                     report_activity("Thinking...")

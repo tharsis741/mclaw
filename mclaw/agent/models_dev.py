@@ -4,8 +4,8 @@
 
 """models.dev registry integration for provider model metadata.
 
-The module uses an offline-first lookup path: one-hour memory cache, disk cache,
-then the public models.dev registry. It resolves provider metadata for context
+The module checks the shared disk cache version before reusing memory, then
+falls back to the public models.dev registry. It resolves provider metadata for context
 length detection, setup model choices, and runtime model catalog views.
 """
 
@@ -13,8 +13,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 import time
 from collections.abc import Iterator
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +37,7 @@ _MODELS_DEV_CACHE_TTL = 3600  # one-hour in-memory cache
 # In-memory cache.
 _models_dev_cache: dict[str, Any] = {}
 _models_dev_cache_time: float = 0
+_models_dev_cache_home: str = ""
 
 
 def _providers_data(registry: dict[str, Any]) -> dict[str, Any]:
@@ -126,62 +130,101 @@ def _get_cache_path() -> Path:
     return get_mclaw_home() / "models_dev_cache.json"
 
 
+@lru_cache(maxsize=2)
+def _read_cache_version(path: str, modified: int, size: int) -> dict[str, Any]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return data if isinstance(data, dict) else {}
+
+
 def _load_disk_cache() -> dict[str, Any]:
     """Read the offline registry cache, treating unreadable data as a miss."""
     try:
         path = _get_cache_path()
         if path.exists():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            return data if isinstance(data, dict) else {}
+            stat = path.stat()
+            return _read_cache_version(str(path), stat.st_mtime_ns, stat.st_size)
     except (OSError, json.JSONDecodeError) as exc:
         logger.debug("Failed to load models.dev disk cache: %s", exc)
     return {}
 
 
-def _save_disk_cache(data: dict[str, Any]) -> None:
+def cached_models_dev() -> dict[str, Any]:
+    """Read the shared cache without network I/O; notice updates from other UIs."""
+    return _load_disk_cache()
+
+
+def cached_models_dev_status() -> dict[str, Any]:
+    data = cached_models_dev()
+    try:
+        updated_at = _get_cache_path().stat().st_mtime if data else None
+    except OSError:
+        updated_at = None
+    return {"updated_at": updated_at, **_registry_stats(data)}
+
+
+def _save_disk_cache(data: dict[str, Any]) -> bool:
     """Persist fresh registry data without making lookup callers depend on disk I/O."""
+    temporary = ""
     try:
         path = _get_cache_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".models-dev-", suffix=".tmp", delete=False) as stream:
+            temporary = stream.name
+            json.dump(data, stream, ensure_ascii=False)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        return True
     except (OSError, TypeError) as exc:
         logger.debug("Failed to save models.dev disk cache: %s", exc)
+        return False
+    finally:
+        if temporary:
+            try:
+                Path(temporary).unlink(missing_ok=True)
+            except OSError:
+                logger.debug("Failed to remove models.dev temporary file")
 
 
 def fetch_models_dev(force_refresh: bool = False) -> dict[str, Any]:
     """Fetch models.dev registry.
 
     Resolution order:
-      1. In-memory cache (1hr TTL)
-      2. Disk cache in M-Claw home models_dev_cache.json
+      1. Shared disk cache (parsed once per file version)
+      2. In-memory cache (1hr TTL, for the same application home)
       3. Network fetch (https://models.dev/api.json)
     """
-    global _models_dev_cache, _models_dev_cache_time
-
-    if not force_refresh and _models_dev_cache and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL:
-        return _models_dev_cache
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_cache_home
+    cache_home = str(_get_cache_path())
 
     # Try disk cache before network.
     disk = _load_disk_cache()
     if disk:
         _models_dev_cache = disk
         _models_dev_cache_time = time.time()
+        _models_dev_cache_home = cache_home
         logger.debug("models.dev loaded from disk cache")
         if not force_refresh:
             return disk
+
+    if (not force_refresh and _models_dev_cache_home == cache_home and _models_dev_cache
+            and (time.time() - _models_dev_cache_time) < _MODELS_DEV_CACHE_TTL):
+        return _models_dev_cache
 
     # Then try a short network fetch.
     try:
         data = _fetch_network_registry(timeout=5)
         _models_dev_cache = data
         _models_dev_cache_time = time.time()
+        _models_dev_cache_home = cache_home
         _save_disk_cache(data)
         logger.debug("models.dev fetched from network, cached")
         return data
     except (requests.RequestException, ValueError) as exc:
         logger.debug("models.dev network fetch failed: %s", exc)
 
-    return _models_dev_cache or {}
+    return _models_dev_cache if _models_dev_cache_home == cache_home else {}
 
 
 def refresh_models_dev_cache(*, timeout: int = 10) -> dict[str, Any]:
@@ -190,25 +233,29 @@ def refresh_models_dev_cache(*, timeout: int = 10) -> dict[str, Any]:
     Returns a small status dict suitable for CLI rendering, including whether
     fresh network data replaced the existing cache.
     """
-    global _models_dev_cache, _models_dev_cache_time
+    global _models_dev_cache, _models_dev_cache_time, _models_dev_cache_home
 
     path = _get_cache_path()
     try:
         data = _fetch_network_registry(timeout=timeout)
+        if not _registry_stats(data)["models"]:
+            raise ValueError("models.dev returned no model records")
+        if not _save_disk_cache(data):
+            raise OSError("Unable to save the model cache")
         _models_dev_cache = data
         _models_dev_cache_time = time.time()
-        _save_disk_cache(data)
+        _models_dev_cache_home = str(path)
         return {
             "ok": True,
             "cache_path": str(path),
             **_registry_stats(data),
         }
-    except (requests.RequestException, ValueError) as exc:
+    except (requests.RequestException, ValueError, OSError) as exc:
         return {
             "ok": False,
             "error": str(exc),
             "cache_path": str(path),
-            **_registry_stats(_models_dev_cache or _load_disk_cache()),
+            **_registry_stats(_load_disk_cache()),
         }
 
 
@@ -258,9 +305,10 @@ def resolve_models_dev_provider(provider: str, profile_id: str = "") -> str:
     return profile.models_dev_provider
 
 
-def list_models_dev_provider(provider_id: str, *, limit: int | None = 20) -> list[str]:
+def list_models_dev_provider(provider_id: str, *, limit: int | None = 20,
+                             registry: dict[str, Any] | None = None) -> list[str]:
     """Return model IDs for one raw models.dev provider ID."""
-    registry = fetch_models_dev()
+    registry = fetch_models_dev() if registry is None else registry
     providers_data = _providers_data(registry)
     provider_data = providers_data.get(provider_id)
     if not provider_data:
@@ -286,7 +334,8 @@ def list_models_dev_provider(provider_id: str, *, limit: int | None = 20) -> lis
     return models
 
 
-def list_provider_models(provider: str, *, limit: int | None = 20, profile_id: str = "") -> list[str]:
+def list_provider_models(provider: str, *, limit: int | None = 20, profile_id: str = "",
+                         registry: dict[str, Any] | None = None) -> list[str]:
     """Return model IDs for one provider from the current models.dev registry.
 
     ``provider`` may be an M-Claw provider key or a raw models.dev provider ID.
@@ -294,7 +343,7 @@ def list_provider_models(provider: str, *, limit: int | None = 20, profile_id: s
     empty list when the provider is not present in the registry.
     """
     dev_provider = resolve_models_dev_provider(provider, profile_id)
-    return list_models_dev_provider(dev_provider, limit=limit)
+    return list_models_dev_provider(dev_provider, limit=limit, registry=registry)
 
 
 def list_models_dev_provider_ids() -> list[str]:

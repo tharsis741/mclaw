@@ -9,8 +9,12 @@ from __future__ import annotations
 import queue
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 from .events import EventBus
 from .session import RuntimeSessionState
+
+if TYPE_CHECKING:
+    from mclaw.application.task_queue import TaskQueue
 
 
 @dataclass
@@ -24,6 +28,7 @@ class InteractiveRuntime:
     agent_running: bool = False
     force_exit_no_flush: bool = False
     last_interrupt_at: float = 0.0
+    task_queue: TaskQueue | None = None
 
     def submit_text(self, text: str) -> None:
         """Queue user text for the runtime loop without binding to a TUI widget."""

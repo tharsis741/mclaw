@@ -17,7 +17,7 @@ EVOLUTION_SECTIONS = (
     "runtime_notes",
 )
 SOURCE_TYPES = {"agent_created", "github", "skills_sh", "clawhub", "local", "bundled"}
-ACTORS = {"install", "main_agent", "background_review", "bundled"}
+ACTORS = {"install", "main_agent", "background_review", "bundled", "user"}
 SKILL_YAML_FIELDS = frozenset(
     {
         "schema_version",

@@ -530,6 +530,10 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                             "thinking": str(_field(block, "thinking", "")),
                             "signature": str(_field(block, "signature", "")),
                         }
+                        if options.stream_reasoning_callback is not None:
+                            options.stream_reasoning_callback("".join(
+                                str(thinking[i].get("thinking") or "") for i in sorted(thinking)
+                            ))
                     elif block_type == "redacted_thinking":
                         thinking[index] = {
                             "type": "redacted_thinking",
@@ -556,6 +560,10 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                             {"type": "thinking", "thinking": "", "signature": ""},
                         )
                         block["thinking"] += str(_field(delta, "thinking", ""))
+                        if options.stream_reasoning_callback is not None:
+                            options.stream_reasoning_callback("".join(
+                                str(thinking[i].get("thinking") or "") for i in sorted(thinking)
+                            ))
                     elif delta_type == "signature_delta":
                         block = thinking.setdefault(
                             index,

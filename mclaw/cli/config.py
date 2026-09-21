@@ -617,7 +617,10 @@ def load_config(*, strict: bool = False) -> dict[str, Any]:
 
 def save_config(config: dict[str, Any]) -> None:
     """Save configuration to M-Claw home config.yaml."""
+    from mclaw.application.setup_interaction import check_setup_cancelled
     from mclaw.utils import atomic_yaml_write
+
+    check_setup_cancelled()
     ensure_mclaw_home()
     atomic_yaml_write(get_config_path(), config)
     _secure_file(get_config_path())
@@ -693,6 +696,19 @@ def _sanitize_api_key(value: str) -> str:
 
 def save_env_value(key: str, value: str) -> None:
     """Save or update a value in M-Claw home .env."""
+    from mclaw.application.setup_interaction import check_setup_cancelled
+    from mclaw.system.lock import file_lock
+
+    check_setup_cancelled()
+    # This short commit lock is separate from Setup's interactive workflow lock.
+    with file_lock(get_env_path().with_name(".env.lock")):
+        _save_env_value_unlocked(key, value)
+
+
+def _save_env_value_unlocked(key: str, value: str) -> None:
+    from mclaw.application.setup_interaction import check_setup_cancelled
+
+    check_setup_cancelled()
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     value = value.replace("\n", "").replace("\r", "")
@@ -740,6 +756,13 @@ def save_env_value(key: str, value: str) -> None:
 
 def remove_env_value(key: str) -> bool:
     """Remove a key from M-Claw home .env and os.environ."""
+    from mclaw.system.lock import file_lock
+
+    with file_lock(get_env_path().with_name(".env.lock")):
+        return _remove_env_value_unlocked(key)
+
+
+def _remove_env_value_unlocked(key: str) -> bool:
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     env_path = get_env_path()

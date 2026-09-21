@@ -487,6 +487,8 @@ def test_turn_disabled_tool_names_filter_model_and_dispatch_without_mutating_age
     )
     agent = _runtime_agent(monkeypatch, context, transport)
     agent._tool_callback = lambda name, _args: callbacks.append(name)
+    events: list[dict] = []
+    agent._event_callback = events.append
     original_tools = [
         {"type": "function", "function": {"name": "ordinary_tool", "parameters": {}}},
         {"type": "function", "function": {"name": "delegate_task", "parameters": {}}},
@@ -523,6 +525,11 @@ def test_turn_disabled_tool_names_filter_model_and_dispatch_without_mutating_age
     assert json.loads(ordinary_result)["success"] is True
     assert executed == [{"value": 1}]
     assert callbacks == ["ordinary_tool"]
+    tool_events = [event for event in events if event["type"].startswith("tool.")]
+    assert [event["type"] for event in tool_events] == ["tool.started", "tool.finished"]
+    assert all(event["tool_call_id"] == "ordinary-call" for event in tool_events)
+    assert tool_events[0]["arguments"] == {"value": 1}
+    assert json.loads(tool_events[1]["result"])["success"] is True
     assert any(
         "[TURN TOOL FILTER] rejected_model_calls=['delegate_task']"
         in record.getMessage()

@@ -1368,10 +1368,11 @@ class MClaw:
 
     def _emit_event(self, event: dict):
         """Send structured agent events to the hosting runtime without failing turns."""
-        if not self._event_callback:
+        callback = getattr(self, "_event_callback", None)
+        if not callback:
             return
         try:
-            self._event_callback(event)
+            callback(event)
         except Exception:
             logger.warning("agent event callback failed", exc_info=True)
 
@@ -1417,6 +1418,7 @@ class MClaw:
             "api_call_index": api_call_index,
             "content": visible_content,
             "content_source": content_source,
+            "reasoning": str(reasoning_content or ""),
             "is_final": is_final,
             "tool_call_count": len(calls),
             "tool_names": [
@@ -1739,6 +1741,8 @@ class MClaw:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         disabled_tool_names: set[str] | None = None,
+        before_model_callback: Callable[[List[Dict], str], None] | None = None,
+        input_operation_id: str | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn and discard stale estimates on failure."""
         turn_cancel_event, owns_turn = self._acquire_turn_cancel_event(cancel_event)
@@ -1753,6 +1757,8 @@ class MClaw:
                 deadline_monotonic=deadline_monotonic,
                 cancel_event=turn_cancel_event,
                 disabled_tool_names=disabled_tool_names,
+                before_model_callback=before_model_callback,
+                input_operation_id=input_operation_id,
             )
         except Exception:
             self._clear_unconfirmed_context_display()
@@ -1773,6 +1779,8 @@ class MClaw:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event,
         disabled_tool_names: set[str] | None = None,
+        before_model_callback: Callable[[List[Dict], str], None] | None = None,
+        input_operation_id: str | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -1853,6 +1861,7 @@ class MClaw:
                 "user",
                 content=user_message,
                 turn_id=self._checkpoint_turn_id,
+                operation_id=input_operation_id,
             )
             if hasattr(self._session_db, "count_user_messages"):
                 try:
@@ -1921,6 +1930,15 @@ class MClaw:
             if self._is_interrupted(cancel_event):
                 interrupted = True
                 break
+
+            # Hosts may apply queued additions only here, between complete tool
+            # batches and model requests. They must persist additions before
+            # acknowledging them to their presentation layer.
+            if before_model_callback is not None:
+                before_model_callback(messages, self._checkpoint_turn_id)
+                if self._is_interrupted(cancel_event):
+                    interrupted = True
+                    break
 
             # Successful write payloads shrink at one boundary for fresh,
             # resumed, and post-tool requests. Pending writes remain raw until
@@ -2162,6 +2180,14 @@ class MClaw:
                             stream_activity_callback=(
                                 self._emit_status if self._stream_callback else None
                             ),
+                            stream_reasoning_callback=(
+                                lambda text: self._emit_event({
+                                    "type": "assistant.reasoning",
+                                    "turn_id": getattr(self, "_checkpoint_turn_id", None),
+                                    "api_call_index": api_call_count,
+                                    "content": text,
+                                })
+                            ) if self._event_callback else None,
                             cache_plan=build_prompt_cache_plan(
                                 messages=messages,
                                 tools=active_tools,
@@ -2812,16 +2838,21 @@ class MClaw:
                 "[TURN TOOL FILTER] rejected_model_calls=%s",
                 rejected_names,
             )
-        if self._tool_callback:
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                if allowed_tool_names is not None and name not in allowed_tool_names:
-                    continue
-                try:
-                    args = json.loads(fn.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
+        tool_started_at = {}
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            if allowed_tool_names is not None and name not in allowed_tool_names:
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            tool_started_at[tc["id"]] = time.monotonic()
+            self._emit_event({"type": "tool.started", "tool_call_id": tc["id"],
+                              "name": name, "arguments": args,
+                              "turn_id": getattr(self, "_checkpoint_turn_id", None)})
+            if self._tool_callback:
                 self._tool_callback(name, args)
 
         # Batch dispatch: write tools take the serialized CheckpointManager path.
@@ -2921,6 +2952,11 @@ class MClaw:
 
             fn = tc.get("function", {})
             name = fn.get("name", "")
+            if tc["id"] in tool_started_at:
+                self._emit_event({"type": "tool.finished", "tool_call_id": tc["id"],
+                                  "name": name, "result": result,
+                                  "elapsed_ms": round((time.monotonic() - tool_started_at[tc["id"]]) * 1000),
+                                  "turn_id": getattr(self, "_checkpoint_turn_id", None)})
             if name == "delegate_task":
                 try:
                     result_data = json.loads(result)

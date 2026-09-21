@@ -1,0 +1,119 @@
+.configuration-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+.settings-page .configuration-heading h3 {
+  margin: 0;
+}
+.configuration-heading > span {
+  color: #555;
+  font-size: 12px;
+}
+.configuration-row {
+  gap: 28px;
+  align-items: center;
+}
+.configuration-label {
+  min-width: 0;
+  flex: 1;
+}
+.configuration-label > label {
+  display: block;
+  color: #171717;
+  font-size: 14px;
+}
+.settings-page .configuration-label small {
+  display: block;
+  color: #555;
+  max-width: 480px;
+}
+.configuration-row > input:not([type='checkbox']) {
+  border: 1px solid #dcded8;
+  border-radius: 8px;
+  padding: 9px 11px;
+  color: #171717;
+  background: #fff;
+  font: inherit;
+}
+.configuration-row > .configuration-number {
+  width: 126px;
+}
+.configuration-row > .configuration-text,
+.configuration-row > .select-control {
+  width: 270px;
+  max-width: 45%;
+}
+.configuration-advanced {
+  margin-top: 14px;
+}
+.configuration-advanced > summary {
+  cursor: pointer;
+  color: #333;
+  font-size: 12px;
+  padding: 5px 0;
+}
+.configuration-advanced[open] > summary {
+  margin-bottom: 12px;
+}
+.configuration-actions {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 0 18px;
+  border-bottom: 1px solid #e7e8e3;
+}
+.configuration-actions > span {
+  flex: 1;
+  color: #333;
+  font-size: 12px;
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.configuration-conflict {
+  color: #333;
+  font-size: 13px;
+}
+.settings-page .page-tabs {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.settings-page .page-tabs > button {
+  flex-shrink: 0;
+}
+@media (max-width: 760px) {
+  .settings-page .page-tabs {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 0 14px;
+    overflow: visible;
+  }
+  .configuration-heading {
+    align-items: start;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .configuration-row {
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .configuration-row > .configuration-text,
+  .configuration-row > .select-control {
+    width: 100%;
+    max-width: 100%;
+  }
+  .configuration-row:has(.configuration-text) .configuration-label,
+  .configuration-row:has(.select-control) .configuration-label {
+    flex-basis: 100%;
+  }
+  .configuration-actions {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .configuration-actions > span {
+    flex-basis: 100%;
+  }
+}

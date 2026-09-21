@@ -1575,6 +1575,9 @@ class SessionDB:
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and detach children that referenced it as parent."""
         def _do(conn):
+            # Future scheduled runs allocate a fresh conversation. Run history
+            # still retains its original session identifier for audit purposes.
+            conn.execute("UPDATE scheduler_jobs SET session_id = NULL WHERE session_id = ?", (session_id,))
             if conn.execute("SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)).fetchone()[0] == 0:
                 return False
             conn.execute("DELETE FROM context_rollbacks WHERE session_id = ?", (session_id,))

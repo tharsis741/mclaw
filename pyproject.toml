@@ -43,6 +43,9 @@ dependencies = [
     # HTTP / networking
     "httpx>=0.28.1,<1",
     "requests>=2.33.0,<3",
+    "starlette>=1.0.0,<2",
+    "uvicorn>=0.44.0,<1",
+    "websockets>=15,<17",
 
     # CLI / TUI
     "fire>=0.7.1,<1",
@@ -107,6 +110,8 @@ mclaw = [
     "skills/**/*",
     "skills/**/.rels",
     "pet/assets/**/*",
+    "web/static/**/*",
+    "web/static/*",
 ]
 
 [tool.setuptools.exclude-package-data]

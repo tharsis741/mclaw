@@ -143,7 +143,7 @@ class CommandsRenderer:
                     ("/title <名称>", "设置会话标题"),
                     ("/clear", "清屏并开启新会话"),
                     ("/save", "导出会话 JSON"),
-                    ("/quit", "退出 M-Claw"),
+                    ("/quit", "退出终端"),
                 ]
             ),
         ]

@@ -57,6 +57,9 @@ import subprocess
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from functools import wraps
+from inspect import signature
 from pathlib import Path
 from mclaw.constants import get_mclaw_home
 from mclaw.runtime.manager import RuntimeManager
@@ -73,6 +76,37 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 CHECKPOINT_BASE = get_mclaw_home() / "checkpoints"
+_CHECKPOINT_LOCK = threading.RLock()
+_CHECKPOINT_LOCK_STATE = threading.local()
+
+
+@contextmanager
+def checkpoint_store_guard(base=None):
+    """Serialize shared indexes, snapshot refs and garbage collection."""
+    from mclaw.system.lock import file_lock
+
+    with _CHECKPOINT_LOCK:
+        if getattr(_CHECKPOINT_LOCK_STATE, "held", False):
+            yield
+            return
+        with file_lock((base or CHECKPOINT_BASE).parent / ".checkpoints.lock"):
+            _CHECKPOINT_LOCK_STATE.held = True
+            try:
+                yield
+            finally:
+                _CHECKPOINT_LOCK_STATE.held = False
+
+
+def _locked_checkpoint_store(function):
+    arguments = signature(function)
+    @wraps(function)
+    def call(*args, **kwargs):
+        if function.__name__ in {"ensure_checkpoint", "create_checkpoint"} and not args[0].enabled:
+            return function(*args, **kwargs)
+        base = arguments.bind_partial(*args, **kwargs).arguments.get("checkpoint_base")
+        with checkpoint_store_guard(base):
+            return function(*args, **kwargs)
+    return call
 
 # Single shared store directory under CHECKPOINT_BASE.
 _STORE_DIRNAME = "store"
@@ -274,8 +308,12 @@ def _checkpoint_skip_reason(path_value: str) -> Optional[str]:
 
     roots: List[Tuple[Path, str]] = [
         (CHECKPOINT_BASE, "M-Claw checkpoint store"),
-        (get_mclaw_home(), "M-Claw runtime directory"),
     ]
+    from mclaw.runtime.paths import PathPolicy
+
+    home = get_mclaw_home()
+    if not PathPolicy(mclaw_home=home).is_task_file_path(path):
+        roots.append((home, "M-Claw runtime directory"))
 
     for root, reason in roots:
         try:
@@ -1051,6 +1089,7 @@ class CheckpointManager:
     # Public API
     # ------------------------------------------------------------------
 
+    @_locked_checkpoint_store
     def ensure_checkpoint(
         self,
         working_dir: str,
@@ -1127,6 +1166,7 @@ class CheckpointManager:
             self._record_attempt("failed", abs_dir, reason, detail=str(e))
             return False
 
+    @_locked_checkpoint_store
     def create_checkpoint(
         self,
         working_dir: str,
@@ -1165,6 +1205,7 @@ class CheckpointManager:
             self._record_attempt("failed", abs_dir, reason, detail=str(e))
             return False
 
+    @_locked_checkpoint_store
     def list_checkpoints(self, working_dir: str) -> List[Dict]:
         """List available checkpoints for a directory (most recent first)."""
         abs_dir = str(_normalize_path(working_dir))
@@ -1212,6 +1253,7 @@ class CheckpointManager:
                 results.append(entry)
         return results
 
+    @_locked_checkpoint_store
     def has_checkpoint(self, working_dir: str, commit_hash: str) -> bool:
         """Return whether a checkpoint is still available for this directory."""
         if _validate_commit_hash(commit_hash):
@@ -1236,16 +1278,104 @@ class CheckpointManager:
         if m:
             entry["deletions"] = int(m.group(1))
 
+    @_locked_checkpoint_store
+    def workspace_maintenance(self, working_dir: str, action: str = "status", *, retention_days: int = 30, apply: bool = False) -> Dict:
+        """Inspect or clean only this workspace's refs using existing retention rules."""
+        if action not in {"status", "prune", "clear"}:
+            raise ValueError("Invalid checkpoint maintenance action")
+        workspace = str(_normalize_path(working_dir))
+        store = _store_path(CHECKPOINT_BASE)
+        dir_hash = _project_hash(workspace)
+        records = _list_snapshot_records(store, workspace, dir_hash) if (store / "HEAD").exists() else []
+        meta = next((item for item in _list_projects(store) if item.get("_hash") == dir_hash), {})
+        stale = retention_days > 0 and 0 < float(meta.get("last_touch") or 0) < time.time() - retention_days * 86400
+        releasable = {str(intent["id"]): intent for intent in _read_restore_intents(store)
+                      if intent.get("workspace") == workspace and intent.get("status") in {"completed", "recovered"}
+                      and (action == "clear" or (retention_days > 0 and float(intent.get("updated_at") or intent.get("created_at") or 0) < time.time() - retention_days * 86400))}
+        pinned = [record for record in records if set(record["metadata"].get("recovery_pins") or []) - set(releasable)]
+        whole_project = action == "clear" or (action == "prune" and stale)
+        candidates = []
+        if whole_project:
+            candidates = [] if pinned else records
+        elif action == "prune":
+            candidates = [record for record in records[:-self.max_snapshots] if record not in pinned]
+        before = _dir_size_bytes(CHECKPOINT_BASE) if CHECKPOINT_BASE.exists() else 0
+        result = {"workspace": workspace, "shared_store_bytes": before, "workspace_snapshot_count": len(records),
+                  "pinned_count": len(pinned), "policy": {"retention_days": retention_days, "max_snapshots": self.max_snapshots,
+                                                       "max_total_size_mb": self.max_total_size_mb},
+                  "affected_checkpoints": [{"hash": row["hash"], "created_at": row["created_at"],
+                                            "session_id": row["metadata"].get("session_id")} for row in candidates],
+                  "blocked_by_recovery": bool(whole_project and pinned)}
+        if not apply:
+            return result
+        if result["blocked_by_recovery"]:
+            return {**result, "success": False, "error": "恢复事务正在保留检查点，请先完成恢复处理"}
+        for intent_id, intent in releasable.items():
+            commits = {str(intent.get("target_commit") or ""), str(intent.get("recovery_commit") or ""),
+                       *(str(commit) for commit in intent.get("target_commits") or [])}
+            if not all(_unpin_checkpoint(store, commit, intent_id) for commit in commits if commit):
+                return {**result, "success": False, "error": "恢复点保留标记无法更新，清理已停止"}
+            _restore_intent_path(store, intent_id).unlink(missing_ok=True)
+        deleted, errors = 0, 0
+        if candidates and whole_project:
+            if _delete_project_refs(store, dir_hash, workspace):
+                deleted = len(candidates)
+                _index_path(store, dir_hash).unlink(missing_ok=True)
+                _project_meta_path(store, dir_hash).unlink(missing_ok=True)
+            else:
+                errors += 1
+        else:
+            for record in candidates:
+                if _delete_snapshot_ref(store, _snapshot_ref_name(dir_hash, record["hash"]), record["hash"]):
+                    deleted += 1
+                else:
+                    errors += 1
+        if deleted:
+            _run_git(["reflog", "expire", "--expire=now", "--all"], store, workspace)
+            ok, _, _ = _run_git(["gc", "--prune=now", "--quiet"], store, workspace, timeout=_GIT_TIMEOUT * 3)
+            errors += int(not ok)
+        after = _dir_size_bytes(CHECKPOINT_BASE) if CHECKPOINT_BASE.exists() else 0
+        return {**result, "success": errors == 0, "deleted_count": deleted, "errors": errors,
+                "bytes_freed": max(0, before - after), "shared_store_bytes": after}
+
+    @_locked_checkpoint_store
+    def describe_restore(self, working_dir: str, commit_hash: str) -> Dict:
+        """Resolve the actual recorded paths an unchanged restore would touch."""
+        if _validate_commit_hash(commit_hash):
+            return {"success": False, "error": "Invalid checkpoint hash"}
+        abs_dir = str(_normalize_path(working_dir))
+        store = _store_path(CHECKPOINT_BASE)
+        resolved = _resolve_project_commit(store, abs_dir, commit_hash)
+        if not resolved:
+            return {"success": False, "error": "Checkpoint does not belong to this workspace"}
+        metadata = _read_checkpoint_meta(store, resolved) or {}
+        targets, error = _normalize_restore_targets(abs_dir, list(metadata.get("target_paths_rel") or []) if metadata.get("targeted") else ["."])
+        if error:
+            return {"success": False, "error": error}
+        ok, output, error = _run_git(["ls-tree", "-r", "-z", "--name-only", resolved], store, abs_dir)
+        if not ok:
+            return {"success": False, "error": error}
+        paths = list(dict.fromkeys(path for path in output.split("\0") + list(metadata.get("missing_at_checkpoint") or [])
+                                   if path and any(_restore_target_contains(target, path) for target in targets)))
+        normalized, error = _normalize_restore_targets(abs_dir, paths)
+        if error:
+            return {"success": False, "error": error}
+        return {"success": True, "commit_hash": resolved, "target_paths": [str(Path(abs_dir) / path) for path in normalized], "metadata": metadata}
+
+    @_locked_checkpoint_store
     def diff(
         self,
         working_dir: str,
         commit_hash: str,
         target_paths: Optional[List[str]] = None,
+        *,
+        reverse: bool = False,
     ) -> Dict:
         """Show diff between a checkpoint and the current working tree.
 
         Targeted checkpoints compare only the paths captured in metadata so
         large-project snapshots do not accidentally report unrelated changes.
+        ``reverse=True`` shows the proposed restore from current to checkpoint.
         """
         hash_err = _validate_commit_hash(commit_hash)
         if hash_err:
@@ -1304,12 +1434,13 @@ class CheckpointManager:
             _run_git(["add", "-A"], store, abs_dir,
                      timeout=_GIT_TIMEOUT * 2, index_file=index_file)
 
+        direction = ["-R"] if reverse else []
         ok_stat, stat_out, _ = _run_git(
-            ["diff", "--stat", commit_hash, "--cached"],
+            ["diff", *direction, "--stat", commit_hash, "--cached"],
             store, abs_dir, index_file=index_file,
         )
         ok_diff, diff_out, _ = _run_git(
-            ["diff", commit_hash, "--cached", "--no-color"],
+            ["diff", *direction, commit_hash, "--cached", "--no-color"],
             store, abs_dir, index_file=index_file,
         )
 
@@ -1329,6 +1460,7 @@ class CheckpointManager:
             "diff": diff_out if ok_diff else "",
         }
 
+    @_locked_checkpoint_store
     def list_restore_intents(
         self,
         working_dir: Optional[str] = None,
@@ -1348,6 +1480,7 @@ class CheckpointManager:
             and (not unresolved_only or intent.get("status") in unresolved)
         ]
 
+    @_locked_checkpoint_store
     def recover_restore(
         self,
         intent_id: Optional[str] = None,
@@ -1447,6 +1580,7 @@ class CheckpointManager:
             "restore": result,
         }
 
+    @_locked_checkpoint_store
     def begin_restore_intent(
         self,
         working_dir: str,
@@ -1584,6 +1718,7 @@ class CheckpointManager:
             "target_paths": normalized_targets,
         }
 
+    @_locked_checkpoint_store
     def finish_restore_intent(
         self,
         intent_id: str,
@@ -1603,6 +1738,7 @@ class CheckpointManager:
             return False
         return _set_restore_intent_status(store, intent, status, error=error)
 
+    @_locked_checkpoint_store
     def restore_batch(
         self,
         working_dir: str,
@@ -1800,6 +1936,7 @@ class CheckpointManager:
             "target_paths": union_targets,
         }
 
+    @_locked_checkpoint_store
     def restore(
         self,
         working_dir: str,
@@ -2894,6 +3031,7 @@ def _expire_restore_intents(store: Path, cutoff: float) -> None:
                 pass
 
 
+@_locked_checkpoint_store
 def prune_checkpoints(
     retention_days: int = 7,
     delete_orphans: bool = True,
@@ -3063,6 +3201,7 @@ def maybe_auto_prune_checkpoints(
 # Public maintenance helpers used by checkpoint command handlers.
 # ---------------------------------------------------------------------------
 
+@_locked_checkpoint_store
 def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     """Return a summary of the shadow store.
 
@@ -3109,6 +3248,7 @@ def store_status(checkpoint_base: Optional[Path] = None) -> Dict:
     return out
 
 
+@_locked_checkpoint_store
 def clear_all(checkpoint_base: Optional[Path] = None) -> Dict[str, int]:
     """Remove the entire checkpoint base. Irreversible.
 

@@ -109,6 +109,10 @@ class RuntimeSchedulerCoordinator:
         """Return whether the scheduler owns the next user input turn."""
         return self._state is not None
 
+    def close(self, *, cancel_running: bool = True) -> None:
+        """Stop this TUI's scheduler workers and relinquish the shared root lock."""
+        self.engine.shutdown(cancel_running=cancel_running)
+
     def handle_command(self, args: str = "") -> None:
         """Enter the scheduler dashboard, creation wizard, or target manager."""
         raw = (args or "").strip().lower()
@@ -341,7 +345,7 @@ class RuntimeSchedulerCoordinator:
         self._selected_job_id = job.id
         self._selected_run_scope = None
         if action == "run_now":
-            run = self.engine.run_job_now(job.id)
+            run = self.engine.run_job_now(job.id, manual=False)
             self._render_run_completed(run, ["B 返回任务列表"])
             self._state = "job_detail"
             return
@@ -367,7 +371,7 @@ class RuntimeSchedulerCoordinator:
             self.render_schedule_dashboard()
             return
         if value == "1":
-            run = self.engine.run_job_now(job.id)
+            run = self.engine.run_job_now(job.id, manual=False)
             self._render_run_completed(run, ["B 返回任务列表"])
             return
         if value == "2":
@@ -386,6 +390,10 @@ class RuntimeSchedulerCoordinator:
 
     def _handle_delete_confirm(self, value: str) -> None:
         if value.upper() == "Y":
+            if any(run.status in {"running", "queued"} for run in self.store.list_runs(self._selected_job_id, limit=10000)):
+                self._render("计划仍在运行", "请先在运行记录中取消对应运行，再删除计划。\n\nB 返回任务列表")
+                self._state = "job_detail"
+                return
             self.store.delete_job(self._selected_job_id)
             self.render_schedule_dashboard()
             return
@@ -475,7 +483,7 @@ class RuntimeSchedulerCoordinator:
                 run.error or "-",
                 "",
                 "操作",
-                "1 查看保存路径   2 重新运行该任务   B 返回运行记录列表",
+                "1 查看保存路径   2 重新运行该任务   3 取消本次运行   B 返回运行记录列表",
             ]),
         )
 
@@ -494,7 +502,12 @@ class RuntimeSchedulerCoordinator:
         if value == "2":
             run = self.store.get_run(self._selected_run_id) if self._selected_run_id else None
             if run:
-                self.engine.run_job_now(run.job_id)
+                self.engine.run_job_now(run.job_id, manual=False)
+            self._render_runs_list(job_id=self._selected_run_scope)
+            return
+        if value == "3":
+            if self._selected_run_id:
+                self.engine.cancel_run(self._selected_run_id)
             self._render_runs_list(job_id=self._selected_run_scope)
             return
         self._invalid()
@@ -804,7 +817,7 @@ class RuntimeSchedulerCoordinator:
 
     def _handle_created_done(self, value: str) -> None:
         if value == "1" and self._selected_job_id:
-            run = self.engine.run_job_now(self._selected_job_id)
+            run = self.engine.run_job_now(self._selected_job_id, manual=False)
             self._render_run_completed(run, ["B 返回任务列表"])
             return
         if value.upper() == "B":
@@ -1141,7 +1154,11 @@ class RuntimeSchedulerCoordinator:
             "操作",
             *actions,
         ]
-        self._render("运行完成", "\n".join(lines), kind="success" if run.status == "succeeded" else "warning")
+        pending = run.status in {"running", "queued"}
+        if pending:
+            lines.insert(0, "已提交到后台，可在运行记录中查看进展或取消。")
+        self._render("运行已提交" if pending else "运行完成", "\n".join(lines),
+                     kind="info" if pending else ("success" if run.status == "succeeded" else "warning"))
 
     def _render_preview(self) -> None:
         assert self._draft and self._draft.schedule

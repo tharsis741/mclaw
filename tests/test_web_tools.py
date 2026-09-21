@@ -464,7 +464,7 @@ def test_setup_selects_web_search_and_extract_independently(monkeypatch) -> None
 
     assert capability_ids[:2] == ["web_extract", "web_search"]
     assert capability_descriptions["web_extract"] == (
-        "使用 Trafilatura、Tavily 或 Firecrawl 提取网页正文。"
+        "读取链接里的正文，方便总结和整理资料。"
     )
     assert config["toolsets"] == ["mclaw-required", "web"]
     assert config["tools"]["disabled"] == ["web_search"]
@@ -527,8 +527,8 @@ def test_setup_reuses_tavily_key_from_extract_for_search(monkeypatch) -> None:
     assert config["auxiliary"]["web_extract"]["backend"] == "tavily"
     assert config["auxiliary"]["web_search"]["backend"] == "tavily"
     assert [title for title, _items, _kwargs in menus] == [
-        "M-Claw 网页提取后端",
-        "M-Claw 网页搜索后端",
+        "网页提取服务",
+        "网页搜索服务",
     ]
     extract_items = menus[0][1]
     assert [item["id"] for item in extract_items] == ["trafilatura", "tavily", "firecrawl"]
@@ -665,7 +665,7 @@ def test_setup_web_search_does_not_skip_tavily_when_qwen_key_exists(monkeypatch)
         Colors=colors,
     )
 
-    assert menu["title"] == "M-Claw 网页搜索后端"
+    assert menu["title"] == "网页搜索服务"
     assert menu["kwargs"]["default_selected"] == ["tavily", "dashscope"]
     assert requested == [["TAVILY_API_KEY"]]
     assert authorized == [
@@ -825,9 +825,9 @@ def test_setup_configures_selected_capabilities_in_order_with_qwen_intl(monkeypa
     cli_main._run_setup_capability_selection(config)
 
     assert prompt_titles == [
-        "M-Claw 可选能力",
-        "M-Claw IM 交互配置",
-        "M-Claw 语音输入",
+        "可选能力",
+        "消息渠道",
+        "语音输入",
     ]
     assert actions == [
         "web_extract",

@@ -957,6 +957,10 @@ def delegate_task(
         }, ensure_ascii=False)
 
     # Synchronous mode when the caller did not request progress callbacks.
+    live_callback = getattr(parent_agent, "_delegate_live_callback", None)
+    if live_callback:
+        live_callback(SubtaskEvent(-1, "batch_started", {"num_tasks": len(task_list),
+                                  "goals": [task["goal"] for task in task_list]}, delegation_id=task_id))
     overall_start = time.monotonic()
     results = []
     goal_map = {i: task["goal"] for i, task, _child in children}
@@ -969,6 +973,8 @@ def delegate_task(
             children[0][1]["goal"],
             child,
             parent_agent,
+            progress_callback=live_callback,
+            delegation_id=task_id,
             timeout_seconds=effective_timeout,
             cancel_event=cancel_event,
         )
@@ -984,6 +990,8 @@ def delegate_task(
                     goal=task["goal"],
                     child=child,
                     parent_agent=parent_agent,
+                    progress_callback=live_callback,
+                    delegation_id=task_id,
                     timeout_seconds=effective_timeout,
                     cancel_event=cancel_event,
                 )
@@ -1009,6 +1017,10 @@ def delegate_task(
         results.sort(key=lambda r: r["task_index"])
 
     total_duration = round(time.monotonic() - overall_start, 2)
+
+    if live_callback:
+        live_callback(SubtaskEvent(-1, "batch_completed", {"results": results,
+                                  "total_duration_seconds": total_duration}, delegation_id=task_id))
 
     logger.info(
         "delegate_task 完成, %d 个任务, 总耗时=%.2fs",

@@ -36,6 +36,25 @@ def _coordinator(tmp_path: Path, *, now: float):
     return store, coordinator, notices, ticks
 
 
+def test_runtime_manual_run_stays_responsive_and_cancel_uses_actual_engine(tmp_path: Path) -> None:
+    store, coordinator, notices, _ticks = _coordinator(tmp_path, now=time.time())
+    submitted = []
+    cancelled = []
+    run = SimpleNamespace(id="run", job_id="job", status="running", output_path="", delivery_result={})
+    coordinator.engine.run_job_now = lambda job_id, **kwargs: (submitted.append((job_id, kwargs)) or run)
+    coordinator.engine.cancel_run = lambda run_id: cancelled.append(run_id)
+    coordinator._selected_job_id = "job"
+    coordinator._selected_run_id = "run"
+    try:
+        coordinator._handle_created_done("1")
+        assert submitted == [("job", {"manual": False})]
+        assert "运行已提交" in notices[-1][0]
+        coordinator._handle_run_detail("3")
+        assert cancelled == ["run"]
+    finally:
+        store.session_db.close()
+
+
 def test_local_job_creation_wizard_persists_the_completed_draft(tmp_path: Path) -> None:
     store, coordinator, notices, _ticks = _coordinator(tmp_path, now=1_800_000_000)
     try:

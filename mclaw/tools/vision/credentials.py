@@ -88,8 +88,10 @@ def resolve_vision_credentials(parent_agent: Any = None, config: dict | None = N
         )
 
     profile = _qwen_profile(provider_hint, base_url_hint)
+    selected = cfg.get("credential_env")
+    names = [selected] if selected in profile.env_vars else profile.env_vars
     env_var, api_key = next(
-        ((name, value) for name in profile.env_vars if (value := authorized_env_value(name))),
+        ((name, value) for name in names if (value := authorized_env_value(name))),
         ("", ""),
     )
     base_url = base_url_hint or env_value(profile.base_url_env_var, profile.base_url)

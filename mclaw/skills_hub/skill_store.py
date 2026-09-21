@@ -423,23 +423,45 @@ def create_skill_scaffold(
     }
 
 
-def edit_skill(*, name: str, skill_md: str, actor: str = "main_agent") -> dict[str, Any]:
-    """Replace SKILL.md after validation and security review, rolling back on failure."""
+def edit_skill(
+    *,
+    name: str,
+    skill_md: str | None = None,
+    short_description: str | None = None,
+    actor: str = "main_agent",
+) -> dict[str, Any]:
+    """Edit content or its brief description, restoring both files on failure."""
 
-    _validate_skill_md(skill_md, name)
+    if skill_md is None and short_description is None:
+        raise SkillStoreError("Skill content or short_description is required.")
+    if skill_md is not None:
+        _validate_skill_md(skill_md, name)
+    if short_description is not None:
+        if not isinstance(short_description, str) or not short_description.strip():
+            raise SkillStoreError("short_description must be a non-empty string.")
+        short_description = short_description.strip()
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
     skill_path = skill_dir / "SKILL.md"
-    backup = skill_path.read_text(encoding="utf-8", errors="replace")
+    metadata_path = skill_dir / "mclaw_skill.yaml"
+    content_backup = skill_path.read_bytes()
+    metadata_backup = metadata_path.read_bytes()
     try:
-        skill_path.write_text(skill_md, encoding="utf-8")
+        if skill_md is not None:
+            skill_path.write_text(skill_md, encoding="utf-8")
+        if short_description is not None:
+            metadata = read_skill_yaml(skill_dir)
+            metadata["short_description"] = short_description
+            write_skill_yaml(skill_dir, metadata)
         review = review_skill_package(skill_dir, source="agent_created")
         if review.get("verdict") == "dangerous":
             raise SkillStoreError(f"Security scan blocked this skill: {review.get('summary')}")
         _validate_package(skill_dir, expected_status="enabled")
         touch_skill_yaml(skill_dir, actor=actor)
     except BaseException:
-        skill_path.write_text(backup, encoding="utf-8")
+        if skill_md is not None:
+            skill_path.write_bytes(content_backup)
+        metadata_path.write_bytes(metadata_backup)
         raise
     clear_skills_cache()
     return {"success": True, "action": "edit", "name": name, "path": str(skill_path)}

@@ -159,7 +159,7 @@ def _output_path_error(path: str | None, tool_name: str, parent_agent=None) -> s
         return None
     try:
         from mclaw.tools import file_operations as ops
-        from mclaw.tools.file_tools import _check_delegation_path, _skill_store_mutation_error
+        from mclaw.tools.file_tools import _skill_store_mutation_error
 
         try:
             ops._checked_path(path, "write")
@@ -169,9 +169,6 @@ def _output_path_error(path: str | None, tool_name: str, parent_agent=None) -> s
         blocked = _skill_store_mutation_error(path, tool_name)
         if blocked:
             return blocked
-        safe, err = _check_delegation_path(path, parent_agent)
-        if not safe:
-            return err
     except Exception as exc:
         return f"File safety blocked {tool_name}: invalid or unsafe output path {path!r}: {exc}"
     return None

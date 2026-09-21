@@ -54,6 +54,7 @@ def _dsoftbus_forbidden_result(tool_name: str) -> str:
 _current_session_db: ContextVar[Any] = ContextVar("current_session_db", default=None)
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
 _current_task_id: ContextVar[str] = ContextVar("current_task_id", default="")
+_current_tool_call_id: ContextVar[str] = ContextVar("current_tool_call_id", default="")
 _tool_whitelist: ContextVar[set[str] | None] = ContextVar("tool_whitelist", default=None)
 _tool_action_whitelist: ContextVar[dict[str, set[str]] | None] = ContextVar("tool_action_whitelist", default=None)
 
@@ -87,6 +88,11 @@ def get_session_db() -> Any:
 def get_current_session_id() -> str:
     """Get the current session_id from context."""
     return _current_session_id.get()
+
+
+def get_current_tool_call_id() -> str:
+    """Identify the actual dispatch across thread and async context copies."""
+    return _current_tool_call_id.get()
 
 
 def set_current_task_id(task_id: str) -> Any:
@@ -1154,6 +1160,7 @@ def _dispatch_single(
         _finalize_operation(operation, builtin_result, _tool_result_success(builtin_result), parent_agent)
         return builtin_result
 
+    call_token = _current_tool_call_id.set(str(call.get("id") or ""))
     try:
         result = registry.dispatch(tool_name, arguments, parent_agent=parent_agent)
     except Exception as e:
@@ -1163,6 +1170,8 @@ def _dispatch_single(
         result = tool_error(str(e), success=False)
         _finalize_operation(operation, result, False, parent_agent)
         return result
+    finally:
+        _current_tool_call_id.reset(call_token)
 
     # Final result-size guard before tool output enters conversation history.
     # Individual tools should limit themselves first; this catches abnormal

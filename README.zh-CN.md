@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
+  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="96" height="96">
 </p>
 
 <h2 align="center">自进化具身智能体运行时<br>Self-Evolving Embodied Agent Harness</h2>
@@ -248,7 +248,10 @@ M-Claw 支持以下交互入口：
 ## 终端命令入口
 
 ```bash
-mclaw                         # 启动Agent Runtime
+mclaw                         # 启动或复用本机后台，并打开 Web UI
+mclaw status                  # 查看服务地址与进程号
+mclaw stop                    # 保存进展、等待工具收尾并停止本机后台
+mclaw cli                     # 进入终端交互界面
 mclaw setup                   # 首次配置
 mclaw doctor                  # 检查核心运行时、工具能力和 IM 通道状态
 mclaw help                    # 查看命令指引
@@ -263,6 +266,10 @@ mclaw dingtalk                # 启动钉钉 Stream 网关
 ## 安装与启动
 
 **当前以源码形式分发**
+
+`mclaw` 默认启动 Web UI，`mclaw cli` 进入终端界面，`setup`、`doctor` 和 `resume` 等管理命令继续可用。首次使用源码中的 Web UI，在仓库根目录依次运行 `npm --prefix webui ci` 和 `npm --prefix webui run build`（Node >=22.12、npm >=10）。前端项目位于 `webui/`，构建后的页面随 Python 安装包分发，目标设备无需安装 Node.js。使用方法见 [Web 界面](docs/manual/18-Web界面.md)，开发与打包流程见 [前端开发说明](webui/README.md)。
+
+重复运行 `mclaw` 会复用当前数据目录对应的后台进程，并重新打开页面。`mclaw status` 显示本地地址与 PID；`mclaw stop` 保存会话进展，停止受管任务、调度和渠道，等待工具收尾后退出。关闭网页或启动终端不会停止后台。Web UI 设置页也提供“退出本机服务”。
 
 ### Windows / Linux
 

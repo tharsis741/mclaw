@@ -239,7 +239,7 @@ def test_dsoftbus_setup_uses_one_optional_capability_selection(
         config,
         runtime=runtime,
     )
-    assert [title for title, _items, _kwargs in prompts] == ["M-Claw 可选能力"]
+    assert [title for title, _items, _kwargs in prompts] == ["可选能力"]
     assert prompts[0][1] == [
         {
             "id": "dsoftbus",
@@ -299,7 +299,7 @@ def test_setup_capability_flow_persists_dsoftbus_answers_for_oh61_candidate(
 
     def choose_multiple(title, items, **_kwargs):
         prompt_titles.append(title)
-        if title == "M-Claw 可选能力":
+        if title == "可选能力":
             assert any(item.get("id") == "dsoftbus" for item in items)
             return ["dsoftbus"]
         return []
@@ -311,9 +311,9 @@ def test_setup_capability_flow_persists_dsoftbus_answers_for_oh61_candidate(
     cli_main._run_setup_capability_selection(config)
 
     assert prompt_titles == [
-        "M-Claw 可选能力",
-        "M-Claw IM 交互配置",
-        "M-Claw 语音输入",
+        "可选能力",
+        "消息渠道",
+        "语音输入",
     ]
     assert config["dsoftbus"]["enabled"] == "auto"
     assert config["dsoftbus"]["accept_remote_messages"] is True
@@ -365,7 +365,7 @@ def test_fresh_product_setup_can_enable_trusted_device_collaboration(
         selection_prompt,
         "prompt_multi_select",
         lambda title, *_args, **_kwargs: (
-            ["dsoftbus"] if title == "M-Claw 可选能力" else []
+            ["dsoftbus"] if title == "可选能力" else []
         ),
     )
     monkeypatch.setattr(cli_main, "_print_setup_intro", lambda: False)
@@ -488,7 +488,7 @@ def test_oh_setup_eligibility_depends_on_runtime(
         config,
         runtime=runtime,
     )
-    assert prompts == ["M-Claw 可选能力"]
+    assert prompts == ["可选能力"]
     assert config["dsoftbus"]["enabled"] == "auto"
     assert config["dsoftbus"]["accept_remote_messages"] is True
     assert config["dsoftbus"]["allow_remote_tools"] is True

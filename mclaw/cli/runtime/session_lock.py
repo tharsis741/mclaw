@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any
 
 from mclaw.constants import get_mclaw_home
+from mclaw.system.lock import file_lock
+from mclaw.utils import atomic_json_write
 
 
 class InteractiveSessionLockError(RuntimeError):
@@ -30,16 +32,23 @@ def _is_process_alive(pid: int) -> bool:
 
             process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
             if not process:
-                return False
-            ctypes.windll.kernel32.CloseHandle(process)
-            return True
+                return ctypes.windll.kernel32.GetLastError() == 5
+            try:
+                exit_code = ctypes.c_ulong()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
+                    return True
+                return exit_code.value == 259
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process)
         except Exception:
             return True
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except ProcessLookupError:
         return False
+    except OSError:
+        return True
 
 
 def _lock_name(session_id: str) -> str:
@@ -60,6 +69,11 @@ class InteractiveSessionLock:
     def acquire(self) -> None:
         """Create the lock file atomically or fail when a live owner exists."""
         self.root.mkdir(parents=True, exist_ok=True)
+        with file_lock(self.root / ".session-lock.guard"):
+            self._acquire_guarded()
+
+    def _acquire_guarded(self) -> None:
+        """Keep stale inspection and metadata publication in one OS lock."""
         payload = {
             "pid": os.getpid(),
             "session_id": self.session_id,
@@ -79,21 +93,35 @@ class InteractiveSessionLock:
         """Remove the lock only when it is still owned by this process."""
         if not self._acquired:
             return
-        try:
+        with file_lock(self.root / ".session-lock.guard"):
             data = self._read_lock()
-            if (
-                int(data.get("pid") or 0) == os.getpid()
-                and str(data.get("session_id") or "") == self.session_id
-            ):
-                self.path.unlink(missing_ok=True)
-        finally:
-            self._acquired = False
+            worker_pid = int(data.get("worker_pid") or 0)
+            if worker_pid and _is_process_alive(worker_pid):
+                return
+            try:
+                if (
+                    int(data.get("pid") or 0) == os.getpid()
+                    and str(data.get("session_id") or "") == self.session_id
+                ):
+                    self.path.unlink(missing_ok=True)
+            finally:
+                self._acquired = False
+
+    def attach_worker(self, worker_pid: int) -> None:
+        """Fence a child that can outlive its owning service during cleanup."""
+        with file_lock(self.root / ".session-lock.guard"):
+            data = self._read_lock()
+            if int(data.get("pid") or 0) != os.getpid() or data.get("session_id") != self.session_id:
+                raise InteractiveSessionLockError("Session ownership changed before worker startup")
+            data["worker_pid"] = int(worker_pid)
+            atomic_json_write(self.path, data)
 
     def _handle_existing_lock(self) -> None:
         """Reject live owners and clear stale or unreadable lock files."""
         data = self._read_lock()
         pid = int(data.get("pid") or 0)
-        if pid and _is_process_alive(pid):
+        worker_pid = int(data.get("worker_pid") or 0)
+        if (pid and _is_process_alive(pid)) or (worker_pid and _is_process_alive(worker_pid)):
             created_at = str(data.get("created_at") or "unknown")
             cwd = str(data.get("cwd") or "unknown")
             raise InteractiveSessionLockError(

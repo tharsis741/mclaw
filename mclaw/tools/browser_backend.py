@@ -1414,7 +1414,14 @@ class BrowserBackend:
         try:
             logger.info("Triggering download from URL: %s", url)
             with page.expect_download(timeout=10_000) as download_info:
-                page.goto(url, wait_until="domcontentloaded")
+                try:
+                    page.goto(url, wait_until="domcontentloaded")
+                except Exception as exc:
+                    # Chromium ends navigation when the response becomes a
+                    # download. Success still requires the actual download
+                    # event and save_as below; ordinary navigation errors fail.
+                    if not any(marker in str(exc) for marker in ("Download is starting", "net::ERR_ABORTED")):
+                        raise
             downloaded_file = self._save_download(
                 state,
                 download_info.value,

@@ -450,7 +450,7 @@ def test_setup_model_pins_current_or_recommended_first(
     monkeypatch.setattr(selection_prompt, "prompt_single_select", choose)
 
     assert cli_main._select_setup_model("qwen", config, profile_id) == expected
-    assert menu["title"] == "M-Claw 模型选择"
+    assert menu["title"] == "选择模型"
     assert menu["items"][0]["id"] == expected
     assert {item["id"] for item in menu["items"][:-1]} == set(candidates)
     assert menu["items"][-1]["label"] == "其他模型名称"
@@ -1021,7 +1021,7 @@ def test_setup_selects_multiple_providers_before_configuring_each_model(monkeypa
     cli_main._run_setup_impl(object())
 
     item_ids = [item["id"] for item in provider_menu["items"]]
-    assert provider_menu["title"] == "M-Claw 大模型接入配置"
+    assert provider_menu["title"] == "大模型接入配置"
     assert provider_menu["kwargs"]["default_selected"] == ["qwen", "openai"]
     assert "microsoft" in item_ids
     assert "qwen-intl" not in item_ids

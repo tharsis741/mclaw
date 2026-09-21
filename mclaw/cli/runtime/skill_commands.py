@@ -27,6 +27,7 @@ class RuntimeSkillCommandHooks:
     render_loaded: Callable[[str], None]
     record_loaded_skill: Callable[[str, dict[str, Any]], None] | None = None
     build_base_system_prompt: Callable[[], str] | None = None
+    queue_skill_intent: Callable[[str, str], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,19 @@ class RuntimeSkillCommandCoordinator:
 
     def invoke_skill(self, skill: Any, user_intent: str) -> bool:
         """Inject Skill guidance and optionally queue the user's follow-up intent."""
+        if self.hooks.queue_skill_intent is not None:
+            try:
+                queued = self.hooks.queue_skill_intent(str(skill.name), user_intent)
+            except Exception as exc:
+                self.hooks.render_read_error(f"Cannot select skill: {exc}")
+                return True
+            if queued:
+                if str(user_intent or "").strip():
+                    self.hooks.render_processing(str(skill.name))
+                    self.hooks.set_skip_next_prompt()
+                else:
+                    self.hooks.render_loaded(str(skill.name))
+                return True
         try:
             view = skill_store.view_skill(str(skill.name))
             skill_content = str(view.get("content") or "")

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from types import SimpleNamespace
 
 import pytest
 
@@ -186,6 +189,37 @@ def test_download_by_snapshot_ref_writes_expected_content(tmp_path, backend) -> 
 
     assert result["success"] is True
     assert output.read_text(encoding="utf-8") == "hello browser"
+
+
+def test_download_tool_saves_a_direct_http_attachment(tmp_path, backend, monkeypatch) -> None:
+    payload = b"%PDF-1.4\nlocal download regression\n%%EOF"
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Disposition", 'attachment; filename="paper.pdf"')
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        def log_message(self, *_args):
+            pass
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    sid = "browser_direct-download-tool"
+    output = tmp_path / "paper.pdf"
+    monkeypatch.setattr(browser_tool, "_start_cleanup_if_needed", lambda: None)
+    monkeypatch.setattr(browser_tool, "_get_or_create_session", lambda _sid: browser_tool.BrowserSession(sid, backend))
+    try:
+        result = json.loads(browser_tool.browser_download(url=f"http://127.0.0.1:{server.server_port}/paper.pdf",
+            path=str(output), parent_agent=SimpleNamespace(session_id="direct-download-tool")))
+        assert result["success"], result
+        assert output.read_bytes() == payload
+    finally:
+        backend.close_session(sid)
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_close_session_preserves_other_browser_contexts(tmp_path, backend) -> None:
