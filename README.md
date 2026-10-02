@@ -1,5 +1,5 @@
 <p align="center">
-  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+  <strong>English</strong> | <a href="docs/README.zh-CN.md">简体中文</a>
 </p>
 
 <p align="center">
@@ -362,4 +362,4 @@ This repository was imported from [m-robots/mclaw on AtomGit](https://atomgit.co
 
 M-Claw is licensed under Apache-2.0. See [LICENSE](LICENSE).
 
-See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for third-party notices and [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for acknowledgements.
+See [THIRD_PARTY_NOTICES.md](docs/THIRD_PARTY_NOTICES.md) for third-party notices and [ACKNOWLEDGEMENTS.md](docs/ACKNOWLEDGEMENTS.md) for acknowledgements.

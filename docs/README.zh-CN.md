@@ -1,9 +1,9 @@
 <p align="center">
-  <a href="README.md">English</a> | <strong>简体中文</strong>
+  <a href="../README.md">English</a> | <strong>简体中文</strong>
 </p>
 
 <p align="center">
-  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
+  <img src="assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
 </p>
 
 <h2 align="center">自进化具身智能体运行时<br>Self-Evolving Embodied Agent Harness</h2>
@@ -11,7 +11,7 @@
 <p align="center">
   <a href="#安装与启动">快速开始</a> ·
   <a href="#能力概览">功能</a> ·
-  <a href="docs/manual/README.md">操作手册</a> ·
+  <a href="manual/README.md">操作手册</a> ·
   <a href="#智能体循环">架构</a> ·
   <a href="#开发者生态">开发</a>
 </p>
@@ -31,7 +31,7 @@
 > 开源协议：Apache-2.0<br>
 > 当前安装方式：从源码安装
 
-> 📖 **完整用户指南：** [M-Claw 操作手册](docs/manual/README.md) — 按功能查看设计说明、操作步骤、内置指令、示例提示词和平台限制。
+> 📖 **完整用户指南：** [M-Claw 操作手册](manual/README.md) — 按功能查看设计说明、操作步骤、内置指令、示例提示词和平台限制。
 
 ## 路线图
 
@@ -251,7 +251,7 @@ M-Claw 支持以下交互入口：
 - **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
 
 
-定时任务也可以触发智能体循环，相关命令和配置见 [操作手册](docs/manual/README.md)。
+定时任务也可以触发智能体循环，相关命令和配置见 [操作手册](manual/README.md)。
 
 ## 终端命令入口
 
@@ -387,7 +387,7 @@ M-Claw 将围绕 Skill Hub 构建开放技能生态。开发者可以面向办�
 
 本仓库导入自 [AtomGit 上游 m-robots/mclaw](https://atomgit.com/m-robots/mclaw)，原项目作者为 Shenzhen Kaihong Digital Industry Development Co., Ltd.。本 GitHub 仓库保留上游提交历史、版权与开源声明。
 
-M-Claw 基于 Apache-2.0 发布，详见 [LICENSE](LICENSE)。
+M-Claw 基于 Apache-2.0 发布，详见 [LICENSE](../LICENSE)。
 
 第三方开源声明见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 
