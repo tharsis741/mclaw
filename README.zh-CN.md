@@ -1,4 +1,8 @@
 <p align="center">
+  <a href="README.md">English</a> | <strong>简体中文</strong>
+</p>
+
+<p align="center">
   <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
 </p>
 
@@ -21,7 +25,7 @@
 
 **M-CLAW 是 M-Robots OS 原生的具身智能体运行时，面向异构多机协同场景，打通模型与物理世界的执行桥梁。**
 
-**以 Agent Harness 为核心，将空间上下文认知与记忆、工具与 Skill调用、安全设备控制、和协作任务按需组织为统一的智能体运行闭环；依托 M-Robots OS 的 M-DDS 带来的设备协同能力，支持“一机一脑、多脑协同”的分布式智能架构。**
+**以 Agent Harness 为核心，将空间上下文认知与记忆、工具与 Skill 调用、安全设备控制和协作任务按需组织为统一的智能体运行闭环；依托 M-Robots OS 的 M-DDS 带来的设备协同能力，支持“一机一脑、多脑协同”的分布式智能架构。**
 
 > 当前版本：1.1.1<br>
 > 开源协议：Apache-2.0<br>
@@ -29,7 +33,9 @@
 
 > 📖 **完整用户指南：** [M-Claw 操作手册](docs/manual/README.md) — 按功能查看设计说明、操作步骤、内置指令、示例提示词和平台限制。
 
-## Roadmap
+## 路线图
+
+以下为上游项目路线图：1.0 和 1.1 为已有版本里程碑；1.2 和 2.0 为规划方向，日期为上游目标，不代表当前版本已实现。
 
 ### 2026.06 | **1.0.0 单机智能体运行时**
 
@@ -37,7 +43,7 @@
 
 ### 2026.09 | **1.1.0 分布式协同网络运行时**
 
-引入分布式智能体协同运行时，基于M-Robot OS的分布式协同特性-M-DDS，支持不同设备/机器人之间的任务分发、状态同步与能力共享。
+引入分布式智能体协同运行时，基于 M-Robots OS 的分布式协同特性 M-DDS，支持不同设备/机器人之间的任务分发、状态同步与能力共享。
 
 同时建立基于M-CLAW的机器人“脑-小脑”分层控制架构：
 
@@ -63,7 +69,7 @@
 - 安全执行能力：模型仅生成预备动作执行提案，由独立控制边界审计后决定真实执行
 
 
-## 当前能力（1.1.0版本）
+## 当前能力（1.1.1）
 
 **当前版本已在M-Robots OS / Kaihong OS 上形成多设备智能体协作运行闭环。智能体可以在本设备完成模型推理和工具编排，也可以通过分布式软总线调用其他可信设备上的 M-Claw Agent。**
 
@@ -88,14 +94,14 @@
 - **操作系统运行时适配**：针对不同操作系统的运行时适配。
 - **可信设备协作**：在 Kaihong OS/M-Robots OS 设备间完成可信设备组网、可信设备管理、跨设备智能体通信、任务分发、流式进展、任务续接、文件传输和返回。
 
-## 模型与缓存命中率
+## 模型与供应商
 
 **M-Claw 支持在当前会话中动态切换模型和 Provider。**
 
-- **模型目录**：基于 [models.dev](https://models.dev/) 获取模型 ID、Provider 归属和上下文长度等元数据；当前公开目录包含约 `145` 个 provider、`5,246` 个模型 （具体根据model.dev数据库动态调整）。
-- **供应商适配**：集成31个国内外主流模型供应商进的深度优化。
+- **模型目录**：基于 models.dev 获取模型 ID、Provider 归属和上下文长度等元数据；目录内容随上游更新。
+- **供应商适配**：集成多个国内外模型供应商，并提供运行时适配。
 - **自定义接口**：支持用户自定义 `OpenAI-compatible` 或 `Anthropic Messages` 接口。
-- **缓存命中率**：M-CLAW 接入 `Qwen`、`DeepSeek`、`Moonshot`、`MiniMax` 四家国内主流模型服务时，平均缓存命中率超过 `85%`。
+- **缓存表现**：取决于模型服务、提示词结构与实际工作负载，本项目不在此承诺固定命中率。
 
 **不同模型的实际可用能力取决于模型自身对工具调用、思考深度、视觉输入等能力的支持。**
 
@@ -220,7 +226,7 @@ CheckpointManager 使用单个共享 shadow git store，在文件写入、patch�
 
 RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可同步回滚会话上下文。 内置命令提供 `/rollback` 和 `/checkpoints` 命令查看、预览、撤销和恢复变更。
 
-### **M-Claw 1.1.0 不提供安全沙箱或权限分级。**
+**当前版本不提供安全沙箱或权限分级。**
 
 ## 系统运行时适配
 
@@ -244,6 +250,8 @@ M-Claw 支持以下交互入口：
 - **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word 和 push-to-talk 两种模式。
 - **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
 
+
+定时任务也可以触发智能体循环，相关命令和配置见 [操作手册](docs/manual/README.md)。
 
 ## 终端命令入口
 
@@ -273,7 +281,7 @@ mclaw dingtalk                # 启动钉钉 Stream 网关
 - 官方下载：[git-scm.com/download/win](https://git-scm.com/download/win)
 - 国内镜像：[华为云 Git for Windows 镜像](https://mirrors.huaweicloud.com/git-for-windows/)
 
-如果 Linux 主机尚未安装 Git，请以下方式安装：
+在 Debian/Ubuntu Linux 上可使用以下命令安装 Git：
 ```bash
 sudo apt update
 sudo apt install -y git
@@ -287,19 +295,25 @@ git --version
 
 #### 步骤二：拉取源码并安装M-CLAW
 
-从官方库拉取源码
+从本 GitHub 仓库拉取源码
 ```powershell
-git clone https://gitcode.com/m-robots/mclaw.git
+git clone https://github.com/tharsis741/mclaw.git
 ```
 
 在源码目录执行安装：
 
 ```powershell
-cd 源码目录路径
-pip install -e .
+cd mclaw
+python -m pip install -e .
 ```
 
-安装浏览器自动化运行时：
+如需浏览器自动化，先安装可选依赖：
+
+```bash
+python -m pip install -e ".[browser]"
+```
+
+再安装浏览器自动化运行时：
 
 ```powershell
 # Windows
@@ -327,11 +341,13 @@ mclaw
 
 #### 后续 M-Claw 更新：
 
+在源码目录中执行以下命令；拉取更新前检查并处理本地改动。
+
 ```powershell
 # 首先退出正在运行的 M-Claw
 git status --porcelain
 git pull --ff-only
-pip install -e .
+python -m pip install -e .
 ```
 
 ### Kaihong OS / M-Robots OS
@@ -367,7 +383,9 @@ run mclaw
 
 M-Claw 将围绕 Skill Hub 构建开放技能生态。开发者可以面向办公、工业、教育、机器人、数据分析、智能家居和行业知识等方向开发 Skill，并通过本地 Skill 管理能力完成安装、更新、复用和演化。
 
-## License
+## 来源与许可证
+
+本仓库导入自 [AtomGit 上游 m-robots/mclaw](https://atomgit.com/m-robots/mclaw)，原项目作者为 Shenzhen Kaihong Digital Industry Development Co., Ltd.。本 GitHub 仓库保留上游提交历史、版权与开源声明。
 
 M-Claw 基于 Apache-2.0 发布，详见 [LICENSE](LICENSE)。
 
