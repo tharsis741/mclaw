@@ -80,6 +80,7 @@ class RuntimeProviderProfile:
     base_url: str = ""
     base_url_required: bool = False
     base_url_env_var: str = ""
+    base_url_env_vars: tuple[str, ...] = ()
     key_url: str = ""
     models_url: str = ""
     models_dev_provider: str = ""
