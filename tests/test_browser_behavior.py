@@ -209,7 +209,7 @@ def test_download_tool_saves_a_direct_http_attachment(tmp_path, backend, monkeyp
     sid = "browser_direct-download-tool"
     output = tmp_path / "paper.pdf"
     monkeypatch.setattr(browser_tool, "_start_cleanup_if_needed", lambda: None)
-    monkeypatch.setattr(browser_tool, "_get_or_create_session", lambda _sid: browser_tool.BrowserSession(sid, backend))
+    monkeypatch.setattr(browser_tool, "_get_or_create_session", lambda _sid: SimpleNamespace(backend=backend))
     try:
         result = json.loads(browser_tool.browser_download(url=f"http://127.0.0.1:{server.server_port}/paper.pdf",
             path=str(output), parent_agent=SimpleNamespace(session_id="direct-download-tool")))
@@ -220,6 +220,110 @@ def test_download_tool_saves_a_direct_http_attachment(tmp_path, backend, monkeyp
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.fixture
+def inline_download_server():
+    import io
+    from PIL import Image
+
+    requests = []
+    picture = io.BytesIO()
+    Image.new("RGB", (4, 4), "blue").save(picture, format="PNG")
+    text = b"original text file\n"
+    payloads = {"plain": text, "redirect": text, "missing": b"File not found",
+                "picture.png": picture.getvalue(), "document.pdf": b"%PDF-1.4\nlocal fixture\n%%EOF"}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            requests.append((self.path, self.headers.get("Cookie", "")))
+            if self.path == "/redirect":
+                self.send_response(302)
+                self.send_header("Location", "/plain")
+                self.send_header("Set-Cookie", "redirected=yes; Path=/")
+                self.end_headers()
+                return
+            self.send_response(404 if self.path == "/missing" else 200)
+            payload = payloads[self.path.lstrip("/")]
+            mime = {"/picture.png": "image/png", "/document.pdf": "application/pdf"}.get(self.path, "text/plain")
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(payload)))
+            if self.path == "/document.pdf":
+                self.send_header("Content-Disposition", 'inline; filename="server-name.pdf"')
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{server.server_port}", payloads, requests
+    server.shutdown()
+    server.server_close()
+    thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("endpoint", ["plain", "picture.png", "document.pdf", "redirect"])
+def test_direct_download_accepts_inline_files_and_preserves_current_tab(backend, tmp_path, inline_download_server, endpoint):
+    base, payloads, requests = inline_download_server
+    sid = "inline-download-" + endpoint
+    url = _page_url(tmp_path, '<button onclick="this.textContent=\'Still works\'">Existing control</button>')
+    try:
+        backend.navigate(sid, url)
+        snap = backend.snapshot(sid)
+        existing = _element_ref(snap["snapshot"], "Existing control")
+        backend._run_on_worker(lambda: backend._sessions[sid].context.add_cookies([
+            {"name": "authenticated", "value": "yes", "url": base}]))
+        result = backend.download(sid, url=base + "/" + endpoint, path=str(tmp_path) + "/")
+        assert result["success"], result
+        from pathlib import Path
+        assert Path(result["path"]).read_bytes() == payloads[endpoint]
+        if endpoint == "document.pdf":
+            assert Path(result["path"]).name == "server-name.pdf"
+        assert all("authenticated=yes" in cookie for _, cookie in requests)
+        if endpoint == "redirect":
+            assert "redirected=yes" in requests[-1][1]
+        tabs = backend.tabs(sid)
+        assert len(tabs["tabs"]) == 1 and tabs["tabs"][0]["url"] == url
+        assert "Still works" in backend.click(sid, existing)["snapshot"]
+    finally:
+        backend.close_session(sid)
+
+
+def test_direct_download_http_error_preserves_existing_file(backend, tmp_path, inline_download_server):
+    base, _, _ = inline_download_server
+    sid = "download-http-error"
+    output = tmp_path / "saved.txt"
+    output.write_bytes(b"keep existing")
+    try:
+        # A different retained download must not be reported as this request's file.
+        backend.get_or_create_page(sid)
+        backend._run_on_worker(lambda: backend._sessions[sid].downloads.append(output))
+        result = backend.download(sid, url=base + "/missing", path=str(output))
+        assert not result["success"] and "404" in result["error"]
+        assert result["download_retained"] is False
+        assert output.read_bytes() == b"keep existing"
+        assert len(backend.tabs(sid)["tabs"]) == 1
+    finally:
+        backend.close_session(sid)
+
+
+def test_direct_download_keeps_capture_when_saving_fails(backend, tmp_path, inline_download_server):
+    base, payloads, requests = inline_download_server
+    sid = "inline-download-retry"
+    blocker = tmp_path / "blocker"
+    blocker.write_text("keep")
+    try:
+        failed = backend.download(sid, url=base + "/plain", path=str(blocker / "saved.txt"))
+        assert not failed["success"] and failed["download_retained"]
+        retried = backend.download(sid, path=str(tmp_path / "saved.txt"))
+        assert retried["success"], retried
+        assert (tmp_path / "saved.txt").read_bytes() == payloads["plain"]
+        assert len(requests) == 1
+    finally:
+        backend.close_session(sid)
 
 
 def test_close_session_preserves_other_browser_contexts(tmp_path, backend) -> None:

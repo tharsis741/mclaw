@@ -17,7 +17,7 @@ from mclaw.cli import config as config_io
 from mclaw.providers.registry import get_runtime_profile
 from mclaw.runtime import secrets
 from mclaw.system.lock import file_lock
-from mclaw.tools.toolsets import REQUIRED_TOOLSETS, TOOLSETS, resolve_multiple_toolsets
+from mclaw.tools.toolsets import REQUIRED_TOOLSETS, TOOLSETS, effective_disabled_tools, resolve_multiple_toolsets
 
 _LABELS = {
     "credentials": ("凭据授权", "按任务需要申请使用 API Key"),
@@ -119,7 +119,7 @@ class ToolService:
     def catalog(self) -> dict:
         with file_lock(self.home / "config.lock"):
             config, env = self._config(), self._environment()
-            active = resolve_multiple_toolsets(config.get("toolsets", ["mclaw-required"])) - set(config.get("tools", {}).get("disabled", []))
+            active = resolve_multiple_toolsets(config.get("toolsets", ["mclaw-required"])) - effective_disabled_tools(config.get("tools", {}).get("disabled", []))
             items = []
             for identifier, (label, description) in _LABELS.items():
                 required = identifier in REQUIRED_TOOLSETS

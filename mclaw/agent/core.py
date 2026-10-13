@@ -2778,7 +2778,9 @@ class MClaw:
         checkpoint_mgr = self._get_checkpoint_manager()
         checkpoint_mgr.new_turn()
 
-        disabled = set(
+        from mclaw.tools.toolsets import effective_disabled_tools
+
+        disabled = effective_disabled_tools(
             getattr(self, "config", {}).get("tools", {}).get("disabled", [])
         )
         filtered_calls = []

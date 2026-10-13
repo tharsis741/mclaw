@@ -15,7 +15,7 @@ from mclaw.cli import config as config_io
 from mclaw.cli.runtime.tool_configuration import refresh_interactive_tools
 from mclaw.providers.registry import get_runtime_profile
 from mclaw.runtime import secrets
-from mclaw.tools.toolsets import resolve_multiple_toolsets
+from mclaw.tools.toolsets import BROWSER_TOOLS, resolve_multiple_toolsets
 from mclaw.web.app import create_app
 
 
@@ -70,7 +70,26 @@ def test_all_preset_can_disable_optional_without_removing_required(tools):
     raw = config_io.load_raw_user_config()
     assert "all" in raw["toolsets"]
     assert "browser_download" in raw["tools"]["disabled"]
+    assert set(BROWSER_TOOLS) <= set(raw["tools"]["disabled"])
     assert "terminal" not in raw["tools"]["disabled"]
+
+
+def test_legacy_browser_disabled_group_stays_off_until_explicitly_enabled(tools):
+    from mclaw.tools.dispatch import get_tool_definitions
+
+    legacy = ["browser_navigate", "browser_snapshot", "browser_screenshot", "browser_click",
+              "browser_type", "browser_scroll", "browser_press", "browser_download"]
+    config_io.save_config({"toolsets": ["all"], "tools": {"disabled": legacy}, "unknown_field": {"keep": True}})
+    before = (tools.home / "config.yaml").read_bytes()
+    assert item(tools, "browser")["enabled"] is False
+    _, active = get_tool_definitions(enabled_toolsets=["all"], config=config_io.load_config())
+    assert set(BROWSER_TOOLS).isdisjoint(active)
+    assert (tools.home / "config.yaml").read_bytes() == before
+    save(tools, "browser")
+    assert item(tools, "browser")["enabled"] is True
+    raw = config_io.load_raw_user_config()
+    assert set(BROWSER_TOOLS).isdisjoint(raw["tools"]["disabled"])
+    assert raw["unknown_field"] == {"keep": True}
 
 
 def test_missing_key_does_not_enable_or_authorize_anything(tools):

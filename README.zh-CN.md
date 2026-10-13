@@ -80,7 +80,7 @@
 当前已经包含以下智能体工具和运行时能力：
 
 - **21 个基础工具**：默认工具集，覆盖凭据授权、文件读写、终端、记忆、Skill、历史会话检索和子代理委派。
-- **13 个可选工具**：覆盖联网搜索、网页提取、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
+- **21 个可选工具**：覆盖联网搜索、网页提取、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
 - **可信设备协作工具**：在 M-Robots OS/Kaihong OS 上提供 4 个设备协作入口工具，并在远端任务中按上下文提供 5 个结果返回、补充输入和源文件按需获取工具。
 - **22 个内置命令**：包括动态模型切换、搜索/提取后端切换、语音输入、查看历史会话、操作回退、定时任务、Skill 管理和运行环境诊断；M-Robots OS/Kaihong OS 激活可信设备协作后增加 `/devices`、`/pair`、`/unpair` 3 个设备管理命令。
 
@@ -143,7 +143,7 @@
 | --- | --- | --- |
 | web | `web_search`, `web_extract` | 搜索互联网并返回答案与来源；提取指定网页的正文。 |
 | vision | `vision_analyze` | 使用 Qwen 视觉模型分析 URL 或本地图片。 |
-| browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download` | 打开网页并执行点击、输入、滚动、截图和下载等操作。 |
+| browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download`, `browser_tabs`, `browser_select`, `browser_check`, `browser_hover`, `browser_upload`, `browser_handle_dialog`, `browser_wait_for`, `browser_back` | 页面与标签页交互、表单、上传下载、弹窗响应、条件等待和截图。 |
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
 | dingtalk | `dingtalk_send_file` | 在当前钉钉会话中发送文件。 |
 

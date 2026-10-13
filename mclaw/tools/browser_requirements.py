@@ -7,43 +7,66 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import subprocess
+import sys
+from functools import lru_cache
 from pathlib import Path
 
 
-def _has_chromium_browser(root: Path) -> bool:
-    """Return whether a Playwright browser cache contains a Chromium binary."""
-    return any(root.glob("chromium-*")) or any(root.glob("chrome-*")) or any(root.glob("**/chrome.exe"))
+_REGISTRY_ENV = (
+    "PLAYWRIGHT_BROWSERS_PATH", "PLAYWRIGHT_NODEJS_PATH", "PLAYWRIGHT_HOST_PLATFORM_OVERRIDE",
+    "LOCALAPPDATA", "XDG_CACHE_HOME", "HOME", "USERPROFILE", "INIT_CWD",
+)
+
+
+@lru_cache(maxsize=8)
+def _driver_browser_paths(
+    registry_file: str, modified_ns: int, environment: tuple[tuple[str, str | None], ...], cwd: str,
+) -> tuple[str, str]:
+    """Ask the installed driver for its exact platform/revision/headless binary.
+
+    This reads registry metadata only; it neither launches nor installs a browser.
+    Cache metadata, but check binary existence afresh on every diagnosis.
+    """
+    package_dir = Path(registry_file).parents[3]
+    env = os.environ.copy()
+    for key, value in environment:
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    node = env.get("PLAYWRIGHT_NODEJS_PATH") or str(package_dir.parent / ("node.exe" if sys.platform == "win32" else "node"))
+    script = """
+const {registry, registryDirectory} = require(process.argv[1]);
+const executable = registry.findExecutable('chromium-headless-shell') || registry.findExecutable('chromium');
+process.stdout.write(JSON.stringify([registryDirectory, executable?.executablePath() || '']));
+"""
+    result = subprocess.run(
+        [node, "-e", script, registry_file], capture_output=True, text=True, encoding="utf-8",
+        timeout=5, check=True, env=env, cwd=cwd,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    root, executable = json.loads(result.stdout)
+    return str(root), str(executable)
 
 
 def find_playwright_browsers_root(config: dict | None = None) -> tuple[bool, str]:
-    """Locate Playwright's browser cache and report Chromium availability."""
-    env_value = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip().strip('"')
-    if env_value:
-        root = Path(env_value)
-        if not root.exists():
-            return False, f"{env_value}; path does not exist"
-        has_chromium = _has_chromium_browser(root)
-        return has_chromium, f"{env_value}; chromium={'yes' if has_chromium else 'no'}"
-
-    candidates: list[Path] = []
-    local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_appdata:
-        candidates.append(Path(local_appdata) / "ms-playwright")
-    candidates.append(Path.home() / ".cache" / "ms-playwright")
-    if os.name == "nt":
-        candidates.append(Path.home() / "AppData" / "Local" / "ms-playwright")
-
-    seen: set[str] = set()
-    for root in candidates:
-        key = os.path.normcase(str(root))
-        if key in seen:
-            continue
-        seen.add(key)
-        if root.exists():
-            has_chromium = _has_chromium_browser(root)
-            return has_chromium, f"{root}; chromium={'yes' if has_chromium else 'no'}; source=default cache"
-    return False, "not found in PLAYWRIGHT_BROWSERS_PATH or default Playwright cache"
+    """Verify the installed Playwright driver's expected headless executable."""
+    spec = importlib.util.find_spec("playwright")
+    if spec is None or spec.origin is None:
+        return False, "Playwright Python package is missing"
+    registry_file = Path(spec.origin).parent / "driver/package/lib/server/registry/index.js"
+    try:
+        root, executable = _driver_browser_paths(
+            str(registry_file), registry_file.stat().st_mtime_ns,
+            tuple((key, os.environ.get(key)) for key in _REGISTRY_ENV), os.getcwd(),
+        )
+        available = bool(executable) and Path(executable).is_file() and os.access(executable, os.X_OK)
+        return available, f"{root}; chromium={'yes' if available else 'no'}; expected={executable}"
+    except Exception as exc:
+        return False, f"Could not inspect the installed Playwright driver: {type(exc).__name__}"
 
 
 def diagnose_browser_requirements(config: dict | None = None) -> dict:

@@ -65,37 +65,13 @@ def test_model_facing_web_tool_contracts_are_small_and_distinct() -> None:
 
 def test_browser_definition_reserves_browser_for_interaction_and_visual_inspection() -> None:
     definitions = {item["name"]: item["description"] for item in browser_tool._BROWSER_TOOLS}
-    assert definitions == {
-        "browser_navigate": (
-            "Navigate to a URL in the interactive browser. Initializes the session, loads "
-            "the page, and returns a compact snapshot of the current viewport with element "
-            "refs. For information "
-            "retrieval, prefer web_search or web_extract. Use browser tools when you need to "
-            "interact with a page, such as clicking or filling forms. Call browser_navigate "
-            "before browser tools that act on or inspect the current page; browser_snapshot "
-            "is not needed immediately after navigation."
-        ),
-        "browser_snapshot": (
-            "Refresh the compact snapshot of the current viewport and its element refs."
-        ),
-        "browser_screenshot": "Save a full-page screenshot and return its file path.",
-        "browser_click": (
-            "Click an element by ref and return the updated current-viewport snapshot."
-        ),
-        "browser_type": (
-            "Set an input's text by ref and return the updated current-viewport snapshot."
-        ),
-        "browser_scroll": (
-            "Scroll the current page and return a compact snapshot of the new viewport."
-        ),
-        "browser_press": (
-            "Press a keyboard key and return the updated current-viewport snapshot."
-        ),
-        "browser_download": (
-            "Download from ref if provided, otherwise from url; with neither, return the latest "
-            "captured download."
-        ),
-    }
+    assert "prefer web_search or web_extract" in definitions["browser_navigate"]
+    assert "latest returned snapshot" in definitions["browser_navigate"]
+    assert "Replaces all earlier element refs" in definitions["browser_snapshot"]
+    assert "BEFORE triggering" in definitions["browser_handle_dialog"]
+    assert "Unconfigured dialogs are dismissed" in definitions["browser_handle_dialog"]
+    assert "automatic upload" in definitions["browser_upload"]
+    assert "exactly one of text" in definitions["browser_wait_for"]
     assert BROWSER_TOOLS == list(definitions)
     assert all("JavaScript" not in description for description in definitions.values())
     assert next(
@@ -132,12 +108,20 @@ def test_model_facing_web_browser_index_is_capability_only() -> None:
         "web_extract": "Extract content from known public URLs",
         "browser_navigate": "Navigate the interactive browser to a URL",
         "browser_snapshot": "Refresh the current viewport snapshot and element refs",
-        "browser_screenshot": "Save a full-page screenshot",
+        "browser_screenshot": "Save a full-page or viewport screenshot",
         "browser_click": "Click an element by snapshot ref",
         "browser_type": "Set text in an input by snapshot ref",
         "browser_scroll": "Scroll the current page",
         "browser_press": "Press a keyboard key on the current page",
         "browser_download": "Download a file by URL or snapshot ref",
+        "browser_tabs": "List, create, select, or close browser tabs",
+        "browser_select": "Select native dropdown options by value",
+        "browser_check": "Set a checkbox or radio button state",
+        "browser_hover": "Hover over an element by snapshot ref",
+        "browser_upload": "Choose local files for a page upload",
+        "browser_handle_dialog": "Set the response for the next browser dialog",
+        "browser_wait_for": "Wait for page text or an element to appear or disappear",
+        "browser_back": "Go back in the selected tab's history",
     }
 
     assert {

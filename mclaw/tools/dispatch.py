@@ -34,7 +34,7 @@ from mclaw.tools.interrupt import (
     set_interrupt_event,
 )
 from mclaw.tools.registry import registry
-from mclaw.tools.toolsets import DSOFTBUS_TOOLS, resolve_multiple_toolsets
+from mclaw.tools.toolsets import DSOFTBUS_TOOLS, effective_disabled_tools, resolve_multiple_toolsets
 
 logger = logging.getLogger(__name__)
 
@@ -516,7 +516,7 @@ def get_tool_definitions(
         tools_config = config.get("tools", {})
         raw_disabled = tools_config.get("disabled", []) if isinstance(tools_config, dict) else []
         if isinstance(raw_disabled, (list, tuple, set)):
-            tool_names -= {str(name) for name in raw_disabled}
+            tool_names -= effective_disabled_tools(raw_disabled)
 
     try:
         from mclaw.runtime.manager import RuntimeManager
