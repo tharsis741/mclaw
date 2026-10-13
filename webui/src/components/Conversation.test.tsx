@@ -9,6 +9,48 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+it('shows stable local timestamps below user and assistant messages, including imported history', () => {
+  const moment = new Date('2026-09-23T08:06:15Z');
+  const session: Session = {
+    id: 'times',
+    title: '消息时间',
+    status: 'running',
+    queue: [],
+    messages: [
+      { id: 'u', role: 'user', content: '你好', created_at: moment.getTime() / 1000 },
+      { id: 'a', role: 'assistant', content: '正在回复', created_at: moment.toISOString() },
+      { id: 'old', role: 'assistant', content: '未记录时间的旧消息' },
+      { id: 'bad', role: 'user', content: '损坏的时间', created_at: 'invalid' },
+    ],
+  };
+  const view = render(<Conversation session={session} />);
+  const times = view.container.querySelectorAll('time');
+  expect(times).toHaveLength(2);
+  for (const time of times) {
+    expect(time).toHaveAttribute('datetime', moment.toISOString());
+    expect(time).toHaveAttribute('title', expect.stringContaining('2026'));
+    expect(time).toBeVisible();
+    const body = time.closest('article')!.querySelector('.markdown')!;
+    expect(body.compareDocumentPosition(time) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(time.closest('.message-identity')).toBeNull();
+  }
+  expect(times[0].textContent).toBe(times[1].textContent);
+  view.rerender(
+    <Conversation
+      session={{
+        ...session,
+        messages: session.messages.map((message) =>
+          message.id === 'a' ? { ...message, content: '回复完成' } : message,
+        ),
+      }}
+    />,
+  );
+  expect(view.container.querySelectorAll('time')[1]).toHaveAttribute(
+    'datetime',
+    moment.toISOString(),
+  );
+});
+
 it('links remote progress to its exact tool call, preserving a separate failed call and the real call count', async () => {
   const file: FileReference = {
     id: 'remote-file',
@@ -218,7 +260,7 @@ it('folds live reasoning by default and preserves manual expansion through strea
     ],
   };
   const { rerender } = render(<Conversation session={session} />);
-  expect(screen.getByText('先确认文件')).not.toBeVisible();
+  expect(screen.queryByText('先确认文件')).not.toBeInTheDocument();
   expect(screen.getByText('思考中')).toBeVisible();
   await userEvent.click(screen.getByText('思考中'));
   expect(screen.getByText('先确认文件')).toBeVisible();
@@ -268,7 +310,7 @@ it('folds live reasoning by default and preserves manual expansion through strea
   expect(screen.getByText('已确认位置。')).toBeVisible();
   await userEvent.click(screen.getByText('思考完成'));
   rerender(<Conversation session={{ ...completed, usage: { total_tokens: 100 } }} />);
-  expect(screen.getByText('已确认位置。')).not.toBeVisible();
+  expect(screen.queryByText('已确认位置。')).not.toBeInTheDocument();
   expect(screen.getByText('文件已找到。')).toBeVisible();
 });
 
@@ -392,13 +434,13 @@ it('keeps a manually folded process closed as new entries arrive and the final a
     'aria-expanded',
     'false',
   );
-  expect(screen.getByText('更多内容')).not.toBeVisible();
+  expect(screen.queryByText('更多内容')).not.toBeInTheDocument();
   expect(screen.getByText('已经完成检查。')).toBeVisible();
   await user.click(screen.getByRole('button', { name: '复制回复' }));
   expect(await navigator.clipboard.readText()).toBe('已经完成检查。');
   await user.click(screen.getByRole('button', { name: '执行过程 2 次工具调用' }));
   expect(screen.getByText('文件内容')).toBeVisible();
-  expect(screen.getByText('更多内容')).not.toBeVisible();
+  expect(screen.queryByText('更多内容')).not.toBeInTheDocument();
 });
 
 it('does not carry a folded process into a different session with the same message ID', async () => {

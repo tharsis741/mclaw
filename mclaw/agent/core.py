@@ -2161,6 +2161,9 @@ class MClaw:
                         logger.info("[subagent-%s] 开始 API 调用", getattr(self, "session_id", "?")[-6:])
                     api_call_count += 1
                     self._record_api_attempt()
+                    model_call_started = time.monotonic()
+                    logger.info("[MODEL REQUEST] agent=%s provider=%s model=%s attempt=%d messages=%d",
+                                self.session_id, self.provider, self.model, api_call_count, len(messages))
                     result = self.transport.call(
                         messages=messages,
                         tools=active_tools,
@@ -2230,6 +2233,10 @@ class MClaw:
                         stream_callback=self._stream_callback,
                         interrupted=cancel_event.is_set,
                     )
+                    logger.info("[MODEL RESPONSE] agent=%s attempt=%d finish=%s tools=%d elapsed_ms=%d",
+                                self.session_id, api_call_count, result.finish_reason if result else "interrupted",
+                                len(result.tool_calls or []) if result else 0,
+                                round((time.monotonic() - model_call_started) * 1000))
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
                     break
@@ -2840,7 +2847,8 @@ class MClaw:
                 "[TURN TOOL FILTER] rejected_model_calls=%s",
                 rejected_names,
             )
-        tool_started_at = {}
+        advertised_tool_ids = set()
+        tool_timings: dict[str, int] = {}
         for tc in tool_calls:
             fn = tc.get("function", {})
             name = fn.get("name", "")
@@ -2850,7 +2858,7 @@ class MClaw:
                 args = json.loads(fn.get("arguments", "{}"))
             except (json.JSONDecodeError, TypeError):
                 args = {}
-            tool_started_at[tc["id"]] = time.monotonic()
+            advertised_tool_ids.add(tc["id"])
             self._emit_event({"type": "tool.started", "tool_call_id": tc["id"],
                               "name": name, "arguments": args,
                               "turn_id": getattr(self, "_checkpoint_turn_id", None)})
@@ -2886,6 +2894,7 @@ class MClaw:
                 parent_agent=self,
                 cancel_event=cancel_event,
                 call_source=call_source,
+                timings=tool_timings,
             )
         finally:
             reset_tool_context(context_tokens)
@@ -2954,10 +2963,12 @@ class MClaw:
 
             fn = tc.get("function", {})
             name = fn.get("name", "")
-            if tc["id"] in tool_started_at:
+            if tc["id"] in advertised_tool_ids:
+                logger.info("[TOOL FINISHED] agent=%s call=%s name=%s elapsed_ms=%s",
+                            self.session_id, tc["id"], name, tool_timings.get(tc["id"]))
                 self._emit_event({"type": "tool.finished", "tool_call_id": tc["id"],
                                   "name": name, "result": result,
-                                  "elapsed_ms": round((time.monotonic() - tool_started_at[tc["id"]]) * 1000),
+                                  "elapsed_ms": tool_timings.get(tc["id"]),
                                   "turn_id": getattr(self, "_checkpoint_turn_id", None)})
             if name == "delegate_task":
                 try:

@@ -472,6 +472,15 @@ def _run_single_child(
     # parent's _tool_callback; child tool calls should not render in the
     # parent TUI as normal parent actions.
     try:
+        if progress_callback and getattr(parent_agent, "_delegate_live_callback", None):
+            def relay_activity(event: dict):
+                progress_callback(SubtaskEvent(task_index, "activity", event,
+                                               delegation_id=delegation_id))
+
+            child._stream_callback = lambda text: relay_activity({"type": "delta", "text": text})
+            child._status_callback = lambda text: relay_activity({"type": "status", "text": text})
+            child._event_callback = relay_activity
+            child._print_fn = lambda *_args, **_kwargs: None
         if progress_callback:
             def _relay_tool(tool_name: str, args: dict):
                 progress_callback(SubtaskEvent(
@@ -485,7 +494,8 @@ def _run_single_child(
             # Emit a started event.
             progress_callback(SubtaskEvent(
                 task_index, SUBAGENT_STARTED,
-                {"goal": goal[:100], "depth": child._delegate_depth},
+                {"goal": goal, "depth": child._delegate_depth,
+                 "model": getattr(child, "model", None), "session_id": getattr(child, "session_id", None)},
                 delegation_id=delegation_id,
             ))
     except BaseException:
@@ -630,8 +640,10 @@ def _run_single_child(
                 {
                     "status": status,
                     "duration": duration,
-                    "summary": inline_summary,
+                    "summary": summary,
                     "api_calls": api_calls,
+                    "exit_reason": exit_reason,
+                    "error": entry.get("error"),
                 },
                 delegation_id=delegation_id,
             ))
@@ -959,8 +971,10 @@ def delegate_task(
     # Synchronous mode when the caller did not request progress callbacks.
     live_callback = getattr(parent_agent, "_delegate_live_callback", None)
     if live_callback:
+        from mclaw.tools.dispatch import get_current_tool_call_id
         live_callback(SubtaskEvent(-1, "batch_started", {"num_tasks": len(task_list),
-                                  "goals": [task["goal"] for task in task_list]}, delegation_id=task_id))
+                                  "goals": [task["goal"] for task in task_list],
+                                  "tool_call_id": get_current_tool_call_id()}, delegation_id=task_id))
     overall_start = time.monotonic()
     results = []
     goal_map = {i: task["goal"] for i, task, _child in children}

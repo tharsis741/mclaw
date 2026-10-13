@@ -136,6 +136,9 @@ class ApplicationStore:
                 if task:
                     task["status"] = "interrupted"
                     task["recovery_required"] = True
+                from mclaw.application.delegation_events import finish_delegations
+                for message in session.get("messages", []):
+                    finish_delegations(message)
                 session["seq"] += 1
                 self.save(session)
 

@@ -67,6 +67,67 @@ def tool_status(result: Any) -> str:
     return "completed"
 
 
+def agent_events(event: dict, scope: str, secrets: Collection[str] = ()) -> list[dict]:
+    """Use the same public conversation records for main and delegated agents."""
+    kind = event.get("type")
+    records = []
+    if kind in {"delta", "body_reset"}:
+        return [public_detail(event, secrets)]
+    if kind == "status":
+        return [{"type": "status", "text": status_text(str(event.get("text") or ""))}]
+    if kind == "remote.task":
+        entry = public_detail({key: value for key, value in event.items() if key not in {"type", "origin"}}, secrets)
+        output = entry.get("output")
+        if isinstance(output, dict) and isinstance(output.get("text"), str):
+            # Body and technical details have separate budgets. Never parse clipped JSON as a reply.
+            entry["result_text"] = output["text"]
+            entry["output"] = {**output, "text": "完整回复见上方正文"}
+        for key in ("arguments", "output"):
+            if key in entry:
+                entry[key], entry[key + "_truncated"] = display_text(entry[key], secrets)
+        return [{**entry, "type": "process"}]
+    if kind in {"assistant.reasoning", "assistant.message"}:
+        reasoning = event.get("content") if kind == "assistant.reasoning" else event.get("reasoning")
+        if reasoning:
+            content, truncated = display_text(reasoning, secrets)
+            records.append({"type": "process", "kind": "reasoning", "title": "思考",
+                            "id": f"reasoning_{scope}_{event.get('turn_id')}_{event.get('api_call_index')}",
+                            "content": content, "truncated": truncated,
+                            "status": "running" if kind == "assistant.reasoning" else "completed"})
+    if kind == "assistant.message":
+        if event.get("is_final"):
+            records.append({"type": "body", "text": public_detail(event.get("content") or "", secrets)})
+        else:
+            if event.get("was_streamed"):
+                records.append({"type": "body_reset"})
+            if event.get("content_source") != "reasoning_content" and event.get("content"):
+                content, truncated = display_text(event["content"], secrets)
+                records.append({"type": "process", "kind": "progress", "title": "执行进展",
+                                "id": f"progress_{scope}_{event.get('turn_id')}_{event.get('api_call_index')}",
+                                "content": content, "truncated": truncated})
+    elif kind in {"tool.started", "tool.finished"}:
+        entry = {"type": "process", "id": f"tool_{event['tool_call_id']}", "kind": "tool",
+                 "title": event["name"], "tool_call_id": event["tool_call_id"]}
+        if kind == "tool.started":
+            text, truncated = display_text(event.get("arguments") or {}, secrets)
+            entry.update(arguments=text, status="running", truncated=truncated)
+        else:
+            text, truncated = display_text(event.get("result") or "", secrets)
+            entry.update(output=text, status=tool_status(event.get("result")),
+                         output_truncated=truncated, elapsed_ms=event.get("elapsed_ms"))
+        records.append(entry)
+    return records
+
+
+def status_text(text: str) -> str:
+    label = {"Thinking...": "思考中…", "Waiting for model...": "等待回复…",
+             "Preparing tool call...": "准备调用工具…", "Pruning tool results...": "整理执行记录…",
+             "Refreshing context...": "整理上下文…", "Compressing context...": "整理上下文…",
+             "Reviewing memory and skills...": "整理记忆和技能…", "Reviewing memory...": "整理记忆…",
+             "Reviewing skills...": "整理技能…"}.get(text, text)
+    return "正在执行工具…" if label.startswith("Running ") and "tool" in label else label
+
+
 def history_process(rows: list[dict], secrets: Collection[str] = ()) -> list[dict]:
     """Reconstruct earlier Web/TUI records from persisted call IDs, once."""
     entries: list[dict] = []

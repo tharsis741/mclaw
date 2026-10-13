@@ -16,6 +16,7 @@ export interface ProcessEntry {
   tool_call_id?: string;
   arguments?: string;
   output?: string;
+  result_text?: string;
   status?: 'running' | 'completed' | 'failed' | 'interrupted' | 'unknown' | 'waiting';
   device_id?: string;
   device_name?: string;
@@ -39,13 +40,51 @@ export interface Message {
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
   process?: ProcessEntry[];
-  created_at?: string;
+  delegations?: Record<string, Delegation>;
+  created_at?: number | string;
   mode?: string;
   applied?: boolean;
   invalidated?: boolean;
   skills?: SkillReference[];
   attachments?: FileReference[];
   device_selection?: DeviceSelection;
+}
+export interface SubagentTask {
+  task_index: number;
+  goal: string;
+  status:
+    | 'pending'
+    | 'running'
+    | 'finalizing'
+    | 'completed'
+    | 'failed'
+    | 'timed_out'
+    | 'interrupted'
+    | 'completion_unknown';
+  messages: Message[];
+  model?: string;
+  duration_seconds?: number;
+  status_text?: string;
+  last_tool?: string;
+  error?: string;
+  legacy?: boolean;
+}
+export interface Delegation {
+  tool_call_id?: string;
+  goals?: string[];
+  tasks?: Record<string, SubagentTask>;
+  events?: { task_index: number; event_type: string; data: Record<string, unknown> }[];
+  result?: {
+    results: {
+      task_index: number;
+      goal?: string;
+      status?: string;
+      summary?: string;
+      error?: string;
+      model?: string;
+      duration_seconds?: number;
+    }[];
+  };
 }
 export interface QueueItem {
   id: string;

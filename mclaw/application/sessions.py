@@ -728,6 +728,8 @@ class SessionService:
                                                  "duration", "api_calls", "tool_calls", "max_iterations_reached"}}
                 from mclaw.application.process_events import finish_process
                 finish_process(response)
+                from mclaw.application.delegation_events import finish_delegations
+                finish_delegations(response)
                 if result.get("final_response"):
                     response["content"] = result["final_response"]
                 self._save(session, activity=True)
@@ -744,6 +746,12 @@ class SessionService:
     def _event(self, session_id: str, response_id: str, event: dict) -> None:
         session = self._load(session_id)
         message = next(item for item in session["messages"] if item["id"] == response_id)
+        events = event["events"] if event.get("type") == "batch" else [event]
+        for item in events:
+            self._apply_event(session, message, item)
+        self._save(session)
+
+    def _apply_event(self, session: dict, message: dict, event: dict) -> None:
         kind = event.get("type")
         if kind == "delta":
             message["content"] += str(event.get("text") or "")
@@ -757,19 +765,15 @@ class SessionService:
                 message["attachments"] = list(attachments.values())
         elif kind == "status":
             session["status_text"] = str(event.get("text") or "")
+        elif kind == "body":
+            message["content"] = str(event.get("text") or "")
         elif kind == "body_reset":
             message["content"] = ""
         elif kind == "runtime_view":
             session["runtime_view"] = event["view"]
         elif kind == "delegation":
-            group = message.setdefault("delegations", {}).setdefault(event["delegation_id"], {"events": []})
-            if event["event_type"] == "batch_started":
-                group.update(event["data"])
-            elif event["event_type"] == "batch_completed":
-                group["result"] = event["data"]
-            else:
-                group["events"].append({key: value for key, value in event.items() if key != "type"})
-                group["events"] = group["events"][-200:]
+            from mclaw.application.delegation_events import update_delegation
+            update_delegation(message, event)
         elif kind == "request":
             session["pending_request"] = event["request"]
             if event["request"].get("kind") == "skill_install" and session.get("active_task"):
@@ -795,7 +799,6 @@ class SessionService:
             message["process"].append({"id": new_id("event"), "kind": kind or "progress",
                                        "title": event.get("title") or kind or "执行进展",
                                        "content": str(event.get("text") or "")})
-        self._save(session)
 
     def _worker_background(self, session_id: str, event: dict) -> None:
         """Queue watcher follow-ups through the same durable execution owner."""

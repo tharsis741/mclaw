@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from 'react';
+import { memo, useCallback, useDeferredValue, useEffect, useId, useRef, useState } from 'react';
 import {
   ArrowDown,
   Check,
@@ -12,16 +12,19 @@ import {
 } from 'lucide-react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { FileReference, Message, ProcessEntry, Session } from '../types';
+import type { Delegation, FileReference, Message, ProcessEntry, Session } from '../types';
 import { AttachmentChips } from './Attachments';
 import { RemoteExecution } from './RemoteExecution';
 import { BrandWordmark } from './BrandWordmark';
 import { ChannelLogo } from './ChannelLogo';
 import { sourceLabel } from './SkillsPage';
 import { STATUS_TEXT } from '../session-state';
+import { Subagents } from './Subagents';
+import { MessageTime } from './MessageTime';
 const scrollPositions = new Map<string, number>();
 
-const TOOL_LABELS: Record<string, string> = {
+export const TOOL_LABELS: Record<string, string> = {
+  delegate_task: '子代理',
   terminal: '运行命令',
   process: '查看进程',
   read_file: '读取文件',
@@ -43,6 +46,7 @@ const TOOL_LABELS: Record<string, string> = {
   dsoftbus_get_device_context: '读取设备能力',
   dsoftbus_run_agent_task: '远程任务',
   dsoftbus_continue_agent_task: '继续远程任务',
+  dsoftbus_read_task_result: '读取远程回复',
   dsoft_bus_source_list: '查看共享目录',
   dsoft_bus_source_search: '搜索共享资料',
   dsoft_bus_source_fetch: '读取共享文件',
@@ -93,7 +97,13 @@ function outputText(text: string) {
   return text;
 }
 
-function ProgressNote({ content }: { content: string }) {
+const MARKDOWN_PLUGINS = [remarkGfm];
+const MessageMarkdown = memo(function MessageMarkdown({ content }: { content: string }) {
+  const text = useDeferredValue(content);
+  return <Markdown remarkPlugins={MARKDOWN_PLUGINS}>{text}</Markdown>;
+});
+
+const ProgressNote = memo(function ProgressNote({ content }: { content: string }) {
   const [expanded, setExpanded] = useState(false);
   const [overflowing, setOverflowing] = useState(false);
   const preview = useRef<HTMLDivElement>(null);
@@ -120,7 +130,7 @@ function ProgressNote({ content }: { content: string }) {
         ref={preview}
         className={`process-note-content markdown${expanded ? '' : ' is-collapsed'}`}
       >
-        <Markdown remarkPlugins={[remarkGfm]}>{content}</Markdown>
+        <MessageMarkdown content={content} />
       </div>
       {(overflowing || expanded) && (
         <button
@@ -136,9 +146,9 @@ function ProgressNote({ content }: { content: string }) {
       )}
     </div>
   );
-}
+});
 
-function ExecutionEntry({ entry }: { entry: ProcessEntry }) {
+const ExecutionEntry = memo(function ExecutionEntry({ entry }: { entry: ProcessEntry }) {
   const [open, setOpen] = useState(false);
   if (entry.kind === 'remote') return <RemoteExecution entry={entry} />;
   if (entry.kind === 'progress') {
@@ -195,48 +205,60 @@ function ExecutionEntry({ entry }: { entry: ProcessEntry }) {
           </span>
         )}
       </summary>
-      <div className="execution-detail">
-        {tool && <div className="tool-detail-name">{entry.title}</div>}
-        {command && (
-          <>
-            <h4>命令</h4>
-            <pre>{command}</pre>
-          </>
-        )}
-        {argumentsText && (
-          <>
-            <h4>参数</h4>
-            <pre>{argumentsText}</pre>
-          </>
-        )}
-        {entry.output !== undefined && (
-          <>
-            <h4>输出</h4>
-            <pre>{outputText(entry.output)}</pre>
-          </>
-        )}
-        {entry.content && (
-          <div className="markdown">
-            <Markdown remarkPlugins={[remarkGfm]}>{entry.content}</Markdown>
-          </div>
-        )}
-        {tool && !entry.arguments && entry.output === undefined && (
-          <p className="muted">这条历史记录没有保存调用详情。</p>
-        )}
-        {(entry.truncated || entry.output_truncated) && (
-          <p className="muted">内容较长，当前显示前 64,000 个字符。</p>
-        )}
-      </div>
+      {open && (
+        <div className="execution-detail">
+          {tool && <div className="tool-detail-name">{entry.title}</div>}
+          {command && (
+            <>
+              <h4>命令</h4>
+              <pre>{command}</pre>
+            </>
+          )}
+          {argumentsText && (
+            <>
+              <h4>参数</h4>
+              <pre>{argumentsText}</pre>
+            </>
+          )}
+          {entry.output !== undefined && (
+            <>
+              <h4>输出</h4>
+              <pre>{outputText(entry.output)}</pre>
+            </>
+          )}
+          {entry.content && (
+            <div className="markdown">
+              <MessageMarkdown content={entry.content} />
+            </div>
+          )}
+          {tool && !entry.arguments && entry.output === undefined && (
+            <p className="muted">这条历史记录没有保存调用详情。</p>
+          )}
+          {(entry.truncated || entry.output_truncated) && (
+            <p className="muted">内容较长，当前显示前 64,000 个字符。</p>
+          )}
+        </div>
+      )}
     </details>
   );
-}
+});
 
-function ExecutionProcess({ entries }: { entries: ProcessEntry[] }) {
+function ExecutionProcess({
+  entries,
+  delegations,
+  onFilePreview,
+}: {
+  entries: ProcessEntry[];
+  delegations?: Record<string, Delegation>;
+  onFilePreview: (file: FileReference | { id: string; name: string }) => void;
+}) {
   const [open, setOpen] = useState(true);
   const contentId = useId();
   const tools = new Set(
     entries.filter((entry) => entry.kind === 'tool').map((entry) => entry.tool_call_id || entry.id),
   ).size;
+  const groups = Object.entries(delegations ?? {});
+  const linked = new Set(entries.map((entry) => entry.tool_call_id).filter(Boolean));
   const visible = entries.filter(
     (entry) =>
       !(
@@ -259,15 +281,32 @@ function ExecutionProcess({ entries }: { entries: ProcessEntry[] }) {
         执行过程{tools > 0 && <span>{tools} 次工具调用</span>}
       </button>
       <div id={contentId} className="process-content" hidden={!open}>
-        {visible.map((entry) => (
-          <ExecutionEntry key={entry.id} entry={entry} />
-        ))}
+        {visible.map((entry) => {
+          const group = groups.find(
+            ([, value]) => value.tool_call_id && value.tool_call_id === entry.tool_call_id,
+          );
+          return group ? (
+            <Subagents
+              key={entry.id}
+              identifier={group[0]}
+              group={group[1]}
+              onFilePreview={onFilePreview}
+            />
+          ) : (
+            <ExecutionEntry key={entry.id} entry={entry} />
+          );
+        })}
+        {groups
+          .filter(([, group]) => !group.tool_call_id || !linked.has(group.tool_call_id))
+          .map(([id, group]) => (
+            <Subagents key={id} identifier={id} group={group} onFilePreview={onFilePreview} />
+          ))}
       </div>
     </section>
   );
 }
 
-function MessageView({
+const MessageView = memo(function MessageView({
   message,
   onFilePreview,
 }: {
@@ -281,6 +320,8 @@ function MessageView({
         {message.role === 'user' ? (
           message.source === 'weixin' || message.source === 'dingtalk' ? (
             <ChannelLogo source={message.source} size={20} />
+          ) : message.source === 'delegate' ? (
+            '主代理'
           ) : (
             '你'
           )
@@ -296,9 +337,15 @@ function MessageView({
         )}
         {message.invalidated && <span className="message-tag">已撤销</span>}
       </div>
-      {!!message.process?.length && <ExecutionProcess entries={message.process} />}
+      {(!!message.process?.length || !!Object.keys(message.delegations ?? {}).length) && (
+        <ExecutionProcess
+          entries={message.process ?? []}
+          delegations={message.delegations}
+          onFilePreview={onFilePreview}
+        />
+      )}
       <div className="markdown">
-        <Markdown remarkPlugins={[remarkGfm]}>{message.content}</Markdown>
+        <MessageMarkdown content={message.content} />
       </div>
       {!!message.attachments?.length && (
         <AttachmentChips files={message.attachments} onPreview={onFilePreview} />
@@ -328,35 +375,46 @@ function MessageView({
           ))}
         </div>
       )}
-      {message.role === 'assistant' && !!message.content && (
-        <button
-          className="copy-button"
-          aria-label="复制回复"
-          onClick={async () => {
-            try {
-              await navigator.clipboard.writeText(message.content);
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            } catch {
-              setCopied(false);
-            }
-          }}
-        >
-          {copied ? <Check size={14} /> : <Copy size={14} />}
-          {copied ? '已复制' : '复制'}
-        </button>
+      {(message.role === 'user' || message.role === 'assistant') && (
+        <div className="message-footer">
+          <MessageTime value={message.created_at} />
+          {message.role === 'assistant' && !!message.content && (
+            <button
+              className="copy-button"
+              aria-label="复制回复"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(message.content);
+                  setCopied(true);
+                  setTimeout(() => setCopied(false), 1500);
+                } catch {
+                  setCopied(false);
+                }
+              }}
+            >
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+              {copied ? '已复制' : '复制'}
+            </button>
+          )}
+        </div>
       )}
     </article>
   );
-}
+});
 
 export function Conversation({
   session,
-  onFilePreview = () => {},
+  onFilePreview,
 }: {
   session: Session;
   onFilePreview?: (file: FileReference | { id: string; name: string }) => void;
 }) {
+  const previewCallback = useRef(onFilePreview);
+  previewCallback.current = onFilePreview;
+  const previewFile = useCallback(
+    (file: FileReference | { id: string; name: string }) => previewCallback.current?.(file),
+    [],
+  );
   const scroller = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
@@ -392,7 +450,7 @@ export function Conversation({
             <MessageView
               key={`${session.id}:${message.id}`}
               message={message}
-              onFilePreview={onFilePreview}
+              onFilePreview={previewFile}
             />
           ))}
           {['stopping', 'stopped', 'interrupted', 'paused'].includes(session.status) && (

@@ -982,6 +982,141 @@ header.topbar.management-topbar {
   min-height: 0;
   position: relative;
 }
+.subagents {
+  margin: 6px 0 10px;
+}
+.subagents-label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 0 8px;
+  font-size: 12px;
+  color: var(--text);
+}
+.subagents-label span:last-child {
+  margin-left: 3px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.subagent-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  padding: 10px 11px;
+  margin-bottom: 5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--text);
+  text-align: left;
+}
+.subagent-row:hover {
+  background: #f0f1f3;
+}
+.subagent-row-text {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  flex: 1;
+}
+.subagent-row-title,
+.subagent-row-activity {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-row-title {
+  font-size: 12px;
+  font-weight: 500;
+}
+.subagent-row-activity,
+.subagent-row-status {
+  font-size: 11px;
+  color: var(--muted);
+}
+.subagent-row-status {
+  flex-shrink: 0;
+}
+.subagent-state-icon,
+.subagent-open {
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.subagent-backdrop[hidden] {
+  display: none;
+}
+.modal.subagent-dialog {
+  width: min(850px, calc(100vw - 48px));
+  height: min(760px, calc(100dvh - 64px));
+  max-height: calc(100dvh - 64px);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  overflow: hidden;
+}
+.subagent-dialog .subagent-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 25px 18px;
+  margin: 0;
+  border-bottom: 1px solid var(--border);
+}
+.subagent-heading {
+  min-width: 0;
+}
+.subagent-eyebrow,
+.subagent-meta,
+.subagent-live {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.subagent-dialog .subagent-heading h3 {
+  font-size: 15px;
+  line-height: 1.6;
+  margin: 6px 0 9px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+.subagent-meta {
+  flex-wrap: wrap;
+  gap: 7px 12px;
+}
+.subagent-dialog .message-list {
+  padding: 25px;
+}
+.subagent-notice {
+  margin: 16px 25px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.subagent-live {
+  padding: 12px 25px;
+  border-top: 1px solid var(--border);
+}
+@media (max-width: 640px) {
+  .modal.subagent-dialog {
+    width: calc(100vw - 20px);
+    height: calc(100dvh - 28px);
+    max-height: calc(100dvh - 28px);
+  }
+  .subagent-row-status {
+    display: none;
+  }
+  .subagent-dialog .message-list,
+  .subagent-dialog .subagent-header {
+    padding: 18px;
+  }
+}
 .conversation {
   height: 100%;
   overflow-y: auto;
@@ -999,6 +1134,7 @@ header.topbar.management-topbar {
 }
 .message-identity {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 7px;
   font-size: 12px;
@@ -1012,6 +1148,26 @@ header.topbar.management-topbar {
 .message-identity .brand-wordmark {
   width: 86px;
   height: 12px;
+}
+.message-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin-top: 10px;
+}
+.message-footer:empty {
+  display: none;
+}
+.message > .markdown > :last-child {
+  margin-bottom: 0;
+}
+.message-time {
+  color: #626975;
+  font-size: 11px;
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .mini-mark {
   display: block;

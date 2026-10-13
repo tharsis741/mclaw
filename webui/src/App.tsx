@@ -19,7 +19,14 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
-import { api, ApiError, filesApi, initializeConnection, subscribeSession } from './api';
+import {
+  api,
+  ApiError,
+  filesApi,
+  initializeConnection,
+  subscribeBrowserLaunch,
+  subscribeSession,
+} from './api';
 import { Composer, WorkspaceDialog } from './components/Composer';
 import { Conversation } from './components/Conversation';
 import { Authorization } from './components/Authorization';
@@ -141,6 +148,7 @@ export default function App() {
   }, []);
   useEffect(() => {
     void load();
+    return subscribeBrowserLaunch(() => window.location.reload());
   }, [load]);
   useEffect(() => {
     saveDrafts(drafts);

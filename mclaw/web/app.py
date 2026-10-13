@@ -230,15 +230,23 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
             return
         await websocket.accept()
         last = -1
+        previous = None
+        incremental = websocket.query_params.get("incremental") == "1"
         try:
             while not service.closing:
                 snapshot = service.snapshot(session_id, owner)
                 if snapshot["seq"] != last:
-                    await websocket.send_json({"type": "snapshot", "seq": snapshot["seq"], "session": snapshot})
+                    if incremental and previous is not None:
+                        from mclaw.application.streaming import snapshot_changes
+                        await websocket.send_json({"type": "patch", "base_seq": last, "seq": snapshot["seq"],
+                                                   "changes": snapshot_changes(previous, snapshot)})
+                    else:
+                        await websocket.send_json({"type": "snapshot", "seq": snapshot["seq"], "session": snapshot})
+                    previous = snapshot
                     last = snapshot["seq"]
                 # Receiving also detects disconnected sockets while no events change.
                 try:
-                    message = await asyncio.wait_for(websocket.receive(), timeout=0.15)
+                    message = await asyncio.wait_for(websocket.receive(), timeout=0.05 if incremental else 0.15)
                     if message["type"] == "websocket.disconnect":
                         break
                 except asyncio.TimeoutError:

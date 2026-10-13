@@ -1,4 +1,5 @@
 import { ChevronDown, LoaderCircle, Monitor } from 'lucide-react';
+import { useState } from 'react';
 import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { ProcessEntry } from '../types';
@@ -13,6 +14,7 @@ const STATUS: Record<string, string> = {
 };
 
 export function RemoteExecution({ entry }: { entry: ProcessEntry }) {
+  const [open, setOpen] = useState(false);
   let result: Record<string, unknown> = {};
   try {
     const decoded: unknown = JSON.parse(entry.output || '{}');
@@ -21,8 +23,12 @@ export function RemoteExecution({ entry }: { entry: ProcessEntry }) {
   } catch {
     /* Preserve raw details below. */
   }
+  const reply = entry.result_text ?? result.text;
   return (
-    <details className="execution-entry remote-entry">
+    <details
+      className="execution-entry remote-entry"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
       <summary>
         <ChevronDown size={14} className="entry-chevron" />
         <Monitor size={14} />
@@ -43,9 +49,9 @@ export function RemoteExecution({ entry }: { entry: ProcessEntry }) {
             ))}
           </div>
         )}
-        {typeof result.text === 'string' && (
+        {open && typeof reply === 'string' && (
           <div className="markdown">
-            <Markdown remarkPlugins={[remarkGfm]}>{result.text}</Markdown>
+            <Markdown remarkPlugins={[remarkGfm]}>{reply}</Markdown>
           </div>
         )}
         {entry.input_request && !entry.continued && (

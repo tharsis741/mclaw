@@ -32,6 +32,8 @@ import type {
   DeviceSnapshot,
 } from './types';
 
+import { applySnapshotChanges, type SnapshotChange } from './streaming';
+
 const ROOT = '/api/v1';
 export const devicesApi = {
   status: () => request<DeviceSnapshot>('/devices'),
@@ -62,6 +64,16 @@ export class ApiError extends Error {
 }
 
 let connectionReady: Promise<void> | undefined;
+
+export function subscribeBrowserLaunch(onLaunch: () => void): () => void {
+  // A native browser may reuse this page through a fragment-only navigation.
+  // Reload so a new service credential also replaces existing event connections.
+  const receive = () => {
+    if (new URLSearchParams(window.location.hash.slice(1)).get('token')) onLaunch();
+  };
+  window.addEventListener('hashchange', receive);
+  return () => window.removeEventListener('hashchange', receive);
+}
 
 export function initializeConnection(): Promise<void> {
   if (connectionReady) return connectionReady;
@@ -427,12 +439,14 @@ export function subscribeSession(
   let retry: ReturnType<typeof setTimeout> | undefined;
   let delay = 1000;
   let lastSeq = -1;
+  let snapshot: Session | undefined;
   const connect = () => {
     if (disposed) return;
     const url = new URL(`${ROOT}/sessions/${encodeURIComponent(id)}/events`, window.location.href);
     url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
     url.searchParams.set('token', sessionStorage.getItem(TOKEN_KEY) ?? '');
     url.searchParams.set('client', sessionStorage.getItem(CLIENT_KEY) ?? '');
+    url.searchParams.set('incremental', '1');
     socket = new WebSocket(url);
     socket.onopen = () => {
       delay = 1000;
@@ -440,14 +454,29 @@ export function subscribeSession(
     };
     socket.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data) as SessionEvent;
+        const data = JSON.parse(event.data) as SessionEvent & {
+          base_seq?: number;
+          changes?: SnapshotChange[];
+        };
         // Each reconnect begins from an authoritative snapshot; sequence may reset on restart.
-        if (data.type === 'snapshot') lastSeq = data.seq ?? -1;
-        else if (data.seq !== undefined && data.seq <= lastSeq) return;
-        else lastSeq = data.seq ?? lastSeq;
+        if (data.type === 'snapshot') {
+          lastSeq = data.seq ?? -1;
+          snapshot = data.session;
+        } else if (data.seq !== undefined && data.seq <= lastSeq) return;
+        else if (data.type === 'patch') {
+          if (!snapshot || data.base_seq !== lastSeq || !Array.isArray(data.changes)) {
+            socket?.close();
+            return;
+          }
+          snapshot = applySnapshotChanges(snapshot, data.changes);
+          lastSeq = data.seq ?? lastSeq;
+          onEvent({ type: 'snapshot', seq: lastSeq, session: snapshot });
+          return;
+        } else lastSeq = data.seq ?? lastSeq;
         onEvent(data);
       } catch {
-        /* A malformed event never replaces the last valid session snapshot. */
+        // Reconnect from the authoritative snapshot if a patch could not be applied.
+        socket?.close();
       }
     };
     socket.onerror = () => socket?.close();

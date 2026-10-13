@@ -118,3 +118,17 @@ def test_websocket_requires_authentication(web):
     with pytest.raises(WebSocketDisconnect):
         with web.websocket_connect(f"ws://127.0.0.1/api/v1/sessions/{sid}/events?client=window-a"):
             pass
+
+
+def test_incremental_websocket_updates_and_reconnect_starts_with_full_snapshot(web):
+    sid = web.post("/api/v1/sessions", json={}).json()["id"]
+    url = f"ws://127.0.0.1/api/v1/sessions/{sid}/events?token=test-connection-token&client=window-a&incremental=1"
+    with web.websocket_connect(url) as ws:
+        first = ws.receive_json()
+        assert first["type"] == "snapshot"
+        web.patch(f"/api/v1/sessions/{sid}", json={"draft": "新的草稿"})
+        change = ws.receive_json()
+        assert change["type"] == "patch" and change["base_seq"] == first["seq"]
+        assert any(item["path"] == ["draft"] and item["value"] == "新的草稿" for item in change["changes"])
+    with web.websocket_connect(url) as ws:
+        assert ws.receive_json()["session"]["draft"] == "新的草稿"

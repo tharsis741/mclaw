@@ -8,8 +8,20 @@ from copy import deepcopy
 import pytest
 
 from mclaw.application.process_events import history_messages, history_process, tool_status, upgrade_process
+from mclaw.application.process_events import agent_events
 from mclaw.application.sessions import SessionService
 from mclaw.application.worker import SessionWorker
+
+
+def test_remote_reply_body_is_complete_and_redacted_separately_from_technical_details():
+    text = '远程正文\n' * 35000 + 'test-secret END'
+    entry = agent_events({'type': 'remote.task', 'id': 'remote', 'kind': 'remote',
+                          'output': {'text': text, 'success': True, 'api_key': 'another-secret'}},
+                         'run', {'test-secret'})[0]
+    assert entry['result_text'].endswith('<redacted> END')
+    assert entry['result_text'].count('远程正文') == 35000
+    assert '远程正文' not in entry['output']
+    assert json.loads(entry['output'])['api_key'] == '<redacted>'
 
 
 def test_worker_records_streamed_reasoning_and_one_tool_with_arguments_and_result(tmp_path, monkeypatch):

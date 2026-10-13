@@ -211,6 +211,8 @@ class ProcessRunner:
         run_id = str((task.get("attempts") or [{}])[-1].get("id") or uuid.uuid4().hex)
         native_runtime = None
         local_turn = str(uuid.uuid4())
+        from mclaw.application.streaming import EventBatcher
+        batcher = EventBatcher(emit)
         try:
             self._device_cancel = threading.Event()
             from mclaw.application.collaboration import selected_scope
@@ -228,6 +230,7 @@ class ProcessRunner:
                 event = await self._output.get()
                 kind = event.get("type")
                 if kind in {"eof", "protocol_error"}:
+                    batcher.flush()
                     self._cancel_device_calls()
                     if kind == "protocol_error":
                         self.send({"type": "shutdown"})
@@ -237,28 +240,34 @@ class ProcessRunner:
                 if event.get("run_id") != run_id:
                     continue
                 if kind == "result":
+                    batcher.flush()
                     await self._drain_requests()
                     return event.get("result") or {"completed": False, "error": "执行器未返回结果"}
                 if kind == "request" and (event.get("request") or {}).get("kind") == "channel_outbound":
+                    batcher.flush()
                     self._requests.add(asyncio.create_task(self._channel_request(event["request"])))
                     continue
                 if kind == "request" and (event.get("request") or {}).get("kind") == "device_rpc":
+                    batcher.flush()
                     self._requests.add(asyncio.create_task(self._device_request(event["request"])))
                     continue
                 if kind == "device_cancel":
                     self._device_cancels.setdefault(event["request_id"], threading.Event()).set()
                     continue
-                emit({key: value for key, value in event.items() if key != "run_id"})
+                batcher.push({key: value for key, value in event.items() if key != "run_id"})
         except asyncio.CancelledError:
             self.send({"type": "stop"})
             await self.close()
             raise
         finally:
             try:
-                if native_runtime is not None:
-                    native_runtime.local_turn_finished(local_turn)
+                batcher.flush()
             finally:
-                self._running = False
+                try:
+                    if native_runtime is not None:
+                        native_runtime.local_turn_finished(local_turn)
+                finally:
+                    self._running = False
 
     async def control(self, request: dict) -> dict:
         """Execute recovery on the same worker after its task workers drained."""

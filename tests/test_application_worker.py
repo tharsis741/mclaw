@@ -276,7 +276,7 @@ async def test_real_worker_stream_history_model_change_and_trust(local_provider,
     events = []
     approve = False
     def emit(event):
-        events.append(event)
+        events.extend(event["events"] if event.get("type") == "batch" else [event])
         if event.get("type") == "request":
             assert event["request"]["kind"] == "workspace"
             runner.send({"type": "reply", "request_id": event["request"]["id"], "value": approve})
@@ -492,3 +492,10 @@ async def test_real_worker_attachment_paths_are_persisted_once_on_continuation(l
     rows = [row for row in db.get_messages("file-stream-test") if row.get("operation_id") == "task:task-one"]
     assert len(rows) == 1 and "材料.txt" in rows[0]["content"]
     db.close()
+    log_paths = list((home / "logs" / "sessions").glob("*.log"))
+    assert len(log_paths) == 1
+    diagnostics = log_paths[0].read_text(encoding="utf-8")
+    assert "session=file-stream-test" in diagnostics
+    assert diagnostics.count("[MODEL REQUEST]") == len(requests)
+    assert "[MODEL RESPONSE]" in diagnostics and "[WORKER] stopped" in diagnostics
+    assert "local-test-credential" not in diagnostics and "[Attached files]" not in diagnostics

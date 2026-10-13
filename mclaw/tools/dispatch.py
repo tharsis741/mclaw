@@ -1251,6 +1251,7 @@ def _run_tool_worker(
     forbidden_tool_names: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Run one tool into a private slot that the dispatcher snapshots once."""
+    result_slot["started_at"] = time.monotonic()
     token = set_interrupt_event(cancel_event) if cancel_event is not None else None
     try:
         if cancel_event is not None and cancel_event.is_set():
@@ -1436,6 +1437,20 @@ def _skipped_after_unknown_result(tool_name: str) -> str:
     )
 
 
+def _record_tool_timings(calls: list, slots: dict[int, dict], timings: dict[str, int] | None) -> None:
+    """Snapshot individual worker lifetimes, excluding queue and sibling wait time."""
+    if timings is None:
+        return
+    observed_at = time.monotonic()
+    for index, call in enumerate(calls):
+        slot = slots.get(index, {})
+        started = slot.get("started_at")
+        finished = slot.get("finished_at")
+        timings[call["id"]] = 0 if started is None else max(
+            0, round(((finished if finished is not None else observed_at) - started) * 1000)
+        )
+
+
 def handle_function_calls(
     calls: list,
     tool_names: set,
@@ -1444,6 +1459,7 @@ def handle_function_calls(
     parent_agent: Any = None,
     cancel_event: threading.Event | None = None,
     call_source: str = "turn",
+    timings: dict[str, int] | None = None,
 ) -> list:
     """Dispatch a batch of tool calls with turn cancellation and time bounds."""
     if not calls:
@@ -1457,6 +1473,7 @@ def handle_function_calls(
         else None
     )
     use_concurrent = _should_parallelize_tool_batch(calls)
+    slots: dict[int, dict] = {}
 
     if use_concurrent:
         tool_call_names = [c.get("function", {}).get("name", "?") for c in calls]
@@ -1471,6 +1488,7 @@ def handle_function_calls(
             tool_name = tool_call_names[idx]
             tool_timeout = _concurrent_tool_timeout(tool_name, parent_agent)
             result_slot = {"result": None, "finished_at": None}
+            slots[idx] = result_slot
             ctx = copy_context()
             thread = threading.Thread(
                 target=ctx.run,
@@ -1624,6 +1642,7 @@ def handle_function_calls(
                 )
 
         logger.info("[TOOL CONCURRENT END]")
+        _record_tool_timings(calls, slots, timings)
         return results
 
     results = []
@@ -1642,6 +1661,7 @@ def handle_function_calls(
 
         logger.debug("Serial tool %d/%d: %s", idx + 1, len(calls), tool_name)
         result_slot = {"result": None, "finished_at": None}
+        slots[idx] = result_slot
         ctx = copy_context()
         thread = threading.Thread(
             target=ctx.run,
@@ -1773,4 +1793,5 @@ def handle_function_calls(
             for pending in calls[idx + 1:]
         )
         break
+    _record_tool_timings(calls, slots, timings)
     return results
