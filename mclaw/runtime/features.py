@@ -73,6 +73,7 @@ _TOOL_TO_FEATURE = {
     "dsoftbus_get_device_context": "dsoftbus",
     "dsoftbus_run_agent_task": "dsoftbus",
     "dsoftbus_continue_agent_task": "dsoftbus",
+    "dsoftbus_read_task_result": "dsoftbus",
 }
 
 _TOOLSET_TO_FEATURE = {

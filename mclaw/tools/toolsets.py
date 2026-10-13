@@ -47,6 +47,7 @@ DSOFTBUS_TOOLS = [
     "dsoftbus_get_device_context",
     "dsoftbus_run_agent_task",
     "dsoftbus_continue_agent_task",
+    "dsoftbus_read_task_result",
 ]
 DSOFTBUS_ARTIFACT_TOOLS = ["return_artifact"]
 DSOFTBUS_TASK_CONTROL_TOOLS = ["request_task_input"]

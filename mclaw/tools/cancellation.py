@@ -31,6 +31,7 @@ from types import MappingProxyType
 
 ATOMIC_LOCAL_TOOLS = frozenset(
     {
+        "dsoftbus_read_task_result",
         "delete_file",
         "edit_file",
         "list_directory",

@@ -66,6 +66,8 @@ def import_receipts(home: Path, session_id: str, device_id: str, name: str, resu
     root = default_workspace_root(home / "dsoftbus")
     store = FileService(home)
     for receipt in result.get("artifacts", []):
+        if receipt.get("artifactRole") == "final-response":
+            continue
         try:
             artifact_id = str(uuid.UUID(receipt["artifactId"]))
             directory = root / "artifacts" / "received" / peer_directory(device_id) / task_id / artifact_id

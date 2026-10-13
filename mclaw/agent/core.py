@@ -28,6 +28,7 @@ from mclaw.agent.memory_manager import MemoryManager
 from mclaw.agent.prompt_cache import build_prompt_cache_plan
 from mclaw.agent.prompt_builder import build_system_prompt
 from mclaw.agent.retry_utils import jittered_backoff
+from mclaw.agent.remote_results import READ_RESULT_TOOL, REMOTE_TASK_TOOLS, project_history, project_reply
 from mclaw.agent.token_budget import estimate_request_budget
 from mclaw.agent.transports.base import (
     ModelCallError,
@@ -38,10 +39,10 @@ from mclaw.agent.transports.base import (
 )
 from mclaw.agent.transports.factory import create_transport
 from mclaw.agent.usage import UsageRecord
+from mclaw.dsoftbus.agent_message import remote_model_accumulator_limit
 from mclaw.dsoftbus.protocol import (
     MODEL_STREAM_QUEUE_BYTES_MAX,
     MODEL_STREAM_QUEUE_MAX,
-    REMOTE_MODEL_ACCUMULATOR_BYTES_MAX,
     REMOTE_MODEL_MAX_OUTPUT_TOKENS,
 )
 from mclaw.prompts.background import build_memory_flush_system_prompt
@@ -58,6 +59,7 @@ _DSOFTBUS_REMOTE_DATA_TOOLS = frozenset(
         "dsoftbus_list_peers",
         "dsoftbus_run_agent_task",
         "dsoftbus_continue_agent_task",
+        "dsoftbus_read_task_result",
     }
 )
 _DSOFTBUS_TASK_INPUT_TOOL = "request_task_input"
@@ -1851,6 +1853,8 @@ class MClaw:
         dynamic_system_context = "\n\n".join(
             part for part in (extra_system, self._recalled_memory) if part
         )
+        if READ_RESULT_TOOL in self.valid_tool_names and not disable_tools and call_source != "dsoftbus":
+            messages = project_history(self, messages)
         cache_enabled = bool(
             self.config.get("prompt_cache", {}).get("enabled", True)
         )
@@ -2200,7 +2204,7 @@ class MClaw:
                             ),
                             deadline_monotonic=deadline_monotonic,
                             response_utf8_max_bytes=(
-                                REMOTE_MODEL_ACCUMULATOR_BYTES_MAX
+                                remote_model_accumulator_limit()
                                 if call_source == "dsoftbus"
                                 else None
                             ),
@@ -2215,7 +2219,7 @@ class MClaw:
                                 else None
                             ),
                             stream_accumulator_max_bytes=(
-                                REMOTE_MODEL_ACCUMULATOR_BYTES_MAX
+                                remote_model_accumulator_limit()
                                 if call_source == "dsoftbus"
                                 else None
                             ),
@@ -2955,14 +2959,15 @@ class MClaw:
             result = results[i] if i < len(results) else json.dumps(
                 {"error": "No result returned"}
             )
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": result,
-            })
-
             fn = tc.get("function", {})
             name = fn.get("name", "")
+            projection = project_reply(self, result, tc["id"], messages) if name in REMOTE_TASK_TOOLS else result
+            tool_row = {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": projection,
+            }
+            messages.append(tool_row)
             if tc["id"] in advertised_tool_ids:
                 logger.info("[TOOL FINISHED] agent=%s call=%s name=%s elapsed_ms=%s",
                             self.session_id, tc["id"], name, tool_timings.get(tc["id"]))

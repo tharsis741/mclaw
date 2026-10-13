@@ -53,7 +53,7 @@ _RFC3339_UTC = re.compile(
     r"[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z$"
 )
 _MAX_INT32 = 2**31 - 1
-_MAX_MESSAGE_TEXT_BYTES = 24_576
+_MAX_MESSAGE_TEXT_BYTES = protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX
 _TERMINAL_TASK_STATES = frozenset(
     {
         "TASK_STATE_COMPLETED",
@@ -1480,7 +1480,7 @@ def validate_core_method(method: str, params: Any) -> CoreMethodCall | Mapping[s
             combined,
             "message text",
             minimum=0 if continuation else 1,
-            maximum=24_576,
+            maximum=protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX,
         )
         if continuation and not combined and not task_inputs_seen:
             _fail("INVALID_PARAMS")

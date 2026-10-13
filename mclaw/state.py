@@ -1392,6 +1392,16 @@ class SessionDB:
             result.append(msg)
         return result
 
+    def get_tool_result(self, session_id: str, tool_call_id: str) -> dict | None:
+        """Read one active result within the owning session, without loading its history."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, tool_name FROM messages WHERE session_id = ? AND role = 'tool' "
+                "AND tool_call_id = ? AND invalidated_at IS NULL ORDER BY id DESC LIMIT 1",
+                (session_id, tool_call_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
     def get_pending_tool_call_ids(self, session_id: str) -> set[str]:
         """Recover the newest tool batch not followed by a persisted model reply.
 

@@ -11,12 +11,23 @@ import copy
 import hashlib
 import json
 from collections.abc import Awaitable, Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
 
 from . import protocol
+
+
+_REMOTE_REPLY_LIMIT: ContextVar[int] = ContextVar(
+    "mclaw_remote_reply_limit", default=protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX,
+)
+
+
+def remote_model_accumulator_limit() -> int:
+    """Leave bounded room for reasoning/tool metadata alongside a negotiated reply."""
+    return max(protocol.REMOTE_MODEL_ACCUMULATOR_BYTES_MAX, _REMOTE_REPLY_LIMIT.get() + 32_768)
 
 
 def _plain(value: Any) -> Any:
@@ -211,6 +222,7 @@ class RemoteTurnRequest:
     attachments: tuple[Any, ...] = ()
     source_client: Any | None = None
     event_sink: Callable[[Mapping[str, Any]], Awaitable[None]] | None = None
+    reply_bytes_max: int = protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX
 
     @property
     def execution_session_id(self) -> str:
@@ -384,6 +396,7 @@ class AgentRunnerTurnExecutor:
                 loop=asyncio.get_running_loop(),
                 callback=_stream_event,
             )
+        reply_limit_token = _REMOTE_REPLY_LIMIT.set(min(request.reply_bytes_max, protocol.REMOTE_TEXT_RESULT_BYTES_MAX))
         try:
             result = await self._runner.handle_message(
                 message=message,
@@ -396,6 +409,7 @@ class AgentRunnerTurnExecutor:
                 workspace_path=request.workspace_path or None,
             )
         finally:
+            _REMOTE_REPLY_LIMIT.reset(reply_limit_token)
             try:
                 if event_sink is not None:
                     try:

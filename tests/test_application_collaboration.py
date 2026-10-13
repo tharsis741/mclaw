@@ -177,6 +177,12 @@ def test_verified_remote_file_is_previewable_session_bound_and_replay_safe(tmp_p
         store.preview("s-b", item["id"])
 
 
+def test_internal_reply_receipt_is_not_imported_as_a_user_file(tmp_path, monkeypatch):
+    _path, result = receipt_fixture(tmp_path, monkeypatch)
+    result['artifacts'][0]['artifactRole'] = 'final-response'
+    assert import_receipts(tmp_path / 'home', 's-a', A, '电脑 A', result) == ([], [])
+
+
 @pytest.mark.parametrize("change", ["path", "hash", "size", "peer"])
 def test_remote_receipt_rejects_wrong_path_peer_or_changed_content(tmp_path, monkeypatch, change):
     path, result = receipt_fixture(tmp_path, monkeypatch)

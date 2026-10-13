@@ -45,10 +45,10 @@ def test_cancellation_contract_exactly_covers_all_registered_tools() -> None:
     registered_tools = set(registry._tools)
     declared_tools = set(CANCELLATION_STRATEGY_BY_TOOL)
 
-    assert len(toolset_tools) == 51
+    assert len(toolset_tools) == 52
     assert registered_tools == toolset_tools
     assert declared_tools == toolset_tools
-    assert len(ATOMIC_LOCAL_TOOLS) == 15
+    assert len(ATOMIC_LOCAL_TOOLS) == 16
     assert len(COOPERATIVE_TOOLS) == 4
     assert len(ASYNC_OR_FENCED_TOOLS) == 32
     assert ATOMIC_LOCAL_TOOLS.isdisjoint(COOPERATIVE_TOOLS)
@@ -58,6 +58,7 @@ def test_cancellation_contract_exactly_covers_all_registered_tools() -> None:
         CANCELLATION_STRATEGY_BY_TOOL.values()
     )
     assert cancellation_strategy("read_file") == "atomic-local"
+    assert cancellation_strategy("dsoftbus_read_task_result") == "atomic-local"
     assert cancellation_strategy("session_search") == "cooperative"
     assert cancellation_strategy("secret_request_many") == "async-or-fenced"
 
