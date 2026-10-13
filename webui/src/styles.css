@@ -3685,6 +3685,19 @@ kbd {
 .detail-drawer.file-preview {
   width: min(800px, 100vw);
 }
+.file-preview-backdrop {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  color: inherit;
+}
+.file-preview-backdrop::backdrop {
+  background: transparent;
+}
 .file-content {
   overflow: auto;
   white-space: pre-wrap;

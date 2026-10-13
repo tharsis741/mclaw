@@ -170,6 +170,14 @@ def _append_feature_checks(results: list[CheckResult], cfg: dict | None) -> None
         display = getattr(spec, "display_name", "") or getattr(spec, "name", "")
         required_for = getattr(spec, "required_for", "")
         enabled = _feature_enabled(cfg, spec)
+        if spec.name == "vision_analyze":
+            from mclaw.tools.vision.credentials import diagnose_vision_credentials
+
+            diagnosis = diagnose_vision_credentials(cfg)
+            results.append(CheckResult(f"feature {display}", not enabled or diagnosis["available"],
+                                       diagnosis["reason"] if enabled else "not enabled; optional",
+                                       diagnosis.get("fix", "") if enabled and not diagnosis["available"] else ""))
+            continue
         configured = configured_env_vars(spec, get_env_value)
         if not enabled and getattr(spec, "name", "") == "asr" and configured:
             inbound_mode = _config_path_value(

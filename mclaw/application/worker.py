@@ -318,11 +318,9 @@ class SessionWorker:
         for item in pending:
             cancellation_checkpoint(self.cancel)
             identifier = item["id"]
-            if item.get("attachments") and "supplement:" + identifier not in self._applied:
-                from mclaw.application.files import FileService
-                item = {**item, "attachments": FileService(self.home).task_inputs(self.session["id"], item["attachments"])}
             apply_pending_supplement(
                 self.db, self.session["id"], messages, turn_id, item, self._applied,
+                parent_agent=self.agent, cancel_event=self.cancel,
             )
             with self._condition:
                 self._supplements.pop(identifier, None)
@@ -381,10 +379,13 @@ class SessionWorker:
 
     def execute(self, task: dict, cancel: threading.Event) -> dict:
         from mclaw.application.files import FileService, attachment_context
+        from mclaw.application.process_events import public_detail
+        from mclaw.application.sessions import ApplicationError
         from mclaw.cli.config import ConfigError
         from mclaw.providers.resolver import ProviderResolutionError
         from mclaw.tools.cancellation import cancellation_checkpoint
         from mclaw.tools.dispatch import reset_current_task_id, set_current_task_id
+        from mclaw.tools.vision.types import VisionInputError
 
         token = set_current_task_id(str(task.get("id") or ""))
         self._current_task = task
@@ -409,6 +410,8 @@ class SessionWorker:
                 before_model_callback=self._apply_supplements,
                 input_operation_id=None if continuing else input_operation_id,
                 extra_system=str((task.get("execution") or {}).get("extra_system") or ""),
+                **({"image_paths": [item["path"] for item in attachments if str(item.get("mime_type", "")).startswith("image/")]}
+                   if any(str(item.get("mime_type", "")).startswith("image/") for item in attachments) else {}),
             )
             while result.get("pending_skill_import_confirmation"):
                 self._drain_tools()
@@ -447,6 +450,9 @@ class SessionWorker:
             return {"completed": False, "error": "配置文件无法加载，请检查设置", "settings_required": True}
         except PermissionError:
             return {"completed": False, "error": "工作目录尚未获得信任，任务已保留"}
+        except (ApplicationError, VisionInputError) as exc:
+            return {"completed": False, "error": public_detail(str(exc), self._secret_values),
+                    "error_code": exc.code}
         except Exception:
             logging.getLogger(__name__).exception("[WORKER] task failed")
             return {"completed": False, "error": "任务执行失败，请检查执行过程并核对已知结果"}

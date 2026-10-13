@@ -1,8 +1,11 @@
-import { render, screen } from '@testing-library/react';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Composer } from './Composer';
-import type { Session } from '../types';
+import { filesApi } from '../api';
+import type { FileReference, Session } from '../types';
+
+afterEach(() => vi.restoreAllMocks());
 
 const makeSession = (status: Session['status']): Session => ({
   id: 's1',
@@ -28,6 +31,73 @@ const props = {
   disabled: false,
 };
 describe('composer interaction', () => {
+  it('retains every file from a batch upload when editing a queued message', async () => {
+    const upload = vi.spyOn(filesApi, 'upload').mockImplementation(
+      async (_id, file) =>
+        ({
+          id: file.name,
+          name: file.name,
+          mime_type: file.type,
+          size: file.size,
+          source: 'upload',
+        }) as FileReference,
+    );
+    const onQueue = vi.fn().mockResolvedValue(undefined);
+    render(
+      <Composer
+        {...props}
+        onQueue={onQueue}
+        session={{
+          ...makeSession('running'),
+          queue: [{ id: 'q1', content: 'Read both files' }],
+        }}
+      />,
+    );
+    await userEvent.click(screen.getByRole('button', { name: /1 条排队消息/ }));
+    await userEvent.click(screen.getByRole('button', { name: '添加附件' }));
+    await userEvent.upload(await screen.findByLabelText('选择上传文件'), [
+      new File(['first'], 'first.png', { type: 'image/png' }),
+      new File(['second'], 'second.txt', { type: 'text/plain' }),
+    ]);
+    expect(upload).toHaveBeenCalledTimes(2);
+    await userEvent.click(screen.getByRole('button', { name: '保存队列' }));
+    expect(onQueue.mock.calls[0][0][0].attachment_ids).toEqual(['first.png', 'second.txt']);
+    expect(onQueue.mock.calls[0][0][0].attachments).toHaveLength(2);
+  });
+  it('does not apply a queued attachment upload to a different session', async () => {
+    let finish!: (file: FileReference) => void;
+    vi.spyOn(filesApi, 'upload').mockReturnValue(
+      new Promise((resolve) => {
+        finish = resolve;
+      }),
+    );
+    const first = { ...makeSession('running'), queue: [{ id: 'q1', content: 'First task' }] };
+    const onQueue = vi.fn().mockResolvedValue(undefined);
+    const view = render(<Composer {...props} onQueue={onQueue} session={first} />);
+    await userEvent.click(screen.getByRole('button', { name: /1 条排队消息/ }));
+    await userEvent.click(screen.getByRole('button', { name: '添加附件' }));
+    await userEvent.upload(
+      await screen.findByLabelText('选择上传文件'),
+      new File(['notes'], 'notes.txt'),
+    );
+    view.rerender(
+      <Composer
+        {...props}
+        onQueue={onQueue}
+        session={{
+          ...first,
+          id: 's2',
+          queue: [{ id: 'q2', content: 'Second task' }],
+        }}
+      />,
+    );
+    await act(async () =>
+      finish({ id: 'old-file', name: 'notes.txt', mime_type: 'text/plain' } as FileReference),
+    );
+    await userEvent.click(screen.getByRole('button', { name: /1 条排队消息/ }));
+    expect(screen.getByRole('textbox', { name: '排队消息 1' })).toHaveValue('Second task');
+    expect(screen.queryByText('notes.txt')).not.toBeInTheDocument();
+  });
   it('searches the model menu without sending or replacing the draft', async () => {
     const onModel = vi.fn();
     const onSend = vi.fn();

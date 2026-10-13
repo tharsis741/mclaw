@@ -35,6 +35,8 @@ _DEFAULT_CONTEXT_LIMIT_MARKERS = (
     "entity too large",
 )
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+[^\s,;\}\]]+")
+_IMAGE_DATA_RE = re.compile(r"(data:image/[a-z0-9.+-]+;base64,)[a-z0-9+/=]+", re.IGNORECASE)
+_BASE64_DATA_RE = re.compile(r"([\"']data[\"']\s*:\s*)([\"'])[a-z0-9+/=]{64,}\2", re.IGNORECASE)
 _SECRET_NAME = (
     r"(?:authorization|proxy-authorization|x-api-key|api[_-]?key|apikey|"
     r"access[_-]?token|token|client[_-]?secret|password|secret)"
@@ -464,6 +466,8 @@ def _redact_error_message(message: str, api_key: str) -> str:
     if api_key:
         redacted = redacted.replace(api_key, "<redacted>")
     redacted = _BEARER_RE.sub("Bearer <redacted>", redacted)
+    redacted = _IMAGE_DATA_RE.sub(r"\1<redacted>", redacted)
+    redacted = _BASE64_DATA_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}<redacted>{match.group(2)}", redacted)
     redacted = _QUOTED_SECRET_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}{match.group(2)}<redacted>{match.group(2)}",
         redacted,

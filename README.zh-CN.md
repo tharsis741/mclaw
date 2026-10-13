@@ -142,7 +142,7 @@
 | 工具集 | 工具 | 能力 |
 | --- | --- | --- |
 | web | `web_search`, `web_extract` | 搜索互联网并返回答案与来源；提取指定网页的正文。 |
-| vision | `vision_analyze` | 使用 Qwen 视觉模型分析 URL 或本地图片。 |
+| vision | `vision_analyze` | 使用当前模型或专用视觉模型分析图片，以 models.dev 判断图片输入能力。 |
 | browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download`, `browser_tabs`, `browser_select`, `browser_check`, `browser_hover`, `browser_upload`, `browser_handle_dialog`, `browser_wait_for`, `browser_back` | 页面与标签页交互、表单、上传下载、弹窗响应、条件等待和截图。 |
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
 | dingtalk | `dingtalk_send_file` | 在当前钉钉会话中发送文件。 |

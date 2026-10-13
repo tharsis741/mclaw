@@ -2,132 +2,86 @@
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Credential resolution for the built-in Qwen vision provider."""
+"""Resolve independent vision targets through the shared provider registry."""
 
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
-from mclaw.cli.config import ConfigError
+from mclaw.providers.capabilities import resolve_image_capability
 from mclaw.providers.normalization import normalize_provider_key
-from mclaw.providers.registry import get_runtime_profile
+from mclaw.providers.registry import PROVIDER_REGISTRY
+from mclaw.providers.resolver import resolve_provider_runtime_context
 from mclaw.tools.vision.config import (
-    DEFAULT_PROVIDER,
-    QWEN_DEFAULT_MODEL,
-    VISION_REQUIRED_FOR,
-    authorized_env_value,
-    env_value,
-    vision_config,
+    DEFAULT_PROVIDER, QWEN_DEFAULT_MODEL, VISION_REQUIRED_FOR,
+    authorized_env_value, effective_config, env_value, resolve_mode, vision_config,
 )
 from mclaw.tools.vision.types import VisionCredentials
 
-_QWEN_PROVIDER_KEYS = {"qwen", "qwen-intl"}
-
-
-def _is_qwen_model(model: str) -> bool:
-    """Return whether a model name belongs to the supported Qwen family."""
-    return str(model or "").strip().lower().startswith("qwen")
-
-
-def _is_qwen_target(provider: str, base_url: str, model: str) -> bool:
-    """Infer Qwen compatibility from provider hint, base URL, or model name."""
-    provider_hint = str(provider or "").strip().lower()
-    return (
-        normalize_provider_key(provider_hint) in _QWEN_PROVIDER_KEYS
-        or "dashscope" in str(base_url or "").lower()
-        or _is_qwen_model(model)
-    )
-
-
-def _qwen_profile(provider: str, base_url: str):
-    """Select the canonical regional Qwen metadata for this tool target."""
-    endpoint = str(base_url or "").lower()
-    if "dashscope-intl" in endpoint:
-        return get_runtime_profile("qwen-intl")
-    if "dashscope.aliyuncs.com" in endpoint:
-        return get_runtime_profile("qwen")
-    normalized = normalize_provider_key(str(provider or "").strip())
-    return get_runtime_profile(normalized if normalized in _QWEN_PROVIDER_KEYS else DEFAULT_PROVIDER)
-
-
-def _unsupported_reason(provider: str, base_url: str, model: str) -> str:
-    """Explain unsupported provider/model combinations without probing secrets."""
-    provider_hint = str(provider or "").strip().lower()
-    if provider_hint not in {"", "auto"} and not _is_qwen_target(provider, base_url, model):
-        return (
-            f"vision provider '{provider_hint}' is not supported. "
-            "Configure auxiliary.vision.provider as qwen or dashscope."
-        )
-    if model and not _is_qwen_model(model) and not _is_qwen_target(provider, base_url, model):
-        return (
-            f"vision model '{model}' is outside the supported Qwen vision configuration. "
-            "Configure a Qwen vision model for auxiliary.vision.model."
-        )
-    return ""
-
 
 def resolve_vision_credentials(parent_agent: Any = None, config: dict | None = None) -> VisionCredentials:
-    """Resolve credentials for the currently supported vision provider.
-
-    M-Claw enables Qwen vision through DashScope-compatible credentials. The
-    provider field keeps client selection separate from tool orchestration.
-    """
-    cfg = vision_config(parent_agent=parent_agent, config=config)
-    provider_hint = str(cfg.get("provider") or "auto").strip().lower()
-    base_url_hint = str(cfg.get("base_url") or "").strip()
-    model_hint = str(cfg.get("model") or "").strip()
-
-    unsupported = _unsupported_reason(provider_hint, base_url_hint, model_hint)
-    if unsupported:
-        return VisionCredentials(
-            provider=provider_hint or "unsupported",
-            api_key="",
-            base_url=base_url_hint,
-            model=model_hint,
-            unsupported_reason=unsupported,
+    config = effective_config(parent_agent, config)
+    cfg = vision_config(config=config)
+    provider = str(cfg.get("provider") or DEFAULT_PROVIDER).strip()
+    if provider == "auto":
+        provider = DEFAULT_PROVIDER
+    provider = normalize_provider_key(provider, config.get("providers", {}))
+    endpoint = str(cfg.get("base_url") or "").strip()
+    if provider in {"qwen", "qwen-intl"} and "dashscope-intl" in endpoint:
+        provider = "qwen-intl"
+    profile = PROVIDER_REGISTRY.get(provider)
+    if profile and not endpoint:
+        endpoint = env_value(profile.base_url_env_var, profile.base_url) if profile.base_url_env_var else profile.base_url
+    model = str(cfg.get("model") or (QWEN_DEFAULT_MODEL if provider in {"qwen", "qwen-intl"} else "")).strip()
+    try:
+        if not model:
+            raise ValueError("Configure a dedicated vision model name.")
+        # Resolve metadata without borrowing an unrelated or unauthorized credential.
+        runtime = resolve_provider_runtime_context(
+            provider=provider, model=model, base_url=endpoint,
+            api_key="vision-metadata-only", config=config, reasoning_config={"enabled": False},
         )
-
-    profile = _qwen_profile(provider_hint, base_url_hint)
-    selected = cfg.get("credential_env")
-    names = [selected] if selected in profile.env_vars else profile.env_vars
-    env_var, api_key = next(
-        ((name, value) for name in names if (value := authorized_env_value(name))),
-        ("", ""),
-    )
-    base_url = base_url_hint or env_value(profile.base_url_env_var, profile.base_url)
-    model = model_hint or QWEN_DEFAULT_MODEL
-
-    return VisionCredentials(
-        provider=profile.name,
-        api_key=api_key,
-        base_url=base_url,
-        model=model,
-        env_var=env_var,
-    )
+        selected = cfg.get("credential_env")
+        names = runtime.profile.env_vars
+        if selected:
+            if selected not in names:
+                raise ValueError("The selected credential is not declared by this vision provider.")
+            names = (selected,)
+        env_var, key = next(((name, value) for name in names if (value := authorized_env_value(name))), ("", ""))
+        runtime = replace(runtime, api_key=key, auth_source=env_var)
+        capability = resolve_image_capability(
+            runtime, config, image_input=cfg.get("image_input", "auto"),
+            catalog_provider=cfg.get("catalog_provider", ""), catalog_model=cfg.get("catalog_model", ""),
+        )
+        reason = capability.reason if capability.state == "unsupported" else ""
+        return VisionCredentials(runtime.provider, key, runtime.base_url, runtime.model, env_var, reason, runtime)
+    except (ValueError, TypeError) as exc:
+        return VisionCredentials(provider, "", endpoint, model, unsupported_reason=str(exc))
 
 
 def diagnose_vision_credentials(config: dict | None = None) -> dict:
-    """Return availability diagnostics without exposing credential values."""
+    """Return a route diagnosis without exposing secrets or making model calls."""
     try:
-        creds = resolve_vision_credentials(config=config)
-    except ConfigError as exc:
-        return {
-            "available": False,
-            "reason": f"vision config check failed: {type(exc).__name__}: {exc}",
-            "fix": "Check auxiliary.vision config.",
-        }
-    if creds.unsupported_reason:
-        return {
-            "available": False,
-            "reason": creds.unsupported_reason,
-            "fix": "Configure auxiliary.vision.provider as qwen or auto, then authorize a registry-declared Qwen key.",
-        }
-    if creds.api_key:
-        return {"available": True, "reason": "Qwen vision key found in environment", "fix": ""}
-    profile = get_runtime_profile(creds.provider if creds.provider in _QWEN_PROVIDER_KEYS else DEFAULT_PROVIDER)
-    credential_names = "/".join(profile.env_vars)
-    return {
-        "available": False,
-        "reason": f"{profile.display_name} key is missing or not authorized ({credential_names})",
-        "fix": f"Call secret_request_many(required_for='{VISION_REQUIRED_FOR}', ...) or rerun setup.",
-    }
+        config = effective_config(config=config)
+        mode = resolve_mode(config=config)
+        from mclaw.tools.vision.routing import choose_vision_route
+
+        main = None
+        if mode != "auxiliary":
+            try:
+                main = resolve_provider_runtime_context(config=config)
+            except ValueError:
+                pass
+        native, creds = choose_vision_route(SimpleNamespace(config=config, provider_runtime=main))
+        if native:
+            capability = resolve_image_capability(main, config)
+            return {"available": True, "reason": f"当前模型：{capability.reason}", "fix": "",
+                    "mode": mode, "route": "main", "main_capability": capability.to_dict()}
+        return {"available": creds.available, "mode": mode,
+                "route": "auxiliary",
+                "reason": creds.unsupported_reason or (f"专用视觉模型：{creds.provider}/{creds.model}" if creds.available else "专用视觉模型的凭据缺失或尚未授权。"),
+                "fix": "" if creds.available else f"Configure vision or authorize a provider credential for {VISION_REQUIRED_FOR}."}
+    except (ValueError, TypeError) as exc:
+        return {"available": False, "reason": str(exc), "fix": "Check auxiliary.vision configuration."}

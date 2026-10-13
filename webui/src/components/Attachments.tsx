@@ -16,6 +16,15 @@ import { filesApi } from '../api';
 import type { FileBrowse, FilePreview, FileReference } from '../types';
 import { usePickerPosition } from './usePickerPosition';
 
+const MAX_IMAGE_ATTACHMENTS = 8;
+const imageLimitMessage = `每条消息最多添加 ${MAX_IMAGE_ATTACHMENTS} 张图片。`;
+
+export const isImageAttachment = (file: { name: string; mime_type?: string; type?: string }) =>
+  file.mime_type !== undefined
+    ? file.mime_type.startsWith('image/')
+    : !!file.type?.startsWith('image/') ||
+      /\.(png|jpe?g|gif|webp|bmp|svg|avif|heic|heif|tiff?|ico)$/i.test(file.name);
+
 const sizeLabel = (bytes: number) =>
   bytes < 1024
     ? `${bytes} B`
@@ -66,12 +75,14 @@ export function AttachmentPicker({
   ensureSession,
   onAdded,
   count,
+  imageCount = 0,
   disabled,
   labelled = false,
 }: {
   ensureSession: () => Promise<string>;
   onAdded: (session: string, file: FileReference) => void;
   count: number;
+  imageCount?: number;
   disabled: boolean;
   labelled?: boolean;
 }) {
@@ -82,17 +93,28 @@ export function AttachmentPicker({
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [remaining, setRemaining] = useState(20 - count);
+  const [remainingImages, setRemainingImages] = useState(MAX_IMAGE_ATTACHMENTS - imageCount);
   const picker = useRef<HTMLInputElement>(null);
   const anchor = useRef<HTMLButtonElement>(null);
   const panel = useRef<HTMLElement>(null);
+  const restoreFocus = useRef(false);
   const position = usePickerPosition(!!session, anchor, { width: 420, maxHeight: 490 });
   const close = () => {
+    restoreFocus.current = true;
     setSession(null);
-    anchor.current?.focus({ preventScroll: true });
   };
   useEffect(() => {
+    if (!session && !busy && restoreFocus.current) {
+      restoreFocus.current = false;
+      anchor.current?.focus({ preventScroll: true });
+    }
+  }, [session, busy]);
+  useEffect(() => {
     if (!session) return;
-    panel.current?.querySelector<HTMLElement>('.upload-zone')?.focus({ preventScroll: true });
+    const initial =
+      panel.current?.querySelector<HTMLElement>('.upload-zone:not(:disabled)') ??
+      panel.current?.querySelector<HTMLElement>('button:not(:disabled)');
+    initial?.focus({ preventScroll: true });
   }, [session]);
   useEffect(() => {
     if (!session) return;
@@ -119,6 +141,7 @@ export function AttachmentPicker({
     };
   }, [session, busy]);
   useEffect(() => setRemaining(20 - count), [count]);
+  useEffect(() => setRemainingImages(MAX_IMAGE_ATTACHMENTS - imageCount), [imageCount]);
   const browse = async (target: string, location?: string) => {
     setBusy(true);
     setError('');
@@ -137,6 +160,7 @@ export function AttachmentPicker({
     setBusy(true);
     setError('');
     let available = remaining;
+    let availableImages = remainingImages;
     const errors: string[] = [];
     for (const file of Array.from(files)) {
       if (available <= 0) {
@@ -147,14 +171,25 @@ export function AttachmentPicker({
         errors.push(`${file.name} 超过 20 MB。`);
         continue;
       }
+      if (isImageAttachment(file) && availableImages <= 0) {
+        errors.push(`${file.name}：${imageLimitMessage}`);
+        continue;
+      }
       try {
-        onAdded(session, await filesApi.upload(session, file));
+        const uploaded = await filesApi.upload(session, file);
+        if (isImageAttachment(uploaded) && availableImages <= 0) {
+          errors.push(`${file.name}：${imageLimitMessage}`);
+          continue;
+        }
+        onAdded(session, uploaded);
         available -= 1;
+        if (isImageAttachment(uploaded)) availableImages -= 1;
       } catch (e) {
         errors.push(`${file.name}：${e instanceof Error ? e.message : '上传失败'}`);
       }
     }
     setRemaining(available);
+    setRemainingImages(availableImages);
     setBusy(false);
     setError(errors.join('\n'));
     if (!errors.length) close();
@@ -170,7 +205,7 @@ export function AttachmentPicker({
         title="添加附件"
         aria-expanded={!!session}
         data-selected={count > 0}
-        disabled={disabled || busy || count >= 20}
+        disabled={disabled || busy}
         onClick={async () => {
           setBusy(true);
           setError('');
@@ -207,7 +242,10 @@ export function AttachmentPicker({
             <header className="picker-heading">
               <div>
                 <strong id="attachment-title">添加附件</strong>
-                <small>还可添加 {remaining} 个</small>
+                <small>
+                  还可添加 {remaining} 个，图片最多{' '}
+                  {Math.max(0, Math.min(remaining, remainingImages))} 张
+                </small>
               </div>
               <button
                 type="button"
@@ -255,6 +293,7 @@ export function AttachmentPicker({
                   ref={picker}
                   type="file"
                   multiple
+                  disabled={busy || remaining <= 0}
                   className="sr-only"
                   aria-label="选择上传文件"
                   onChange={(event) => void upload(event.target.files)}
@@ -317,10 +356,21 @@ export function AttachmentPicker({
                           await browse(session, entry.path);
                           return;
                         }
+                        if (isImageAttachment(entry) && remainingImages <= 0) {
+                          setError(imageLimitMessage);
+                          return;
+                        }
                         setBusy(true);
                         setError('');
                         try {
-                          onAdded(session, await filesApi.link(session, entry.path));
+                          const linked = await filesApi.link(session, entry.path);
+                          if (isImageAttachment(linked) && remainingImages <= 0) {
+                            setError(imageLimitMessage);
+                            return;
+                          }
+                          onAdded(session, linked);
+                          setRemaining((value) => value - 1);
+                          if (isImageAttachment(linked)) setRemainingImages((value) => value - 1);
                           close();
                         } catch (e) {
                           setError(e instanceof Error ? e.message : '引用文件失败');
@@ -361,6 +411,20 @@ export function FilePreviewPanel({
   const [url, setUrl] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const dialog = useRef<HTMLDialogElement>(null);
+  const close = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    const previous = document.activeElement;
+    const modal = dialog.current;
+    modal?.showModal();
+    close.current?.focus({ preventScroll: true });
+    return () => {
+      modal?.close();
+      if (previous instanceof HTMLElement && previous.isConnected) {
+        previous.focus({ preventScroll: true });
+      }
+    };
+  }, []);
   useEffect(() => {
     let active = true;
     let objectUrl = '';
@@ -388,17 +452,51 @@ export function FilePreviewPanel({
     };
   }, [session, file.id]);
   return (
-    <div className="drawer-backdrop" onClick={onClose}>
-      <aside
-        className="detail-drawer file-preview"
-        role="dialog"
-        aria-modal="true"
-        aria-label={`预览 ${file.name}`}
-        onClick={(event) => event.stopPropagation()}
-      >
+    <dialog
+      ref={dialog}
+      className="drawer-backdrop file-preview-backdrop"
+      aria-label={`预览 ${file.name}`}
+      aria-modal="true"
+      onCancel={(event) => {
+        event.preventDefault();
+        onClose();
+      }}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          event.preventDefault();
+          event.stopPropagation();
+          if (!event.nativeEvent.isComposing) onClose();
+        }
+        if (event.key !== 'Tab') return;
+        const nodes = Array.from(
+          event.currentTarget.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), a[href], summary, iframe, [tabindex="0"]',
+          ),
+        );
+        const first = nodes[0],
+          last = nodes.at(-1);
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+      }}
+      onClick={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <aside className="detail-drawer file-preview">
         <header className="drawer-heading">
           <h2>{preview?.file.name ?? file.name}</h2>
-          <button type="button" className="icon-button" aria-label="关闭文件预览" onClick={onClose}>
+          <button
+            ref={close}
+            type="button"
+            className="icon-button"
+            aria-label="关闭文件预览"
+            onClick={onClose}
+          >
             <X size={18} />
           </button>
         </header>
@@ -477,6 +575,6 @@ export function FilePreviewPanel({
           </>
         )}
       </aside>
-    </div>
+    </dialog>
   );
 }

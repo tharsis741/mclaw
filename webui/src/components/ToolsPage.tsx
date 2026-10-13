@@ -74,6 +74,13 @@ function ToolEditor({
   const [source, setSource] = useState(tool.credential_source);
   const [key, setKey] = useState('');
   const [model, setModel] = useState(tool.model);
+  const [mode, setMode] = useState<'auto' | 'main' | 'auxiliary'>(tool.mode ?? 'auxiliary');
+  const [baseUrl, setBaseUrl] = useState(tool.base_url ?? '');
+  const [imageInput, setImageInput] = useState(tool.image_input ?? 'auto');
+  const [mainImageInput, setMainImageInput] = useState(tool.main_image_input ?? 'auto');
+  const [mainCapabilityEdited, setMainCapabilityEdited] = useState(false);
+  const [catalogProvider, setCatalogProvider] = useState(tool.catalog_provider ?? '');
+  const [catalogModel, setCatalogModel] = useState(tool.catalog_model ?? '');
   const [enabled, setEnabled] = useState(enable || tool.enabled);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -87,6 +94,12 @@ function ToolEditor({
     : (configured[0]?.id ?? choices[0]?.id ?? '');
   const hasModel = tool.id === 'vision' || (tool.id === 'web_search' && backend !== 'tavily');
   const missingCredential =
+    (tool.id !== 'vision' || mode === 'auxiliary') &&
+    !(
+      tool.id === 'vision' &&
+      backend.startsWith('custom') &&
+      /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(?=[:/]|$)/i.test(baseUrl)
+    ) &&
     choices.length > 0 &&
     !key.trim() &&
     !choices.find((item) => item.id === credential)?.configured;
@@ -100,7 +113,21 @@ function ToolEditor({
     setError('');
     try {
       const form: ToolForm = { revision, enabled };
-      if (tool.backends.length && (enabled || !missingCredential)) {
+      if (tool.id === 'vision') {
+        form.mode = mode;
+        if (mode !== 'auxiliary' && mainCapabilityEdited) form.main_image_input = mainImageInput;
+        if (mode !== 'main') {
+          form.base_url = baseUrl;
+          form.image_input = imageInput;
+          form.catalog_provider = catalogProvider;
+          form.catalog_model = catalogModel;
+        }
+      }
+      if (
+        tool.backends.length &&
+        (enabled || !missingCredential) &&
+        (tool.id !== 'vision' || mode !== 'main')
+      ) {
         form.backend = backend;
         if (choices.length) {
           form.credential_source = credential;
@@ -199,7 +226,69 @@ function ToolEditor({
             />
           </label>
         )}
-        {tool.backends.length > 0 && (
+        {tool.id === 'vision' && (
+          <div className="tool-form-fields">
+            <label className="field-label">
+              视觉模式
+              <Select
+                label="视觉模式"
+                value={mode}
+                disabled={busy}
+                onChange={(value) => setMode(value as typeof mode)}
+              >
+                <option value="auto">自动：优先当前模型</option>
+                <option value="main">当前模型</option>
+                <option value="auxiliary">专用视觉模型</option>
+              </Select>
+            </label>
+            {mode !== 'auxiliary' && (
+              <>
+                <p className="field-hint">
+                  默认模型预览：{tool.main_model || '尚未配置'} · 图片输入：
+                  {tool.main_capability?.state === 'supported'
+                    ? '支持'
+                    : tool.main_capability?.state === 'unsupported'
+                      ? '不支持'
+                      : '未知'}
+                  {tool.main_capability?.source === 'models.dev' ? '（models.dev 声明）' : ''}
+                </p>
+                <details className="plain-details">
+                  <summary>默认模型能力设置（高级）</summary>
+                  <label className="field-label">
+                    默认模型图片能力
+                    <Select
+                      label="默认模型图片能力"
+                      value={mainImageInput}
+                      disabled={busy}
+                      onChange={(value) => {
+                        setMainImageInput(value);
+                        setMainCapabilityEdited(true);
+                      }}
+                    >
+                      <option value="auto">按 models.dev 判断</option>
+                      <option value="enabled">手动声明支持图片</option>
+                      <option value="disabled">禁用图片输入</option>
+                    </Select>
+                  </label>
+                  <p className="field-hint">
+                    仅修改上方默认模型及其接口的能力判断。已有对话以顶部实际选择为准；手动声明不会增加模型本身的能力。
+                  </p>
+                </details>
+              </>
+            )}
+            {mode === 'auto' && (
+              <p className="field-hint">
+                当前模型支持图片时直接看图；不支持时使用下方专用视觉模型。能力未知时优先使用已配置的专用视觉模型，否则尝试当前模型。
+              </p>
+            )}
+            {mode !== 'main' && (
+              <p className="field-hint">
+                专用视觉模型先分析图片，再把分析文字交给当前模型回答。它可以与当前模型使用同一供应商。
+              </p>
+            )}
+          </div>
+        )}
+        {tool.backends.length > 0 && (tool.id !== 'vision' || mode !== 'main') && (
           <div className="tool-form-fields">
             <label className="field-label">
               服务来源
@@ -211,6 +300,13 @@ function ToolEditor({
                   setBackend(selectedValue);
                   setSource('');
                   setKey('');
+                  if (tool.id === 'vision') {
+                    setModel(selectedValue.startsWith('dashscope') ? 'qwen3-vl-flash' : '');
+                    setBaseUrl('');
+                    setImageInput('auto');
+                    setCatalogProvider('');
+                    setCatalogModel('');
+                  }
                 }}
               >
                 {tool.backends.map((item) => (
@@ -265,10 +361,69 @@ function ToolEditor({
                 <input
                   value={model}
                   disabled={busy}
-                  placeholder={tool.id === 'vision' ? 'qwen3-vl-flash' : '使用默认模型'}
-                  onChange={(event) => setModel(event.target.value)}
+                  placeholder={tool.id === 'vision' ? '填写专用视觉模型名称' : '使用默认模型'}
+                  onChange={(event) => {
+                    setModel(event.target.value);
+                    if (tool.id === 'vision') {
+                      setImageInput('auto');
+                      setCatalogProvider('');
+                      setCatalogModel('');
+                    }
+                  }}
                 />
               </label>
+            )}
+            {tool.id === 'vision' && (
+              <>
+                <label className="field-label">
+                  接口地址
+                  <input
+                    value={baseUrl}
+                    disabled={busy}
+                    placeholder="留空使用供应商默认地址"
+                    onChange={(event) => {
+                      setBaseUrl(event.target.value);
+                      setImageInput('auto');
+                      setCatalogProvider('');
+                      setCatalogModel('');
+                    }}
+                  />
+                </label>
+                <details className="plain-details">
+                  <summary>专用视觉模型能力设置（高级）</summary>
+                  <label className="field-label">
+                    专用视觉模型图片能力
+                    <Select
+                      label="专用视觉模型图片能力"
+                      value={imageInput}
+                      disabled={busy}
+                      onChange={setImageInput}
+                    >
+                      <option value="auto">按 models.dev 判断</option>
+                      <option value="enabled">手动声明支持图片</option>
+                      <option value="disabled">禁用图片输入</option>
+                    </Select>
+                  </label>
+                  <label className="field-label">
+                    models.dev 供应商映射
+                    <input
+                      value={catalogProvider}
+                      disabled={busy}
+                      placeholder="可选，用于自定义接口"
+                      onChange={(event) => setCatalogProvider(event.target.value)}
+                    />
+                  </label>
+                  <label className="field-label">
+                    models.dev 模型映射
+                    <input
+                      value={catalogModel}
+                      disabled={busy}
+                      placeholder="可选，用于模型别名"
+                      onChange={(event) => setCatalogModel(event.target.value)}
+                    />
+                  </label>
+                </details>
+              </>
             )}
           </div>
         )}

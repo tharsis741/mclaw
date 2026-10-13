@@ -179,6 +179,14 @@ export interface ManagedTool {
   credential_source: string;
   model: string;
   channel: string;
+  mode?: 'auto' | 'main' | 'auxiliary';
+  base_url?: string;
+  image_input?: string;
+  main_image_input?: string;
+  catalog_provider?: string;
+  catalog_model?: string;
+  main_model?: string;
+  main_capability?: { state: string; source: string; reason?: string; updated_at?: number | null };
 }
 export interface ToolCatalog {
   items: ManagedTool[];
@@ -191,6 +199,12 @@ export interface ToolForm {
   credential_source?: string;
   api_key?: string;
   model?: string;
+  mode?: 'auto' | 'main' | 'auxiliary';
+  base_url?: string;
+  image_input?: string;
+  main_image_input?: string;
+  catalog_provider?: string;
+  catalog_model?: string;
 }
 export interface Capability {
   id: string;
@@ -353,6 +367,7 @@ export interface ModelLibrarySnapshot {
     provider: string;
     provider_label: string;
     context: number | null;
+    input_modalities?: string[] | null;
   }[];
   total: number;
   offset: number;

@@ -226,7 +226,9 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
 
         for original in deepcopy(messages):
             role = str(original.get("role") or "")
-            content = original.get("content", "")
+            from mclaw.agent.transports.images import anthropic_image_content
+
+            content = anthropic_image_content(original.get("content", ""))
             if role == "system":
                 if isinstance(content, list):
                     system_blocks.extend(

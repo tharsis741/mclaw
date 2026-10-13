@@ -158,6 +158,9 @@ async def _call_openai_auxiliary(
         options,
     )
     kwargs = _final_sanitize(kwargs)
+    if options.source == "vision" and context.provider in {"qwen", "qwen-intl"} and context.model.casefold().startswith("qwen3-vl-"):
+        # These VL models accept the flag but predate the shared reasoning policy.
+        kwargs.setdefault("extra_body", {})["enable_thinking"] = False
     http_client = httpx.AsyncClient(timeout=None, verify=_TLS_CONTEXT)
     client = openai.AsyncOpenAI(
         api_key=_auxiliary_api_key(context),
@@ -191,7 +194,7 @@ async def _call_openai_auxiliary(
                 context,
                 source=options.source,
             )
-            return (content or reasoning).strip(), usage
+            return (content if options.source == "vision" else content or reasoning).strip(), usage
 
         kwargs["stream"] = True
         if traits.include_stream_usage_option:
@@ -225,7 +228,7 @@ async def _call_openai_auxiliary(
             context,
             source=options.source,
         )
-        return (content or reasoning).strip(), usage
+        return (content if options.source == "vision" else content or reasoning).strip(), usage
 
 
 async def _call_anthropic_auxiliary(
@@ -256,7 +259,7 @@ async def _call_anthropic_auxiliary(
     async with client:
         response = await client.messages.create(**kwargs)
     result = transport._result_from_response(response, options, was_streamed=False)
-    return extract_content_or_reasoning(result), result.usage
+    return (str(result.content or "").strip() if options.source == "vision" else extract_content_or_reasoning(result)), result.usage
 
 
 async def _call_auxiliary_model(

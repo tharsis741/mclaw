@@ -44,7 +44,7 @@ def _names(identifier: str) -> list[str]:
     return [identifier] if identifier in {"web_search", "web_extract"} else TOOLSETS[identifier]["tools"]
 
 
-def _backends(identifier: str) -> list[dict]:
+def _backends(identifier: str, config: dict | None = None) -> list[dict]:
     cn, intl = get_runtime_profile("qwen"), get_runtime_profile("qwen-intl")
     qwen = [{"id": "dashscope", "label": "通义千问 · 中国区", "credentials": list(cn.env_vars)},
             {"id": "dashscope-intl", "label": "通义千问 · 国际区", "credentials": list(intl.env_vars)}]
@@ -56,7 +56,9 @@ def _backends(identifier: str) -> list[dict]:
                 {"id": "tavily", "label": "Tavily", "credentials": ["TAVILY_API_KEY"]},
                 {"id": "firecrawl", "label": "Firecrawl", "credentials": ["FIRECRAWL_API_KEY"]}]
     if identifier == "vision":
-        return qwen
+        from mclaw.application.vision_settings import vision_backends
+
+        return vision_backends(config or {})
     return []
 
 
@@ -68,7 +70,10 @@ def _selection(identifier: str, config: dict) -> tuple[dict, str]:
     auxiliary = (config.get("auxiliary") or {}).get(identifier) or {}
     endpoint = str(auxiliary.get("base_url") or "").lower()
     if identifier == "vision":
-        selected = "dashscope-intl" if auxiliary.get("provider") == "qwen-intl" or "dashscope-intl" in endpoint else "dashscope"
+        provider = auxiliary.get("provider", "qwen")
+        selected = {"qwen": "dashscope", "qwen-intl": "dashscope-intl", "auto": "dashscope"}.get(provider, provider)
+        if provider in {"qwen", "qwen-intl", "auto"} and "dashscope-intl" in endpoint:
+            selected = "dashscope-intl"
     else:
         selected = str(auxiliary.get("backend") or ("trafilatura" if identifier == "web_extract" else "auto")).lower()
         if selected == "dashscope" and "dashscope-intl" in endpoint:
@@ -87,7 +92,7 @@ class ToolService:
             raise ApplicationError("CONFIG_ROOT_MISMATCH", "配置目录与本机服务不一致", 409)
         try:
             raw = config_io.load_raw_user_config(strict=True)
-            for key in ("tools", "auxiliary", "channels"):
+            for key in ("tools", "auxiliary", "channels", "providers", "model_capabilities"):
                 if not isinstance(raw.get(key, {}), dict):
                     raise ValueError(key)
             for value in (raw.get("toolsets", []), raw.get("tools", {}).get("disabled", [])):
@@ -100,6 +105,18 @@ class ToolService:
             for value in raw.get("auxiliary", {}).values():
                 if not isinstance(value, dict):
                     raise ValueError("auxiliary")
+            from mclaw.tools.vision.config import resolve_mode
+
+            resolve_mode(config=raw)
+            vision = raw.get("auxiliary", {}).get("vision", {})
+            for key in ("provider", "model", "base_url", "credential_env", "catalog_provider", "catalog_model"):
+                if not isinstance(vision.get(key, ""), str):
+                    raise ValueError("vision " + key)
+            for entry in [vision, *raw.get("model_capabilities", {}).values()]:
+                if not isinstance(entry, dict) or entry.get("image_input", "auto") not in ("auto", "enabled", "disabled"):
+                    raise ValueError("image capability")
+                if any(not isinstance(entry.get(key, ""), str) for key in ("catalog_provider", "catalog_model")):
+                    raise ValueError("image capability mapping")
             return raw
         except (config_io.ConfigError, ValueError, TypeError, OSError):
             raise ApplicationError("CONFIG_INVALID", "工具配置无法读取，请检查配置文件。", 409) from None
@@ -122,29 +139,32 @@ class ToolService:
             active = resolve_multiple_toolsets(config.get("toolsets", ["mclaw-required"])) - effective_disabled_tools(config.get("tools", {}).get("disabled", []))
             items = []
             for identifier, (label, description) in _LABELS.items():
+                vision_metadata = {}
                 required = identifier in REQUIRED_TOOLSETS
                 auxiliary, selected = _selection(identifier, config)
-                backends = _backends(identifier)
+                backends = _backends(identifier, config)
                 for backend in backends:
                     backend["credentials"] = [{"id": name, "configured": bool(env.get(name))} for name in backend["credentials"]]
                 backend = next((item for item in backends if item["id"] == selected), None)
                 choices = backend["credentials"] if backend else []
                 preferred = auxiliary.get("credential_env", "")
                 available = [item["id"] for item in choices if item["configured"]]
-                credential = preferred if preferred in available else next(iter(available), "")
+                credential = preferred if preferred in [item["id"] for item in choices] else next(iter(available), "")
                 ready = not backends or bool(backend and (not choices or any(secrets.is_authorized(_scope(identifier), name) for name in available)))
                 if identifier == "web_search":
                     from mclaw.tools.search.credentials import dashscope_creds_ok, tavily_creds_ok
                     ready = (selected in {"auto", "tavily"} and tavily_creds_ok()) or (selected in {"auto", "dashscope", "dashscope-intl"} and dashscope_creds_ok(config=config))
                 elif identifier == "vision":
-                    from mclaw.tools.vision.credentials import resolve_vision_credentials
-                    ready = bool(resolve_vision_credentials(config=config).api_key)
+                    from mclaw.application.vision_settings import vision_status
+                    vision_metadata = vision_status(config)
+                    ready = vision_metadata["ready"]
                 items.append({"id": identifier, "label": label, "description": description,
                               "required": required, "enabled": required or bool(set(_names(identifier)) & active),
                               "ready": ready, "tools": _names(identifier), "backends": backends,
                               "backend": selected if backends else "", "credential_source": credential,
-                              "model": str(auxiliary.get("model") or ("qwen3-vl-flash" if identifier == "vision" else "")),
-                              "channel": identifier if identifier in {"weixin", "dingtalk"} else ""})
+                              "model": str(auxiliary.get("model") or ("qwen3-vl-flash" if identifier == "vision" and selected in {"dashscope", "dashscope-intl"} else "")),
+                              "channel": identifier if identifier in {"weixin", "dingtalk"} else "",
+                              **vision_metadata})
             return {"items": items, "revision": self._revision()}
 
     def save(self, identifier: str, data: dict) -> dict:
@@ -152,7 +172,8 @@ class ToolService:
 
         if identifier not in _LABELS:
             raise ApplicationError("TOOL_NOT_FOUND", "工具不存在", 404)
-        if set(data) - {"revision", "enabled", "backend", "credential_source", "api_key", "model"}:
+        vision_fields = {"mode", "base_url", "image_input", "main_image_input", "catalog_provider", "catalog_model"} if identifier == "vision" else set()
+        if set(data) - {"revision", "enabled", "backend", "credential_source", "api_key", "model"} - vision_fields:
             raise ApplicationError("INVALID_TOOL", "工具配置包含不支持的选项", 422)
         if type(data.get("enabled")) is not bool:
             raise ApplicationError("INVALID_TOOL", "请选择是否启用工具", 422)
@@ -175,6 +196,21 @@ class ToolService:
                     if grants:
                         secrets._authorize_unlocked(_scope(identifier), grants)
                     config_io.save_config(candidate)
+                    if identifier == "vision" and "main_image_input" in data:
+                        from mclaw.providers.capabilities import clear_image_observation
+                        from mclaw.providers.resolver import resolve_provider_runtime_context
+                        try:
+                            current = resolve_provider_runtime_context(config=candidate)
+                        except ValueError:
+                            pass
+                        else:
+                            clear_image_observation(current)
+                    if identifier == "vision" and "image_input" in data:
+                        from mclaw.providers.capabilities import clear_image_observation
+                        from mclaw.tools.vision.credentials import resolve_vision_credentials
+                        credentials = resolve_vision_credentials(config=candidate)
+                        if credentials.runtime is not None:
+                            clear_image_observation(credentials.runtime)
                 except Exception:
                     try:
                         for path, content in previous.items():
@@ -193,8 +229,11 @@ class ToolService:
     def _prepare(self, identifier: str, data: dict, config: dict) -> tuple[dict, list]:
         writes, grants = {}, []
         auxiliary, current = _selection(identifier, config)
-        backends = _backends(identifier)
-        if backends and (data["enabled"] or any(key in data for key in ("backend", "api_key", "credential_source", "model"))):
+        backends = _backends(identifier, config)
+        if identifier == "vision":
+            from mclaw.application.vision_settings import prepare_vision_settings
+            writes, grants = prepare_vision_settings(data, config, self._environment())
+        elif backends and (data["enabled"] or any(key in data for key in ("backend", "api_key", "credential_source", "model"))):
             selected = data.get("backend", current)
             backend = next((item for item in backends if item["id"] == selected), None)
             if backend is None:

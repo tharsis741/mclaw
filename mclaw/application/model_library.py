@@ -73,8 +73,13 @@ class ModelLibraryService:
                 if needle and needle not in f"{provider_text} {model_id} {title}".casefold():
                     continue
                 context = models_dev._extract_context_length(raw) if isinstance(raw, dict) else None
+                modalities = raw.get("modalities") if isinstance(raw, dict) else None
+                inputs = modalities.get("input") if isinstance(modalities, dict) else None
+                if not isinstance(inputs, list) or not inputs or any(not isinstance(value, str) or not value for value in inputs):
+                    inputs = None
                 matches.append({"id": model_id, "name": title, "provider": provider_id,
-                                "provider_label": label, "context": context})
+                                "provider_label": label, "context": context,
+                                "input_modalities": inputs})
         offset = min(offset, max(0, (len(matches) - 1) // 100 * 100))
         return {"status": self.status(), "providers": providers, "models": matches[offset:offset + 100],
                 "total": len(matches), "offset": offset, "limit": 100}

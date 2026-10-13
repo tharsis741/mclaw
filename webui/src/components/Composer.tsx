@@ -20,7 +20,7 @@ import { api } from '../api';
 import { SkillsPicker } from './SkillsPicker';
 import { DevicesPicker } from './DevicesPicker';
 import { VoiceInput } from './VoiceInput';
-import { AttachmentChips, AttachmentPicker } from './Attachments';
+import { AttachmentChips, AttachmentPicker, isImageAttachment } from './Attachments';
 import { useSlashCommands } from './useSlashCommands';
 import type { SlashCommand } from './useSlashCommands';
 
@@ -85,6 +85,8 @@ export function Composer({
 }) {
   const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
   const input = useRef<HTMLTextAreaElement>(null);
+  const currentSession = useRef(session?.id);
+  currentSession.current = session?.id;
   useEffect(() => () => onFocusChange?.(false), [onFocusChange]);
   const [queueOpen, setQueueOpen] = useState(false);
   const [queueEdit, setQueueEdit] = useState<QueueItem[] | null>(null);
@@ -197,10 +199,18 @@ export function Composer({
                         <AttachmentPicker
                           ensureSession={async () => session.id}
                           count={item.attachment_ids?.length ?? item.attachments?.length ?? 0}
+                          imageCount={
+                            (item.attachments ?? []).filter(
+                              (file) =>
+                                (!item.attachment_ids || item.attachment_ids.includes(file.id)) &&
+                                isImageAttachment(file),
+                            ).length
+                          }
                           disabled={disabled}
-                          onAdded={(_id, file) =>
-                            setQueueEdit(
-                              items.map((q) =>
+                          onAdded={(id, file) => {
+                            if (id !== currentSession.current) return;
+                            setQueueEdit((current) =>
+                              (current ?? items).map((q) =>
                                 q.id === item.id
                                   ? {
                                       ...q,
@@ -216,8 +226,8 @@ export function Composer({
                                     }
                                   : q,
                               ),
-                            )
-                          }
+                            );
+                          }}
                         />
                       )}
                       {(item.skill_names ?? item.skills?.map((skill) => skill.name) ?? []).map(
@@ -405,6 +415,7 @@ export function Composer({
                 ensureSession={ensureSession}
                 onAdded={onAttachmentAdded}
                 count={attachments.length}
+                imageCount={attachments.filter(isImageAttachment).length}
                 labelled
                 disabled={disabled || busy}
               />

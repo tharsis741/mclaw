@@ -18,7 +18,9 @@ from pathlib import Path
 
 from mclaw.application.sessions import ApplicationError
 from mclaw.platform.detect import get_local_device_name
+from mclaw.runtime.attachments import attachment_context
 from mclaw.runtime.paths import PathPolicy
+from mclaw.tools.vision.assets import MAX_IMAGES
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_PREVIEW_BYTES = 256 * 1024
@@ -152,6 +154,8 @@ class FileService:
             # A task retains the selected source and file metadata. Local originals
             # remain live files and are read through the standard versioned tools.
             result.append(record | {"size": path.stat().st_size, "modified_at": path.stat().st_mtime})
+        if sum(str(item.get("mime_type", "")).startswith("image/") for item in result) > MAX_IMAGES:
+            raise ApplicationError("TOO_MANY_IMAGES", f"每条消息最多添加 {MAX_IMAGES} 张图片", 422)
         return result
 
     def task_inputs(self, session_id: str, attachments: list[dict]) -> list[dict]:
@@ -240,11 +244,3 @@ class FileService:
         parent = root if policy.is_runtime_internal_path(root.parent) else root.parent
         return {"path": str(root), "parent": str(parent), "entries": sorted(entries, key=lambda item: (not item["directory"], item["name"].casefold())),
                 "truncated": truncated, "max_upload_bytes": MAX_UPLOAD_BYTES}
-
-
-def attachment_context(attachments: list[dict]) -> str:
-    """Describe user-selected paths without treating file contents as instructions."""
-    if not attachments:
-        return ""
-    selected = [{"name": item["name"], "path": item["path"], "source": item["source"]} for item in attachments]
-    return "\n\n[Attached files]\nThe user attached these local files. Read the relevant files with available tools before using their contents. Uploaded files are copies; local references retain their original paths.\n" + json.dumps(selected, ensure_ascii=False)

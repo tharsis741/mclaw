@@ -1436,6 +1436,8 @@ class InteractiveChat:
                 additions["before_model_callback"] = self._apply_queued_supplements
                 if getattr(self, "_task_input_operation_id", ""):
                     additions["input_operation_id"] = self._task_input_operation_id
+                    if getattr(self, "_task_image_paths", None):
+                        additions["image_paths"] = self._task_image_paths
             result = self.agent.run_conversation(
                 user_input,
                 conversation_history=self.agent.messages,
@@ -1490,7 +1492,7 @@ class InteractiveChat:
         def apply(item: dict) -> None:
             apply_pending_supplement(
                 self._session_db, self.session_id, messages, turn_id, item,
-                self._applied_supplement_ids,
+                self._applied_supplement_ids, parent_agent=self.agent,
             )
 
         task_queue.apply_supplements(apply)
@@ -1502,12 +1504,17 @@ class InteractiveChat:
             for item in self._session_db.get_messages(self.session_id, include_invalidated=True)
         )
         self._task_input_operation_id = "" if already_started else marker
+        self._task_image_paths = []
         if already_started:
             return "继续处理尚未完成的原任务，先核对已有执行结果，再接续剩余工作。原任务：\n" + task["content"]
         content = task["content"]
         if task.get("attachments"):
-            from mclaw.application.files import attachment_context
-            content += attachment_context(task["attachments"])
+            from mclaw.application.files import FileService, attachment_context
+            from mclaw.constants import get_mclaw_home
+
+            attachments = FileService(get_mclaw_home()).task_inputs(self.session_id, task["attachments"])
+            self._task_image_paths = [item["path"] for item in attachments if str(item.get("mime_type", "")).startswith("image/")]
+            content += attachment_context(attachments)
         return content
 
     def _submit_composer_text(self, text: str, *, supplement: bool = False) -> bool:

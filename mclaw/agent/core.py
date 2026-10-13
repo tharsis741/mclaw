@@ -1745,6 +1745,7 @@ class MClaw:
         disabled_tool_names: set[str] | None = None,
         before_model_callback: Callable[[List[Dict], str], None] | None = None,
         input_operation_id: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn and discard stale estimates on failure."""
         turn_cancel_event, owns_turn = self._acquire_turn_cancel_event(cancel_event)
@@ -1761,6 +1762,7 @@ class MClaw:
                 disabled_tool_names=disabled_tool_names,
                 before_model_callback=before_model_callback,
                 input_operation_id=input_operation_id,
+                image_paths=image_paths,
             )
         except Exception:
             self._clear_unconfirmed_context_display()
@@ -1783,6 +1785,7 @@ class MClaw:
         disabled_tool_names: set[str] | None = None,
         before_model_callback: Callable[[List[Dict], str], None] | None = None,
         input_operation_id: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -1834,7 +1837,15 @@ class MClaw:
             except Exception:
                 logger.debug("Could not capture checkpoint message marker", exc_info=True)
 
-        messages.append({"role": "user", "content": user_message})
+        user_images = []
+        if image_paths:
+            from mclaw.agent.vision import prepare_user_images
+
+            user_message, user_images = prepare_user_images(self, user_message, image_paths, cancel_event)
+        user_row = {"role": "user", "content": user_message}
+        if user_images:
+            user_row["_vision_images"] = user_images
+        messages.append(user_row)
 
         # Background review counters are advanced only after this user turn completes.
         _should_review_memory = False
@@ -1860,13 +1871,16 @@ class MClaw:
         )
 
         if self._session_db:
-            self._session_db.append_message(
+            user_message_id = self._session_db.append_message(
                 self.session_id,
                 "user",
                 content=user_message,
                 turn_id=self._checkpoint_turn_id,
                 operation_id=input_operation_id,
+                **({"image_parts": user_images} if user_images else {}),
             )
+            if user_images:
+                user_row["_message_id"] = user_message_id
             if hasattr(self._session_db, "count_user_messages"):
                 try:
                     self.session_user_messages = self._session_db.count_user_messages(self.session_id)
@@ -2075,6 +2089,7 @@ class MClaw:
             result: ModelCallResult | None = None
             retry_count = 0
             context_recovery_attempts = 0
+            vision_recovery_attempted = False
 
             while retry_count < MAX_RETRIES:
                 if _deadline_reached():
@@ -2085,6 +2100,7 @@ class MClaw:
                 if self._is_interrupted(cancel_event):
                     interrupted = True
                     break
+                request_messages = []
                 try:
                     if self._prompt_epoch_dirty:
                         self._refresh_prompt_epoch(messages)
@@ -2163,13 +2179,25 @@ class MClaw:
 
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] 开始 API 调用", getattr(self, "session_id", "?")[-6:])
+                    from mclaw.agent.vision import project_vision_messages
+
+                    try:
+                        request_messages = project_vision_messages(self, messages, cancel_event)
+                    except Exception as image_error:
+                        if getattr(image_error, "termination_fence", None) is not None:
+                            raise
+                        if cancel_event.is_set():
+                            result = None
+                            interrupted = True
+                            break
+                        raise ModelCallError(str(image_error), self.provider, self.model, code="VISION_INPUT_FAILED") from None
                     api_call_count += 1
                     self._record_api_attempt()
                     model_call_started = time.monotonic()
                     logger.info("[MODEL REQUEST] agent=%s provider=%s model=%s attempt=%d messages=%d",
-                                self.session_id, self.provider, self.model, api_call_count, len(messages))
+                                self.session_id, self.provider, self.model, api_call_count, len(request_messages))
                     result = self.transport.call(
-                        messages=messages,
+                        messages=request_messages,
                         tools=active_tools,
                         options=ModelCallOptions(
                             stream=(
@@ -2196,7 +2224,7 @@ class MClaw:
                                 })
                             ) if self._event_callback else None,
                             cache_plan=build_prompt_cache_plan(
-                                messages=messages,
+                                messages=request_messages,
                                 tools=active_tools,
                                 context=self.provider_runtime,
                                 session_id=self.session_id,
@@ -2245,6 +2273,13 @@ class MClaw:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
                     break
                 except ModelCallError as error:
+                    from mclaw.agent.vision import recover_image_rejection
+
+                    if not vision_recovery_attempted and not cancel_event.is_set() and error.code != "VISION_INPUT_FAILED":
+                        if recover_image_rejection(self, request_messages, error, cancel_event):
+                            vision_recovery_attempted = True
+                            self._emit_status("当前模型拒绝图片输入，正在使用专用视觉模型…")
+                            continue
                     remote_error_code = (
                         error.code
                         if error.code
@@ -2469,6 +2504,9 @@ class MClaw:
                 break
 
             if response_confirms_visibility:
+                from mclaw.agent.vision import mark_vision_images_seen
+
+                mark_vision_images_seen(self, messages)
                 # A successful model response proves the pending tool calls and
                 # paired results were visible once.
                 self._tool_visibility_state_reliable = True
@@ -2962,11 +3000,16 @@ class MClaw:
             fn = tc.get("function", {})
             name = fn.get("name", "")
             projection = project_reply(self, result, tc["id"], messages) if name in REMOTE_TASK_TOOLS else result
+            from mclaw.agent.vision import tool_images
+
+            images = tool_images(self, name, result, cancel_event)
             tool_row = {
                 "role": "tool",
                 "tool_call_id": tc["id"],
                 "content": projection,
             }
+            if images:
+                tool_row["_vision_images"] = images
             messages.append(tool_row)
             if tc["id"] in advertised_tool_ids:
                 logger.info("[TOOL FINISHED] agent=%s call=%s name=%s elapsed_ms=%s",
@@ -3009,14 +3052,17 @@ class MClaw:
                     pass
 
             if self._session_db:
-                self._session_db.append_message(
+                tool_message_id = self._session_db.append_message(
                     self.session_id, "tool",
                     content=result,
                     tool_name=name,
                     tool_call_id=tc["id"],
                     turn_id=self._checkpoint_turn_id,
                     operation_id=getattr(self, "_tool_operation_ids", {}).get(tc["id"]),
+                    **({"image_parts": images} if images else {}),
                 )
+                if images:
+                    tool_row["_message_id"] = tool_message_id
 
         if memory_prompt_changed or skill_prompt_changed:
             self._refresh_prompt_epoch(messages)

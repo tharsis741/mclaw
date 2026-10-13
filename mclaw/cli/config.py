@@ -187,7 +187,7 @@ def load_raw_user_config(*, strict: bool = True) -> dict[str, Any]:
     config_path = get_config_path()
     try:
         raw = _load_user_config_file(config_path) if config_path.exists() else {}
-        merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw)
+        merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), _vision_compat_config(raw))
         _validate_config(merged)
         return copy.deepcopy(raw)
     except ConfigError as exc:
@@ -216,7 +216,11 @@ def load_merged_config(
     snapshot = source_snapshot or load_config_source_snapshot(cwd)
     user_config = snapshot.user_config_copy()
     project_config = _normalize_project_config(snapshot.project_config_copy())
-    config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), user_config)
+    config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), _vision_compat_config(user_config))
+    user_auxiliary = user_config.get("auxiliary", {})
+    user_vision = user_auxiliary.get("vision", {}) if isinstance(user_auxiliary, dict) else {}
+    if not isinstance(user_vision, dict) or "mode" not in user_vision:
+        project_config = _vision_compat_config(project_config)
     config = _deep_merge(config, project_config)
     if snapshot.project_path is not None:
         config["_project_config_dir"] = str(snapshot.project_path.parent)
@@ -318,10 +322,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "auxiliary": {
         "vision": {
+            "mode": "auto",
             "provider": "qwen",
             "model": "qwen3-vl-flash",
             "base_url": "",
-            "max_pixels": 1_310_720,
+            "max_pixels": None,
             "timeout": 30,
             "download_timeout": 30,
         },
@@ -510,6 +515,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 # Config I/O.
 
+def _vision_compat_config(source: dict) -> dict:
+    """Retain pre-mode independent vision semantics at config source boundaries."""
+    auxiliary = source.get("auxiliary")
+    legacy_vision = auxiliary.get("vision") if isinstance(auxiliary, dict) else None
+    if isinstance(legacy_vision, dict) and "mode" not in legacy_vision and any(key in legacy_vision for key in ("provider", "model", "base_url")):
+        source = copy.deepcopy(source)
+        source["auxiliary"]["vision"]["mode"] = "auxiliary"
+    return source
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge override into base, returning a new dict."""
     result = dict(base)
@@ -604,7 +619,7 @@ def load_config(*, strict: bool = False) -> dict[str, Any]:
     try:
         if config_path.exists():
             user_config = _load_user_config_file(config_path)
-            config = _deep_merge(config, user_config)
+            config = _deep_merge(config, _vision_compat_config(user_config))
         _validate_config(config)
     except ConfigError as exc:
         if strict:

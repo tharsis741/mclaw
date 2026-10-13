@@ -7,3 +7,10 @@ Object.defineProperty(window, 'matchMedia', {
   value: () => ({ matches: true, addEventListener() {}, removeEventListener() {} }),
 });
 Element.prototype.scrollIntoView = () => {};
+// jsdom lacks dialog methods; native modality is also checked in a real browser.
+HTMLDialogElement.prototype.showModal = function () {
+  this.setAttribute('open', '');
+};
+HTMLDialogElement.prototype.close = function () {
+  this.removeAttribute('open');
+};

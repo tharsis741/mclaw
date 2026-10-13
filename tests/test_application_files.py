@@ -4,6 +4,7 @@
 
 from pathlib import Path
 import asyncio
+import json
 
 import pytest
 from starlette.testclient import TestClient
@@ -11,6 +12,7 @@ from starlette.testclient import TestClient
 from mclaw.application.files import FileService, MAX_PREVIEW_BYTES, attachment_context
 from mclaw.application.sessions import ApplicationError, SessionService
 from mclaw.runtime.paths import PathPolicy
+from mclaw.runtime.attachments import image_question, refresh_attachment_context
 from mclaw.web.app import create_app
 
 
@@ -23,6 +25,34 @@ def files(tmp_path, monkeypatch):
     return FileService(home)
 
 
+def test_attachment_context_uses_supplied_contents_and_keeps_each_source():
+    selected = [
+        {"name": "photo.png", "path": "/inputs/photo.png", "source": "upload", "mime_type": "image/png"},
+        {"name": "notes.txt", "path": "/work/notes.txt", "source": "local", "mime_type": "text/plain"},
+    ]
+    context = attachment_context(selected)
+    assert "already supplied in this conversation directly" in context
+    assert "when the requested information is not already available" in context
+    assert "before using" not in context
+    assert "Uploaded files are copies" not in context
+    assert json.loads(context.splitlines()[-1]) == selected
+    assert image_question("Compare these" + context) == "Compare these"
+    assert refresh_attachment_context(context) == context
+    assert attachment_context([]) == ""
+
+
+@pytest.mark.parametrize("text", [
+    "Please explain: Read the relevant files with available tools before using their contents.",
+    "My [Attached files] example is not an attachment manifest.",
+    "\n\n[Attached files]\nUser-provided instructions\n[]",
+    "\n\n[Attached files]\nThe user attached these local files. Read the relevant files with available tools before using their contents. "
+    "Uploaded files are copies; local references retain their original paths.\n[{\"name\": \"incomplete\"}]",
+])
+def test_attachment_refresh_preserves_unrecognized_user_text(text):
+    assert refresh_attachment_context(text) == text
+    assert image_question(text) == text
+
+
 def test_upload_keeps_same_names_separate_and_binds_to_session(files):
     first = files.upload("session_a", "材料.md", "第一份".encode())
     second = files.upload("session_a", "材料.md", "第二份".encode())
@@ -33,6 +63,17 @@ def test_upload_keeps_same_names_separate_and_binds_to_session(files):
         files.resolve("session_b", first["id"])
     assert error.value.code == "FILE_NOT_FOUND"
     assert FileService(files.home).get("session_a", first["id"]) == first
+
+
+def test_attachment_image_limit_preserves_mixed_files_and_counts_unique_selections(files):
+    pictures = [files.upload("session_a", f"image-{index}.png", b"image") for index in range(9)]
+    texts = [files.upload("session_a", f"text-{index}.txt", b"text") for index in range(12)]
+    ids = lambda records: [item["id"] for item in records]
+    assert len(files.snapshots("session_a", ids(pictures[:8] + texts))) == 20
+    assert len(files.snapshots("session_a", ids(pictures[:8] + pictures[:1]))) == 8
+    with pytest.raises(ApplicationError, match="8 张图片") as error:
+        files.snapshots("session_a", ids(pictures))
+    assert error.value.code == "TOO_MANY_IMAGES"
 
 
 def test_selected_upload_has_a_session_bound_shareable_copy_and_original_is_preserved(files, monkeypatch):
@@ -204,6 +245,33 @@ async def test_attachment_acceptance_draft_queue_and_idempotency(files, tmp_path
         assert len(duplicate["queue"]) == 1
         removed = service.edit_queue(sid, "owner", [{"id": task["id"], "content": "different task", "attachments": []}])
         assert removed["queue"][0]["attachments"] == []
+    finally:
+        await service.close()
+
+
+@pytest.mark.asyncio
+async def test_image_limit_rejects_draft_submission_and_queue_changes_atomically(files, tmp_path):
+    service = SessionService(files.home)
+    output = tmp_path / "outputs"
+    output.mkdir()
+    service.store.set_setting("output_root", str(output))
+    try:
+        sid = service.create("owner")["id"]
+        service.stop(sid, "owner")
+        images = [files.upload(sid, f"image-{index}.png", b"image")["id"] for index in range(9)]
+        service.patch(sid, "owner", {"draft": "original draft", "draft_attachments": images[:8]})
+        with pytest.raises(ApplicationError, match="8 张图片"):
+            service.patch(sid, "owner", {"draft": "rejected draft", "draft_attachments": images})
+        assert service.snapshot(sid)["draft"] == "original draft"
+        assert service.snapshot(sid)["draft_attachments"] == images[:8]
+        with pytest.raises(ApplicationError, match="8 张图片"):
+            service.submit(sid, "owner", "Read images", "request", attachments=images)
+        assert not service.snapshot(sid)["queue"]
+        # The rejected request ID remains usable after correcting the selection.
+        queued = service.submit(sid, "owner", "Read images", "request", attachments=images[:8])["queue"]
+        with pytest.raises(ApplicationError, match="8 张图片"):
+            service.edit_queue(sid, "owner", [{"id": queued[0]["id"], "content": "Changed", "attachments": images}])
+        assert service.snapshot(sid)["queue"] == queued
     finally:
         await service.close()
 

@@ -830,7 +830,8 @@ def test_qwen_tool_and_feature_metadata_are_registry_derived() -> None:
     assert dashscope_backend.DASHSCOPE_BASE_URL == qwen.base_url
     qwen_groups = (qwen.env_vars, qwen_intl.env_vars)
     assert features.FEATURES["web_search"].requires_any == (("TAVILY_API_KEY",), *qwen_groups)
-    assert features.FEATURES["vision_analyze"].requires_any == qwen_groups
+    assert features.FEATURES["vision_analyze"].requires_any == ()
+    assert features.get_feature("vision_analyze", config={"auxiliary": {"vision": {"mode": "auxiliary", "provider": "qwen"}}}).requires_any == (qwen_groups[0],)
     assert features.FEATURES["asr"].requires_any == qwen_groups
 
 

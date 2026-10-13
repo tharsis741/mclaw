@@ -32,7 +32,7 @@ def _queue_key(session_id: str) -> str:
 
 
 def apply_pending_supplement(db, session_id: str, messages: list[dict], turn_id: str,
-                             item: dict, applied_ids: set[str]) -> bool:
+                             item: dict, applied_ids: set[str], *, parent_agent=None, cancel_event=None) -> bool:
     """Persist one task addition before acknowledging it at a safe boundary.
 
     Hosts restore applied_ids from SessionDB operation_id values on startup.
@@ -46,11 +46,25 @@ def apply_pending_supplement(db, session_id: str, messages: list[dict], turn_id:
         apply_skill_snapshots(db, session_id, messages, turn_id, item, applied_ids)
         return False
     content = str(item["content"])
+    image_parts = []
     if item.get("attachments"):
-        from mclaw.application.files import attachment_context
-        content += attachment_context(item["attachments"])
-    db.append_message(session_id, "user", content=content, turn_id=turn_id, operation_id=operation_id)
-    messages.append({"role": "user", "content": content})
+        from mclaw.application.files import FileService, attachment_context
+        from mclaw.constants import get_mclaw_home
+
+        attachments = FileService(get_mclaw_home()).task_inputs(session_id, item["attachments"])
+        content += attachment_context(attachments)
+        paths = [item["path"] for item in attachments if str(item.get("mime_type", "")).startswith("image/")]
+        if paths:
+            from mclaw.agent.vision import prepare_user_images
+            from mclaw.tools.interrupt import get_interrupt_event
+
+            content, image_parts = prepare_user_images(parent_agent, content, paths, cancel_event or get_interrupt_event())
+    identifier = db.append_message(session_id, "user", content=content, turn_id=turn_id, operation_id=operation_id,
+                                   **({"image_parts": image_parts} if image_parts else {}))
+    message = {"role": "user", "content": content}
+    if image_parts:
+        message.update(_vision_images=image_parts, _message_id=identifier)
+    messages.append(message)
     applied_ids.add(operation_id)
     apply_skill_snapshots(db, session_id, messages, turn_id, item, applied_ids)
     return True

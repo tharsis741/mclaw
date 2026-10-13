@@ -1731,11 +1731,12 @@ def _run_setup_capability_selection(config: dict) -> None:
         if name in web_tools:
             continue
         if name == "vision":
-            if not _setup_configure_feature_keys(
-                "vision_analyze", print_plain=print_plain, color=color, Colors=Colors
+            from mclaw.tools.vision.config import resolve_mode
+            _ensure_vision_config(config)
+            if resolve_mode(config=config) == "auxiliary" and not _setup_configure_feature_keys(
+                "vision_analyze", print_plain=print_plain, color=color, Colors=Colors, config=config
             ):
                 continue
-            _ensure_vision_config(config)
         elif name != "browser":
             continue
         if name not in enabled_optional:
@@ -2189,6 +2190,8 @@ def _ensure_vision_config(config: dict) -> None:
     if not isinstance(vision_cfg, dict):
         vision_cfg = {}
         auxiliary["vision"] = vision_cfg
+    from mclaw.tools.vision.config import resolve_mode
+    vision_cfg.setdefault("mode", resolve_mode(config=config))
     provider = str(vision_cfg.get("provider") or "").strip().lower()
     qwen_provider = _setup_qwen_provider()
     if provider in {"", "auto", "dashscope"} or (
@@ -2197,25 +2200,24 @@ def _ensure_vision_config(config: dict) -> None:
         and not str(vision_cfg.get("base_url") or "").strip()
     ):
         vision_cfg["provider"] = qwen_provider
-    vision_cfg.setdefault("model", "qwen3-vl-flash")
-    if not str(vision_cfg.get("model") or "").strip():
+    if vision_cfg.get("provider") in {"qwen", "qwen-intl"} and not str(vision_cfg.get("model") or "").strip():
         vision_cfg["model"] = "qwen3-vl-flash"
     vision_cfg.setdefault("base_url", "")
-    vision_cfg.setdefault("max_pixels", 1_310_720)
+    vision_cfg.setdefault("max_pixels", None)
     vision_cfg.setdefault("timeout", 30)
     vision_cfg.setdefault("download_timeout", 30)
 
 
-def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colors) -> bool:
+def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colors, config=None) -> bool:
     """Ensure setup-selected built-in features have scoped credentials."""
     from mclaw.cli import config as cli_config
     from mclaw.runtime.features import configured_env_vars, get_feature, secret_requests_for_feature
     from mclaw.runtime.secrets import authorize
 
-    spec = get_feature(feature_name)
+    spec = get_feature(feature_name, config=config)
     if spec is None:
         return True
-    credential_label = "Qwen 凭据" if feature_name in {"vision_analyze", "asr"} else "凭据"
+    credential_label = "Qwen 凭据" if feature_name == "asr" else "供应商凭据"
 
     existing = configured_env_vars(spec, cli_config.get_env_value)
     if existing:

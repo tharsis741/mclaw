@@ -38,6 +38,169 @@ def item(service, name):
     return next(row for row in service.catalog()["items"] if row["id"] == name)
 
 
+def test_main_vision_can_be_enabled_without_independent_credentials(tools):
+    save(tools, "vision", mode="main", main_image_input="auto")
+    config = config_io.load_raw_user_config(strict=True)
+    assert config["auxiliary"]["vision"]["mode"] == "main"
+    assert item(tools, "vision")["enabled"]
+    assert not (tools.home / ".env").exists()
+    assert config["unknown_field"] == {"keep": True}
+
+
+@pytest.mark.parametrize("values", [{"mode": []}, {"mode": "main", "main_image_input": {}}, {"mode": "auto", "image_input": []}])
+def test_malformed_vision_enum_is_a_validation_error_and_does_not_write(tools, values):
+    before = (tools.home / "config.yaml").read_bytes()
+    with pytest.raises(ApplicationError) as error:
+        save(tools, "vision", **values)
+    assert error.value.status == 422
+    assert (tools.home / "config.yaml").read_bytes() == before
+
+
+def test_auxiliary_vision_supports_anthropic_and_preserves_credentials_on_main_switch(tools, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    save(tools, "vision", mode="auxiliary", backend="anthropic", model="fixture-vision", api_key="fixture-anthropic")
+    original = config_io.load_raw_user_config(strict=True)["auxiliary"]["vision"]
+    assert original["provider"] == "anthropic"
+    assert secrets.is_authorized("tool:vision_analyze", "ANTHROPIC_API_KEY")
+    assert "fixture-anthropic" not in json.dumps(tools.catalog())
+    save(tools, "vision", mode="main")
+    updated = config_io.load_raw_user_config(strict=True)["auxiliary"]["vision"]
+    assert updated == {**original, "mode": "main"}
+
+
+def test_vision_auto_optional_credentials_local_backend_and_endpoint_validation(tools):
+    save(tools, "vision", mode="auto", backend="dashscope")
+    assert not (tools.home / ".env").exists()
+    save(tools, "vision", mode="auxiliary", backend="custom", model="fixture-local", base_url="http://127.0.0.1:8080/v1")
+    assert item(tools, "vision")["ready"]
+    before = (tools.home / "config.yaml").read_bytes()
+    with pytest.raises(ApplicationError) as error:
+        save(tools, "vision", mode="auxiliary", base_url="https://user:password@example.test/v1")
+    assert error.value.code == "INVALID_TOOL_ENDPOINT"
+    assert (tools.home / "config.yaml").read_bytes() == before
+
+
+def test_auxiliary_capability_save_clears_only_its_observed_rejection(tools):
+    from mclaw.providers.capabilities import observe_image_rejection
+    from mclaw.tools.vision.credentials import resolve_vision_credentials
+
+    save(tools, "vision", mode="auxiliary", backend="custom", model="fixture-local", base_url="http://127.0.0.1:8080/v1")
+    credentials = resolve_vision_credentials(config=config_io.load_raw_user_config(strict=True))
+    observe_image_rejection(credentials.runtime)
+    assert not resolve_vision_credentials(config=config_io.load_raw_user_config(strict=True)).available
+    save(tools, "vision", image_input="enabled")
+    assert resolve_vision_credentials(config=config_io.load_raw_user_config(strict=True)).available
+
+
+def test_main_capability_override_is_bound_to_provider_model_and_endpoint(tools, monkeypatch):
+    from mclaw.providers.capabilities import resolve_image_capability
+    from mclaw.providers.resolver import resolve_provider_runtime_context
+
+    config = config_io.load_raw_user_config(strict=True)
+    config.update(active_provider="custom", model="fixture-local")
+    monkeypatch.setenv("MCLAW_BASE_URL", "http://127.0.0.1:8080/v1")
+    config_io.save_config(config)
+    save(tools, "vision", mode="main", main_image_input="enabled")
+    config = config_io.load_raw_user_config(strict=True)
+    context = resolve_provider_runtime_context(config=config)
+    assert resolve_image_capability(context, config).state == "supported"
+    config["model"] = "other-model"
+    assert resolve_image_capability(resolve_provider_runtime_context(config=config), config, registry={}).state == "unknown"
+
+
+@pytest.mark.parametrize("field,new_value", [("model", "different-model"), ("base_url", "http://localhost:8081/v1")])
+def test_changing_vision_target_clears_previous_capability_and_alias(tools, field, new_value):
+    save(tools, "vision", mode="auxiliary", backend="custom", model="old-model", base_url="http://127.0.0.1:8080/v1",
+         image_input="enabled", catalog_provider="openai", catalog_model="catalog-name")
+    save(tools, "vision", **{field: new_value})
+    section = config_io.load_raw_user_config(strict=True)["auxiliary"]["vision"]
+    assert section[field] == new_value
+    assert not set(section) & {"image_input", "catalog_provider", "catalog_model"}
+
+
+def test_failed_settings_validation_does_not_clear_current_model_observation(tools, monkeypatch):
+    from mclaw.providers.capabilities import observe_image_rejection, resolve_image_capability
+    from mclaw.providers.resolver import resolve_provider_runtime_context
+
+    config = config_io.load_raw_user_config(strict=True)
+    config.update(active_provider="custom", model="fixture-local")
+    monkeypatch.setenv("MCLAW_BASE_URL", "http://127.0.0.1:8080/v1")
+    config_io.save_config(config)
+    context = resolve_provider_runtime_context(config=config)
+    observe_image_rejection(context)
+    with pytest.raises(ApplicationError):
+        save(tools, "vision", mode="auto", main_image_input="enabled", base_url="invalid-address")
+    assert resolve_image_capability(context, config).source == "runtime"
+    save(tools, "vision", mode="main", main_image_input="enabled")
+    assert resolve_image_capability(context, config_io.load_raw_user_config(strict=True)).state == "supported"
+
+
+@pytest.mark.parametrize("mode", ["main", "auxiliary"])
+def test_capability_save_invalidates_observation_in_a_separate_worker_process(tools, monkeypatch, mode):
+    from mclaw.providers import capabilities
+    from mclaw.providers.resolver import resolve_provider_runtime_context
+    from mclaw.tools.vision.credentials import resolve_vision_credentials
+
+    config = config_io.load_raw_user_config(strict=True)
+    config.update(active_provider="custom", model="fixture-local")
+    monkeypatch.setenv("MCLAW_BASE_URL", "http://127.0.0.1:8181/v1")
+    config_io.save_config(config)
+    save(tools, "vision", mode=mode, backend="custom", model="fixture-local", base_url="http://127.0.0.1:8181/v1")
+    config = config_io.load_raw_user_config(strict=True)
+    context = resolve_provider_runtime_context(config=config) if mode == "main" else resolve_vision_credentials(config=config).runtime
+    capabilities.observe_image_rejection(context, config)
+    # The Web process cannot mutate a worker's in-memory cache. Keep it intact.
+    monkeypatch.setattr(capabilities, "clear_image_observation", lambda _context: None)
+    save(tools, "vision", **{"main_image_input" if mode == "main" else "image_input": "enabled"})
+    updated = config_io.load_raw_user_config(strict=True)
+    assert capabilities.resolve_image_capability(context, updated, image_input="enabled").state == "supported"
+    capabilities.observe_image_rejection(context, updated)
+    assert capabilities.resolve_image_capability(context, updated, image_input="enabled").source == "runtime"
+
+
+def test_dedicated_custom_endpoint_must_be_resolvable_before_saving(tools, monkeypatch):
+    monkeypatch.setenv("MCLAW_BASE_URL", "")
+    monkeypatch.setenv("OPENAI_BASE_URL", "")
+    before = (tools.home / "config.yaml").read_bytes()
+    with pytest.raises(ApplicationError) as error:
+        save(tools, "vision", mode="auxiliary", backend="custom", model="fixture-model", api_key="fixture-key")
+    assert error.value.code == "INVALID_TOOL_ENDPOINT"
+    assert (tools.home / "config.yaml").read_bytes() == before
+
+
+def test_blank_vision_endpoint_follows_provider_environment_instead_of_pinning_default(tools, monkeypatch):
+    from mclaw.tools.vision.credentials import resolve_vision_credentials
+
+    profile = get_runtime_profile("qwen")
+    monkeypatch.setenv(profile.base_url_env_var, "https://proxy.example.test/v1")
+    save(tools, "vision", mode="auto", backend="dashscope", base_url="")
+    config = config_io.load_raw_user_config(strict=True)
+    assert config["auxiliary"]["vision"]["base_url"] == ""
+    assert resolve_vision_credentials(config=config).base_url == "https://proxy.example.test/v1"
+
+
+@pytest.mark.parametrize("section", [{"mode": []}, {"provider": []}, {"image_input": {}}, {"catalog_model": []}])
+def test_invalid_saved_vision_configuration_is_reported_without_internal_error(tools, section):
+    config_io.save_config({"auxiliary": {"vision": section}})
+    with pytest.raises(ApplicationError) as error:
+        tools.catalog()
+    assert error.value.code == "CONFIG_INVALID"
+
+
+def test_legacy_auto_provider_can_be_saved_and_explicit_missing_key_is_not_replaced(tools, monkeypatch):
+    names = get_runtime_profile("qwen").env_vars
+    assert len(names) >= 2
+    config_io.save_config({"auxiliary": {"vision": {"provider": "auto", "credential_env": names[0]}}})
+    monkeypatch.setenv(names[0], "")
+    monkeypatch.setenv(names[1], "fixture-second-key")
+    assert item(tools, "vision")["credential_source"] == names[0]
+    with pytest.raises(ApplicationError) as error:
+        save(tools, "vision")
+    assert error.value.code == "TOOL_CREDENTIAL_REQUIRED"
+    save(tools, "vision", credential_source=names[1])
+    assert config_io.load_raw_user_config(strict=True)["auxiliary"]["vision"]["provider"] == "qwen"
+
+
 def test_required_switches_are_enforced_and_catalog_is_read_only(tools):
     before = (tools.home / "config.yaml").read_bytes()
     for row in tools.catalog()["items"]:

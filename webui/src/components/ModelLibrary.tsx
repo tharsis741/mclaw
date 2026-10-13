@@ -112,6 +112,14 @@ export function ModelLibrary({ updatedAt }: { updatedAt?: number | null }) {
                 </div>
                 <code>{model.id}</code>
                 {model.context && <small>上下文 {model.context.toLocaleString()} tokens</small>}
+                <small>
+                  图片输入：
+                  {model.input_modalities?.length
+                    ? model.input_modalities.includes('image')
+                      ? '支持'
+                      : '不支持'
+                    : '未知'}
+                </small>
               </article>
             ))}
             {!data.total && (

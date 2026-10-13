@@ -728,13 +728,14 @@ def test_setup_qwen_features_report_reused_qwen_credentials(monkeypatch) -> None
             print_plain=lambda text="": output.append(text),
             color=lambda text, *_styles: text,
             Colors=colors,
+            config={"auxiliary": {"vision": {"mode": "auxiliary", "provider": "qwen"}}},
         )
 
     assert authorized == [
         ("tool:vision_analyze", ["DASHSCOPE_API_KEY"]),
         ("runtime:asr", ["DASHSCOPE_API_KEY"]),
     ]
-    assert any("视觉分析: 已检测到" in line and "Qwen 凭据" in line for line in output)
+    assert any("视觉分析: 已检测到" in line and "供应商凭据" in line for line in output)
     assert any("语音输入: 已检测到" in line and "Qwen 凭据" in line for line in output)
 
 

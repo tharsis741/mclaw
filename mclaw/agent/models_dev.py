@@ -287,6 +287,20 @@ def lookup_models_dev_context(provider: str, model: str) -> int | None:
     return None
 
 
+def lookup_model_metadata(provider: str, model: str, *, registry: dict | None = None) -> dict | None:
+    """Read one exact provider/model entry; a cache miss must remain unknown."""
+    data = cached_models_dev() if registry is None else registry
+    entry = _providers_data(data).get(provider, {})
+    if not isinstance(entry, dict):
+        return None
+    models = entry.get("models", {})
+    value = models.get(model) if isinstance(models, dict) else None
+    if isinstance(value, dict):
+        return value
+    # Some snapshots carry the API ID in the value rather than in the key.
+    return next((item for item in _iter_models(entry) if item.get("id") == model), None)
+
+
 def resolve_models_dev_provider(provider: str, profile_id: str = "") -> str:
     """Resolve M-Claw provider/profile to a raw models.dev provider id."""
     profile = PROVIDER_REGISTRY.get(provider)

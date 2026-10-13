@@ -75,6 +75,31 @@ def _task(**changes):
     return {"id": "task-one", "content": "original work", "model": "test-model", "attempts": [{"id": "attempt-one"}], **changes}
 
 
+@pytest.mark.parametrize("kind", ["image", "file", "unexpected"])
+def test_worker_reports_known_attachment_errors_and_redacts_credentials(worker, monkeypatch, kind):
+    from mclaw.application.sessions import ApplicationError
+    from mclaw.tools.vision.types import VisionInputError
+
+    secret = "fixture-sensitive-token"
+    worker._secret_values.add(secret)
+    message = "图片读取失败 " + secret
+    failure = {"image": VisionInputError(message), "file": ApplicationError("FILE_CHANGED", message),
+               "unexpected": ValueError(message)}[kind]
+
+    def fail(*_args, **_kwargs):
+        raise failure
+
+    worker.agent = SimpleNamespace(messages=[], run_conversation=fail)
+    worker.db = SimpleNamespace(get_messages=lambda *_a, **_k: [])
+    monkeypatch.setattr(worker, "_prepare_agent", lambda _task: worker.agent)
+    result = worker.execute(_task(), worker.cancel)
+    assert result["completed"] is False and secret not in result["error"]
+    if kind == "unexpected":
+        assert "任务执行失败" in result["error"]
+    else:
+        assert "图片读取失败" in result["error"] and result["error_code"] == failure.code
+
+
 def test_provider_selector_distinguishes_identical_model_names(monkeypatch):
     from mclaw.providers import resolver
 
@@ -460,7 +485,8 @@ async def test_real_channel_worker_skips_allocated_directory_prompt_and_refreshe
 
 
 @pytest.mark.asyncio
-async def test_real_worker_attachment_paths_are_persisted_once_on_continuation(local_provider, tmp_path, monkeypatch):
+@pytest.mark.parametrize("with_image", [False, True])
+async def test_real_worker_attachment_paths_are_persisted_once_on_continuation(local_provider, tmp_path, monkeypatch, with_image):
     from mclaw.application.files import FileService
 
     port, requests = local_provider
@@ -469,18 +495,26 @@ async def test_real_worker_attachment_paths_are_persisted_once_on_continuation(l
     workspace.mkdir()
     monkeypatch.setenv("MCLAW_HOME", str(home))
     (home / "config.yaml").write_text(
-        "active_provider: custom\nmodel: test-model\ncompression:\n  enabled: false\ncheckpoints:\n  enabled: false\nmemory:\n  memory_review_round: 0\nskills:\n  evolution_review_round: 0\n", encoding="utf-8")
+        "active_provider: custom\nmodel: test-model\nauxiliary:\n  vision:\n    mode: main\ncompression:\n  enabled: false\ncheckpoints:\n  enabled: false\nmemory:\n  memory_review_round: 0\nskills:\n  evolution_review_round: 0\n", encoding="utf-8")
     (home / ".env").write_text(f"MCLAW_BASE_URL=http://127.0.0.1:{port}/v1\nMCLAW_API_KEY=local-test-credential\n", encoding="utf-8")
     files = FileService(home)
     attached = files.upload("file-stream-test", "材料.txt", "资料正文".encode())
+    attachments = [attached]
+    if with_image:
+        import io
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (32, 24), "blue").save(buffer, format="PNG")
+        attachments.append(files.upload("file-stream-test", "photo.png", buffer.getvalue()))
     runner = ProcessRunner(home, {"id": "file-stream-test", "workspace": str(workspace)})
     def emit(event):
         if event["type"] == "request":
             runner.send({"type": "reply", "request_id": event["request"]["id"], "value": True})
     try:
-        first = await asyncio.wait_for(runner.run(_task(attachments=[attached]), emit), 30)
+        first = await asyncio.wait_for(runner.run(_task(attachments=attachments), emit), 30)
         assert first["completed"]
-        continued = await asyncio.wait_for(runner.run(_task(attachments=[attached], attempts=[{"id": "first"}, {"id": "resume"}]), emit), 30)
+        continued = await asyncio.wait_for(runner.run(_task(attachments=attachments, attempts=[{"id": "first"}, {"id": "resume"}]), emit), 30)
         assert continued["completed"]
     finally:
         await asyncio.wait_for(runner.close(), 20)
@@ -488,10 +522,10 @@ async def test_real_worker_attachment_paths_are_persisted_once_on_continuation(l
         context = "\n".join(str(message.get("content") or "") for message in request["messages"])
         assert context.count("[Attached files]") == 1
         assert "材料.txt" in context
-    db = SessionDB(home / "state.db")
-    rows = [row for row in db.get_messages("file-stream-test") if row.get("operation_id") == "task:task-one"]
-    assert len(rows) == 1 and "材料.txt" in rows[0]["content"]
-    db.close()
+        assert "already supplied in this conversation directly" in context
+        assert "Read the relevant files" not in context
+        assert ("data:image/png;base64," in context) is with_image
+        assert ("This image is included below; inspect it directly." in context) is with_image
     log_paths = list((home / "logs" / "sessions").glob("*.log"))
     assert len(log_paths) == 1
     diagnostics = log_paths[0].read_text(encoding="utf-8")
@@ -499,3 +533,8 @@ async def test_real_worker_attachment_paths_are_persisted_once_on_continuation(l
     assert diagnostics.count("[MODEL REQUEST]") == len(requests)
     assert "[MODEL RESPONSE]" in diagnostics and "[WORKER] stopped" in diagnostics
     assert "local-test-credential" not in diagnostics and "[Attached files]" not in diagnostics
+    assert ("[VISION INPUT] mode=main" in diagnostics) is with_image
+    db = SessionDB(home / "state.db")
+    rows = [row for row in db.get_messages("file-stream-test") if row.get("operation_id") == "task:task-one"]
+    assert len(rows) == 1 and "材料.txt" in rows[0]["content"]
+    db.close()
