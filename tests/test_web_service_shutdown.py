@@ -70,7 +70,7 @@ def test_http_shutdown_reaps_worker_and_service(tmp_path, connection_mode):
     (home / ".env").write_text(
         f"MCLAW_BASE_URL=http://127.0.0.1:{provider.server_port}/v1\nMCLAW_API_KEY=local-test-credential\n",
         encoding="utf-8")
-    process = subprocess.Popen([sys.executable, "-m", "mclaw.web.server"],
+    process = subprocess.Popen([sys.executable, "-m", "mclaw.web.server", "--port", "0"],
                                env=dict(os.environ, MCLAW_HOME=str(home)),
                                cwd=Path(__file__).resolve().parents[1],
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)

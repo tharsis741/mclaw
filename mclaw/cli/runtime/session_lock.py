@@ -15,6 +15,8 @@ from typing import Any
 
 from mclaw.constants import get_mclaw_home
 from mclaw.system.lock import file_lock
+from mclaw.system.process import is_process_alive as _is_process_alive
+from mclaw.system.process import process_matches_record, process_started_at
 from mclaw.utils import atomic_json_write
 
 
@@ -22,33 +24,18 @@ class InteractiveSessionLockError(RuntimeError):
     """Raised when an interactive session is already owned by another process."""
 
 
-def _is_process_alive(pid: int) -> bool:
-    """Best-effort liveness probe used before removing a stale session lock."""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            process = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
-            if not process:
-                return ctypes.windll.kernel32.GetLastError() == 5
-            try:
-                exit_code = ctypes.c_ulong()
-                if not ctypes.windll.kernel32.GetExitCodeProcess(process, ctypes.byref(exit_code)):
-                    return True
-                return exit_code.value == 259
-            finally:
-                ctypes.windll.kernel32.CloseHandle(process)
-        except Exception:
-            return True
+def _is_lock_process_alive(data: dict[str, Any], *, worker: bool = False) -> bool:
+    """Check the recorded process instance rather than a possibly recycled PID."""
+    prefix = "worker_" if worker else ""
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+        pid = int(data.get(prefix + "pid") or 0)
+    except (TypeError, ValueError):
         return False
-    except OSError:
-        return True
+    return pid > 0 and _is_process_alive(pid) and process_matches_record(
+        pid, data.get(prefix + "process_started_at"),
+        # A legacy worker may have started after its parent's lock was created.
+        recorded_at=data.get("worker_attached_at" if worker else "created_at"),
+    )
 
 
 def _lock_name(session_id: str) -> str:
@@ -76,6 +63,7 @@ class InteractiveSessionLock:
         """Keep stale inspection and metadata publication in one OS lock."""
         payload = {
             "pid": os.getpid(),
+            "process_started_at": process_started_at(os.getpid()),
             "session_id": self.session_id,
             "cwd": os.getcwd(),
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -95,8 +83,7 @@ class InteractiveSessionLock:
             return
         with file_lock(self.root / ".session-lock.guard"):
             data = self._read_lock()
-            worker_pid = int(data.get("worker_pid") or 0)
-            if worker_pid and _is_process_alive(worker_pid):
+            if _is_lock_process_alive(data, worker=True):
                 return
             try:
                 if (
@@ -114,14 +101,15 @@ class InteractiveSessionLock:
             if int(data.get("pid") or 0) != os.getpid() or data.get("session_id") != self.session_id:
                 raise InteractiveSessionLockError("Session ownership changed before worker startup")
             data["worker_pid"] = int(worker_pid)
+            data["worker_process_started_at"] = process_started_at(worker_pid)
+            data["worker_attached_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             atomic_json_write(self.path, data)
 
     def _handle_existing_lock(self) -> None:
         """Reject live owners and clear stale or unreadable lock files."""
         data = self._read_lock()
-        pid = int(data.get("pid") or 0)
-        worker_pid = int(data.get("worker_pid") or 0)
-        if (pid and _is_process_alive(pid)) or (worker_pid and _is_process_alive(worker_pid)):
+        pid = data.get("pid")
+        if _is_lock_process_alive(data) or _is_lock_process_alive(data, worker=True):
             created_at = str(data.get("created_at") or "unknown")
             cwd = str(data.get("cwd") or "unknown")
             raise InteractiveSessionLockError(

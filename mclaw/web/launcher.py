@@ -72,10 +72,7 @@ def ensure_service(home: Path | None = None) -> dict:
         if process.poll() is not None:
             # Another launcher can win the instance lock long before its HTTP
             # startup completes. Wait for that live owner using the same deadline.
-            from mclaw.cli.runtime.session_lock import InteractiveSessionLock, _is_process_alive
-
-            owner = InteractiveSessionLock("mclaw-application-service", home / "web" / "locks")._read_lock()
-            if not _is_process_alive(int(owner.get("pid") or 0)):
+            if _service_owner_pid(home) is None:
                 raise RuntimeError(f"后台服务启动失败，请查看 {log_dir / 'web-service.log'}")
         time.sleep(0.1)
     raise RuntimeError(f"后台服务启动超时，请查看 {log_dir / 'web-service.log'}")
@@ -90,9 +87,10 @@ def open_browser(url: str) -> bool:
         if not executable:
             return False
         # Kaihong's default URI resolver can open a spurious file-error dialog.
-        # Address its browser explicitly; other images can use URI resolution.
+        # Address its browser explicitly; API 11's browser reads jumpUrl instead
+        # of Want.uri. Supplying both supports the existing browser generations.
         for arguments in (
-            ["-b", "com.kaihong.browser", "-a", "MainAbility", "-U", url],
+            ["-b", "com.kaihong.browser", "-a", "MainAbility", "-U", url, "--ps", "jumpUrl", url],
             ["-A", "ohos.want.action.viewData", "-U", url],
         ):
             try:
@@ -133,14 +131,14 @@ def launch() -> None:
 
 def _service_owner_pid(home: Path) -> int | None:
     """Find a live service owner even while its HTTP listener is closing."""
-    from mclaw.cli.runtime.session_lock import InteractiveSessionLock, _is_process_alive
+    from mclaw.cli.runtime.session_lock import InteractiveSessionLock, _is_lock_process_alive
 
     owner = InteractiveSessionLock("mclaw-application-service", home / "web" / "locks")._read_lock()
     try:
         pid = int(owner.get("pid") or 0)
     except (TypeError, ValueError):
         return None
-    return pid if _is_process_alive(pid) else None
+    return pid if _is_lock_process_alive(owner) else None
 
 
 def show_status() -> None:

@@ -17,7 +17,7 @@ def kaihong(monkeypatch):
     monkeypatch.setattr(launcher.webbrowser, "open", lambda _: pytest.fail("Desktop launcher used on Kaihong"))
 
 
-def test_kaihong_passes_authenticated_url_as_one_argument(kaihong, monkeypatch):
+def test_kaihong_passes_authenticated_url_to_uri_and_legacy_jump_url(kaihong, monkeypatch):
     calls = []
     url = "http://127.0.0.1:18789/#token=local-test&next=/"
 
@@ -27,7 +27,8 @@ def test_kaihong_passes_authenticated_url_as_one_argument(kaihong, monkeypatch):
 
     monkeypatch.setattr(launcher.subprocess, "run", run)
     assert launcher.open_browser(url)
-    assert calls[0][0] == ["/bin/aa", "start", "-b", "com.kaihong.browser", "-a", "MainAbility", "-U", url]
+    assert calls[0][0] == ["/bin/aa", "start", "-b", "com.kaihong.browser", "-a", "MainAbility",
+                           "-U", url, "--ps", "jumpUrl", url]
     assert calls[0][1].get("shell", False) is False
     assert calls[0][1]["timeout"] == 8
     assert calls[0][1]["capture_output"] is True

@@ -14,6 +14,7 @@ import pytest
 
 from mclaw.cli.runtime import session_lock
 from mclaw.cli.runtime.session_lock import InteractiveSessionLock, InteractiveSessionLockError
+from mclaw.system import process as process_info
 
 
 def test_live_worker_blocks_takeover_after_service_owner_exits(tmp_path, monkeypatch):
@@ -126,3 +127,57 @@ def test_exited_process_is_not_alive_even_while_popen_handle_exists():
     process = subprocess.Popen([sys.executable, "-c", "pass"])
     process.wait(timeout=10)
     assert not session_lock._is_process_alive(process.pid)
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_recycled_live_pid_does_not_block_session_or_service_start(tmp_path, monkeypatch, legacy):
+    owner = InteractiveSessionLock("mclaw-application-service", tmp_path)
+    old = {"pid": 123, "session_id": owner.session_id, "created_at": "1970-01-01T00:01:40Z"}
+    if not legacy:
+        old["process_started_at"] = 90
+    owner.path.write_text(json.dumps(old), encoding="utf-8")
+    monkeypatch.setattr(session_lock, "_is_process_alive", lambda _pid: True)
+    monkeypatch.setattr(process_info, "process_started_at", lambda _pid: 200)
+    owner.acquire()
+    assert owner._read_lock()["pid"] == os.getpid()
+    assert owner._read_lock()["process_started_at"] is not None
+    owner.release()
+    assert not owner.path.exists()
+
+
+@pytest.mark.parametrize("actual,blocked", [(200, False), (100, True), (None, True)])
+def test_worker_fence_tracks_process_birth_after_parent_exits(tmp_path, monkeypatch, actual, blocked):
+    owner = InteractiveSessionLock("session", tmp_path)
+    owner.path.write_text(json.dumps({"pid": 111, "worker_pid": 222,
+                                     "worker_process_started_at": 100}), encoding="utf-8")
+    monkeypatch.setattr(session_lock, "_is_process_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(process_info, "process_started_at", lambda _pid: actual)
+    if blocked:
+        with pytest.raises(InteractiveSessionLockError):
+            owner.acquire()
+    else:
+        owner.acquire()
+        owner.release()
+        assert not owner.path.exists()
+
+
+def test_legacy_worker_may_start_after_parent_lock_creation(tmp_path, monkeypatch):
+    owner = InteractiveSessionLock("session", tmp_path)
+    owner.path.write_text(json.dumps({"pid": 111, "worker_pid": 222,
+                                     "created_at": "1970-01-01T00:01:40Z"}), encoding="utf-8")
+    monkeypatch.setattr(session_lock, "_is_process_alive", lambda pid: pid == 222)
+    monkeypatch.setattr(process_info, "process_started_at", lambda _pid: 200)
+    with pytest.raises(InteractiveSessionLockError):
+        owner.acquire()
+
+
+def test_parent_release_ignores_recycled_worker_pid(tmp_path, monkeypatch):
+    owner = InteractiveSessionLock("session", tmp_path)
+    owner.acquire()
+    monkeypatch.setattr(session_lock, "process_started_at", lambda _pid: 100)
+    owner.attach_worker(222)
+    assert owner._read_lock()["worker_process_started_at"] == 100
+    monkeypatch.setattr(session_lock, "_is_process_alive", lambda _pid: True)
+    monkeypatch.setattr(process_info, "process_started_at", lambda _pid: 200)
+    owner.release()
+    assert not owner.path.exists()

@@ -178,3 +178,36 @@ def test_stop_does_not_signal_an_unreachable_live_owner(monkeypatch, tmp_path, c
     with pytest.raises(SystemExit):
         launcher.stop()
     assert "服务暂时无法连接（PID 123）" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("command", [launcher.show_status, launcher.stop])
+def test_service_commands_ignore_unrelated_process_reusing_old_pid(monkeypatch, tmp_path, capsys, command):
+    from mclaw.cli.runtime import session_lock
+    from mclaw.system import process
+
+    monkeypatch.setattr(launcher, "get_mclaw_home", lambda: tmp_path)
+    monkeypatch.setattr(launcher, "running_service", lambda _home: None)
+    monkeypatch.setattr(session_lock.InteractiveSessionLock, "_read_lock", lambda _self: {
+        "pid": 123, "created_at": "1970-01-01T00:01:40Z",
+    })
+    monkeypatch.setattr(session_lock, "_is_process_alive", lambda _pid: True)
+    monkeypatch.setattr(process, "process_started_at", lambda _pid: 200)
+    monkeypatch.setattr(launcher.httpx, "post", lambda *_a, **_k: pytest.fail("Unrelated process"))
+    command()
+    assert "服务未运行" in capsys.readouterr().out
+
+
+def test_failed_launch_does_not_wait_for_recycled_owner_pid(monkeypatch, tmp_path):
+    from mclaw.cli.runtime import session_lock
+    from mclaw.system import process
+
+    monkeypatch.setattr(launcher, "running_service", lambda _home: None)
+    monkeypatch.setattr(launcher.subprocess, "Popen", lambda *_a, **_k: SimpleNamespace(poll=lambda: 1))
+    monkeypatch.setattr(session_lock.InteractiveSessionLock, "_read_lock", lambda _self: {
+        "pid": 123, "process_started_at": 100,
+    })
+    monkeypatch.setattr(session_lock, "_is_process_alive", lambda _pid: True)
+    monkeypatch.setattr(process, "process_started_at", lambda _pid: 200)
+    monkeypatch.setattr(launcher.time, "sleep", lambda _seconds: pytest.fail("No live service to wait for"))
+    with pytest.raises(RuntimeError, match="启动失败"):
+        launcher.ensure_service(tmp_path)
