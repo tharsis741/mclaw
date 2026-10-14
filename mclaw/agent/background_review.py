@@ -12,6 +12,7 @@ import logging
 import threading
 from typing import Any
 
+from mclaw.agent.skill_review_state import SkillReviewRequest, get_skill_review_state
 from mclaw.prompts import background as background_prompts
 from mclaw.tools.dispatch import tool_dispatch_policy
 
@@ -185,18 +186,37 @@ def spawn_background_review(
     messages_snapshot: list[dict[str, Any]],
     review_memory: bool = False,
     review_skills: bool = False,
+    pending_skill_review: bool = False,
+    _skill_review_request: SkillReviewRequest | None = None,
 ) -> None:
     """Start an isolated background review thread for memory and Skill evolution."""
     if not review_memory and not review_skills:
         logger.debug("Background review skipped: no review target requested")
         return
 
-    prompt = _prompt_for(review_memory, review_skills)
     session_id = getattr(parent, "session_id", None)
     provider_runtime = parent.provider_runtime
+    skill_state = get_skill_review_state(parent) if review_skills else None
+    skill_request = _skill_review_request
+    if skill_state is not None:
+        if skill_request is None:
+            skill_request = skill_state.reserve(
+                messages_snapshot, pending_only=pending_skill_review,
+                task_id=getattr(parent, "_application_task_id", None),
+                response_id=getattr(parent, "_application_response_id", None),
+            )
+        review_skills = skill_request is not None
+        if skill_request is not None:
+            messages_snapshot = skill_request.messages
+            session_id = skill_request.session_id or session_id
+    if not review_memory and not review_skills:
+        return
+    prompt = _prompt_for(review_memory, review_skills)
+    review_id = skill_request.review_id if skill_request else None
     logger.info(
-        "Background review scheduled: session=%s memory=%s skills=%s messages=%d",
+        "[BACKGROUND REVIEW] scheduled session=%s review=%s memory=%s skills=%s messages=%d",
         session_id,
+        review_id,
         review_memory,
         review_skills,
         len(messages_snapshot or []),
@@ -207,20 +227,23 @@ def spawn_background_review(
 
     def _run_review() -> None:
         review_agent = None
+        result = None
+        failed = False
         try:
             logger.info(
-                "Background review started: session=%s memory=%s skills=%s",
+                "[BACKGROUND REVIEW] started session=%s review=%s memory=%s skills=%s",
                 session_id,
+                review_id,
                 review_memory,
                 review_skills,
             )
-            # The review runs as a cloned agent so background memory and
-            # Skill updates cannot mutate the parent's turn state directly.
+            # Keep conversation state isolated. Only committed Skill saves are
+            # reported to the owner; output suppression must also be local.
             review_agent = parent.__class__(
                 provider_runtime=provider_runtime,
                 usage_sink=_record_review_usage,
                 session_db=None,
-                session_id=getattr(parent, "session_id", None),
+                session_id=session_id,
                 system_prompt=background_prompts.build_background_review_system_prompt(
                     tool_names=set(), skill_actions=REVIEW_SKILL_ACTION_ORDER,
                 ),
@@ -235,9 +258,13 @@ def spawn_background_review(
             review_agent._turns_since_evolution_review = 0
             review_agent._evolution_review_round = 0
             review_agent._execution_actor = "background_review"
+            review_agent._skill_review_id = review_id
+            review_agent._skill_save_owner = parent
             review_agent._memory_store = getattr(parent, "_memory_store", None)
             review_agent._memory_manager = getattr(parent, "_memory_manager", None)
-            _restrict_review_agent_tools(review_agent, review_memory=review_memory, review_skills=review_skills)
+            _restrict_review_agent_tools(
+                review_agent, review_memory=review_memory, review_skills=review_skills,
+            )
 
             with tool_dispatch_policy(
                 tool_whitelist=review_agent.valid_tool_names,
@@ -245,7 +272,7 @@ def spawn_background_review(
             ):
                 # The dispatch policy is the final safety boundary: even if
                 # the cloned agent keeps extra schemas, only review tools run.
-                review_agent.run_conversation(
+                result = review_agent.run_conversation(
                     user_message=prompt,
                     conversation_history=[
                         {"role": "system", "content": review_agent.system_prompt},
@@ -283,13 +310,17 @@ def spawn_background_review(
                 else:
                     logger.info("Background skill review completed: nothing to save")
             logger.info(
-                "Background review completed: session=%s memory=%s skills=%s",
+                "[BACKGROUND REVIEW] %s session=%s review=%s memory=%s skills=%s",
+                "completed" if result and result.get("completed") else "incomplete",
                 session_id,
+                review_id,
                 review_memory,
                 review_skills,
             )
         except Exception as exc:
-            logger.warning("Background review failed: session=%s error=%s", session_id, exc, exc_info=True)
+            failed = True
+            logger.warning("[BACKGROUND REVIEW] failed session=%s review=%s error=%s",
+                           session_id, review_id, exc, exc_info=True)
         finally:
             if review_agent is not None:
                 close = getattr(review_agent, "close", None)
@@ -312,4 +343,22 @@ def spawn_background_review(
                 except Exception as refresh_exc:
                     logger.debug("Background memory review snapshot refresh failed: %s", refresh_exc)
 
-    threading.Thread(target=_run_review, daemon=True, name="mclaw-background-review").start()
+            if skill_state is not None and skill_request is not None:
+                next_request = skill_state.finish(skill_request)
+                if next_request is not None:
+                    try:
+                        spawn_background_review(
+                            parent,
+                            messages_snapshot=next_request.messages,
+                            review_skills=True,
+                            _skill_review_request=next_request,
+                        )
+                    except Exception:
+                        logger.warning("Pending Skill review scheduling failed: session=%s", session_id, exc_info=True)
+
+    try:
+        threading.Thread(target=_run_review, daemon=True, name="mclaw-background-review").start()
+    except BaseException:
+        if skill_state is not None and skill_request is not None:
+            skill_state.finish(skill_request, started=False)
+        raise

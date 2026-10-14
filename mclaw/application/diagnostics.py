@@ -21,6 +21,7 @@ _STAGES = (
     "[WORKER]", "[MODEL REQUEST]", "[MODEL RESPONSE]", "[VISION INPUT]",
     "[TOOL DISPATCH START]", "[TOOL DISPATCH END]", "[TOOL CONCURRENT START]",
     "[TOOL CONCURRENT END]", "[TOOL DONE]", "[TOOL FINISHED]",
+    "[SKILL REVIEW]", "[BACKGROUND REVIEW]",
 )
 _SECRET_NAME = re.compile(r"key|token|secret|password|credential", re.I)
 _ASSIGNMENT = re.compile(

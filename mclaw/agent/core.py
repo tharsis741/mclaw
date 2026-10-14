@@ -30,6 +30,7 @@ from mclaw.agent.prompt_cache import build_prompt_cache_plan
 from mclaw.agent.prompt_builder import SKILL_TOOL_NAMES, build_system_prompt
 from mclaw.agent.retry_utils import jittered_backoff
 from mclaw.agent.remote_results import READ_RESULT_TOOL, REMOTE_TASK_TOOLS, project_history, project_reply
+from mclaw.agent.skill_review_state import get_skill_review_state
 from mclaw.agent.token_budget import estimate_request_budget
 from mclaw.agent.transports.base import (
     ModelCallError,
@@ -904,11 +905,32 @@ class MClaw:
 
     # Background memory and Skill review.
 
+    @property
+    def _turns_since_evolution_review(self) -> int:
+        return get_skill_review_state(self).turns
+
+    @_turns_since_evolution_review.setter
+    def _turns_since_evolution_review(self, value: int) -> None:
+        get_skill_review_state(self).turns = value
+
+    def _on_skill_write(self, action: str, result: dict[str, Any]) -> None:
+        """Observe a committed tool write, independently of model completion."""
+        if not result.get("success") or action not in SKILL_WRITE_ACTIONS:
+            return
+        owner = getattr(self, "_skill_save_owner", self)
+        if action != "create_scaffold":
+            get_skill_review_state(owner).saved(
+                source=getattr(self, "_execution_actor", "main_agent"), action=action,
+                review_id=getattr(self, "_skill_review_id", None),
+            )
+        owner.mark_prompt_epoch_dirty()
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
+        pending_skill_review: bool = False,
     ) -> None:
         """Start a background review thread for memory and Skill evolution.
 
@@ -922,6 +944,7 @@ class MClaw:
             messages_snapshot=messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            pending_skill_review=pending_skill_review,
         )
         return
 
@@ -1579,6 +1602,9 @@ class MClaw:
                 _close_transport_once(resource)
                 closed_transport_ids.add(identity)
             self._close_complete = True
+            skill_review_state = getattr(self, "_skill_review_state", None)
+            if skill_review_state is not None:
+                skill_review_state.close()
             return True
         except Exception as error:
             if getattr(self, "platform", "") == "dsoftbus":
@@ -1811,6 +1837,8 @@ class MClaw:
         """
         self._memory_changed_in_turn = False
         self._skills_changed_in_turn = False
+        skill_review_state = get_skill_review_state(self)
+        skill_save_generation = skill_review_state.save_generation
         with self._usage_lock:
             self._turn_usage = {
                 "input_tokens": 0,
@@ -2760,14 +2788,15 @@ class MClaw:
             if (
                 getattr(self, "_evolution_review_round", 0) > 0
                 and "skill_manage" in self.valid_tool_names
+                and getattr(self, "_delegate_depth", 0) == 0
             ):
-                if getattr(self, "_skills_changed_in_turn", False):
-                    self._turns_since_evolution_review = 0
-                else:
-                    self._turns_since_evolution_review = getattr(self, "_turns_since_evolution_review", 0) + 1
-                    if self._turns_since_evolution_review >= getattr(self, "_evolution_review_round", 0):
-                        _should_review_skills = True
-                        self._turns_since_evolution_review = 0
+                _should_review_skills = skill_review_state.complete_turn(
+                    generation=skill_save_generation,
+                    interval=self._evolution_review_round,
+                    messages=messages,
+                    task_id=getattr(self, "_application_task_id", None),
+                    response_id=getattr(self, "_application_response_id", None),
+                )
 
         # Background memory/Skill reviews start after the reply completes so
         # they do not compete with the user task. Subagents are temporary and
@@ -2784,6 +2813,7 @@ class MClaw:
                     messages_snapshot=list(messages),
                     review_memory=_should_review_memory,
                     review_skills=_should_review_skills,
+                    pending_skill_review=True,
                 )
             except Exception as exc:
                 logger.debug("Background review scheduling failed: %s", exc)
@@ -3007,22 +3037,6 @@ class MClaw:
                     break
             except (json.JSONDecodeError, TypeError, AttributeError) as exc:
                 logger.debug("Memory write result could not be parsed: %s", exc)
-
-        # A successful Skill write resets the review interval. Read-only actions
-        # and failed writes leave the completed-turn counter unchanged.
-        if getattr(self, "_evolution_review_round", 0) > 0 and "skill_manage" in self.valid_tool_names:
-            for tc, result in zip(tool_calls, results):
-                fn = tc.get("function", {})
-                if fn.get("name") != "skill_manage":
-                    continue
-                try:
-                    result_data = json.loads(result)
-                    action = str(result_data.get("action") or "").strip()
-                    if result_data.get("success") and action in SKILL_WRITE_ACTIONS:
-                        self._turns_since_evolution_review = 0
-                        break  # One successful write is enough to reset the counter.
-                except (json.JSONDecodeError, TypeError) as exc:
-                    logger.debug("Memory write result could not be parsed: %s", exc)
 
         pending_delegate_data = None
         pending_skill_import_confirmation = None

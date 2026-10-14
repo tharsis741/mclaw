@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from mclaw.prompts.skills import SKILL_AUTHORING_STORAGE_GUIDANCE
+
 MEMORY_REVIEW_PROMPT = (
     "审查上面的会话，提取值得长期保存的记忆。\n\n"
     "重点保存用户偏好、稳定个人背景、环境事实、工具习惯和明确的长期要求。"
@@ -15,8 +17,8 @@ MEMORY_REVIEW_PROMPT = (
 EVOLUTION_REVIEW_PROMPT = (
     "审查已完成会话，提取可复用的 Skill 经验。\n\n"
     "会话中出现稳定流程、明确纠正、可复用教训或弃用信号时，"
-    "用 skill_manage(action='evolution_update', ...) 更新对应 Skill。"
-    "需要维护 Skill 文件时，使用允许的 skill_manage 文件动作。"
+    "在本轮工具和动作允许的范围内，更新适用的已有 Skill 的经验或文件；"
+    "没有适用 Skill，且信息足够形成完整流程时，自动创建新 Skill。"
     "没有值得保存的内容时，回复 Nothing to save."
 )
 
@@ -51,6 +53,7 @@ def build_background_review_system_prompt(*, tool_names: set[str], skill_actions
     if "skill_manage" in tool_names:
         sections.append("Skill 管理允许的动作：" + "、".join(skill_actions) + "。")
         sections.append("仅在会话有充分依据时维护 Skill；所有修改均受本轮动作权限约束。")
+        sections.append(SKILL_AUTHORING_STORAGE_GUIDANCE)
         if "evolution_update" in skill_actions:
             sections.append("已有 Skill 的可复用教训使用 evolution_update。")
         if "create" in skill_actions:

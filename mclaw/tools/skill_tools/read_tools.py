@@ -207,6 +207,8 @@ SKILL_VIEW_SCHEMA = {
         "name": "skill_view",
         "description": (
             "Load one Skill's mclaw_skill.yaml, SKILL.md, and full skill_evolution.json. "
+            "content contains only SKILL.md; mclaw_skill and skill_evolution are separate fields. "
+            "Do not copy the sidecar fields into SKILL.md when authoring. "
             "With file_path, read one non-sidecar file under the Skill root."
         ),
         "parameters": {

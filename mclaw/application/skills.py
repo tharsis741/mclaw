@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from mclaw.application.sessions import ApplicationError
+from mclaw.prompts.skills import build_skill_runtime_content
 from mclaw.skills_hub import install_service, skill_store
 from mclaw.skills_hub.paths import (
     ensure_within_dir, get_enabled_skills_dir, get_skill_drafting_dir,
@@ -293,7 +294,7 @@ class SkillService:
                 view = skill_store.view_skill(name)
                 if _digest(root) != before:
                     raise ApplicationError("SKILL_VERSION_CONFLICT", "技能正在变化，请重试", 409)
-                snapshots.append({"name": name, "content": view["content"],
+                snapshots.append({"name": name, "content": build_skill_runtime_content(view),
                                   "source": view["mclaw_skill"]["source"], "version": before})
         if sum(len(item["content"].encode("utf-8")) for item in snapshots) > MAX_TEXT_BYTES:
             raise ApplicationError("SKILL_SNAPSHOT_TOO_LARGE", "所选技能正文过大，请减少选择", 413)

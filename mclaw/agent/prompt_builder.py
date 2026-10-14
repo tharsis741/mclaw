@@ -19,6 +19,7 @@ from mclaw.constants import get_mclaw_home, get_skills_dir
 from mclaw.platform import get_platform_info
 from mclaw.agent.skill_utils import get_disabled_skill_names
 from mclaw.prompts.memory import build_memory_guidance
+from mclaw.prompts.skills import SKILL_AUTHORING_STORAGE_GUIDANCE
 
 logger = logging.getLogger(__name__)
 
@@ -163,20 +164,24 @@ def build_skill_creation_prompt(*, has_skill_manage: bool) -> str:
         return ""
     return (
         "## 创建 Skill\n\n"
-        "用户要求创建 Skill，或明确同意沉淀可复用流程时，先判断信息是否足够：\n"
+        "用户要求创建 Skill、明确同意沉淀，或你从对话中明确发现值得沉淀的稳定经验、可复用流程时，可以创建 Skill。创建前先判断信息是否足够：\n"
         "- Skill 名称或用途。\n"
         "- 什么时候使用。\n"
         "- 可重复执行的流程。\n"
         "- 输入、输出、安全边界和验证方式。\n\n"
-        "信息不足时，向用户补问缺失项。\n\n"
+        "先根据当前会话和相关 Skill 内容补齐信息。\n"
+        "用户要求创建但仍缺少影响核心流程的信息时，补问关键缺失项。\n"
+        "自动沉淀时，仅保存已有充分依据、与目标 Skill 用途相关的内容；不足以形成完整新 Skill 时，暂缓创建。\n\n"
         "信息足够时：\n"
-        "1. 用 skill_manage(action=\"create_scaffold\", name=..., short_description=..., user_intent=...) 初始化。\n"
+        "1. 用 skill_manage(action=\"create_scaffold\", name=..., short_description=...) 初始化。\n"
+        "   用户明确要求创建时，可通过 user_intent 传入对应的原始请求。\n"
         "2. 用 skill_manage(action=\"edit\") 写入最终 SKILL.md。\n"
         "3. 需要脚本、模板、参考资料或资产时，用 skill_manage(action=\"write_file\") 添加。\n"
         "4. 用 skill_manage(action=\"validate\", name=...) 校验。\n"
         "5. Skill 包含可执行行为时，在临时目录做最小 smoke test。\n"
         "6. 对比预期结果和实际结果，再报告创建完成。\n\n"
-        "SKILL.md frontmatter 包含 name 和 description；description 写清楚 Skill 做什么、何时使用。"
+        "SKILL.md frontmatter 包含 name 和 description；description 写清楚 Skill 做什么、何时使用。\n"
+        + SKILL_AUTHORING_STORAGE_GUIDANCE
     )
 
 
@@ -242,10 +247,11 @@ def build_skill_maintenance_prompt(*, has_skill_manage: bool) -> str:
         return ""
     return (
         "## Skill 沉淀\n\n"
-        "会话产生可复用流程、稳定纠正、重复任务模式或长期经验时，维护对应 Skill。\n\n"
+        "会话中明确发现有充分依据的可复用流程、稳定纠正、重复任务模式或长期经验时，主动完成相应沉淀。\n"
+        "自动沉淀时，优先补充或更新适用的已有 Skill。\n\n"
         "- 已有 Skill 的经验补充：skill_manage(action=\"evolution_update\")。\n"
         "- 已有 Skill 文件需要更新：skill_manage(action=\"edit\"|\"patch\"|\"write_file\"|\"remove_file\")。\n"
-        "- 新的可复用流程：先 create_scaffold，再 edit/write_file/validate。\n"
+        "- 自动沉淀的新流程：没有适用的已有 Skill，且信息足够时，按照“创建 Skill”章节自动创建。\n"
         "- 用户要求删除 Skill：skill_manage(action=\"delete\")。\n\n"
         "沉淀稳定可复用知识；当前任务进度、临时 TODO 和一次性日志保留在会话中。"
     )
@@ -305,7 +311,7 @@ def build_skills_system_prompt(
                 "- skill_manage(install_prepare: source, user_intent)：准备安装 skills.sh、GitHub、ClawHub 或本地目录 Skill，并返回 dependency_hints；不收集密钥。",
                 "- skill_manage(security_review: drafting_id)：重新审查 drafting Skill；正常 /skill install 流程不要单独调用。",
                 "- skill_manage(enable_drafting/cancel_drafting: drafting_id)：只用于 runtime confirmation flow，不要在普通对话中主动调用。",
-                "- skill_manage(create_scaffold: name, short_description, user_intent)：用中文 short_description 初始化最小 enabled Skill 壳，后续必须用 edit/write_file/validate 完成。",
+                "- skill_manage(create_scaffold: name, short_description, user_intent 可选)：用中文 short_description 初始化最小 enabled Skill 壳，后续必须用 edit/write_file/validate 完成。",
                 "- skill_manage(validate: name)：校验 Skill 的 frontmatter、sidecar、skill_evolution 和安全扫描；创建成功前必须调用。",
                 "- skill_manage(create: name, skill_md, short_description, initial_evolution)：一次性创建 enabled Skill；/skill creation 默认使用 create_scaffold。",
                 "- skill_manage(edit: name, skill_md)：整体替换 SKILL.md。",

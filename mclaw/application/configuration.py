@@ -64,7 +64,7 @@ GROUPS = [
          number("memory.memory_char_limit", "长期记忆容量（字）", 1, 1000000, advanced=True),
          number("memory.user_char_limit", "个人偏好容量（字）", 1, 1000000, advanced=True),
          number("memory.memory_review_round", "记忆整理间隔（轮）", 0, 10000, description="每隔多少轮对话整理记忆；0 表示关闭自动整理。", advanced=True),
-         number("skills.evolution_review_round", "技能整理间隔（轮）", 0, 10000, description="每隔多少轮对话检查技能改进；0 表示关闭自动检查。", advanced=True),
+         number("skills.evolution_review_round", "技能整理间隔（轮）", 0, 10000, description="每累计多少轮对话检查可沉淀的经验和 Skill；保存成功后重新计数。0 表示关闭定期检查，对话中的主动沉淀仍可执行。", advanced=True),
      ]},
     {"id": "terminal", "page": "execution", "title": "命令与文件", "effect": "下一次任务生效",
      "fields": [

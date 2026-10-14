@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from mclaw.prompts.skills import build_skill_invocation_system
+from mclaw.prompts.skills import build_skill_invocation_system, build_skill_runtime_content
 from mclaw.skills_hub import skill_store
 
 
@@ -71,7 +71,7 @@ class RuntimeSkillCommandCoordinator:
                 return True
         try:
             view = skill_store.view_skill(str(skill.name))
-            skill_content = str(view.get("content") or "")
+            skill_content = build_skill_runtime_content(view)
         except Exception as exc:
             self.hooks.render_read_error(f"Cannot read skill: {exc}")
             return True

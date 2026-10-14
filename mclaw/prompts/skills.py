@@ -6,8 +6,30 @@
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
+
+
+SKILL_AUTHORING_STORAGE_GUIDANCE = (
+    "SKILL.md 只保存 frontmatter 和可复用流程正文。"
+    "skill_view 的 content 是正文，mclaw_skill 和 skill_evolution 是独立字段；"
+    "创建者、更新时间和状态由运行时维护，不要复制到正文。"
+    "经验通过 initial_evolution 或 evolution_update 保存。"
+)
+
+
+def build_skill_runtime_content(view: dict[str, Any]) -> str:
+    """Include saved experience for invocation without copying audit metadata."""
+    content = str(view.get("content") or "")
+    evolution = view.get("skill_evolution") or {}
+    if any(evolution.values()):
+        content += (
+            "\n\n[运行时提供的 Skill 经验，独立于 SKILL.md]\n"
+            + json.dumps(evolution, ensure_ascii=False, indent=2)
+            + "\n[Skill 经验结束]"
+        )
+    return content
 
 
 def strip_skill_invocations(content: str, *, name: str | None = None) -> str:

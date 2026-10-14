@@ -155,6 +155,14 @@ def skill_manage(
                 f"Unknown action. Use: {', '.join(SKILL_MANAGE_ACTION_ORDER)}",
                 success=False,
             )
+        on_write = getattr(parent_agent, "_on_skill_write", None)
+        if callable(on_write):
+            try:
+                on_write(action, result)
+            except Exception:
+                # The store has already committed. Notification failures must
+                # not turn a successful save into a misleading tool error.
+                logger.warning("Skill write notification failed: action=%s", action, exc_info=True)
         return _json(result)
     except InterruptedError as exc:
         return tool_error(
@@ -200,7 +208,9 @@ SKILL_MANAGE_SCHEMA = {
                     "type": "string",
                     "description": (
                         "Full SKILL.md content for create/edit. Must include YAML frontmatter "
-                        "with name and description."
+                        "with name and description, followed by reusable instructions only. "
+                        "Do not copy mclaw_skill metadata or skill_evolution memory into this field; "
+                        "the service owns metadata, and experience uses initial_evolution/evolution_update."
                     ),
                 },
                 "short_description": {

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 import shutil
 import threading
 import uuid
@@ -76,6 +77,7 @@ def _validate_skill_md(
     expected_name: str | None = None,
     *,
     allow_placeholder: bool = False,
+    allow_embedded_sidecars: bool = False,
 ) -> None:
     """Validate the root Skill instructions and frontmatter contract."""
 
@@ -95,6 +97,22 @@ def _validate_skill_md(
     if not fm_description:
         raise SkillStoreError("SKILL.md frontmatter description is required.")
     instruction_body = body if frontmatter else text
+    if not allow_embedded_sidecars:
+        fence = ""
+        for line in instruction_body.splitlines():
+            marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+            if marker:
+                if not fence:
+                    fence = marker[1]
+                elif marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                    fence = ""
+                continue
+            if not fence and re.match(r"^ {0,3}#{1,6}\s+M-Claw Skill (?:Metadata|Memory)\s*#*\s*$", line, re.I):
+                raise SkillStoreError(
+                    "SKILL.md must contain only frontmatter and reusable instructions, not the "
+                    "M-Claw Skill Metadata/Memory sections from skill_view. Runtime metadata is "
+                    "maintained by the service; save experience with initial_evolution or evolution_update."
+                )
     if not instruction_body.strip():
         raise SkillStoreError("SKILL.md must contain reusable instructions.")
     meaningful_lines = [
@@ -128,6 +146,8 @@ def _validate_package(
         (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace"),
         str(yaml_data.get("name") or skill_dir.name),
         allow_placeholder=allow_placeholder,
+        # Older packages remain readable so they can be repaired through edit.
+        allow_embedded_sidecars=True,
     )
     return yaml_data
 
@@ -189,7 +209,7 @@ def get_skill_record(name: str) -> dict[str, Any]:
 
 
 def view_skill(name: str, file_path: str | None = None) -> dict[str, Any]:
-    """Read either a mutable Skill file or the composed Skill overview payload."""
+    """Read instructions and service-owned sidecars as separate fields."""
 
     record = get_skill_record(name)
     skill_dir = Path(record["path"])
@@ -212,19 +232,11 @@ def view_skill(name: str, file_path: str | None = None) -> dict[str, Any]:
     skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
     yaml_data = read_skill_yaml(skill_dir)
     evolution = read_evolution(skill_dir)
-    payload = (
-        f"# Skill: {record['name']}\n\n"
-        f"{render_skill_vars(skill_md, skill_dir, record['name']).strip()}\n\n"
-        "## M-Claw Skill Metadata\n\n"
-        f"```yaml\n{json.dumps(yaml_data, ensure_ascii=False, indent=2)}\n```\n\n"
-        "## M-Claw Skill Memory\n\n"
-        f"```json\n{json.dumps(evolution, ensure_ascii=False, indent=2)}\n```"
-    )
     return {
         "success": True,
         "name": record["name"],
         "short_description": record["short_description"],
-        "content": payload,
+        "content": render_skill_vars(skill_md, skill_dir, record["name"]),
         "mclaw_skill": yaml_data,
         "skill_evolution": evolution,
     }
@@ -416,6 +428,7 @@ def create_skill_scaffold(
             "SKILL.md must include YAML frontmatter with name and description.",
             "Frontmatter name must match the skill directory name.",
             "Frontmatter description must explain what the Skill does and when to use it.",
+            "Keep runtime metadata and Skill memory out of SKILL.md; use initial_evolution or evolution_update for experience.",
             "Replace the scaffold placeholder through skill_manage(action=\"edit\") before final validation.",
             "Write non-system Skill files anywhere under the Skill root through skill_manage(action=\"write_file\"); assets/, references/, scripts/, and templates/ are recommended organization directories, not hard limits.",
             "Run skill_manage(action=\"validate\") and a temporary-directory smoke test before reporting success.",
@@ -480,9 +493,9 @@ def patch_skill(*, name: str, old_text: str, new_text: str, actor: str = "main_a
     if occurrences != 1:
         raise SkillStoreError("old_text must uniquely match one location.")
     updated = original.replace(old_text, new_text, 1)
+    _validate_skill_md(updated, name)
     try:
         skill_path.write_text(updated, encoding="utf-8")
-        _validate_skill_md(updated, name)
         review = review_skill_package(skill_dir, source="agent_created")
         if review.get("verdict") == "dangerous":
             raise SkillStoreError(f"Security scan blocked this skill: {review.get('summary')}")
@@ -515,8 +528,13 @@ def write_skill_file(
     backup = target.read_bytes() if target.exists() else None
     try:
         if encoding == "base64":
-            target.write_bytes(base64.b64decode(content or "", validate=True))
+            decoded = base64.b64decode(content or "", validate=True)
+            if target == (skill_dir / "SKILL.md").resolve():
+                _validate_skill_md(decoded.decode("utf-8"), name)
+            target.write_bytes(decoded)
         elif encoding == "text":
+            if target == (skill_dir / "SKILL.md").resolve():
+                _validate_skill_md(content or "", name)
             target.write_text(content or "", encoding="utf-8")
         else:
             raise SkillStoreError("encoding must be text or base64.")
