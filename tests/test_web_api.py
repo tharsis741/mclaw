@@ -33,6 +33,20 @@ def web(tmp_path, monkeypatch):
 @pytest.mark.parametrize("headers", [{"Authorization": ""}, {"Authorization": "Bearer wrong"}, {"Origin": "https://evil.example"}, {"Host": "evil.example"}, {"Host": "testserver"}])
 def test_api_rejects_missing_auth_and_cross_origin(web, headers):
     assert web.get("/api/v1/health", headers=headers).status_code == 403
+    assert web.get("/api/v1/task-notifications", headers=headers).status_code == 403
+    assert web.post("/api/v1/task-notifications", json={"ids": [], "action": "dismiss"}, headers=headers).status_code == 403
+
+
+@pytest.mark.parametrize("payload", [{}, {"ids": "bad", "action": "read"}, {"ids": [], "action": []},
+                                     {"ids": [{}], "action": "read"}, {"ids": ["x"] * 101, "action": "dismiss"}])
+def test_notification_ack_rejects_invalid_parameters(web, payload):
+    assert web.post("/api/v1/task-notifications", json=payload).status_code == 400
+
+
+def test_notification_feed_is_global_without_claiming_sessions(web):
+    assert web.get("/api/v1/task-notifications?q=unrelated&offset=999").json() == {
+        "notifications": [], "pending_count": 0, "unread_session_ids": []}
+    assert web.post("/api/v1/task-notifications", json={"ids": ["missing"], "action": "dismiss"}).status_code == 200
 
 
 def test_api_session_creation_rename_and_ownership(web):

@@ -168,12 +168,20 @@ class SessionService:
             if deadline <= self.clock():
                 self.release(session_id, client)
 
-    def _save(self, session: dict, *, activity: bool = False) -> dict:
+    def _save(self, session: dict, *, activity: bool = False, notification: dict | None = None) -> dict:
         session["seq"] += 1
         if activity:
             session["updated_at"] = time.time()
-        self.store.save(session)
+        self.store.save(session, notification=notification)
         return self.public(session)
+
+    def acknowledge_task_notifications(self, identifiers: list[str], action: str) -> dict:
+        if (not isinstance(identifiers, list) or len(identifiers) > 100
+                or any(not isinstance(item, str) or not item or len(item) > 128 for item in identifiers)
+                or not isinstance(action, str) or action not in {"dismiss", "read"}):
+            raise ApplicationError("INVALID_NOTIFICATION_ACK", "通知确认参数无效")
+        self.store.acknowledge_task_notifications(identifiers, read=action == "read")
+        return self.store.task_notifications()
 
     @staticmethod
     def public(session: dict) -> dict:
@@ -733,9 +741,14 @@ class SessionService:
                 finish_process(response)
                 from mclaw.application.delegation_events import finish_delegations
                 finish_delegations(response)
-                if result.get("final_response"):
+                if isinstance(result.get("final_response"), str):
                     response["content"] = result["final_response"]
-                self._save(session, activity=True)
+                from mclaw.application.task_notifications import completion_notice
+                from mclaw.application.process_events import secret_values
+                notification = completion_notice(session, active, response, secret_values(self.home))
+                if notification:
+                    response["task_notification_id"] = notification["id"]
+                self._save(session, activity=True, notification=notification)
                 if session["paused"]:
                     return
         finally:

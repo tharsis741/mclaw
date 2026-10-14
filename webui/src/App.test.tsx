@@ -1,8 +1,17 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, expect, it, vi } from 'vitest';
 import App from './App';
-import { api, devicesApi, providersApi, skillsApi, subscribeSession } from './api';
+import {
+  api,
+  devicesApi,
+  providersApi,
+  skillsApi,
+  subscribeSession,
+  taskNotificationsApi,
+} from './api';
 import type { Session, SessionEvent } from './types';
 import { WELCOME_ACTIONS } from './welcome-content';
 
@@ -16,6 +25,14 @@ vi.mock('./api', async () => {
     },
     initializeConnection: vi.fn().mockResolvedValue(undefined),
     subscribeSession: vi.fn(() => () => {}),
+    taskNotificationsApi: {
+      list: vi
+        .fn()
+        .mockResolvedValue({ notifications: [], pending_count: 0, unread_session_ids: [] }),
+      acknowledge: vi
+        .fn()
+        .mockResolvedValue({ notifications: [], pending_count: 0, unread_session_ids: [] }),
+    },
     skillsApi: { ...actual.skillsApi, list: vi.fn() },
     devicesApi: { ...actual.devicesApi, status: vi.fn() },
     providersApi: {
@@ -117,6 +134,7 @@ const base: Session = {
 beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
+  sessionStorage.clear();
   vi.mocked(api.bootstrap).mockResolvedValue({
     setup_required: false,
     version: 'test',
@@ -132,7 +150,180 @@ beforeEach(() => {
   vi.mocked(skillsApi.list).mockResolvedValue({ skills: [] });
   vi.mocked(providersApi.list).mockResolvedValue({ catalog: [], configured: [], revision: 'test' });
   vi.mocked(subscribeSession).mockImplementation(() => () => {});
+  vi.mocked(taskNotificationsApi.list).mockResolvedValue({
+    notifications: [],
+    pending_count: 0,
+    unread_session_ids: [],
+  });
+  vi.mocked(taskNotificationsApi.acknowledge).mockResolvedValue({
+    notifications: [],
+    pending_count: 0,
+    unread_session_ids: [],
+  });
 });
+
+const completionLiveTest = process.env.MCLAW_TASK_LIVE_REPORT_DIR ? it : it.skip;
+const completionEvidence = () =>
+  JSON.parse(
+    readFileSync(
+      resolve(process.env.MCLAW_TASK_LIVE_REPORT_DIR!, 'task-notifications-live.json'),
+      'utf8',
+    ),
+  );
+
+completionLiveTest(
+  'shows real completion notices on the Skills page despite session search and locates the exact reply',
+  async () => {
+    const focused = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    const scroll = vi.spyOn(Element.prototype, 'scrollIntoView');
+    try {
+      const evidence = completionEvidence();
+      const notice = evidence.feed.notifications[1];
+      const target = evidence.sessions.find(
+        (item: Session) => item.id === notice.session_id,
+      ) as Session;
+      vi.mocked(api.session).mockResolvedValue(target);
+      vi.mocked(api.sessions).mockResolvedValue([]);
+      render(<App />);
+      await userEvent.click(
+        within(await screen.findByRole('navigation')).getByRole('button', { name: '技能' }),
+      );
+      await userEvent.type(screen.getByRole('textbox', { name: '搜索会话' }), 'no-such-session');
+      vi.mocked(taskNotificationsApi.list).mockResolvedValue({
+        ...evidence.feed,
+        notifications: [notice],
+      });
+      fireEvent.focus(window);
+      const banner = await screen.findByRole('region', { name: '任务完成通知' });
+      expect(within(banner).getByText(notice.preview)).toBeVisible();
+      expect(api.session).not.toHaveBeenCalled();
+      await userEvent.click(within(banner).getByRole('button', { name: '查看结果' }));
+      await screen.findByRole('heading', { name: target.title });
+      expect(api.session).toHaveBeenCalledWith(target.id);
+      await waitFor(() =>
+        expect(taskNotificationsApi.acknowledge).toHaveBeenCalledWith(
+          expect.arrayContaining([notice.id]),
+          'read',
+        ),
+      );
+      await waitFor(() =>
+        expect(
+          scroll.mock.contexts.some(
+            (node) => (node as HTMLElement)?.dataset.messageId === notice.response_id,
+          ),
+        ).toBe(true),
+      );
+    } finally {
+      focused.mockRestore();
+      scroll.mockRestore();
+    }
+  },
+);
+
+completionLiveTest(
+  'reads completed results when returning to the same conversation from another page',
+  async () => {
+    const focused = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    try {
+      const evidence = completionEvidence();
+      const running = evidence.before_finalization as Session;
+      const finished = evidence.sessions.find((item: Session) => item.id === running.id) as Session;
+      let receive!: (event: SessionEvent) => void;
+      vi.mocked(subscribeSession).mockImplementation((_id, callback) => {
+        receive = callback;
+        return () => {};
+      });
+      vi.mocked(api.sessions).mockResolvedValue([running]);
+      vi.mocked(api.session).mockResolvedValue(running);
+      render(<App />);
+      await userEvent.click(
+        await screen.findByRole('button', { name: new RegExp(running.title + '$') }),
+      );
+      await screen.findByRole('heading', { name: running.title });
+      await userEvent.click(
+        within(screen.getByRole('navigation')).getByRole('button', { name: '技能' }),
+      );
+      vi.mocked(taskNotificationsApi.acknowledge).mockClear();
+      await act(async () => receive({ type: 'snapshot', seq: finished.seq!, session: finished }));
+      expect(taskNotificationsApi.acknowledge).not.toHaveBeenCalled();
+      await userEvent.click(
+        within(screen.getByRole('navigation')).getByRole('button', { name: '对话' }),
+      );
+      const identifiers = finished.messages.flatMap((message) =>
+        message.task_notification_id ? [message.task_notification_id] : [],
+      );
+      expect(identifiers).toHaveLength(2);
+      await waitFor(() =>
+        expect(taskNotificationsApi.acknowledge).toHaveBeenCalledWith(identifiers, 'read'),
+      );
+    } finally {
+      focused.mockRestore();
+    }
+  },
+);
+
+completionLiveTest(
+  'reads a completion in the current conversation before polling and never reannounces it after leaving',
+  async () => {
+    const focused = vi.spyOn(document, 'hasFocus').mockReturnValue(true);
+    try {
+      const evidence = completionEvidence();
+      const target = evidence.before_finalization as Session;
+      const finished = evidence.sessions.find((item: Session) => item.id === target.id) as Session;
+      let receive!: (event: SessionEvent) => void;
+      vi.mocked(subscribeSession).mockImplementation((_id, callback) => {
+        receive = callback;
+        return () => {};
+      });
+      vi.mocked(api.sessions).mockResolvedValue([target]);
+      vi.mocked(api.session).mockResolvedValue(target);
+      render(<App />);
+      await userEvent.click(
+        await screen.findByRole('button', { name: new RegExp(target.title + '$') }),
+      );
+      const draft = screen.getByRole('textbox', { name: '描述你的任务' });
+      await userEvent.type(draft, '正在输入的后续任务');
+      const currentNotices = evidence.feed.notifications.filter(
+        (item: { session_id: string }) => item.session_id === target.id,
+      );
+      let saved!: (value: Awaited<ReturnType<typeof taskNotificationsApi.acknowledge>>) => void;
+      vi.mocked(taskNotificationsApi.acknowledge).mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            saved = resolve;
+          }),
+      );
+      await act(async () => receive({ type: 'snapshot', seq: finished.seq!, session: finished }));
+      await waitFor(() =>
+        expect(taskNotificationsApi.acknowledge).toHaveBeenCalledWith(
+          currentNotices.map((notice: { id: string }) => notice.id),
+          'read',
+        ),
+      );
+      expect(screen.queryByRole('region', { name: '任务完成通知' })).toBeNull();
+      expect(draft).toHaveValue('正在输入的后续任务');
+      expect(draft).toHaveFocus();
+      await userEvent.click(
+        within(screen.getByRole('navigation')).getByRole('button', { name: '技能' }),
+      );
+      vi.mocked(taskNotificationsApi.list).mockResolvedValue({
+        ...evidence.feed,
+        notifications: currentNotices,
+        pending_count: currentNotices.length,
+      });
+      await act(async () => {
+        fireEvent.focus(window);
+      });
+      expect(screen.queryByRole('region', { name: '任务完成通知' })).toBeNull();
+      const empty = { notifications: [], pending_count: 0, unread_session_ids: [] };
+      vi.mocked(taskNotificationsApi.list).mockResolvedValue(empty);
+      await act(async () => saved(empty));
+      expect(screen.queryByRole('region', { name: '任务完成通知' })).toBeNull();
+    } finally {
+      focused.mockRestore();
+    }
+  },
+);
 
 it('dismisses session actions on outside click, Escape, repeated click and session navigation', async () => {
   render(<App />);

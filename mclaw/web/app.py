@@ -184,6 +184,12 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
             raise ApplicationError("INVALID_PAGINATION", "分页参数格式错误") from exc
         return JSONResponse({"sessions": service.list(request.query_params.get("q", ""), offset, limit)})
 
+    async def task_notifications(request):
+        if request.method == "POST":
+            data = await body(request)
+            return JSONResponse(service.acknowledge_task_notifications(data.get("ids"), data.get("action")))
+        return JSONResponse(service.store.task_notifications())
+
     async def session(request):
         if request.method == "DELETE":
             return JSONResponse(await service.delete(sid(request), client(request)))
@@ -326,6 +332,7 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
         return FileResponse(path)
 
     routes = [Route("/api/v1/health", health), Route("/api/v1/bootstrap", bootstrap),
+              Route("/api/v1/task-notifications", task_notifications, methods=["GET", "POST"]),
               Route("/api/v1/sessions", sessions, methods=["GET", "POST"]),
               Route("/api/v1/sessions/{session_id}", session, methods=["GET", "PATCH", "DELETE"]),
               Route("/api/v1/sessions/{session_id}/export", export),

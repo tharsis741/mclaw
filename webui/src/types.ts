@@ -56,6 +56,21 @@ export interface Message {
   attachments?: FileReference[];
   device_selection?: DeviceSelection;
   skill_review?: SkillReviewNotice;
+  task_notification_id?: string;
+}
+export interface TaskCompletionNotice {
+  id: string;
+  session_id: string;
+  task_id: string;
+  response_id: string;
+  title: string;
+  preview: string;
+  created_at: number;
+}
+export interface TaskNotificationFeed {
+  notifications: TaskCompletionNotice[];
+  pending_count: number;
+  unread_session_ids: string[];
 }
 export interface SkillReviewNotice {
   id: string;

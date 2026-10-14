@@ -322,7 +322,7 @@ const MessageView = memo(function MessageView({
     return <SkillReviewNotice notice={message.skill_review} onOpenSkill={onOpenSkill} />;
   }
   return (
-    <article className={`message message-${message.role}`}>
+    <article className={`message message-${message.role}`} data-message-id={message.id}>
       <div className="message-identity">
         {message.role === 'user' ? (
           message.source === 'weixin' || message.source === 'dingtalk' ? (
@@ -413,10 +413,12 @@ export function Conversation({
   session,
   onFilePreview,
   onOpenSkill,
+  focusedMessage,
 }: {
   session: Session;
   onFilePreview?: (file: FileReference | { id: string; name: string }) => void;
   onOpenSkill?: (name: string) => void;
+  focusedMessage?: { id: string; request: number };
 }) {
   const previewCallback = useRef(onFilePreview);
   previewCallback.current = onFilePreview;
@@ -430,6 +432,7 @@ export function Conversation({
   const scroller = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
+  const lastFocused = useRef('');
   const [showLatest, setShowLatest] = useState(false);
   useEffect(() => {
     const node = scroller.current;
@@ -445,6 +448,20 @@ export function Conversation({
   useEffect(() => {
     if (atBottom.current) end.current?.scrollIntoView({ block: 'end' });
   }, [session.messages]);
+  useEffect(() => {
+    if (!focusedMessage) return;
+    const identity = `${session.id}:${focusedMessage.id}:${focusedMessage.request}`;
+    if (lastFocused.current === identity) return;
+    const target = Array.from(
+      scroller.current?.querySelectorAll<HTMLElement>('[data-message-id]') ?? [],
+    ).find((element) => element.dataset.messageId === focusedMessage.id);
+    if (target) {
+      lastFocused.current = identity;
+      atBottom.current = false;
+      target.scrollIntoView({ block: 'start' });
+      setShowLatest(true);
+    }
+  }, [focusedMessage, session.id, session.messages]);
   return (
     <div className="conversation-frame">
       <div

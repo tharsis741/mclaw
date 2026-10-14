@@ -56,6 +56,15 @@ class ApplicationStore:
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY, value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS app_task_notifications (
+                id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                document TEXT NOT NULL, created_at REAL NOT NULL,
+                dismissed_at REAL, read_at REAL
+            );
+            CREATE INDEX IF NOT EXISTS app_task_notifications_pending
+                ON app_task_notifications(created_at, id) WHERE dismissed_at IS NULL;
+            CREATE INDEX IF NOT EXISTS app_task_notifications_unread
+                ON app_task_notifications(session_id) WHERE read_at IS NULL;
             PRAGMA user_version=1;
         """)
         self._db.commit()
@@ -67,13 +76,47 @@ class ApplicationStore:
             ).fetchone()
             return json.loads(row[0]) if row else None
 
-    def save(self, session: dict[str, Any]) -> None:
+    def save(self, session: dict[str, Any], *, notification: dict | None = None) -> None:
         with self._lock, self._db:
             self._db.execute(
                 "INSERT INTO app_sessions VALUES (?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET document=excluded.document, "
                 "updated_at=excluded.updated_at",
                 (session["id"], json.dumps(session, ensure_ascii=False), session["updated_at"]),
+            )
+            if notification is not None:
+                if notification["session_id"] != session["id"]:
+                    raise ValueError("Completion notification belongs to another session")
+                self._db.execute(
+                    "INSERT OR IGNORE INTO app_task_notifications "
+                    "(id, session_id, document, created_at) VALUES (?, ?, ?, ?)",
+                    (notification["id"], session["id"], json.dumps(notification, ensure_ascii=False),
+                     notification["created_at"]),
+                )
+
+    def task_notifications(self) -> dict:
+        """Deliver pending completions independently of session search and pagination."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT document FROM app_task_notifications WHERE dismissed_at IS NULL "
+                "ORDER BY created_at, id LIMIT 100",
+            ).fetchall()
+            return {"notifications": [json.loads(row[0]) for row in rows],
+                    "pending_count": self._db.execute(
+                        "SELECT COUNT(*) FROM app_task_notifications WHERE dismissed_at IS NULL"
+                    ).fetchone()[0],
+                    "unread_session_ids": [row[0] for row in self._db.execute(
+                        "SELECT DISTINCT session_id FROM app_task_notifications WHERE read_at IS NULL"
+                    )]}
+
+    def acknowledge_task_notifications(self, identifiers: list[str], *, read: bool) -> None:
+        """Dismissal and reading are durable and idempotent across windows and restarts."""
+        now = time.time()
+        with self._lock, self._db:
+            self._db.executemany(
+                "UPDATE app_task_notifications SET dismissed_at=COALESCE(dismissed_at, ?), "
+                "read_at=CASE WHEN ? THEN COALESCE(read_at, ?) ELSE read_at END WHERE id=?",
+                [(now, read, now, identifier) for identifier in identifiers],
             )
 
     def all(self) -> list[dict[str, Any]]:
@@ -86,6 +129,7 @@ class ApplicationStore:
         """Remove the application snapshot after its history and worker close."""
         with self._lock, self._db:
             self._db.execute("DELETE FROM app_sessions WHERE id=?", (session_id,))
+            self._db.execute("DELETE FROM app_task_notifications WHERE session_id=?", (session_id,))
             self._db.execute("DELETE FROM app_settings WHERE key=?", (f"channel_title:{session_id}",))
             self._db.execute("INSERT OR REPLACE INTO app_settings VALUES (?, ?)",
                              (f"deleted_session:{session_id}", "true"))

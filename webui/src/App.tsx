@@ -44,6 +44,8 @@ import { Welcome } from './components/Welcome';
 import { BrandLogo } from './components/BrandLogo';
 import { BrandWordmark } from './components/BrandWordmark';
 import { StartupScreen } from './components/StartupScreen';
+import { TaskCompletionBanner } from './components/TaskCompletionBanner';
+import { useTaskNotifications } from './useTaskNotifications';
 import { useStartupIntro } from './useStartupIntro';
 import {
   groupSessions,
@@ -57,7 +59,7 @@ import {
   savePendingSubmissions,
   STATUS_TEXT,
 } from './session-state';
-import type { Bootstrap, FileReference, Session } from './types';
+import type { Bootstrap, FileReference, Session, TaskCompletionNotice } from './types';
 
 type Page = 'chat' | 'devices' | 'schedules' | 'skills' | 'tools' | 'settings';
 const NAV = [
@@ -72,6 +74,10 @@ const normalize = (session: Session): Session => ({
   messages: session.messages ?? [],
   queue: session.queue ?? [],
 });
+const completionIds = (session: Session) =>
+  session.messages.flatMap((message) =>
+    message.task_notification_id ? [message.task_notification_id] : [],
+  );
 
 export default function App() {
   const [bootstrap, setBootstrap] = useState<Bootstrap | null>(null);
@@ -118,6 +124,12 @@ export default function App() {
   const deletedSessions = useRef(new Set<string>());
   const [changesOpen, setChangesOpen] = useState(false);
   const [unread, setUnread] = useState<Set<string>>(new Set());
+  const [focusedMessage, setFocusedMessage] = useState<{
+    session: string;
+    id: string;
+    request: number;
+  }>();
+  const focusRequest = useRef(0);
   const historySearch = useRef<HTMLInputElement>(null);
   const usageDetails = useRef<HTMLDetailsElement>(null);
   const selectedRef = useRef(selected);
@@ -127,6 +139,29 @@ export default function App() {
   const newDraftIdentity = useRef(crypto.randomUUID());
   const movedDrafts = useRef<Record<string, string>>({});
   const session = selected ? (cache[selected] ?? null) : null;
+  const notificationSuspended =
+    startupIntro.visible ||
+    !!deleting ||
+    !!providersOpen ||
+    workspaceOpen ||
+    changesOpen ||
+    !!previewFile ||
+    sidebarOpen ||
+    setupOpen;
+  const viewedSessionId =
+    page === 'chat' && session && !loadingSession && !occupied && !notificationSuspended
+      ? session.id
+      : null;
+  const notifications = useTaskNotifications(
+    !!bootstrap && !bootstrap.setup_required && !serviceShutdown,
+    viewedSessionId,
+  );
+  const acknowledgeNotifications = notifications.acknowledge;
+  const observeCompletion = notifications.observeSession;
+  useEffect(
+    () => setUnread(new Set(notifications.feed.unread_session_ids)),
+    [notifications.feed.unread_session_ids],
+  );
   const draftKey = selected ?? 'new';
   const draft = drafts[draftKey] ?? '';
   const selectedSkills = draftSkills[draftKey] ?? [];
@@ -242,18 +277,6 @@ export default function App() {
             setConnected(true);
             setSessions((previous) => {
               const old = new Map(previous.map((item) => [item.id, item.status]));
-              setUnread((current) => {
-                const changed = new Set(current);
-                next.forEach((item) => {
-                  if (
-                    item.status === 'completed' &&
-                    old.get(item.id) === 'running' &&
-                    item.id !== selectedRef.current
-                  )
-                    changed.add(item.id);
-                });
-                return changed;
-              });
               const refreshed = new Map(next.map((item) => [item.id, normalize(item)]));
               // A short page is the complete result, including deletions made
               // from another window while this page was disconnected.
@@ -269,20 +292,26 @@ export default function App() {
     );
     return () => clearInterval(interval);
   }, [bootstrap, search, serviceShutdown]);
-  const merge = useCallback((next: Session) => {
-    if (deletedSessions.current.has(next.id)) return;
-    const safe = normalize(next);
-    const latest = (previous?: Session) =>
-      previous?.seq !== undefined && safe.seq !== undefined && previous.seq > safe.seq
-        ? previous
-        : safe;
-    setCache((current) => ({ ...current, [safe.id]: latest(current[safe.id]) }));
-    setSessions((current) =>
-      current.some((item) => item.id === safe.id)
-        ? current.map((item) => (item.id === safe.id ? latest(item) : item))
-        : [safe, ...current],
-    );
-  }, []);
+  const merge = useCallback(
+    (next: Session) => {
+      if (deletedSessions.current.has(next.id)) return;
+      const safe = normalize(next);
+      // Observe the completion before a later navigation can change the page,
+      // including when the global notification poll has not arrived yet.
+      observeCompletion(safe);
+      const latest = (previous?: Session) =>
+        previous?.seq !== undefined && safe.seq !== undefined && previous.seq > safe.seq
+          ? previous
+          : safe;
+      setCache((current) => ({ ...current, [safe.id]: latest(current[safe.id]) }));
+      setSessions((current) =>
+        current.some((item) => item.id === safe.id)
+          ? current.map((item) => (item.id === safe.id ? latest(item) : item))
+          : [safe, ...current],
+      );
+    },
+    [observeCompletion],
+  );
   useEffect(() => {
     if (!selected) return;
     let cancelled = false;
@@ -344,6 +373,9 @@ export default function App() {
       dispose();
     };
   }, [selected, merge]);
+  useEffect(() => {
+    if (session) observeCompletion(session);
+  }, [session, viewedSessionId, notifications.foreground, observeCompletion]);
 
   const changeDraft = (value: string) => {
     editedDrafts.current.add(draftKey);
@@ -415,11 +447,33 @@ export default function App() {
     setSelected(id);
     setPage('chat');
     setSidebarOpen(false);
-    setUnread((current) => {
-      const next = new Set(current);
-      next.delete(id);
-      return next;
-    });
+  };
+  const viewCompletion = async (notice: TaskCompletionNotice) => {
+    try {
+      const next = await api.session(notice.session_id);
+      merge(next);
+      openSession(notice.session_id);
+      setFocusedMessage({
+        session: notice.session_id,
+        id: notice.response_id,
+        request: ++focusRequest.current,
+      });
+      await acknowledgeNotifications([...new Set([notice.id, ...completionIds(next)])], 'read');
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '查看结果失败，请重试');
+      throw e;
+    }
+  };
+  const dismissCompletion = async (notice: TaskCompletionNotice) => {
+    try {
+      await acknowledgeNotifications(
+        [notice.id],
+        page === 'chat' && selected === notice.session_id ? 'read' : 'dismiss',
+      );
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '关闭通知失败，请重试');
+      throw e;
+    }
   };
   const runAction = async (action: () => Promise<Session>) => {
     setBusy(true);
@@ -898,6 +952,7 @@ export default function App() {
             ) : (
               <Conversation
                 session={session}
+                focusedMessage={focusedMessage?.session === session.id ? focusedMessage : undefined}
                 onFilePreview={(file) => setPreviewFile({ session: session.id, file })}
                 onOpenSkill={(name) => {
                   setInitialSkillName(name);
@@ -1042,6 +1097,15 @@ export default function App() {
           <DeviceStatus bootstrap={bootstrap} />
         )}
       </main>
+      <TaskCompletionBanner
+        notice={notifications.feed.notifications.find(
+          (notice) => !deletedSessions.current.has(notice.session_id),
+        )}
+        count={notifications.feed.pending_count}
+        suspended={notificationSuspended}
+        onView={viewCompletion}
+        onDismiss={dismissCompletion}
+      />
       {deleting && (
         <DeleteSessionDialog
           session={deleting}

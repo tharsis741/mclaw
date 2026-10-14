@@ -91,6 +91,13 @@ async def test_live_notifications_cross_worker_and_restore(live):
         assert any(item["active_task"] != trigger_task for item in received)
         assert snapshot["status"] == "completed" and not snapshot["queue"] and not snapshot["active_task"]
         assert len(service.store.get(sid)["tasks"]) == 3
+        main_notices = service.store.task_notifications()["notifications"]
+        assert len(main_notices) == 3
+        assert all(item["session_id"] == sid and item["id"].startswith("completion_") for item in main_notices)
+        assert {item["response_id"] for item in main_notices} == {
+            task["attempts"][-1]["id"] for task in service.store.get(sid)["tasks"]}
+        report("background-notification-isolation.json", {"main_task_notifications": main_notices,
+                                                          "inline_skill_notifications": saved})
         # Presentation notices never become context or a user task.
         history = service.history.get_messages_as_conversation(sid)
         assert all("skill_review" not in row for row in history)

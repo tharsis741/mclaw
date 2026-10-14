@@ -23,7 +23,7 @@ async def test_stream_batches_keep_order_and_flush_before_user_requests(tmp_path
     service.store.save(session)
     writes = []
     save = service.store.save
-    monkeypatch.setattr(service.store, "save", lambda value: (writes.append(value["seq"]), save(value)))
+    monkeypatch.setattr(service.store, "save", lambda value, **kwargs: (writes.append(value["seq"]), save(value, **kwargs)))
     batch = EventBatcher(lambda event: service._event(sid, "reply", event))
     for character in "准备检查" * 10:
         batch.push({"type": "delta", "text": character})

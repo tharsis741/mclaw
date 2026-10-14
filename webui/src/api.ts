@@ -30,6 +30,7 @@ import type {
   ConfigurationValue,
   ScheduleDefaults,
   DeviceSnapshot,
+  TaskNotificationFeed,
 } from './types';
 
 import { applySnapshotChanges, type SnapshotChange } from './streaming';
@@ -266,6 +267,12 @@ export const api = {
     request<SetupRun>(`/setup/${encodeURIComponent(id)}/submit`, 'POST', { prompt_id, value }),
   setupCancel: (id: string) =>
     request<SetupRun>(`/setup/${encodeURIComponent(id)}/cancel`, 'POST', {}),
+};
+
+export const taskNotificationsApi = {
+  list: () => request<TaskNotificationFeed>('/task-notifications'),
+  acknowledge: (ids: string[], action: 'dismiss' | 'read') =>
+    request<TaskNotificationFeed>('/task-notifications', 'POST', { ids, action }),
 };
 
 export const providersApi = {
