@@ -23,6 +23,7 @@ def providers(tmp_path, monkeypatch):
     names = {"MCLAW_API_KEY", "MCLAW_BASE_URL", "MCLAW_ANTHROPIC_API_KEY", "MCLAW_ANTHROPIC_BASE_URL", "FIXTURE_KEY"}
     for provider in PROVIDER_REGISTRY.values():
         names.update(provider.env_vars)
+        names.update(provider.base_url_env_vars)
         if provider.base_url_env_var:
             names.add(provider.base_url_env_var)
     for name in names:
@@ -111,12 +112,62 @@ def test_legacy_active_profile_keeps_its_actual_default_when_adding_another_regi
     assert next(item for item in providers.catalog()["configured"] if item["is_default"])["runtime_provider"] == "qwen-intl"
 
 
-def test_local_custom_endpoint_preserves_existing_optional_key_semantics(providers):
-    providers.save(form(providers, provider="custom", profile="api", api_key="",
+@pytest.mark.parametrize(("provider", "base_env", "key_env"), [
+    ("custom", "MCLAW_BASE_URL", "MCLAW_API_KEY"),
+    ("custom_anthropic", "MCLAW_ANTHROPIC_BASE_URL", "MCLAW_ANTHROPIC_API_KEY"),
+])
+def test_local_custom_endpoint_preserves_existing_optional_key_semantics(providers, provider, base_env, key_env):
+    providers.save(form(providers, provider=provider, profile="api", api_key="",
                         model="local-model", base_url="http://127.0.0.1:11434/v1"))
-    assert config_io.get_env_value("MCLAW_BASE_URL") == "http://127.0.0.1:11434/v1"
-    assert not config_io.get_env_value("MCLAW_API_KEY")
-    assert any(item["runtime_provider"] == "custom" for item in providers.catalog()["configured"])
+    assert config_io.get_env_value(base_env) == "http://127.0.0.1:11434/v1"
+    assert not config_io.get_env_value(key_env)
+    assert any(item["runtime_provider"] == provider for item in providers.catalog()["configured"])
+    assert provider not in config_io.load_raw_user_config().get("setup_provider_profiles", {})
+
+
+@pytest.mark.parametrize(("provider", "key_env", "endpoints", "expected_url", "api_mode"), [
+    ("custom", "OPENAI_API_KEY", {"OPENAI_BASE_URL": "https://compat.example/v1"},
+     "https://compat.example/v1", "chat_completions"),
+    ("custom", "MCLAW_API_KEY", {"MCLAW_BASE_URL": "https://primary.example/v1",
+                                "OPENAI_BASE_URL": "https://compat.example/v1"},
+     "https://primary.example/v1", "chat_completions"),
+    ("custom_anthropic", "ANTHROPIC_API_KEY", {"MCLAW_ANTHROPIC_BASE_URL": "https://anthropic.example"},
+     "https://anthropic.example", "anthropic_messages"),
+])
+def test_custom_catalog_uses_one_entry_and_ordered_endpoint_aliases(
+    providers, monkeypatch, provider, key_env, endpoints, expected_url, api_mode,
+):
+    monkeypatch.setenv(key_env, "fixture-alias-key")
+    for name, value in endpoints.items():
+        monkeypatch.setenv(name, value)
+
+    result = providers.catalog()
+    matches = [item for item in result["catalog"] if item["id"] == provider]
+    assert len(matches) == 1
+    profile = matches[0]["profiles"][0]
+    assert profile["id"] == "api"
+    assert profile["api_mode"] == api_mode
+    assert profile["base_url"] == expected_url
+    assert profile["credential_configured"]
+    assert len([item for item in result["configured"] if item["runtime_provider"] == provider]) == 1
+    assert "fixture-alias-key" not in json.dumps(result)
+
+    providers.save(form(providers, provider=provider, profile="api", api_key="", model="alias-model"))
+    target = PROVIDER_REGISTRY[provider]
+    assert config_io.get_env_value(target.base_url_env_var) == expected_url
+    assert not config_io.load_env().get(target.env_vars[0])
+
+
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_remote_custom_provider_requires_credentials_before_saving(providers, provider):
+    before = {name: (providers.home / name).read_bytes() for name in ("config.yaml", ".env")}
+
+    with pytest.raises(ApplicationError) as error:
+        providers.save(form(providers, provider=provider, profile="api", api_key="",
+                            model="remote-model", base_url="https://gateway.example/v1"))
+
+    assert error.value.code == "INVALID_PROVIDER"
+    assert before == {name: (providers.home / name).read_bytes() for name in before}
 
 
 def test_existing_named_custom_provider_keeps_its_identity_and_credential_reference(providers):

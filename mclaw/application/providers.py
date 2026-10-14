@@ -128,7 +128,8 @@ class ProviderService:
         model_registry = models_dev.cached_models_dev()
         common = [name for name in CORE_PROVIDER_KEYS if name in PROVIDER_REGISTRY]
         represented = {p.runtime_provider for name in common for p in get_provider_profiles(name)}
-        brands = common + [name for name in PROVIDER_REGISTRY if name not in common and name not in represented]
+        brands = common + [name for name in PROVIDER_REGISTRY
+                           if name not in common and name not in represented and name not in _CUSTOM_ENV]
         catalog, configured = [], []
         active = _active_provider(config)
         for brand in brands:
@@ -159,10 +160,12 @@ class ProviderService:
                                 "keywords": " ".join([brand, _ALIASES.get(brand, ""), *PROVIDER_REGISTRY[brand].aliases]),
                                 "profiles": profiles})
         custom = dict(config.get("providers") or {})
-        for name, spec in _CUSTOM_ENV.items():
+        for name in _CUSTOM_ENV:
+            target = PROVIDER_REGISTRY[name]
             custom[name] = {"display_name": "自定义 Anthropic 接口" if name.endswith("anthropic") else "自定义 OpenAI 接口",
-                            "api_mode": spec["api_mode"], "base_url": next((environment[key] for key in spec["urls"] if environment.get(key)), ""),
-                            "api_key_env": next((key for key in spec["keys"] if environment.get(key)), spec["keys"][0])}
+                            "api_mode": target.api_mode,
+                            "base_url": next((environment[key] for key in target.base_url_env_vars if environment.get(key)), ""),
+                            "api_key_env": next((key for key in target.env_vars if environment.get(key)), target.env_vars[0])}
         for name, raw in custom.items():
             has_key = bool(environment.get(raw.get("api_key_env", "")))
             saved_model = _model(config, name)
@@ -193,7 +196,13 @@ class ProviderService:
             raise ApplicationError("MODEL_REQUIRED", "请选择或填写模型名称", 422)
         environment = self._environment()
         writes = {}
-        if provider in PROVIDER_REGISTRY:
+        if provider in _CUSTOM_ENV:
+            target = PROVIDER_REGISTRY[provider]
+            key_env, key_aliases = target.env_vars[0], target.env_vars
+            base = base or next((environment[name] for name in target.base_url_env_vars if environment.get(name)), "")
+            writes[target.base_url_env_vars[0]] = base
+            runtime = provider
+        elif provider in PROVIDER_REGISTRY:
             entry = find_provider_profile(provider, profile_id)
             if not entry or not entry.callable or entry.runtime_provider not in PROVIDER_REGISTRY:
                 raise ApplicationError("INVALID_PROVIDER_PROFILE", "请选择支持调用的 API 区域或接口", 422)
@@ -209,12 +218,6 @@ class ProviderService:
             if not isinstance(selected_profiles, dict):
                 raise ApplicationError("CONFIG_INVALID", "已保存的 API 区域配置格式不正确", 409)
             selected_profiles[provider] = entry.id
-        elif provider in _CUSTOM_ENV:
-            spec = _CUSTOM_ENV[provider]
-            key_env, key_aliases = spec["keys"][0], spec["keys"]
-            base = base or next((environment[name] for name in spec["urls"] if environment.get(name)), "")
-            writes[spec["urls"][0]] = base
-            runtime = provider
         elif provider in (config.get("providers") or {}):
             raw = config["providers"][provider]
             key_env, key_aliases = raw.get("api_key_env", ""), (raw.get("api_key_env", ""),)

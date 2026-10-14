@@ -34,14 +34,10 @@ _DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CUSTOM_ENV = {
     "custom": {
-        "urls": ("MCLAW_BASE_URL", "OPENAI_BASE_URL"),
-        "keys": ("MCLAW_API_KEY", "OPENAI_API_KEY"),
-        "api_mode": "chat_completions",
+        "urls": PROVIDER_REGISTRY["custom"].base_url_env_vars,
     },
     "custom_anthropic": {
-        "urls": ("MCLAW_ANTHROPIC_BASE_URL",),
-        "keys": ("MCLAW_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"),
-        "api_mode": "anthropic_messages",
+        "urls": PROVIDER_REGISTRY["custom_anthropic"].base_url_env_vars,
     },
 }
 
@@ -335,6 +331,25 @@ def _profile_and_endpoint(
     user_providers: dict[str, dict[str, Any]],
     base_url: str,
 ) -> tuple[RuntimeProviderProfile, str, str]:
+    if provider in _CUSTOM_ENV:
+        custom = _CUSTOM_ENV[provider]
+        endpoint_source = "explicit" if base_url else "provider_env"
+        endpoint = _validate_base_url(
+            base_url or _custom_endpoint_from_env(custom),
+            provider=provider,
+        )
+        registered = PROVIDER_REGISTRY[provider]
+        profile = _dynamic_profile(
+            name=registered.name,
+            display_name=registered.display_name,
+            api_mode=registered.api_mode,
+            base_url=endpoint,
+            env_vars=registered.env_vars,
+            credential_required=not _is_local_url(endpoint),
+            models_dev_provider=registered.models_dev_provider,
+        )
+        return profile, endpoint, endpoint_source
+
     if provider in PROVIDER_REGISTRY:
         profile = PROVIDER_REGISTRY[provider]
         if base_url:
@@ -367,23 +382,6 @@ def _profile_and_endpoint(
             models_dev_provider=str(raw.get("models_dev_provider") or provider),
         )
         return profile, endpoint, source
-
-    if provider in _CUSTOM_ENV:
-        custom = _CUSTOM_ENV[provider]
-        endpoint_source = "explicit" if base_url else "provider_env"
-        endpoint = _validate_base_url(
-            base_url or _custom_endpoint_from_env(custom),
-            provider=provider,
-        )
-        profile = _dynamic_profile(
-            name=provider,
-            display_name="Custom Anthropic" if provider.endswith("anthropic") else "Custom OpenAI-compatible",
-            api_mode=str(custom["api_mode"]),
-            base_url=endpoint,
-            env_vars=tuple(custom["keys"]),
-            credential_required=not _is_local_url(endpoint),
-        )
-        return profile, endpoint, endpoint_source
 
     raise _fail("unknown_provider", f"Unknown provider '{provider}'", provider=provider)
 
@@ -591,9 +589,23 @@ def restore_provider_runtime_context(
     static_profile = PROVIDER_REGISTRY.get(effective_provider)
     user_config = user_providers.get(effective_provider)
     custom = _CUSTOM_ENV.get(effective_provider)
-    snapshot_only_dynamic = not static_profile and not user_config and not custom
+    snapshot_only_dynamic = not static_profile and not user_config
 
-    if static_profile:
+    if custom:
+        provisional_url = str(base_url or snapshot["safe_base_url"] or _custom_endpoint_from_env(custom))
+        provisional_url = _validate_base_url(provisional_url, provider=effective_provider)
+        registered = PROVIDER_REGISTRY[effective_provider]
+        profile = _dynamic_profile(
+            name=registered.name,
+            display_name=registered.display_name,
+            api_mode=registered.api_mode,
+            base_url=provisional_url,
+            env_vars=registered.env_vars,
+            credential_required=not _is_local_url(provisional_url),
+            models_dev_provider=registered.models_dev_provider,
+        )
+        allowed_auth = profile.env_vars
+    elif static_profile:
         profile = static_profile
         allowed_auth = profile.env_vars
     elif user_config:
@@ -608,18 +620,6 @@ def restore_provider_runtime_context(
             env_vars=(key_env,) if key_env else (),
             credential_required=True,
             models_dev_provider=str(user_config.get("models_dev_provider") or effective_provider),
-        )
-        allowed_auth = profile.env_vars
-    elif custom:
-        provisional_url = str(snapshot["safe_base_url"] or _custom_endpoint_from_env(custom))
-        provisional_url = _validate_base_url(provisional_url, provider=effective_provider)
-        profile = _dynamic_profile(
-            name=effective_provider,
-            display_name="Custom Anthropic" if effective_provider.endswith("anthropic") else "Custom OpenAI-compatible",
-            api_mode=str(custom["api_mode"]),
-            base_url=provisional_url,
-            env_vars=tuple(custom["keys"]),
-            credential_required=not _is_local_url(provisional_url),
         )
         allowed_auth = profile.env_vars
     else:
@@ -645,21 +645,21 @@ def restore_provider_runtime_context(
     if base_url:
         endpoint = _validate_base_url(base_url, provider=effective_provider)
     elif source == "profile":
-        if not static_profile or not profile.base_url:
+        if custom or not static_profile or not profile.base_url:
             raise _fail("invalid_snapshot", "Snapshot profile endpoint source is unavailable", provider=effective_provider)
         endpoint = _validate_base_url(profile.base_url, provider=effective_provider)
     elif source == "provider_env":
         env_name = ""
-        if static_profile:
-            env_name = profile.base_url_env_var
-        elif user_config:
-            env_name = str(user_config.get("base_url_env") or "")
-        elif custom:
+        if custom:
             env_names = custom.get("urls", ())
             env_name = next(
                 (name for name in env_names if isinstance(name, str) and os.environ.get(name)),
                 str(env_names[0]) if isinstance(env_names, tuple) and env_names else "",
             )
+        elif static_profile:
+            env_name = profile.base_url_env_var
+        elif user_config:
+            env_name = str(user_config.get("base_url_env") or "")
         if not env_name:
             raise _fail("invalid_snapshot", "Snapshot endpoint environment source is not allowed", provider=effective_provider)
         current_endpoint = (
@@ -678,7 +678,7 @@ def restore_provider_runtime_context(
     else:
         endpoint = _validate_base_url(snapshot["safe_base_url"], provider=effective_provider)
 
-    if not static_profile:
+    if custom or not static_profile:
         credential_required = profile.credential_required
         if custom:
             credential_required = not _is_local_url(endpoint)
