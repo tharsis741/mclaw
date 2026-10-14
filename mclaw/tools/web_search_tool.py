@@ -17,6 +17,7 @@ from typing import Any
 from mclaw.cli.config import ConfigError
 from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
+from mclaw.tools.result_limits import truncate_json_value
 from mclaw.tools.search.config import load_search_config
 from mclaw.tools.search.credentials import (
     QWEN_CREDENTIAL_HINT,
@@ -25,6 +26,53 @@ from mclaw.tools.search.credentials import (
 )
 
 logger = logging.getLogger(__name__)
+MAX_RESULT_SIZE_CHARS = 15_000
+
+
+def _serialize_search_result(payload: dict[str, Any]) -> str:
+    """Fit successful search results while retaining complete source links."""
+    result = json.dumps(payload, ensure_ascii=False)
+    if len(result) <= MAX_RESULT_SIZE_CHARS:
+        return result
+    payload = {**payload, "_truncated": True, "_original_size": len(result),
+               "_limit": MAX_RESULT_SIZE_CHARS}
+    # An individually unfit source cannot be saved by shortening other results.
+    # Omit it first so its oversized URL does not consume their text budgets.
+    sources = payload["sources"]
+    retained = [source for source in sources
+                if not isinstance(source, dict)
+                or len(json.dumps(source.get("url", ""), ensure_ascii=False)) <= MAX_RESULT_SIZE_CHARS]
+    if len(retained) < len(sources):
+        payload["sources"] = retained
+        payload["_sources_omitted"] = len(sources) - len(retained)
+    protected = frozenset({"url", "index", "id", "_backend", "_fallback_from"})
+    required = {"success", "answer", "sources", "_truncated", "_original_size",
+                "_limit", "_sources_omitted"}
+    while True:
+        result = json.dumps(payload, ensure_ascii=False)
+        if len(result) <= MAX_RESULT_SIZE_CHARS:
+            return result
+        reduced, trimmed = truncate_json_value(
+            payload, len(result) - MAX_RESULT_SIZE_CHARS, protected_keys=protected,
+        )
+        if trimmed:
+            payload = reduced
+            continue
+        # Keep URLs and citation indices intact. Drop optional diagnostics before
+        # omitting entire sources that cannot fit even with brief text previews.
+        optional = [key for key in payload if key not in required]
+        if optional:
+            largest = max(optional, key=lambda key: len(json.dumps(payload[key], ensure_ascii=False)))
+            payload.pop(largest)
+            continue
+        sources = payload["sources"]
+        if sources:
+            largest = max(range(len(sources)), key=lambda i: len(json.dumps(sources[i], ensure_ascii=False)))
+            payload["sources"] = sources[:largest] + sources[largest + 1:]
+            payload["_sources_omitted"] = payload.get("_sources_omitted", 0) + 1
+            continue
+        # Only a bounded answer and the small status envelope remain.
+        return result
 
 
 def _cancelled_result() -> str:
@@ -174,7 +222,7 @@ def web_search(
         len(payload["answer"]),
         len(payload["sources"]),
     )
-    return json.dumps(payload, ensure_ascii=False)
+    return _serialize_search_result(payload)
 
 
 # ── Registry ────────────────────────────────────────────────────────────────
@@ -222,5 +270,5 @@ registry.register(
     diagnose_fn=diagnose_web_search_requirements,
     description="Search the internet and return an answer with sources",
     emoji="🌐",
-    max_result_size_chars=15_000,
+    max_result_size_chars=MAX_RESULT_SIZE_CHARS,
 )

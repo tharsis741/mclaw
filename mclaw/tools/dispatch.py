@@ -34,6 +34,7 @@ from mclaw.tools.interrupt import (
     set_interrupt_event,
 )
 from mclaw.tools.registry import registry
+from mclaw.tools.result_limits import truncate_json_value as _truncate_json_value
 from mclaw.tools.toolsets import DSOFTBUS_TOOLS, effective_disabled_tools, resolve_multiple_toolsets
 
 logger = logging.getLogger(__name__)
@@ -1022,59 +1023,6 @@ def _invoke_tool_builtin(
     return None
 
 
-def _truncate_json_value(obj, excess):
-    """Recursively trim longest string by ``excess`` chars.
-
-    Returns ``(new_obj, trimmed_chars)``.  Only performs one truncation
-    per call so the caller can re-serialize and re-check size.
-    """
-    if isinstance(obj, str):
-        if excess <= 0:
-            return obj, 0
-        # Keep at least 100 chars of original content
-        trim = min(excess, max(0, len(obj) - 100))
-        if trim > 0:
-            truncated = obj[: len(obj) - trim]
-            suffix = f"\n[... {trim:,} chars truncated ...]"
-            return truncated + suffix, trim
-        return obj, 0
-
-    if isinstance(obj, dict):
-        # Trim the longest direct string field first.
-        string_items = [
-            (k, v) for k, v in obj.items() if isinstance(v, str) and len(v) > 100
-        ]
-        string_items.sort(key=lambda x: len(x[1]), reverse=True)
-        for k, v in string_items:
-            new_v, trimmed = _truncate_json_value(v, excess)
-            if trimmed:
-                obj = dict(obj)
-                obj[k] = new_v
-                return obj, trimmed
-
-        # If no direct string is large enough, recurse into nested structures.
-        for k, v in list(obj.items()):
-            if isinstance(v, (dict, list)):
-                new_v, trimmed = _truncate_json_value(v, excess)
-                if trimmed:
-                    obj = dict(obj)
-                    obj[k] = new_v
-                    return obj, trimmed
-        return obj, 0
-
-    if isinstance(obj, list):
-        for i, item in enumerate(obj):
-            if isinstance(item, (str, dict, list)):
-                new_item, trimmed = _truncate_json_value(item, excess)
-                if trimmed:
-                    obj = list(obj)
-                    obj[i] = new_item
-                    return obj, trimmed
-        return obj, 0
-
-    return obj, 0
-
-
 def _extract_json_object(s: str) -> dict | None:
     """Extract the first JSON object from a string with trailing content.
 
@@ -1178,6 +1126,7 @@ def _dispatch_single(
     # payloads that would otherwise exceed the context budget.
     max_size = registry.get_max_result_size(tool_name)
     if max_size is not None and isinstance(result, str) and len(result) > max_size:
+        original_size = len(result)
         # Structured truncation preserves JSON parseability.
         parsed = None
         try:
@@ -1199,7 +1148,7 @@ def _dispatch_single(
 
             if isinstance(parsed, dict):
                 parsed["_truncated"] = True
-                parsed["_original_size"] = len(result)
+                parsed["_original_size"] = original_size
                 parsed["_limit"] = max_size
             result = json.dumps(parsed, ensure_ascii=False)
 
@@ -1207,7 +1156,7 @@ def _dispatch_single(
             if len(result) > max_size:
                 result = json.dumps({
                     "_truncated": True,
-                    "_original_size": len(result),
+                    "_original_size": original_size,
                     "_limit": max_size,
                     "error": (
                         f"Tool output exceeded size limit of {max_size:,} chars. "
