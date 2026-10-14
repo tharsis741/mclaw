@@ -21,6 +21,7 @@ import { sourceLabel } from './SkillsPage';
 import { STATUS_TEXT } from '../session-state';
 import { Subagents } from './Subagents';
 import { MessageTime } from './MessageTime';
+import { SkillReviewNotice } from './SkillReviewNotice';
 const scrollPositions = new Map<string, number>();
 
 export const TOOL_LABELS: Record<string, string> = {
@@ -310,11 +311,16 @@ function ExecutionProcess({
 const MessageView = memo(function MessageView({
   message,
   onFilePreview,
+  onOpenSkill,
 }: {
   message: Message;
   onFilePreview: (file: FileReference | { id: string; name: string }) => void;
+  onOpenSkill?: (name: string) => void;
 }) {
   const [copied, setCopied] = useState(false);
+  if (message.skill_review) {
+    return <SkillReviewNotice notice={message.skill_review} onOpenSkill={onOpenSkill} />;
+  }
   return (
     <article className={`message message-${message.role}`}>
       <div className="message-identity">
@@ -406,9 +412,11 @@ const MessageView = memo(function MessageView({
 export function Conversation({
   session,
   onFilePreview,
+  onOpenSkill,
 }: {
   session: Session;
   onFilePreview?: (file: FileReference | { id: string; name: string }) => void;
+  onOpenSkill?: (name: string) => void;
 }) {
   const previewCallback = useRef(onFilePreview);
   previewCallback.current = onFilePreview;
@@ -416,6 +424,9 @@ export function Conversation({
     (file: FileReference | { id: string; name: string }) => previewCallback.current?.(file),
     [],
   );
+  const skillCallback = useRef(onOpenSkill);
+  skillCallback.current = onOpenSkill;
+  const openSkill = useCallback((name: string) => skillCallback.current?.(name), []);
   const scroller = useRef<HTMLDivElement>(null);
   const end = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
@@ -452,6 +463,7 @@ export function Conversation({
               key={`${session.id}:${message.id}`}
               message={message}
               onFilePreview={previewFile}
+              onOpenSkill={onOpenSkill ? openSkill : undefined}
             />
           ))}
           {['stopping', 'stopped', 'interrupted', 'paused'].includes(session.status) && (

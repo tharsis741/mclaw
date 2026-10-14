@@ -96,6 +96,10 @@ export default function App() {
   const [hasMore, setHasMore] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [page, setPage] = useState<Page>('chat');
+  const [initialSkillName, setInitialSkillName] = useState<string>();
+  useEffect(() => {
+    if (page !== 'skills') setInitialSkillName(undefined);
+  }, [page]);
   const [error, setError] = useState('');
   const [occupied, setOccupied] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -895,6 +899,10 @@ export default function App() {
               <Conversation
                 session={session}
                 onFilePreview={(file) => setPreviewFile({ session: session.id, file })}
+                onOpenSkill={(name) => {
+                  setInitialSkillName(name);
+                  setPage('skills');
+                }}
               />
             )}
             {occupied && (
@@ -1020,7 +1028,7 @@ export default function App() {
         ) : page === 'tools' ? (
           <ToolsPage />
         ) : page === 'skills' ? (
-          <SkillsPage onUse={useSkill} />
+          <SkillsPage onUse={useSkill} initialSkillName={initialSkillName} />
         ) : page === 'schedules' ? (
           <SchedulesPage onSession={openSession} models={bootstrap.models} />
         ) : page === 'settings' ? (

@@ -313,6 +313,7 @@ def test_background_review_prompt_schema_dispatch_and_history_agree(monkeypatch,
             self.enabled_toolsets = ["mclaw-required"]
             self.config = {}
             self.messages = []
+            self.events = []
             self.closed = False
             created.append(self)
 
@@ -327,6 +328,9 @@ def test_background_review_prompt_schema_dispatch_and_history_agree(monkeypatch,
 
         def _refresh_memory_snapshot(self):
             pass
+
+        def _emit_event(self, event):
+            self.events.append(copy.deepcopy(event))
 
         def close(self):
             self.closed = True

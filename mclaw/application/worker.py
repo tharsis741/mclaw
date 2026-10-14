@@ -281,6 +281,11 @@ class SessionWorker:
     def _agent_event(self, event: dict) -> None:
         from mclaw.application.process_events import agent_events
 
+        if event.get("type") == "skill_review":
+            from mclaw.runtime.secrets import redact_secret_values
+            # Reviews outlive turns. Never attach the mutable current run_id.
+            self.emit_raw(redact_secret_values(event, self._secret_values))
+            return
         for record in agent_events(event, self.run_id, self._secret_values):
             self.emit(record)
 
@@ -404,6 +409,8 @@ class SessionWorker:
         try:
             cancellation_checkpoint(cancel)
             agent = self._prepare_agent(task)
+            agent._application_task_id = task.get("id")
+            agent._application_response_id = self.run_id
             cancellation_checkpoint(cancel)
             if task.get("pending_skill_install"):
                 if not self._resolve_skill_install(task["pending_skill_install"]):

@@ -13,6 +13,7 @@ import threading
 from typing import Any
 
 from mclaw.agent.skill_review_state import SkillReviewRequest, get_skill_review_state
+from mclaw.agent.skill_review_notice import SkillReviewNotice
 from mclaw.prompts import background as background_prompts
 from mclaw.tools.dispatch import tool_dispatch_policy
 
@@ -213,6 +214,7 @@ def spawn_background_review(
         return
     prompt = _prompt_for(review_memory, review_skills)
     review_id = skill_request.review_id if skill_request else None
+    notice = SkillReviewNotice(skill_request, parent._emit_event, session_id=session_id) if skill_request else None
     logger.info(
         "[BACKGROUND REVIEW] scheduled session=%s review=%s memory=%s skills=%s messages=%d",
         session_id,
@@ -259,6 +261,7 @@ def spawn_background_review(
             review_agent._evolution_review_round = 0
             review_agent._execution_actor = "background_review"
             review_agent._skill_review_id = review_id
+            review_agent._skill_review_notice = notice
             review_agent._skill_save_owner = parent
             review_agent._memory_store = getattr(parent, "_memory_store", None)
             review_agent._memory_manager = getattr(parent, "_memory_manager", None)
@@ -282,33 +285,6 @@ def spawn_background_review(
                     advance_background_review=False,
                 )
 
-            if review_skills and review_agent is not None:
-                skill_summary = summarize_background_review_actions(
-                    review_agent.messages,
-                    prior_snapshot=messages_snapshot,
-                )
-                if skill_summary:
-                    mark_prompt_epoch_dirty = getattr(parent, "mark_prompt_epoch_dirty", None)
-                    if callable(mark_prompt_epoch_dirty):
-                        mark_prompt_epoch_dirty()
-                    logger.info("Skill review saved: %s", skill_summary["summary"])
-                    display_text = skill_summary["text"]
-                    parent._emit_event(
-                        {
-                            "type": "skills_saved",
-                            "summary": skill_summary["summary"],
-                            "text": display_text,
-                            "skills": skill_summary["skills"],
-                        }
-                    )
-                    print_fn = getattr(parent, "_print_fn", None)
-                    if print_fn:
-                        try:
-                            print_fn(f"  {display_text}")
-                        except Exception as exc:
-                            logger.debug("Background skill review print callback failed: %s", exc)
-                else:
-                    logger.info("Background skill review completed: nothing to save")
             logger.info(
                 "[BACKGROUND REVIEW] %s session=%s review=%s memory=%s skills=%s",
                 "completed" if result and result.get("completed") else "incomplete",
@@ -322,6 +298,21 @@ def spawn_background_review(
             logger.warning("[BACKGROUND REVIEW] failed session=%s review=%s error=%s",
                            session_id, review_id, exc, exc_info=True)
         finally:
+            if notice is not None:
+                try:
+                    saved_skills = notice.finish(result, failed=failed)
+                    logger.info("[BACKGROUND REVIEW] %s session=%s review=%s skills=%d",
+                                "saved" if saved_skills else "nothing_to_save" if result and result.get("completed") else "no_saved_changes",
+                                session_id, review_id, len(saved_skills))
+                    if saved_skills:
+                        text = "技能已保存：" + "、".join(item["name"] for item in saved_skills)
+                        parent._emit_event({"type": "skills_saved", "text": text, "skills": saved_skills})
+                        print_fn = getattr(parent, "_print_fn", None)
+                        if print_fn:
+                            print_fn(f"  {text}")
+                except Exception:
+                    logger.warning("Background Skill notification failed: session=%s review=%s",
+                                   session_id, review_id, exc_info=True)
             if review_agent is not None:
                 close = getattr(review_agent, "close", None)
                 if callable(close):
@@ -359,6 +350,8 @@ def spawn_background_review(
     try:
         threading.Thread(target=_run_review, daemon=True, name="mclaw-background-review").start()
     except BaseException:
+        if notice is not None:
+            notice.finish({"stop_reason": "startup_failed"}, failed=True)
         if skill_state is not None and skill_request is not None:
             skill_state.finish(skill_request, started=False)
         raise

@@ -128,6 +128,10 @@ class ApplicationStore:
     def recover(self) -> None:
         """Never replay work automatically after losing the service process."""
         for session in self.all():
+            from mclaw.application.skill_notices import interrupt_skill_notices
+            if interrupt_skill_notices(session):
+                session["seq"] += 1
+                self.save(session)
             if session.get("active_task") or session.get("queue"):
                 session["status"] = "interrupted"
                 session["error"] = "服务已重启。请先核对已知执行结果，再继续处理原任务。"

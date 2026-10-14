@@ -54,6 +54,7 @@ class SessionService:
         self.global_maintenance: set[str] = set()
         self.deletions: dict[str, asyncio.Task] = {}
         self.closing = False
+        self._store_closed = False
         self.devices = None
         self.runtime_overrides: dict[str, dict] = {}
         if runner_factory is None:
@@ -186,6 +187,7 @@ class SessionService:
                 supplement.pop("skill_snapshots", None)
         for message in value.get("messages", []):
             message.pop("skill_snapshots", None)
+            message.pop("skill_review_worker", None)
         return value
 
     def snapshot(self, session_id: str, client: str | None = None) -> dict:
@@ -802,7 +804,22 @@ class SessionService:
                                        "content": str(event.get("text") or "")})
 
     def _worker_background(self, session_id: str, event: dict) -> None:
-        """Queue watcher follow-ups through the same durable execution owner."""
+        """Persist review notices independently of task and watcher dispatch."""
+        if event.get("type") in {"skill_review", "skill_review_worker_stopped"}:
+            if self._store_closed or session_id in self.deletions:
+                return
+            try:
+                from mclaw.application.skill_notices import apply_skill_notice, interrupt_skill_notices
+                session = self._load(session_id)
+                if event["type"] == "skill_review":
+                    changed = apply_skill_notice(session, event)
+                else:
+                    changed = interrupt_skill_notices(session, worker_id=event.get("worker_id"))
+                if changed:
+                    self._save(session, activity=True)
+            except ApplicationError:
+                pass
+            return
         if self.closing or session_id in self.deletions:
             return
         try:
@@ -926,4 +943,5 @@ class SessionService:
             lock.release()
         self.locks.clear()
         self.history.close()
+        self._store_closed = True
         self.store.close()

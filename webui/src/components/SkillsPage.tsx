@@ -183,7 +183,13 @@ export function DraftFiles({ id, files }: { id?: string; files: unknown }) {
   );
 }
 
-export function SkillsPage({ onUse }: { onUse: (name: string) => void }) {
+export function SkillsPage({
+  onUse,
+  initialSkillName,
+}: {
+  onUse: (name: string) => void;
+  initialSkillName?: string;
+}) {
   const [skills, setSkills] = useState<SkillSummary[]>([]);
   const [query, setQuery] = useState('');
   const [error, setError] = useState('');
@@ -215,6 +221,26 @@ export function SkillsPage({ onUse }: { onUse: (name: string) => void }) {
   useEffect(() => {
     void load();
   }, [load]);
+  useEffect(() => {
+    if (!initialSkillName) return;
+    let cancelled = false;
+    setBusy(true);
+    setError('');
+    skillsApi
+      .detail(initialSkillName)
+      .then((value) => {
+        if (!cancelled) setDetail(value);
+      })
+      .catch((error) => {
+        if (!cancelled) setError(error instanceof Error ? error.message : '技能详情加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setBusy(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [initialSkillName]);
   const action = async (fn: () => Promise<void>) => {
     setBusy(true);
     setError('');

@@ -55,6 +55,20 @@ export interface Message {
   skills?: SkillReference[];
   attachments?: FileReference[];
   device_selection?: DeviceSelection;
+  skill_review?: SkillReviewNotice;
+}
+export interface SkillReviewNotice {
+  id: string;
+  session_id: string;
+  revision: number;
+  status: 'running' | 'completed' | 'partial' | 'failed' | 'interrupted';
+  started_at?: number;
+  updated_at?: number;
+  completed_at?: number;
+  trigger_task_id?: string | null;
+  trigger_response_id?: string | null;
+  error?: string;
+  skills: { name: string; description: string; actions: string[]; deleted?: boolean }[];
 }
 export interface SubagentTask {
   task_index: number;

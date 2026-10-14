@@ -146,6 +146,7 @@ class ProcessRunner:
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         process = self.process
+        worker_id = uuid.uuid4().hex
         from mclaw.cli.runtime.session_lock import InteractiveSessionLock
 
         owner = InteractiveSessionLock(self.session["id"], self.home / "sessions" / "locks")
@@ -170,14 +171,18 @@ class ProcessRunner:
                             raise ValueError("Invalid worker message")
                     except (ValueError, UnicodeDecodeError):
                         value = {"type": "protocol_error"}
-                    if value.get("type") == "background" and self.background_emit:
-                        loop.call_soon_threadsafe(self.background_emit, value)
+                    if value.get("type") in {"background", "skill_review"} and self.background_emit:
+                        loop.call_soon_threadsafe(self.background_emit, {**value, "worker_id": worker_id})
                     else:
                         loop.call_soon_threadsafe(output.put_nowait, value)
             except (OSError, RuntimeError, ValueError):
                 pass
             finally:
                 try:
+                    if self.background_emit:
+                        loop.call_soon_threadsafe(self.background_emit, {
+                            "type": "skill_review_worker_stopped", "worker_id": worker_id,
+                        })
                     loop.call_soon_threadsafe(output.put_nowait, {"type": "eof"})
                 except RuntimeError:
                     pass

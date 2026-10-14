@@ -924,6 +924,9 @@ class MClaw:
                 review_id=getattr(self, "_skill_review_id", None),
             )
         owner.mark_prompt_epoch_dirty()
+        notice = getattr(self, "_skill_review_notice", None)
+        if notice is not None:
+            notice.saved(action, result)
 
     def _spawn_background_review(
         self,

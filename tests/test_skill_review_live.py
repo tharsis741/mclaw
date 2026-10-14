@@ -295,6 +295,13 @@ def test_live_busy_review(live, saves):
     trace.gate_release.set()
     wait_idle(agent)
     after = state.snapshot()
+    origins = [item._skill_review_notice._notice for item in trace.agents
+               if getattr(item, "_execution_actor", "") == "background_review"]
+    assert origins[0]["trigger_task_id"] == "first-trigger"
+    if not saves:
+        assert len(origins) == 2
+        assert origins[1]["trigger_task_id"] == "queued-trigger"
+        assert origins[1]["trigger_response_id"] == "queued-response"
     assert after["turns"] == 0 and not after["pending"] and after["running_review_id"] is None
     saved = [row for row in trace.records if row["event"] == "saved" and row.get("source") == "background_review"]
     if saves:

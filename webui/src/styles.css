@@ -1159,6 +1159,94 @@ header.topbar.management-topbar {
 .message-footer:empty {
   display: none;
 }
+.skill-review-notice {
+  font-size: 12px;
+  color: var(--muted);
+}
+.skill-review-summary {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  list-style: none;
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+  cursor: pointer;
+}
+.skill-review-summary::-webkit-details-marker {
+  display: none;
+}
+.skill-review-chevron {
+  transform: rotate(-90deg);
+}
+.skill-review-notice details[open] .skill-review-chevron {
+  transform: none;
+}
+.skill-review-title {
+  color: var(--text);
+  font-weight: 500;
+}
+.skill-review-toggle {
+  margin-left: auto;
+}
+.skill-review-toggle span:last-child,
+.skill-review-notice details[open] .skill-review-toggle span:first-child {
+  display: none;
+}
+.skill-review-notice details[open] .skill-review-toggle span:last-child {
+  display: inline;
+}
+.skill-review-details {
+  padding: 8px 0 0 22px;
+}
+.skill-review-item {
+  border-left: 2px solid var(--line);
+  padding: 2px 0 2px 15px;
+  margin-bottom: 15px;
+  overflow-wrap: anywhere;
+}
+.skill-review-name {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.skill-review-name .message-tag {
+  flex-shrink: 0;
+}
+.skill-review-slug,
+.skill-review-actions {
+  margin-top: 6px;
+  line-height: 1.7;
+}
+.skill-review-link {
+  padding: 6px 0;
+  font-size: 12px;
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.skill-review-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+.skill-review-error {
+  padding: 10px 12px;
+  border-left: 2px solid #a97835;
+  line-height: 1.8;
+}
+.skill-review-incomplete .skill-review-summary > svg:nth-child(2) {
+  color: #a97835;
+}
+@media (pointer: coarse) {
+  .skill-review-summary,
+  .skill-review-link {
+    min-height: 44px;
+  }
+}
 .message > .markdown > :last-child {
   margin-bottom: 0;
 }
