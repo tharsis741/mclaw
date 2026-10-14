@@ -11,6 +11,7 @@ persistence, and recovery state remain ordered across CLI, channel, and
 scheduler runtimes.
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -26,7 +27,7 @@ from mclaw.agent.context_metadata import resolve_context_length
 from mclaw.agent.context_compressor import ContextCompressor
 from mclaw.agent.memory_manager import MemoryManager
 from mclaw.agent.prompt_cache import build_prompt_cache_plan
-from mclaw.agent.prompt_builder import build_system_prompt
+from mclaw.agent.prompt_builder import SKILL_TOOL_NAMES, build_system_prompt
 from mclaw.agent.retry_utils import jittered_backoff
 from mclaw.agent.remote_results import READ_RESULT_TOOL, REMOTE_TASK_TOOLS, project_history, project_reply
 from mclaw.agent.token_budget import estimate_request_budget
@@ -484,6 +485,7 @@ class MClaw:
 
         # Memory subsystem.
         self._memory_manager: Optional[MemoryManager] = None
+        self._memory_initialized = False
         self._memory_store = None  # BuiltinMemoryProvider sets this
         self._recalled_memory: str = ""  # per-turn prefetch, injected at API-call time only
         memory_cfg = self.config.get("memory", {}) if isinstance(self.config, dict) else {}
@@ -659,6 +661,8 @@ class MClaw:
         )
         self.tools = definitions
         self.valid_tool_names = valid_names
+        if getattr(self, "_memory_initialized", False):
+            self._sync_memory_tool_schema()
 
     def _build_checkpoint_manager(self):
         """Build the filesystem checkpoint manager from config and runtime flags."""
@@ -748,13 +752,16 @@ class MClaw:
             logger.warning("Memory subsystem init failed (non-fatal): %s", e)
             self._memory_manager = None
             self._memory_store = None
+        finally:
+            self._memory_initialized = True
 
     def _sync_memory_tool_schema(self) -> None:
         """Align exposed memory tool schema with the active memory provider config."""
         from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES
 
         memory_tool_names = set(MEMORY_TOOL_NAMES)
-        if not (memory_tool_names & set(self.valid_tool_names)):
+        allowed_names = memory_tool_names & set(self.valid_tool_names)
+        if not allowed_names:
             return
 
         memory_schemas = []
@@ -764,23 +771,16 @@ class MClaw:
             except Exception:
                 memory_schemas = []
 
-        if not memory_schemas:
-            self.valid_tool_names.difference_update(memory_tool_names)
-            self.tools = [
-                t for t in self.tools
-                if t.get("function", {}).get("name") not in memory_tool_names
-            ]
-            return
-
+        self.valid_tool_names.difference_update(memory_tool_names)
         self.tools = [
             t for t in self.tools
             if t.get("function", {}).get("name") not in memory_tool_names
         ]
         for schema in memory_schemas:
             name = schema.get("function", {}).get("name")
-            if not name:
+            if name not in allowed_names:
                 continue
-            self.tools.append({"type": "function", "function": dict(schema.get("function", {}))})
+            self.tools.append({"type": "function", "function": copy.deepcopy(schema["function"])})
             self.valid_tool_names.add(name)
 
     # ── Memory flush (pre-eviction) ─────────────────────────────
@@ -806,15 +806,25 @@ class MClaw:
         if not msgs or len(msgs) < 3:
             return
 
+        from mclaw.tools.memory_tool import MEMORY_WRITE_TOOL_NAMES
+        from mclaw.tools.toolsets import effective_disabled_tools
+
+        disabled = effective_disabled_tools(self.config.get("tools", {}).get("disabled", []))
+        memory_tools = self._memory_manager.get_all_tool_schemas()
+        if disabled:
+            memory_tools = [
+                schema for schema in memory_tools
+                if schema.get("function", {}).get("name") not in disabled
+            ]
+        flush_tool_names = {schema.get("function", {}).get("name") for schema in memory_tools}
+        if not flush_tool_names.intersection(MEMORY_WRITE_TOOL_NAMES):
+            return
         flush_msgs = [
-            {"role": "system", "content": build_memory_flush_system_prompt()}
+            {"role": "system", "content": build_memory_flush_system_prompt(tool_schemas=memory_tools)}
         ]
         for msg in msgs[-8:]:
             if msg.get("role") in ("user", "assistant"):
                 flush_msgs.append(msg)
-        memory_tools = self._memory_manager.get_all_tool_schemas()
-        if not memory_tools:
-            return
         transport = self.transport
         provider_runtime = self.provider_runtime
         cache_enabled = bool(
@@ -854,12 +864,12 @@ class MClaw:
                 # Parse tool calls directly and route them through MemoryManager
                 # without asking the model for a second decision.
                 if result.tool_calls:
-                    from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES
-
                     for tc in result.tool_calls:
                         fn = tc.get("function", {})
                         tool_name = fn.get("name")
-                        if tool_name not in MEMORY_TOOL_NAMES:
+                        if tool_name not in flush_tool_names:
+                            continue
+                        if tool_name in effective_disabled_tools(self.config.get("tools", {}).get("disabled", [])):
                             continue
                         try:
                             args = json.loads(fn.get("arguments", "{}"))
@@ -1598,10 +1608,15 @@ class MClaw:
             messages.insert(0, {"role": "system", "content": content})
         self._prompt_epoch_dirty = False
 
-    def _build_system_prompt(self, *, model: str | None = None) -> str:
+    def _build_system_prompt(
+        self, *, model: str | None = None,
+        tool_names: set[str] | None = None, tool_schemas: list[dict] | None = None,
+    ) -> str:
         """Assemble the current system prompt from platform, tools, and memory."""
         if self.system_prompt:
             return self.system_prompt
+        effective_names = self.valid_tool_names if tool_names is None else tool_names
+        effective_schemas = self.tools if tool_schemas is None else tool_schemas
         memory_block = None
         if self._memory_manager:
             try:
@@ -1612,7 +1627,7 @@ class MClaw:
         # Build available_toolsets from valid_tool_names.
         from mclaw.tools.dispatch import get_toolset_for_tool
         avail_toolsets: set = set()
-        for t in self.valid_tool_names:
+        for t in effective_names:
             ts = get_toolset_for_tool(t)
             if ts:
                 avail_toolsets.add(ts)
@@ -1621,10 +1636,11 @@ class MClaw:
             agent_platform=self.platform,
             model=model or self.model,
             memory_block=memory_block,
-            tool_names=self.valid_tool_names,
+            tool_names=effective_names,
             available_toolsets=avail_toolsets,
-            available_tool_names=sorted(self.valid_tool_names),
+            available_tool_names=sorted(effective_names),
             config=self.config,
+            tool_schemas=effective_schemas,
         )
 
     def _clear_unconfirmed_context_display(self) -> None:
@@ -1807,7 +1823,12 @@ class MClaw:
 
         # Subagents pass None when they should not inherit the parent history.
         messages = list(conversation_history if conversation_history is not None else [])
-        if self._prompt_epoch_dirty:
+        from mclaw.prompts.skills import prepare_skill_contexts_for_turn
+
+        messages, pending_skills = prepare_skill_contexts_for_turn(messages)
+        if self._prompt_epoch_dirty or (not self.system_prompt and self.valid_tool_names & SKILL_TOOL_NAMES):
+            # A separate Web/CLI process can edit the shared Skill index. Rebuild
+            # at the turn boundary; the builder keys cached text by fresh content.
             self._refresh_prompt_epoch(messages)
 
         # Reset prior token counts for fresh sessions so heavy previous tasks
@@ -1826,6 +1847,7 @@ class MClaw:
             else:
                 logger.info("[SYSTEM PROMPT]\n%s", system_prompt_text)
             messages.insert(0, {"role": "system", "content": system_prompt_text})
+        messages.extend(pending_skills)
 
         self._checkpoint_turn_id = uuid.uuid4().hex[:12]
         self._checkpoint_messages_len_before_turn = len(messages)
@@ -2191,6 +2213,16 @@ class MClaw:
                             interrupted = True
                             break
                         raise ModelCallError(str(image_error), self.provider, self.model, code="VISION_INPUT_FAILED") from None
+                    if (disable_tools or disabled_names) and not self.system_prompt:
+                        # Restrict only this request's base prompt. The session
+                        # retains its normal capabilities for subsequent turns.
+                        request_messages = list(request_messages)
+                        request_messages[0] = {
+                            **request_messages[0],
+                            "content": self._build_system_prompt(
+                                tool_names=active_tool_names, tool_schemas=active_tools,
+                            ),
+                        }
                     api_call_count += 1
                     self._record_api_attempt()
                     model_call_started = time.monotonic()

@@ -444,6 +444,14 @@ class ContextCompressor:
         for msg in turns:
             role = msg.get("role", "unknown")
             content = _content_to_text(msg.get("content"))
+            if role == "system":
+                from mclaw.prompts.skills import strip_skill_invocations
+
+                # The host restores current selections from immutable inputs.
+                # Summarizing their instructions would leak them into later tasks.
+                content = strip_skill_invocations(content)
+                if not content:
+                    continue
             for asset in msg.get("_vision_images", []):
                 content += f"\n[Image reference: asset:{asset.get('asset_id', '')}; question: {asset.get('question', '')}; pixels are not included in this summary input.]"
                 if asset.get("analysis"):

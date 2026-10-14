@@ -1479,7 +1479,8 @@ class InteractiveChat:
 
     def _apply_queued_supplements(self, messages: list[dict], turn_id: str) -> None:
         from mclaw.application.task_queue import apply_pending_supplement
-        from mclaw.application.skills import apply_skill_snapshots
+        from mclaw.application.skills import apply_skill_snapshots, sync_task_skill_context
+        from mclaw.agent.skill_utils import get_disabled_skill_names
 
         task_queue = self._runtime().task_queue
         if task_queue is None:
@@ -1496,6 +1497,10 @@ class InteractiveChat:
             )
 
         task_queue.apply_supplements(apply)
+        sync_task_skill_context(
+            messages, task_queue.snapshot().get("active") or {}, self._applied_supplement_ids,
+            disabled_names=get_disabled_skill_names(config=getattr(self.agent, "config", {})),
+        )
 
     def _prepare_task_input(self, task: dict) -> str:
         marker = "task:" + task["id"]

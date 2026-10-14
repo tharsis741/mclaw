@@ -107,19 +107,15 @@ class RuntimeSkillCommandCoordinator:
 
     @staticmethod
     def inject_skill_context(messages: list[dict[str, Any]], skill_text: str) -> None:
-        """Append Skill guidance once to the existing system message.
-
-        The first Skill header line is used as the idempotency marker so repeat
-        invocations can refresh context without duplicating the full Skill text.
-        """
-        first_line = str(skill_text or "").splitlines()[0] if str(skill_text or "").splitlines() else ""
-        marker = first_line if first_line.startswith("[Skill:") else skill_text
-        for msg in messages:
-            if msg.get("role") == "system":
-                if marker not in msg.get("content", ""):
-                    msg["content"] += f"\n\n{skill_text}"
-                return
-        messages.insert(0, {"role": "system", "content": skill_text})
+        """Select fresh guidance for the next turn without modifying the base prompt."""
+        if not skill_text.strip():
+            return
+        header = skill_text.splitlines()[0]
+        messages[:] = [message for message in messages if not (
+            message.get("role") == "system" and message.get("_mclaw_pending_skill")
+            and str(message.get("content") or "").splitlines()[:1] == [header]
+        )]
+        messages.append({"role": "system", "content": skill_text, "_mclaw_pending_skill": True})
 
 
 class RuntimeSkillImportConfirmationCoordinator:

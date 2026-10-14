@@ -229,8 +229,7 @@ SKILL_TREE_SCHEMA = {
         "name": "skill_tree",
         "description": (
             "List one Skill's file tree without reading file contents. "
-            "Use this before skill_view(name, file_path) or skill_manage(write_file/remove_file) "
-            "when you need to discover Skill-internal paths."
+            "Use this to discover Skill-internal paths before reading or modifying package files."
         ),
         "parameters": {
             "type": "object",

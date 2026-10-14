@@ -308,7 +308,8 @@ class SessionWorker:
     def _apply_supplements(self, messages: list[dict], turn_id: str) -> None:
         """Persist once before acknowledging, at the Agent's model boundary."""
         from mclaw.application.task_queue import apply_pending_supplement
-        from mclaw.application.skills import apply_skill_snapshots
+        from mclaw.application.skills import apply_skill_snapshots, sync_task_skill_context
+        from mclaw.agent.skill_utils import get_disabled_skill_names
         from mclaw.tools.cancellation import cancellation_checkpoint
 
         cancellation_checkpoint(self.cancel)
@@ -324,7 +325,17 @@ class SessionWorker:
             )
             with self._condition:
                 self._supplements.pop(identifier, None)
+                supplements = self._current_task.setdefault("supplements", [])
+                existing = next((entry for entry in supplements if entry.get("id") == identifier), None)
+                if existing is None:
+                    supplements.append({**item, "applied": True})
+                else:
+                    existing["applied"] = True
             self.emit({"type": "supplement_applied", "id": identifier})
+        sync_task_skill_context(
+            messages, self._current_task, self._applied,
+            disabled_names=get_disabled_skill_names(config=getattr(self.agent, "config", {})),
+        )
 
     def _drain_tools(self) -> None:
         if self.agent is None:

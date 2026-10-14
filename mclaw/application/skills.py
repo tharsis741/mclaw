@@ -59,30 +59,84 @@ def snapshot_references(snapshots: list[dict]) -> list[dict]:
 
 def apply_skill_snapshots(db, session_id: str, messages: list[dict], turn_id: str,
                           item: dict, applied_ids: set[str]) -> bool:
-    """Commit selected instructions once at the host's safe model boundary.
-
-    Additional system messages survive a rebuild of the first base prompt and
-    follow the normal conversation persistence, compression and rollback rules.
-    """
+    """Audit each immutable input snapshot once, without deduplicating by name."""
     from mclaw.prompts.skills import build_skill_invocation_system
 
     changed = False
+    persisted_ids = None
     for snapshot in item.get("skill_snapshots", []):
         name = snapshot["name"]
-        operation = f"skill:{item['id']}:{name}"
-        marker = f"[Skill: {name}]"
-        if operation in applied_ids:
+        version = snapshot.get("version") or hashlib.sha256(snapshot["content"].encode("utf-8")).hexdigest()
+        legacy_operation = f"skill:{item['id']}:{name}"
+        operation = f"{legacy_operation}:{version}"
+        if operation in applied_ids or legacy_operation in applied_ids:
             continue
-        if any(marker in str(message.get("content") or "") for message in messages
-               if message.get("role") == "system"):
+        if persisted_ids is None:
+            persisted_ids = {row.get("operation_id") for row in db.get_messages(session_id, include_invalidated=True)}
+        if operation in persisted_ids or legacy_operation in persisted_ids:
             applied_ids.add(operation)
             continue
         context = build_skill_invocation_system(name, snapshot["content"], user_intent=item.get("content", ""))
         db.append_message(session_id, "system", content=context, turn_id=turn_id, operation_id=operation)
+        _remove_skill_contexts(messages, name=name)
         messages.append({"role": "system", "content": context})
         applied_ids.add(operation)
         changed = True
     return changed
+
+
+def _remove_skill_contexts(messages: list[dict], *, name: str | None = None) -> None:
+    from mclaw.prompts.skills import strip_skill_invocations
+
+    retained = []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") == "system" and isinstance(content, str):
+            stripped = strip_skill_invocations(content, name=name)
+            if stripped != content.strip():
+                if stripped:
+                    retained.append({**message, "content": stripped})
+                continue
+        retained.append(message)
+    messages[:] = retained
+
+
+def sync_task_skill_context(messages: list[dict], task: dict, applied_ids: set[str], *,
+                            disabled_names: set[str] | frozenset[str] = frozenset()) -> None:
+    """Project only this task's latest selections; keep the durable audit untouched.
+
+    Rebuild from immutable task inputs after reconnect or compression. Applied
+    supplements override earlier selections of the same Skill within this task.
+    """
+    from mclaw.prompts.skills import build_skill_invocation_system, strip_skill_invocations
+
+    inputs = [task, *(item for item in task.get("supplements", [])
+                     if item.get("applied") or "supplement:" + str(item.get("id")) in applied_ids)]
+    selected: dict[str, str] = {}
+    for item in inputs:
+        for snapshot in item.get("skill_snapshots", []):
+            name = snapshot["name"]
+            if name not in disabled_names:
+                selected[name] = build_skill_invocation_system(
+                    name, snapshot["content"], user_intent=item.get("content", ""),
+                )
+    desired = list(selected.values())
+    current = []
+    embedded = False
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") != "system" or not isinstance(content, str):
+            continue
+        stripped = strip_skill_invocations(content)
+        if stripped != content.strip():
+            if stripped:
+                embedded = True
+            else:
+                current.append(content)
+    if current == desired and not embedded:
+        return
+    _remove_skill_contexts(messages)
+    messages.extend({"role": "system", "content": content} for content in desired)
 
 
 class SkillService:

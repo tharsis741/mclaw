@@ -79,9 +79,17 @@ class BuiltinMemoryProvider(MemoryProvider):
                 continue
             target_schema["enum"] = targets
             if targets == ["memory"]:
-                target_schema["description"] = "Only 'memory' is enabled."
+                target_schema["description"] = (
+                    "Only 'memory' is enabled: environment, project, tool, and workflow facts. "
+                    "Defaults to 'memory'."
+                )
             elif targets == ["user"]:
-                target_schema["description"] = "Only 'user' profile memory is enabled."
+                target_schema["description"] = "Required: only 'user' profile/preferences memory is enabled."
+                # The handler's legacy default is 'memory'. Require an explicit
+                # target instead of silently redirecting an omitted target.
+                required = schema["function"]["parameters"].setdefault("required", [])
+                if "target" not in required:
+                    required.append("target")
         return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs) -> str:

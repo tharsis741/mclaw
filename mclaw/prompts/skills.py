@@ -6,7 +6,46 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
+
+
+def strip_skill_invocations(content: str, *, name: str | None = None) -> str:
+    """Remove task-scoped Skill blocks, including legacy blocks in the base prompt."""
+    text = content.strip()
+    header = re.match(r"^\[Skill: ([^\]\r\n]+)\]\r?\n", text)
+    if header and text.endswith("[End Skill]"):
+        # Skill examples can themselves contain delimiter text. A standalone
+        # invocation is one envelope, not a sequence of inner instructions.
+        return "" if name is None or header.group(1) == name else text
+    if name is not None:
+        # Legacy blocks were appended together to the base prompt. Clear that
+        # entire suffix only when projecting a new task, not one inner example.
+        return text
+    pattern = r"(?ms)^\[Skill: [^\]\r\n]+\]\r?\n.*^\[End Skill\](?:\r?\n|$)"
+    return re.sub(pattern, "", content).strip()
+
+
+def prepare_skill_contexts_for_turn(messages: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Expire historical selections and consume fresh legacy slash selections.
+
+    Queue hosts restore the active task from immutable snapshots at the model
+    boundary. Hosts without a queue can explicitly select a Skill for one turn.
+    """
+    history, pending = [], []
+    for message in messages:
+        content = message.get("content")
+        if message.get("role") == "system" and isinstance(content, str):
+            if message.get("_mclaw_pending_skill"):
+                pending.append({key: value for key, value in message.items() if key != "_mclaw_pending_skill"})
+                continue
+            stripped = strip_skill_invocations(content)
+            if stripped != content.strip():
+                if stripped:
+                    history.append({**message, "content": stripped})
+                continue
+        history.append(message)
+    return history, pending
 
 
 def build_skill_invocation_system(
@@ -23,7 +62,7 @@ def build_skill_invocation_system(
     intent_block = f"\nUser Intent:\n{intent}\n" if intent else ""
     return (
         f"[Skill: {skill_name}]\n\n"
-        "用户选择此 Skill 处理当前任务。\n"
+        "用户选择此 Skill 处理当前任务；后续用户补充或纠正优先。\n"
         f"{intent_block}\n"
         "Skill Instructions:\n"
         f"{skill_content}\n\n"

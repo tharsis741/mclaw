@@ -12,13 +12,41 @@ Use `mmx` to generate text, images, video, speech, music, and perform web search
 ```bash
 # Install
 npm install -g mmx-cli
-
-# Auth (persisted to ~/.mmx/credentials.json)
-mmx auth login --api-key sk-xxxxx
-
-# Or pass per-call
-mmx text chat --api-key sk-xxxxx --message "Hello"
 ```
+
+### M-Claw authentication
+
+Use the secret scope `skill:mmx-cli`. Before the first authenticated command,
+request or reuse `MINIMAX_API_KEY` through M-Claw's credential control:
+
+```text
+secret_request_many({
+  "required_for": "skill:mmx-cli",
+  "secrets": [{
+    "env_var": "MINIMAX_API_KEY",
+    "provider": "MiniMax",
+    "purpose": "Authenticate mmx media and text requests"
+  }]
+})
+```
+
+After success, every `terminal` call running mmx must use the same scope.
+M-Claw injects the authorized environment variable; mmx reads it directly:
+
+```text
+terminal({
+  "command": "mmx text chat --message Hello --non-interactive --output json --quiet",
+  "required_for": "skill:mmx-cli"
+})
+```
+
+Keep the key inside the scoped environment. Do not ask for it in ordinary chat,
+read credential files, print it, interpolate it into command arguments, export
+a literal value, or use mmx's persistent login/configuration to store it again.
+If credential access is denied or cancelled, stop the authenticated operation.
+Only after an authentication failure, call `secret_request_many` once with the
+same scope and `force_refresh: true`, then retry the failed command once. Report
+a repeated failure; quota, network, and input errors do not justify a refresh.
 
 Region is auto-detected. Override with `--region global` or `--region cn`.
 
@@ -353,7 +381,8 @@ CLI flags → environment variables → `~/.mmx/config.json` → defaults.
 mmx config set --key region --value cn
 mmx config show
 
-# Environment
-export MINIMAX_API_KEY=sk-xxxxx
+# Non-secret environment setting (Bash example)
 export MINIMAX_REGION=cn
 ```
+
+`MINIMAX_API_KEY` is supplied only by the scoped M-Claw credential flow above.
