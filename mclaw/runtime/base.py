@@ -10,6 +10,8 @@ and search behavior through this interface so tools can stay platform-neutral.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import logging
 import os
 import subprocess
@@ -31,7 +33,7 @@ from mclaw.runtime.process import (
     wait_for_process_group_exit,
 )
 from mclaw.runtime.search import SearchProfile
-from mclaw.runtime.shell import CWD_MARKER, ShellProfile
+from mclaw.runtime.shell import CWD_BASE64_MARKER, CWD_MARKER, ShellProfile
 from mclaw.tools.interrupt import get_cancel_id, safe_cancel_trace
 
 logger = logging.getLogger(__name__)
@@ -445,6 +447,16 @@ class Runtime:
         latest = ""
         kept: list[str] = []
         for line in output.splitlines():
+            if line.startswith(CWD_BASE64_MARKER):
+                try:
+                    decoded = base64.b64decode(
+                        line[len(CWD_BASE64_MARKER):].strip(), validate=True,
+                    ).decode("utf-8")
+                except (ValueError, binascii.Error):
+                    continue
+                if decoded and "\0" not in decoded:
+                    latest = decoded
+                continue
             if line.startswith(CWD_MARKER):
                 latest = line[len(CWD_MARKER):].strip()
                 continue
