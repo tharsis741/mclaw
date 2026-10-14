@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from mclaw.application.process_events import finish_process, update_process
+from mclaw.application.process_events import PROCESS_VERSION, finish_process, update_process
 
 ACTIVE = {"pending", "running", "finalizing"}
 
@@ -19,7 +19,7 @@ def _task(group: dict, identifier: str, index: int, goal: str = "", timestamp=No
         tasks[key] = {"task_index": index, "goal": goal, "status": "pending", "messages": [
             {"id": prefix + "_assignment", "role": "user", "source": "delegate", "content": goal,
              "created_at": timestamp},
-            {"id": prefix + "_reply", "role": "assistant", "content": "", "process": [], "process_version": 2},
+            {"id": prefix + "_reply", "role": "assistant", "content": "", "process": [], "process_version": PROCESS_VERSION},
         ]}
     return tasks[key]
 

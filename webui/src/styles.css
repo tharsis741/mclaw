@@ -5343,7 +5343,8 @@ input.tool-switch:focus-visible {
   margin: 12px 0;
 }
 .remote-warning,
-.entry-status.waiting {
+.entry-status.waiting,
+.entry-status.awaiting_confirmation {
   color: #846127;
 }
 

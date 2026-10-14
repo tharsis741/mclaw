@@ -8,6 +8,7 @@ const STATUS: Record<string, string> = {
   running: '执行中',
   completed: '已完成',
   waiting: '等待补充',
+  awaiting_confirmation: '等待确认',
   failed: '失败',
   interrupted: '已中断',
   unknown: '结果待核对',

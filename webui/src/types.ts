@@ -17,7 +17,14 @@ export interface ProcessEntry {
   arguments?: string;
   output?: string;
   result_text?: string;
-  status?: 'running' | 'completed' | 'failed' | 'interrupted' | 'unknown' | 'waiting';
+  status?:
+    | 'running'
+    | 'completed'
+    | 'failed'
+    | 'interrupted'
+    | 'unknown'
+    | 'waiting'
+    | 'awaiting_confirmation';
   device_id?: string;
   device_name?: string;
   task_id?: string;

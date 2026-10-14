@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 from mclaw.cli.runtime.session_lock import InteractiveSessionLock, InteractiveSessionLockError
 from mclaw.application.store import ApplicationStore, backup_history
+from mclaw.application.process_events import PROCESS_VERSION
 from mclaw.application.task_queue import adopt_terminal_queue, classify_task_result
 from mclaw.application.workspaces import BACKGROUND_WORKSPACE_SOURCES, matches_managed_workspace
 from mclaw.runtime.paths import PathPolicy
@@ -191,7 +192,7 @@ class SessionService:
         if client is not None:
             self.claim(session_id, client)
         session = self._load(session_id)
-        if session_id not in self.jobs and any(m["role"] == "assistant" and m.get("process_version") != 2 for m in session["messages"]):
+        if session_id not in self.jobs and any(m["role"] == "assistant" and m.get("process_version") != PROCESS_VERSION for m in session["messages"]):
             from mclaw.application.process_events import secret_values, upgrade_process
             if upgrade_process(session, self.history.get_messages(session_id, include_invalidated=True), secret_values(self.home)):
                 return self._save(session)
@@ -682,7 +683,7 @@ class SessionService:
                 if len(task["attempts"]) == 1:
                     session["messages"].append({"id": task["id"], "role": "user", "source": task.get("source", "web"), "content": task["content"], "process": [], "created_at": task["created_at"], "skills": task.get("skills", []), "attachments": task.get("attachments", []), "device_selection": task.get("device_selection", {"mode": "auto", "devices": []})})
                 response_id = attempt["id"]
-                session["messages"].append({"id": response_id, "role": "assistant", "content": "", "process": [], "process_version": 2, "created_at": time.time()})
+                session["messages"].append({"id": response_id, "role": "assistant", "content": "", "process": [], "process_version": PROCESS_VERSION, "created_at": time.time()})
                 self._save(session)
                 try:
                     runner = self.runners.get(session_id)

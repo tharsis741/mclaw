@@ -8,7 +8,7 @@ from copy import deepcopy
 import pytest
 
 from mclaw.application.process_events import history_messages, history_process, tool_status, upgrade_process
-from mclaw.application.process_events import agent_events
+from mclaw.application.process_events import PROCESS_VERSION, agent_events
 from mclaw.application.sessions import SessionService
 from mclaw.application.worker import SessionWorker
 
@@ -38,7 +38,7 @@ def test_worker_records_streamed_reasoning_and_one_tool_with_arguments_and_resul
     service = SessionService(home)
     sid = service.create("browser")["id"]
     session = service._load(sid)
-    session["messages"] = [{"id": "response", "role": "assistant", "content": "", "process": [], "process_version": 2}]
+    session["messages"] = [{"id": "response", "role": "assistant", "content": "", "process": [], "process_version": PROCESS_VERSION}]
     service.store.save(session)
     worker = SessionWorker(home, {"id": sid, "workspace": str(tmp_path)}, lambda event: service._event(sid, "response", event))
     worker.run_id = "attempt"
@@ -94,6 +94,50 @@ def test_prior_web_process_is_rebuilt_from_history_without_rewriting_history():
     assert not upgrade_process(session, rows)
 
 
+def test_snapshot_migrates_cached_waiting_status_once(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    monkeypatch.setenv("MCLAW_HOME", str(home))
+    service = SessionService(home)
+    try:
+        sid = service.create("browser")["id"]
+        session = service._load(sid)
+        rows = _confirmation_rows()
+        session["messages"] = [{"id": "response", "role": "assistant", "content": "确认后继续",
+                                "process_version": 2, "process": [
+            {"id": "tool_call-1", "kind": "tool", "title": "skill_manage", "tool_call_id": "call-1",
+             "status": "failed", "output": rows[2]["content"]},
+        ]}]
+        service.store.save(session)
+        reads = []
+
+        def history(*args, **kwargs):
+            reads.append(args)
+            return rows
+
+        monkeypatch.setattr(service.history, "get_messages", history)
+        first = service.snapshot(sid)
+        assert first["messages"][0]["process"][0]["status"] == "awaiting_confirmation"
+        assert service.snapshot(sid)["messages"] == first["messages"]
+        assert len(reads) == 1
+    finally:
+        service.store.close()
+        service.history.close()
+        for lock in service.locks.values():
+            lock.release()
+
+
+def test_delegated_confirmation_migration_does_not_reuse_parent_call_results():
+    pending = {"id": "tool_call-1", "kind": "tool", "tool_call_id": "call-1", "status": "failed",
+               "output": _confirmation_rows()[2]["content"]}
+    session = {"messages": [{"id": "response", "role": "assistant", "process_version": 2,
+                             "delegations": {"delegate": {"tasks": {"0": {"messages": [
+        {"id": "child", "role": "assistant", "process_version": 2, "process": [pending]},
+    ]}}}}}]}
+    rows = [{"role": "tool", "tool_call_id": "call-1", "content": '{"error":"parent failed"}'}]
+    assert upgrade_process(session, rows)
+    assert pending["status"] == "awaiting_confirmation"
+
+
 def test_historical_import_keeps_reasoning_only_rounds_and_tool_output():
     messages = history_messages(_rows())
     assert len(messages) == 3
@@ -139,3 +183,62 @@ def test_two_attempts_keep_their_own_process_records():
 ])
 def test_tool_status_uses_terminal_return_code(result, status):
     assert tool_status(json.dumps(result)) == status
+
+
+@pytest.mark.parametrize("extra,expected", [
+    ({}, "awaiting_confirmation"),
+    ({"success": True}, "awaiting_confirmation"),
+    ({"requires_confirmation": False}, "failed"),
+    ({"requires_confirmation": "true"}, "failed"),
+    ({"error": "review failed"}, "failed"),
+    ({"returncode": 1}, "failed"),
+    ({"exit_code": 2}, "failed"),
+    ({"cancelled": True}, "interrupted"),
+    ({"interrupted": True}, "interrupted"),
+])
+def test_confirmation_status_distinguishes_waiting_from_errors(extra, expected):
+    payload = {"success": False, "requires_confirmation": True,
+               "confirmation_type": "skill_enable_drafting", **extra}
+    assert tool_status(payload) == expected
+    assert tool_status(json.dumps(payload)) == expected
+
+
+def _confirmation_rows():
+    rows = _rows()
+    rows[1]["tool_calls"][0]["function"] = {
+        "name": "skill_manage", "arguments": '{"action":"install_prepare"}',
+    }
+    rows[2]["content"] = json.dumps({
+        "success": False, "requires_confirmation": True,
+        "confirmation_type": "skill_enable_drafting", "drafting_id": "draft-test",
+    })
+    return rows
+
+
+def test_live_and_historical_confirmation_calls_have_the_same_waiting_status():
+    rows = _confirmation_rows()
+    live = agent_events({"type": "tool.finished", "tool_call_id": "call-1",
+                         "name": "skill_manage", "result": rows[2]["content"]}, "test")
+    historical = history_process(rows)
+    assert live[0]["status"] == "awaiting_confirmation"
+    assert next(entry for entry in historical if entry["kind"] == "tool")["status"] == "awaiting_confirmation"
+
+
+@pytest.mark.parametrize("clipped_output", [False, True])
+def test_cached_confirmation_status_is_upgraded_without_rebuilding_other_entries(clipped_output):
+    rows = _confirmation_rows()
+    original_rows = deepcopy(rows)
+    other = {"id": "remote", "kind": "remote", "title": "远程任务", "status": "waiting",
+             "result_text": "保留远程回复", "input_request": {"message": "补充资料"}}
+    session = {"messages": [{"id": "response", "role": "assistant", "content": "确认后继续",
+                            "created_at": 2, "process_version": 2, "process": [
+        {"id": "tool_call-1", "kind": "tool", "title": "skill_manage", "tool_call_id": "call-1",
+         "status": "failed", "output": '{"success":false,' if clipped_output else rows[2]["content"]},
+        deepcopy(other),
+    ]}]}
+    assert upgrade_process(session, rows)
+    assert session["messages"][0]["process"][0]["status"] == "awaiting_confirmation"
+    assert session["messages"][0]["process"][1] == other
+    assert session["messages"][0]["content"] == "确认后继续"
+    assert rows == original_rows
+    assert not upgrade_process(session, rows)

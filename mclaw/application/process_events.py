@@ -17,6 +17,7 @@ from mclaw.runtime.secrets import redact_secret_values
 _SECRET_KEY = re.compile(r"^(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|password|passwd|secret|client[_-]?secret|authorization|cookie|set-cookie)$", re.I)
 _INLINE_SECRET = re.compile(r"(?i)(\b(?:authorization\s*[:=]\s*bearer|api[_-]?key\s*[:=]|access[_-]?token\s*[:=]|password\s*[:=])\s*)[^\s,;\"']+")
 DISPLAY_LIMIT = 64000
+PROCESS_VERSION = 3
 
 
 def secret_values(home: Path) -> set[str]:
@@ -61,8 +62,12 @@ def tool_status(result: Any) -> str:
     if isinstance(data, dict):
         if data.get("interrupted") or data.get("cancelled"):
             return "interrupted"
-        if (data.get("error") or data.get("success") is False
+        if (data.get("error")
                 or any(data.get(key) not in (None, 0) for key in ("exit_code", "returncode"))):
+            return "failed"
+        if data.get("requires_confirmation") is True:
+            return "awaiting_confirmation"
+        if data.get("success") is False:
             return "failed"
     return "completed"
 
@@ -221,25 +226,51 @@ def history_messages(rows: list[dict], secrets: Collection[str] = ()) -> list[di
         related = [{**row, "content": ""}, *(results[identifier] for identifier in identifiers if identifier in results)]
         messages.append({"id": f"history_{row['id']}", "role": row["role"], "content": row.get("content") or "",
                          "process": history_process(related, secrets) if row["role"] == "assistant" else [],
-                         "process_version": 2, "created_at": row.get("timestamp"),
+                         "process_version": PROCESS_VERSION, "created_at": row.get("timestamp"),
                          "turn_id": row.get("turn_id"), "operation_id": row.get("operation_id"),
                          "invalidated": bool(row.get("invalidated_at"))})
     return messages
 
 
+def _upgrade_confirmation_statuses(message: dict, results: dict[str, Any]) -> None:
+    """Repair cached status labels without replacing richer execution records."""
+    for entry in message.get("process", []):
+        if entry.get("kind") != "tool":
+            continue
+        # Stored display JSON may be clipped; prefer the original tool response.
+        result = results.get(entry.get("tool_call_id"), entry.get("output"))
+        if tool_status(result) == "awaiting_confirmation":
+            entry["status"] = "awaiting_confirmation"
+    for group in message.get("delegations", {}).values():
+        for task in group.get("tasks", {}).values():
+            for child in task.get("messages", []):
+                if child.get("role") == "assistant":
+                    # Child conversations have their own tool-call ID namespace.
+                    _upgrade_confirmation_statuses(child, {})
+                    child["process_version"] = PROCESS_VERSION
+
+
 def upgrade_process(session: dict, rows: list[dict], secrets: Collection[str] = ()) -> bool:
     """Upgrade only presentation data; leave original history and tasks intact."""
     messages = session.get("messages", [])
-    if not any(m["role"] == "assistant" and m.get("process_version") != 2 for m in messages):
+    responses = [m for m in messages if m["role"] == "assistant"]
+    if not any(m.get("process_version") != PROCESS_VERSION for m in responses):
         return False
-    if messages and all(str(m.get("id", "")).startswith("history_") for m in messages):
+    needs_rebuild = any(m.get("process_version") not in {2, PROCESS_VERSION} for m in responses)
+    if needs_rebuild and messages and all(str(m.get("id", "")).startswith("history_") for m in messages):
         session["messages"] = history_messages(rows, secrets)
         return True
-    responses = [m for m in messages if m["role"] == "assistant"]
+    results = {row["tool_call_id"]: row.get("content") for row in rows
+               if row["role"] == "tool" and row.get("tool_call_id")}
     imports = {item["id"]: item for item in history_messages(rows, secrets)} if any(
-        str(m.get("id", "")).startswith("history_") and m.get("process_version") != 2 for m in responses) else {}
+        str(m.get("id", "")).startswith("history_") and m.get("process_version") not in {2, PROCESS_VERSION}
+        for m in responses) else {}
     for index, message in enumerate(responses):
+        if message.get("process_version") == PROCESS_VERSION:
+            continue
+        _upgrade_confirmation_statuses(message, results)
         if message.get("process_version") == 2:
+            message["process_version"] = PROCESS_VERSION
             continue
         start = message.get("created_at") or 0
         end = responses[index + 1].get("created_at") if index + 1 < len(responses) else float("inf")
@@ -250,10 +281,10 @@ def upgrade_process(session: dict, rows: list[dict], secrets: Collection[str] = 
             imported = imports.get(message["id"])
             if imported:
                 message["process"] = imported["process"]
-            message["process_version"] = 2
+            message["process_version"] = PROCESS_VERSION
             continue
         entries = history_process(related, secrets)
         if entries:
             message["process"] = entries
-        message["process_version"] = 2
+        message["process_version"] = PROCESS_VERSION
     return True

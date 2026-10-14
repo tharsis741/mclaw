@@ -60,6 +60,7 @@ const PROCESS_STATUS = {
   interrupted: '已中断',
   unknown: '结果待核对',
   waiting: '等待补充',
+  awaiting_confirmation: '等待确认',
 };
 
 function parseArguments(text?: string): Record<string, unknown> {

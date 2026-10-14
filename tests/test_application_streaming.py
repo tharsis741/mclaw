@@ -9,6 +9,7 @@ import json
 import pytest
 
 from mclaw.application.sessions import SessionService
+from mclaw.application.process_events import PROCESS_VERSION
 from mclaw.application.streaming import EventBatcher, snapshot_changes
 
 
@@ -18,7 +19,7 @@ async def test_stream_batches_keep_order_and_flush_before_user_requests(tmp_path
     service = SessionService(tmp_path)
     sid = service.create("browser")["id"]
     session = service._load(sid)
-    session["messages"] = [{"id": "reply", "role": "assistant", "content": "", "process": [], "process_version": 2}]
+    session["messages"] = [{"id": "reply", "role": "assistant", "content": "", "process": [], "process_version": PROCESS_VERSION}]
     service.store.save(session)
     writes = []
     save = service.store.save

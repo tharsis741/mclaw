@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from mclaw.application.sessions import SessionService
+from mclaw.application.process_events import PROCESS_VERSION
 from mclaw.application.worker import SessionWorker
 from mclaw.tools.delegate_tool import SubtaskEvent, _run_single_child
 
@@ -19,7 +20,7 @@ def delegation(tmp_path, monkeypatch):
     service = SessionService(tmp_path)
     sid = service.create("browser")["id"]
     session = service._load(sid)
-    session["messages"] = [{"id": "reply", "role": "assistant", "content": "主代理的回复", "process": [], "process_version": 2}]
+    session["messages"] = [{"id": "reply", "role": "assistant", "content": "主代理的回复", "process": [], "process_version": PROCESS_VERSION}]
     service.store.save(session)
     worker = SessionWorker(tmp_path, {"id": sid, "workspace": str(tmp_path)}, lambda event: service._event(sid, "reply", event))
     worker.run_id = "attempt"

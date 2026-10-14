@@ -497,3 +497,38 @@ it('labels a failed tool and does not count reasoning as a tool call', async () 
   await userEvent.click(screen.getByText('下载文件'));
   expect(screen.getByText(/"error": "timeout"/)).toBeVisible();
 });
+
+it('shows a confirmation request separately from failure and missing information', () => {
+  const view = render(
+    <Conversation
+      session={{
+        id: 'confirmation',
+        title: '安装技能',
+        status: 'completed',
+        queue: [],
+        messages: [
+          {
+            id: 'response',
+            role: 'assistant',
+            content: '技能已准备好，请确认是否启用。',
+            process: [
+              {
+                id: 'tool-prepare',
+                kind: 'tool',
+                title: 'skill_manage',
+                status: 'awaiting_confirmation',
+                output: JSON.stringify({ success: false, requires_confirmation: true }),
+              },
+            ],
+          },
+        ],
+      }}
+    />,
+  );
+  expect(screen.getByText('等待确认')).toBeVisible();
+  expect(screen.queryByText('失败')).not.toBeInTheDocument();
+  expect(screen.queryByText('等待补充')).not.toBeInTheDocument();
+  expect(view.container.querySelector('.entry-status.awaiting_confirmation')).toHaveTextContent(
+    '等待确认',
+  );
+});
