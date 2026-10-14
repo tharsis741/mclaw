@@ -23,7 +23,9 @@ from mclaw.agent.transports.base import (
     StreamBufferLimitError,
     effective_call_deadline,
     json_safe_value,
+    model_http_timeout,
     remaining_call_time,
+    response_timeout,
 )
 from mclaw.providers.runtime import ProviderRuntimeContext
 
@@ -39,6 +41,25 @@ _INTERRUPTED = object()
 
 def _field(value: object, name: str, default: Any = None) -> Any:
     return value.get(name, default) if isinstance(value, Mapping) else getattr(value, name, default)
+
+
+def _has_stream_payload(event: object) -> bool:
+    """Distinguish model output from an early header, usage event, or heartbeat."""
+    kind = _field(event, "type", "")
+    if kind == "message_stop":
+        return True
+    if kind == "message_delta":
+        return bool(_field(_field(event, "delta"), "stop_reason"))
+    if kind == "content_block_delta":
+        delta = _field(event, "delta")
+        return any(_field(delta, name) for name in ("text", "thinking", "signature", "partial_json"))
+    if kind == "content_block_start":
+        block = _field(event, "content_block")
+        return bool(
+            _field(block, "type") in {"tool_use", "redacted_thinking"}
+            or _field(block, "text") or _field(block, "thinking")
+        )
+    return False
 
 
 def _arguments(value: Any) -> str:
@@ -183,12 +204,17 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
     ) -> dict[str, Any]:
         system, conversation = self._convert_messages(messages)
         traits = self.context.profile.model_traits(self.context.model)
-        request_timeout = float(options.timeout)
-        if options.deadline_monotonic is not None:
-            remaining = remaining_call_time(float(options.deadline_monotonic))
-            if remaining <= 0:
-                raise TimeoutError("Remote model deadline exceeded")
-            request_timeout = min(request_timeout, remaining)
+        streaming = options.stream or traits.requires_stream
+        first_timeout = response_timeout(
+            options.first_response_timeout,
+            max(STREAM_CREATE_TIMEOUT if streaming else NONSTREAM_WATCHDOG_TIMEOUT, options.timeout),
+        )
+        idle_timeout = response_timeout(
+            options.stream_idle_timeout, max(STREAM_STALL_TIMEOUT, options.timeout),
+        )
+        request_timeout = model_http_timeout(
+            options, read_timeout=max(first_timeout, idle_timeout) if streaming else first_timeout,
+        )
         base: dict[str, Any] = {
             "model": self.context.model,
             "messages": conversation,
@@ -299,7 +325,7 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
     ) -> ModelCallResult:
         deadline = effective_call_deadline(
             options,
-            max(NONSTREAM_WATCHDOG_TIMEOUT, options.timeout),
+            response_timeout(options.first_response_timeout, max(NONSTREAM_WATCHDOG_TIMEOUT, options.timeout)),
         )
         response = self._watchdog(
             lambda: self.client.messages.create(**kwargs),
@@ -321,9 +347,16 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
         interrupted: Callable[[], bool] | None,
     ) -> ModelCallResult:
         created_at = time.monotonic()
-        stream_create_timeout = max(STREAM_CREATE_TIMEOUT, options.timeout)
-        stream_safety_timeout = max(STREAM_SAFETY_TIMEOUT, options.timeout)
-        stream_stall_timeout = max(STREAM_STALL_TIMEOUT, options.timeout)
+        stream_create_timeout = response_timeout(
+            options.first_response_timeout, max(STREAM_CREATE_TIMEOUT, options.timeout),
+        )
+        stream_safety_timeout = max(
+            STREAM_SAFETY_TIMEOUT, options.timeout,
+            options.first_response_timeout or 0.0, options.stream_idle_timeout or 0.0,
+        )
+        stream_stall_timeout = response_timeout(
+            options.stream_idle_timeout, max(STREAM_STALL_TIMEOUT, options.timeout),
+        )
         create_deadline = effective_call_deadline(options, stream_create_timeout)
         producer_deadline = effective_call_deadline(
             options,
@@ -381,6 +414,7 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
         stream_started_at: float | None = None
         stream_deadline: float | None = None
         last_event_at = created_at
+        received_payload = False
         timed_out = False
         timeout_finish_reason = "stream_stalled"
         was_interrupted = False
@@ -459,6 +493,10 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                     break
 
                 now = time.monotonic()
+                activity_deadline = (
+                    last_event_at + stream_stall_timeout
+                    if received_payload else create_deadline
+                )
                 stream_is_started = started.is_set()
                 if stream_is_started and stream_started_at is None:
                     stream_started_at = stream_started_holder[0] or now
@@ -486,7 +524,7 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                     wait_timeout = min(
                         POLL_INTERVAL,
                         remaining_call_time(stream_deadline),
-                        max(0.0, stream_stall_timeout - (now - last_event_at)),
+                        remaining_call_time(activity_deadline),
                     )
 
                 record = events.get(wait_timeout)
@@ -494,7 +532,7 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                     if events.finished and events.empty:
                         break
                     now = time.monotonic()
-                    if started.is_set() and now - last_event_at >= stream_stall_timeout:
+                    if started.is_set() and now >= activity_deadline:
                         timed_out = True
                         timeout_finish_reason = "stream_stalled"
                         break
@@ -509,12 +547,14 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
                         options,
                         stream_safety_timeout,
                     )
-                if arrived_at - last_event_at >= stream_stall_timeout:
+                if arrived_at >= activity_deadline:
                     timed_out = True
                     timeout_finish_reason = "stream_stalled"
                     break
-                last_event_at = arrived_at
                 event_type = _field(event, "type", "")
+                if _has_stream_payload(event):
+                    received_payload = True
+                    last_event_at = arrived_at
                 if event_type == "message_start":
                     message = _field(event, "message")
                     usage.update(_usage_fields(_field(message, "usage")))
@@ -610,7 +650,10 @@ class AnthropicMessagesTransport(transport_base.ModelTransport):
             stop_requested.set()
             _close_quietly(stream_holder[0])
 
-        has_payload = bool(content or thinking or completed_tool_uses or finish_reason)
+        has_payload = bool(
+            "".join(content) or completed_tool_uses or finish_reason
+            or any(block.get("thinking") or block.get("signature") or block.get("data") for block in thinking.values())
+        )
         producer_error = events.terminal_error
         if isinstance(producer_error, StreamBufferLimitError):
             raise producer_error

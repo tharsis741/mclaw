@@ -23,8 +23,10 @@ from mclaw.agent.transports.base import (
     StreamBufferLimitError,
     effective_call_deadline,
     json_safe_value,
+    model_http_timeout,
     normalize_model_call_error,
     remaining_call_time,
+    response_timeout,
 )
 from mclaw.providers.base import (
     PROMPT_CACHE_LAYOUT_OPENAI_SYSTEM,
@@ -413,12 +415,17 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                     layout=traits.prompt_cache_layout,
                     system_message_index=cache_plan.system_message_index,
                 )
-            request_timeout = float(options.timeout)
-            if options.deadline_monotonic is not None:
-                remaining = remaining_call_time(float(options.deadline_monotonic))
-                if remaining <= 0:
-                    raise TimeoutError("Remote model deadline exceeded")
-                request_timeout = min(request_timeout, remaining)
+            first_timeout = response_timeout(
+                options.first_response_timeout,
+                max(CREATE_TIMEOUT if effective_stream else NONSTREAM_TIMEOUT, options.timeout),
+            )
+            idle_timeout = response_timeout(
+                options.stream_idle_timeout, max(STREAM_STALL_TIMEOUT, options.timeout),
+            )
+            request_timeout = model_http_timeout(
+                options,
+                read_timeout=max(first_timeout, idle_timeout) if effective_stream else first_timeout,
+            )
             base_kwargs: dict[str, Any] = {
                 "model": self.context.model,
                 "messages": cleaned_messages,
@@ -477,7 +484,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
     ) -> ModelCallResult:
         deadline = effective_call_deadline(
             options,
-            max(NONSTREAM_TIMEOUT, options.timeout),
+            response_timeout(options.first_response_timeout, max(NONSTREAM_TIMEOUT, options.timeout)),
         )
         response = self._watchdog(
             lambda: self.client.chat.completions.create(**kwargs),
@@ -537,7 +544,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
     ) -> ModelCallResult:
         create_deadline = effective_call_deadline(
             options,
-            max(CREATE_TIMEOUT, options.timeout),
+            response_timeout(options.first_response_timeout, max(CREATE_TIMEOUT, options.timeout)),
         )
         stream = self._watchdog(
             lambda: self.client.chat.completions.create(**kwargs),
@@ -558,6 +565,8 @@ class OpenAIChatCompletionsTransport(ModelTransport):
             STREAM_SAFETY_TIMEOUT,
             options.timeout,
             profile_safety_timeout or 0.0,
+            options.first_response_timeout or 0.0,
+            options.stream_idle_timeout or 0.0,
         )
         stream_deadline = effective_call_deadline(
             options,
@@ -613,7 +622,10 @@ class OpenAIChatCompletionsTransport(ModelTransport):
         interrupted_result = False
         stalled = False
         safety_timeout = False
-        stream_stall_timeout = max(STREAM_STALL_TIMEOUT, options.timeout)
+        stream_stall_timeout = response_timeout(
+            options.stream_idle_timeout, max(STREAM_STALL_TIMEOUT, options.timeout),
+        )
+        received_payload = False
         last_meaningful = stream_started_at
         activity_status = ""
 
@@ -680,22 +692,26 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 if now >= stream_deadline:
                     safety_timeout = True
                     break
+                activity_deadline = (
+                    last_meaningful + stream_stall_timeout
+                    if received_payload else create_deadline
+                )
                 wait_timeout = min(
                     POLL_INTERVAL,
                     remaining_call_time(stream_deadline),
-                    max(0.0, stream_stall_timeout - (now - last_meaningful)),
+                    remaining_call_time(activity_deadline),
                 )
                 record = chunks.get(wait_timeout)
                 if record is None:
                     if chunks.finished and chunks.empty:
                         break
-                    if time.monotonic() - last_meaningful >= stream_stall_timeout:
+                    if time.monotonic() >= activity_deadline:
                         stalled = True
                         break
                     continue
                 arrived_at = record.arrived_at
                 chunk = record.value
-                if arrived_at - last_meaningful >= stream_stall_timeout:
+                if arrived_at >= activity_deadline:
                     stalled = True
                     break
 
@@ -715,6 +731,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 meaningful = bool(provider_finish)
                 if delta is None:
                     if meaningful:
+                        received_payload = True
                         last_meaningful = arrived_at
                     continue
 
@@ -788,6 +805,7 @@ class OpenAIChatCompletionsTransport(ModelTransport):
                 if not visible_delta and tool_activity:
                     report_activity("Preparing tool call...")
                 if meaningful:
+                    received_payload = True
                     last_meaningful = arrived_at
                 enforce_output_bounds()
         finally:

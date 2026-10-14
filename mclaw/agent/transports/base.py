@@ -18,6 +18,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    import httpx
+
     from mclaw.agent.prompt_cache import PromptCachePlan
     from mclaw.agent.usage import UsageRecord
     from mclaw.providers.runtime import ProviderRuntimeContext
@@ -136,6 +138,8 @@ class ModelCallOptions:
         repr=False,
         compare=False,
     )
+    first_response_timeout: float | None = None
+    stream_idle_timeout: float | None = None
 
 
 @dataclass(frozen=True)
@@ -461,6 +465,34 @@ def remaining_call_time(deadline_monotonic: float) -> float:
     return max(0.0, deadline_monotonic - time.monotonic())
 
 
+def response_timeout(value: float | None, fallback: float) -> float:
+    """Resolve a phase timeout without accepting unbounded or invalid waits."""
+    resolved = fallback if value is None else value
+    if (
+        isinstance(resolved, bool)
+        or not isinstance(resolved, (int, float))
+        or not math.isfinite(resolved)
+        or resolved <= 0
+    ):
+        raise ValueError("Response timeouts must be finite and positive")
+    return float(resolved)
+
+
+def model_http_timeout(options: ModelCallOptions, *, read_timeout: float) -> httpx.Timeout:
+    """Keep the SDK read timeout from preempting the response watchdogs."""
+    import httpx
+
+    connection_timeout = response_timeout(options.timeout, 30.0)
+    read_timeout = response_timeout(read_timeout, connection_timeout)
+    if options.deadline_monotonic is not None:
+        remaining = remaining_call_time(float(options.deadline_monotonic))
+        if remaining <= 0:
+            raise TimeoutError("Remote model deadline exceeded")
+        connection_timeout = min(connection_timeout, remaining)
+        read_timeout = min(read_timeout, remaining)
+    return httpx.Timeout(connection_timeout, read=read_timeout)
+
+
 def _redact_error_message(message: str, api_key: str) -> str:
     redacted = str(message or "")
     if api_key:
@@ -509,12 +541,13 @@ def normalize_model_call_error(
         retryable = is_retryable_error(exc)
     except (ImportError, AttributeError, TypeError):
         retryable = False
-    retryable = (
-        retryable
-        or isinstance(exc, TimeoutError)
-        or type(exc).__name__.casefold().endswith("timeouterror")
-        or status_code in RETRYABLE_STATUS_CODES
+    error_name = type(exc).__name__.casefold()
+    timed_out = (
+        isinstance(exc, TimeoutError)
+        or error_name.endswith("timeouterror")
+        or error_name in {"readtimeout", "connecttimeout", "writetimeout", "pooltimeout"}
     )
+    retryable = retryable or timed_out or status_code in RETRYABLE_STATUS_CODES
     try:
         retry_after = get_retry_after(exc)
     except (AttributeError, TypeError, ValueError):
@@ -532,4 +565,5 @@ def normalize_model_call_error(
         retry_after=retry_after,
         status_code=status_code,
         raw_exception=exc,
+        code="PROVIDER_TIMEOUT" if timed_out else "PROVIDER_ERROR",
     )

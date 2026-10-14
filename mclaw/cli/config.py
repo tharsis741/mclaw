@@ -276,6 +276,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "active_provider_profile": "",
     "providers": {},
     "fallback_providers": [],
+    "agent": {
+        "first_response_timeout": 90,
+        "stream_idle_timeout": 60,
+    },
     "reasoning": {
         "effort": "",
     },
@@ -569,6 +573,13 @@ def _validate_toolset_list(value: Any, path: str) -> None:
 
 def _validate_config(config: Mapping[str, Any]) -> None:
     """Validate host-sensitive configuration after all source merging."""
+    agent = config.get("agent", {})
+    if not isinstance(agent, Mapping):
+        raise ConfigError("agent must be a mapping")
+    for key in ("first_response_timeout", "stream_idle_timeout"):
+        value = agent.get(key, DEFAULT_CONFIG["agent"][key])
+        if type(value) is not int or not 1 <= value <= 600:
+            raise ConfigError(f"agent.{key} must be an integer between 1 and 600")
     dsoftbus = config.get("dsoftbus")
     if not isinstance(dsoftbus, Mapping):
         _raise_dsoftbus_config("dsoftbus")

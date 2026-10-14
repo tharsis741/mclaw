@@ -33,13 +33,17 @@ def number(path: str, label: str, minimum: int, maximum: int, **options) -> dict
 
 
 GROUPS = [
-    {"id": "model", "page": "general", "title": "模型行为", "effect": "新建会话生效",
+    {"id": "model", "page": "general", "title": "模型行为", "effect": "后续任务生效",
      "fields": [
          field("reasoning.effort", "思考强度", "select", description="由模型支持的档位决定；默认使用模型自身设置。",
                options=[{"value": value, "label": label} for value, label in
                         [("", "跟随模型"), ("none", "关闭"), ("minimal", "最低"), ("low", "低"),
                          ("medium", "中"), ("high", "高"), ("xhigh", "更高"), ("max", "最高")]]),
          field("prompt_cache.enabled", "提示词缓存", description="供应商支持时，复用重复上下文以减少开销。"),
+         number("agent.first_response_timeout", "首段回复等待时间（秒）", 1, 600, advanced=True,
+                description="开始请求到收到首段内容的最长等待时间；非流式请求等待完整回复。私有服务响应较慢时可适当增大。"),
+         number("agent.stream_idle_timeout", "回复中断等待时间（秒）", 1, 600, advanced=True,
+                description="已开始回复后，连续没有新内容时允许等待的时间。思考内容和工具调用也计为输出。"),
      ]},
     {"id": "compression", "page": "general", "title": "上下文压缩", "effect": "新建会话生效",
      "fields": [

@@ -1140,7 +1140,7 @@ def test_openai_stream_uses_profile_safety_timeout(monkeypatch) -> None:
         ).call(
             messages=[{"role": "user", "content": "hello"}],
             tools=[],
-            options=ModelCallOptions(stream=True, timeout=0.001),
+            options=ModelCallOptions(stream=True, timeout=0.001, first_response_timeout=0.005),
         )
     assert stalled_stream.closed is True
 
@@ -1283,7 +1283,8 @@ def test_anthropic_nonstream_converts_grouped_tools_reasoning_and_usage() -> Non
     assert request["model"] == "claude-3-5-sonnet"
     assert request["max_tokens"] == 8_192
     assert request["temperature"] == 0.2
-    assert request["timeout"] == 12
+    assert request["timeout"].connect == 12
+    assert request["timeout"].read == 90
     assert request["system"] == [
         {"type": "text", "text": "stable"},
         {"type": "text", "text": "dynamic"},
@@ -1396,7 +1397,8 @@ def test_anthropic_stream_aggregates_thinking_tools_and_cumulative_usage() -> No
     )
 
     assert len(api.stream_calls) == 1
-    assert api.stream_calls[0]["timeout"] == 17
+    assert api.stream_calls[0]["timeout"].connect == 17
+    assert api.stream_calls[0]["timeout"].read == 90
     assert deltas == ["Hello"]
     assert reasoning_updates == ["", "thought"]
     assert all("sig-" not in text for text in reasoning_updates)

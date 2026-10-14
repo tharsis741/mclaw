@@ -2205,6 +2205,8 @@ class MClaw:
                                 or bool(self._stream_callback)
                             ),
                             timeout=30.0,
+                            first_response_timeout=self.config.get("agent", {}).get("first_response_timeout", 90),
+                            stream_idle_timeout=self.config.get("agent", {}).get("stream_idle_timeout", 60),
                             max_output_tokens=(
                                 REMOTE_MODEL_MAX_OUTPUT_TOKENS
                                 if call_source == "dsoftbus"
@@ -2420,7 +2422,10 @@ class MClaw:
                                 wait,
                                 error,
                             )
-                        self._emit_status(f"Retrying in {wait:.0f}s...")
+                        if error.code == "PROVIDER_TIMEOUT":
+                            self._emit_status(f"Model response timed out; retrying in {wait:.0f}s...")
+                        else:
+                            self._emit_status(f"Retrying in {wait:.0f}s...")
                         retry_deadline = time.monotonic() + wait
                         if deadline_monotonic is not None:
                             retry_deadline = min(

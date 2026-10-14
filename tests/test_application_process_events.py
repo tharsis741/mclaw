@@ -13,6 +13,12 @@ from mclaw.application.sessions import SessionService
 from mclaw.application.worker import SessionWorker
 
 
+def test_timeout_retry_status_explains_the_wait():
+    from mclaw.application.process_events import status_text
+
+    assert status_text("Model response timed out; retrying in 7s...") == "模型响应超时，7 秒后重试…"
+
+
 def test_remote_reply_body_is_complete_and_redacted_separately_from_technical_details():
     text = '远程正文\n' * 35000 + 'test-secret END'
     entry = agent_events({'type': 'remote.task', 'id': 'remote', 'kind': 'remote',

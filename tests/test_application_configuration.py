@@ -94,6 +94,19 @@ def test_paired_timeout_edit_and_zero_semantics(service):
     assert values(snapshot)["memory.memory_review_round"] == 0
 
 
+def test_model_response_timeouts_can_be_saved_without_changing_other_agent_settings(service, tmp_path):
+    config_io.save_config({"agent": {"max_turns": 200, "future_option": "keep"}})
+    before = service.read()
+    assert values(before)["agent.first_response_timeout"] == 90
+    assert values(before)["agent.stream_idle_timeout"] == 60
+    after = service.update({"revision": before["revision"], "changes": {
+        "agent.first_response_timeout": 180, "agent.stream_idle_timeout": 45}})
+    assert values(after)["agent.first_response_timeout"] == 180
+    assert values(after)["agent.stream_idle_timeout"] == 45
+    assert yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))["agent"] == {
+        "max_turns": 200, "future_option": "keep", "first_response_timeout": 180, "stream_idle_timeout": 45}
+
+
 def test_sensitive_legacy_url_is_preserved_but_not_sent_to_browser(service, tmp_path):
     endpoint = "https://name:private-fixture-value@example.com/v1?token=hidden"
     config_io.save_config({"delegation": {"base_url": endpoint}})

@@ -120,6 +120,9 @@ def agent_events(event: dict, scope: str, secrets: Collection[str] = ()) -> list
 
 
 def status_text(text: str) -> str:
+    timeout_retry = re.fullmatch(r"Model response timed out; retrying in (\d+)s\.\.\.", text)
+    if timeout_retry:
+        return f"模型响应超时，{timeout_retry.group(1)} 秒后重试…"
     label = {"Thinking...": "思考中…", "Waiting for model...": "等待回复…",
              "Preparing tool call...": "准备调用工具…", "Pruning tool results...": "整理执行记录…",
              "Refreshing context...": "整理上下文…", "Compressing context...": "整理上下文…",
