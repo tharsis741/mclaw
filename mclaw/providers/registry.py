@@ -17,7 +17,10 @@ from mclaw.providers.base import (
 )
 from mclaw.providers.deepseek import DeepSeekProfile
 from mclaw.providers.gemini import GoogleGeminiProfile
-from mclaw.providers.generic import GenericOpenAICompatibleProfile
+from mclaw.providers.generic import (
+    GenericAnthropicCompatibleProfile,
+    GenericOpenAICompatibleProfile,
+)
 from mclaw.providers.kimi import MoonshotKimiProfile
 from mclaw.providers.minimax import MiniMaxProfile
 from mclaw.providers.openai import OpenAIProfile
@@ -79,6 +82,7 @@ def _entry(
     base_url: str,
     *,
     base_url_env_var: str = "",
+    base_url_env_vars: tuple[str, ...] = (),
     base_url_required: bool = False,
     key_url: str = "",
     models_dev_provider: str = "",
@@ -92,6 +96,8 @@ def _entry(
 ) -> _Profile:
     """Build one frozen profile while deriving mechanical metadata once."""
     base_url = base_url.rstrip("/")
+    if not base_url_env_vars and base_url_env_var:
+        base_url_env_vars = (base_url_env_var,)
     if setup_profiles is None:
         setup_profiles = (
             SetupProfileEntry(
@@ -112,6 +118,7 @@ def _entry(
         base_url=base_url,
         base_url_required=base_url_required,
         base_url_env_var=base_url_env_var,
+        base_url_env_vars=base_url_env_vars,
         key_url=key_url,
         models_url=models_url or default_models_url(base_url, api_mode),
         models_dev_provider=models_dev_provider,
@@ -135,6 +142,14 @@ PROVIDER_REGISTRY: dict[str, RuntimeProviderProfile] = {
         key_url="https://platform.openai.com/api-keys", models_dev_provider="openai",
         model_prefixes=("gpt-", "o1", "o3", "o4", "o5"),
     ),
+    "custom": _entry(
+        GenericOpenAICompatibleProfile, "custom", "Custom OpenAI-compatible",
+        ("MCLAW_API_KEY", "OPENAI_API_KEY"), "",
+        base_url_env_var="MCLAW_BASE_URL",
+        base_url_env_vars=("MCLAW_BASE_URL", "OPENAI_BASE_URL"),
+        base_url_required=True,
+        provider_kind="host", setup_profiles=(),
+    ),
     "anthropic": _entry(
         AnthropicProfile, "anthropic", "Anthropic", ("ANTHROPIC_API_KEY",),
         "https://api.anthropic.com", key_url="https://console.anthropic.com/settings/keys",
@@ -149,6 +164,13 @@ PROVIDER_REGISTRY: dict[str, RuntimeProviderProfile] = {
                 note="Vertex 上的 Anthropic 模型需要 Google Cloud 凭据。",
             ),
         ),
+    ),
+    "custom_anthropic": _entry(
+        GenericAnthropicCompatibleProfile, "custom_anthropic", "Custom Anthropic",
+        ("MCLAW_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"), "",
+        base_url_env_var="MCLAW_ANTHROPIC_BASE_URL", base_url_required=True,
+        provider_kind="host", api_mode="anthropic_messages",
+        auth_scheme="anthropic_x_api_key", setup_profiles=(),
     ),
     "google": _entry(
         GoogleGeminiProfile, "google", "Google AI Studio",

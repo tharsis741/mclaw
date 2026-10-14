@@ -850,6 +850,19 @@ def test_restore_uses_current_named_dynamic_metadata(monkeypatch: pytest.MonkeyP
     assert restored.base_url == "https://new.team/v2"
 
 
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic"])
+def test_custom_snapshot_restores_keyless_local_endpoint(provider: str) -> None:
+    original = resolve_provider_runtime_context(
+        provider=provider, model="local-model", base_url="http://localhost:11434/v1",
+    )
+    restored = restore_provider_runtime_context(original.snapshot())
+    assert restored.provider == provider
+    assert restored.api_key == ""
+    assert restored.api_mode == original.api_mode
+    assert restored.profile.models_url == original.profile.models_url
+    assert restored.base_url == original.base_url
+
+
 def test_local_custom_snapshot_cannot_be_overlaid_to_remote_without_a_key() -> None:
     local = resolve_provider_runtime_context(
         provider="custom",

@@ -1205,6 +1205,7 @@ def _run_setup_impl(args):
     from mclaw.cli.provider_profiles import CORE_PROVIDER_KEYS, get_provider_profiles
     from mclaw.cli.tui.console import print_plain
     from mclaw.cli.tui.selection_prompt import prompt_multi_select
+    from mclaw.providers.registry import PROVIDER_REGISTRY as RUNTIME_PROVIDER_REGISTRY
 
     ensure_mclaw_home()
     config = load_config()
@@ -1226,6 +1227,7 @@ def _run_setup_impl(args):
         for provider_key in PROVIDER_REGISTRY
         if provider_key not in common_providers
         and provider_key not in represented_runtime_providers
+        and RUNTIME_PROVIDER_REGISTRY[provider_key].setup_profiles
     ]
     selectable_providers = [*common_providers, *additional_providers]
     other_provider_id = "__other_provider__"

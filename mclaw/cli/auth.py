@@ -92,7 +92,13 @@ def resolve_base_url(provider_name: str) -> str:
     profile = _RUNTIME_PROVIDER_REGISTRY.get(provider_name)
     if not profile:
         return ""
-    return (get_env_value(profile.base_url_env_var) if profile.base_url_env_var else "") or profile.base_url
+    env_vars = profile.base_url_env_vars or (
+        (profile.base_url_env_var,) if profile.base_url_env_var else ()
+    )
+    return (
+        next((value for env in env_vars if (value := get_env_value(env))), None)
+        or profile.base_url
+    )
 
 
 def _configured_providers(config: dict | None = None) -> dict[str, dict]:
@@ -179,7 +185,9 @@ def list_configured_providers() -> list[dict[str, Any]]:
                 "api_mode": str(raw.get("api_mode") or "chat_completions"),
             })
     for name, profile in _RUNTIME_PROVIDER_REGISTRY.items():
-        if name not in user_providers and resolve_api_key(name):
+        if name not in user_providers and (
+            not profile.base_url_required or resolve_base_url(name)
+        ) and resolve_api_key(name):
             result.append({
                 "name": name,
                 "display_name": profile.display_name,

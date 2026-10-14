@@ -10,8 +10,6 @@ from typing import Any
 
 from mclaw.providers.registry import PROVIDER_REGISTRY
 
-_DYNAMIC_PROVIDER_SELECTORS = {"custom", "custom_anthropic"}
-
 
 def _compact(value: str) -> str:
     return "".join(ch for ch in str(value or "").casefold() if ch.isalnum())
@@ -59,8 +57,6 @@ def reserved_provider_collision(provider_name: str) -> str:
     if not raw:
         return ""
     folded = raw.casefold()
-    if folded in _DYNAMIC_PROVIDER_SELECTORS:
-        return folded
     compact = _compact(raw)
     for name, profile in PROVIDER_REGISTRY.items():
         if folded == name.casefold():
