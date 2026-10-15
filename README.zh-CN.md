@@ -24,15 +24,14 @@
 
 **以 Agent Harness 为核心，将空间上下文认知与记忆、智能体工具与 Skill调用、安全设备控制、和多智能体协作组织为统一的智能体运行闭环；依托 M-Robots OS 的 M-DDS 带来的设备协同能力，支持“一机一脑、多脑协同”的分布式智能架构。**
 
-> 当前版本：1.1.2<br>
-> 开源协议：Apache-2.0<br>
-> 当前安装方式：从源码安装
-
-> 📖 [M-CLAW 用户手册](docs/manual/README.md)
-
 ![M-Claw 1.1.2 在 Kaihong BotBook 上的主界面](docs/assets/snapshot/kaihong-overview.png)
 
-<p align="center"><em>M-Claw 1.1.2 · Kaihong BotBook</em></p>
+<p align="center"><em>M-CLAW Version 1.1.2 Overview</em></p>
+
+> 当前版本：1.1.2<br>
+> 开源协议：Apache-2.0<br>
+> 当前安装方式：从源码安装<br>
+> 📖 [M-CLAW 用户手册](docs/manual/README.md)
 
 ## Roadmap
 
