@@ -148,7 +148,7 @@ def test_delegated_web_tools_keep_the_web_content_safety_boundary() -> None:
 def test_enabled_skill_prompts_use_current_web_tool_names() -> None:
     skills_root = Path(__file__).parents[1] / "mclaw" / "skills"
     prompt_files = [skills_root / "hv-analysis" / "SKILL.md"]
-    prompt_files.extend((skills_root / "popular-web-designs").rglob("*.md"))
+    prompt_files.extend((skills_root / "design-taste-frontend").rglob("*.md"))
     text = "\n".join(path.read_text(encoding="utf-8") for path in prompt_files)
 
     assert "WebSearch" not in text

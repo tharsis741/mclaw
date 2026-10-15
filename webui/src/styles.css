@@ -3476,6 +3476,15 @@ kbd {
   overflow: hidden;
   font-size: 11px;
 }
+.skill-source-link {
+  color: inherit;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.skill-source-link:hover,
+.skill-source-link:focus-visible {
+  text-decoration: underline;
+}
 .switch {
   display: inline-flex;
   align-items: center;

@@ -595,17 +595,17 @@ def test_setup_skill_selection_ctrl_a_toggles_all() -> None:
 def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.MonkeyPatch) -> None:
     from mclaw.cli import main as cli_main
     from mclaw.cli.tui import console, selection_prompt
-    from mclaw.skills_hub import builtin_sync, skill_store
+    from mclaw.skills_hub import builtin_sync
 
     skills = [
         {"name": "skill-a", "source_key": "group/skill-a"},
         {"name": "skill-b", "source_key": "group/skill-b"},
     ]
     defaults: list[list[str]] = []
-    enabled: list[dict] = []
+    installed: list[str] = []
 
     monkeypatch.setattr(builtin_sync, "list_builtin_skills", lambda: skills)
-    monkeypatch.setattr(skill_store, "list_skills", lambda: enabled)
+    monkeypatch.setattr(builtin_sync, "list_installed_builtin_skills", lambda: installed)
     monkeypatch.setattr(
         selection_prompt,
         "prompt_builtin_skill_selection",
@@ -614,10 +614,7 @@ def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.Monk
     monkeypatch.setattr(console, "print_plain", lambda *_args, **_kwargs: None)
 
     cli_main._run_setup_builtin_skill_selection()
-    enabled.append({
-        "name": "skill-a",
-        "source": {"type": "bundled", "original": "group/skill-a"},
-    })
+    installed.append("skill-a")
     cli_main._run_setup_builtin_skill_selection()
 
     assert defaults == [[], ["skill-a"]]

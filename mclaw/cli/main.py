@@ -2276,9 +2276,9 @@ def _run_setup_builtin_skill_selection() -> None:
     from mclaw.skills_hub.builtin_sync import (
         get_builtin_skills_dir,
         list_builtin_skills,
+        list_installed_builtin_skills,
         sync_selected_skills,
     )
-    from mclaw.skills_hub.skill_store import list_skills as list_enabled_skills
 
     skills = list_builtin_skills()
     if not skills:
@@ -2294,20 +2294,11 @@ def _run_setup_builtin_skill_selection() -> None:
         )
         return
 
-    installed_builtins = {
-        (str(item.get("name") or ""), str(source.get("original") or ""))
-        for item in list_enabled_skills()
-        if isinstance(item, dict)
-        and isinstance((source := item.get("source")), dict)
-        and source.get("type") == "bundled"
-    }
+    installed_builtins = set(list_installed_builtin_skills())
     default_selected = [
         str(item.get("name") or "")
         for item in skills
-        if (
-            str(item.get("name") or ""),
-            str(item.get("source_key") or ""),
-        ) in installed_builtins
+        if str(item.get("name") or "") in installed_builtins
     ]
 
     try:

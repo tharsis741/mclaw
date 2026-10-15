@@ -20,32 +20,81 @@ import type { SkillDetail, SkillDraft, SkillFile, SkillSummary } from '../types'
 import { readAudits, SecurityAudits } from './SecurityAudits';
 import { DeleteSkillDialog } from './DeleteSkillDialog';
 
+const sourceTypes: Record<string, string> = {
+  local: '本机',
+  builtin: '内置',
+  bundled: '内置',
+  agent_created: '本机创建',
+  github: 'GitHub',
+  skills_sh: 'Skills.sh',
+  skillhub_cn: 'SkillHub',
+  clawhub: 'ClawHub',
+  community: '社区',
+  official: '官方',
+};
+
+function sourceAddress(source: unknown): string {
+  if (typeof source === 'string') return source.trim();
+  if (source && typeof source === 'object') {
+    const value = source as Record<string, unknown>;
+    for (const field of ['url', 'path', 'location', 'original']) {
+      if (typeof value[field] === 'string' && value[field].trim()) return value[field].trim();
+    }
+  }
+  return '';
+}
+
+function sourceUrl(source: unknown): string | undefined {
+  try {
+    const url = new URL(sourceAddress(source));
+    if (url.protocol === 'https:' || url.protocol === 'http:') return url.href;
+  } catch {
+    // Local paths and legacy bundled identifiers are not web links.
+  }
+}
+
 export function sourceLabel(source: unknown, detail = false): string {
   if (typeof source === 'string')
     return (
-      (
-        {
-          local: '本机',
-          builtin: '内置',
-          bundled: '内置',
-          agent_created: '本机创建',
-          github: 'GitHub',
-          skills_sh: 'Skills.sh',
-          skillhub_cn: 'SkillHub',
-          clawhub: 'ClawHub',
-          community: '社区',
-          official: '官方',
-        } as Record<string, string>
-      )[source] ?? (!detail && /^[a-z][a-z0-9_-]*$/.test(source) ? '其他来源' : source)
+      sourceTypes[source] ?? (!detail && /^[a-z][a-z0-9_-]*$/.test(source) ? '其他来源' : source)
     );
   if (source && typeof source === 'object') {
     const value = source as Record<string, unknown>;
-    return sourceLabel(
-      value.url || value.path || value.location || value.original || value.type || '来源已记录',
-      detail,
-    );
+    const address = sourceAddress(source);
+    if (detail && address) return address;
+    if (typeof value.author === 'string' && value.author.trim()) return value.author.trim();
+    const url = sourceUrl(source);
+    if (url) {
+      const parsed = new URL(url);
+      if (parsed.hostname === 'github.com') {
+        return parsed.pathname.split('/').filter(Boolean).slice(0, 2).join('/') || 'GitHub';
+      }
+      if (typeof value.type === 'string' && sourceTypes[value.type]) return sourceTypes[value.type];
+      return parsed.hostname;
+    }
+    // An old bundled original can be a skill slug such as "aihot", not a source type.
+    if (typeof value.type === 'string') return sourceLabel(value.type, detail);
+    return sourceLabel(address || '来源已记录', detail);
   }
   return '本机';
+}
+
+function SkillSource({ source, detail = false }: { source: unknown; detail?: boolean }) {
+  const label = sourceLabel(source, detail);
+  const url = sourceUrl(source);
+  return url ? (
+    <a
+      className="skill-source-link"
+      href={url}
+      title={url}
+      target="_blank"
+      rel="noopener noreferrer"
+    >
+      {label}
+    </a>
+  ) : (
+    <>{label}</>
+  );
 }
 export const skillBody = (content: string) =>
   content.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
@@ -371,8 +420,8 @@ export function SkillsPage({
                   </button>
                   <span className="table-status">{skill.enabled ? '已启用' : '已停用'}</span>
                 </td>
-                <td className="source-cell" title={sourceLabel(skill.source)}>
-                  {sourceLabel(skill.source)}
+                <td className="source-cell" title={sourceLabel(skill.source, true)}>
+                  <SkillSource source={skill.source} />
                 </td>
                 <td>
                   <button
@@ -562,7 +611,9 @@ export function SkillsPage({
                   <summary>来源与版本</summary>
                   <dl className="compact-definition">
                     <dt>来源</dt>
-                    <dd>{sourceLabel(detail.source, true)}</dd>
+                    <dd>
+                      <SkillSource source={detail.source} detail />
+                    </dd>
                     <dt>版本</dt>
                     <dd>{detail.version || '未记录'}</dd>
                   </dl>

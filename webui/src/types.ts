@@ -433,7 +433,20 @@ export interface VoiceStatus {
   notice: string;
 }
 
-export type SkillSource = string | { type: string; original?: string; url?: string; path?: string };
+export type SkillSource =
+  | string
+  | {
+      type: string;
+      original?: string;
+      url?: string;
+      path?: string;
+      author?: string;
+      license?: string;
+      license_file?: string;
+      license_url?: string;
+      copyright?: string;
+      revision?: string;
+    };
 export interface SkillReference {
   name: string;
   source?: SkillSource;

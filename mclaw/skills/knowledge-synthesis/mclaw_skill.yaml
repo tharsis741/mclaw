@@ -1,0 +1,16 @@
+schema_version: 1
+name: knowledge-synthesis
+short_description: 资料综合研究：整合文档和检索结果，交叉核对、去重、解释分歧并保留来源。
+source:
+  type: github
+  original: https://github.com/anthropics/knowledge-work-plugins/tree/f652327d4e953d7957d99e735c3c7f9964e9d2e5/enterprise-search/skills/knowledge-synthesis
+  revision: f652327d4e953d7957d99e735c3c7f9964e9d2e5
+  author: Anthropic
+  license: Apache-2.0
+  license_file: LICENSE
+  license_url: https://github.com/anthropics/knowledge-work-plugins/blob/f652327d4e953d7957d99e735c3c7f9964e9d2e5/enterprise-search/LICENSE
+created_at: '2026-10-15T00:00:00+08:00'
+updated_at: '2026-10-15T00:00:00+08:00'
+created_by: bundled
+updated_by: bundled
+status: enabled

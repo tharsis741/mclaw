@@ -444,6 +444,7 @@ def test_background_review_inherits_context_and_forwards_each_usage(
             self.tools = []
             self.valid_tool_names = set()
             self.recorded: list[tuple[UsageRecord, bool]] = []
+            self.events: list[dict] = []
             self.enabled_toolsets = []
             self.config = {}
             self.session_id = "session"
@@ -452,6 +453,9 @@ def test_background_review_inherits_context_and_forwards_each_usage(
 
         def _record_usage(self, record, include_in_turn=True) -> None:
             self.recorded.append((record, include_in_turn))
+
+        def _emit_event(self, event: dict) -> None:
+            self.events.append(event)
 
         def run_conversation(self, **kwargs):
             self.call = kwargs
@@ -480,6 +484,7 @@ def test_background_review_inherits_context_and_forwards_each_usage(
     assert parent.recorded == [
         (UsageRecord(input_tokens=7, source="background_review"), False)
     ]
+    assert parent.events == []
 
 
 def test_background_review_captures_runtime_before_thread_start(
@@ -496,11 +501,15 @@ def test_background_review_captures_runtime_before_thread_start(
             self.messages = []
             self.tools = []
             self.valid_tool_names = set()
+            self.events: list[dict] = []
             self.enabled_toolsets = []
             self.config = {}
             self.session_id = "session"
             self.system_prompt = "system"
             created.append(self)
+
+        def _emit_event(self, event: dict) -> None:
+            self.events.append(event)
 
         def run_conversation(self, **_kwargs):
             return {"completed": True}
@@ -525,6 +534,7 @@ def test_background_review_captures_runtime_before_thread_start(
     pending[0]()
 
     assert created[-1].provider_runtime is scheduled_runtime
+    assert parent.events == []
 
 
 def test_auxiliary_uses_inherited_or_independent_transport_and_parent_usage(
