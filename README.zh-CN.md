@@ -261,37 +261,11 @@ mclaw help                    # 查看命令指引
 
 ## 安装与启动
 
-当前通过源码安装。运行 `mclaw` 启动 M-Claw，首次使用按设置向导完成模型和工具配置。运行 `mclaw cli` 可使用终端界面。
+### Windows
 
-### 环境要求
-
-| 依赖 | 版本 / 用途 | 安装位置 |
-| --- | --- | --- |
-| Python | 3.11+，运行 M-Claw | 运行设备 |
-| Node.js | 22.12+，构建前端资源 | 构建电脑 |
-| npm | 10+，按锁文件安装前端依赖 | 构建电脑 |
-| Git | 获取源码；支持平台的文件检查点需要 | 源码管理及运行环境 |
-| 浏览器 | 显示操作界面 | 运行设备 |
-| HDC | 向开鸿设备传输文件、进入设备 shell | 部署电脑 |
-
-**Node.js/npm 是前端构建依赖。** 构建产物位于 `mclaw/web/static/`，由 Python 后台提供；传入完整构建资源后，开鸿运行设备无需安装 Node.js。前端源码和锁文件位于 `webui/`。
-
-### Windows 安装
-
-安装 [Python](https://www.python.org/downloads/windows/)、[Node.js](https://nodejs.org/en/download) 和 [Git](https://git-scm.com/downloads/win)，重新打开 PowerShell，检查版本：
+必须安装 [Python 3.11+](https://www.python.org/downloads/windows/)、[Git](https://git-scm.com/downloads/win) 和 [Node.js 22.12+（npm 10+）](https://nodejs.org/en/download)
 
 ```powershell
-python --version
-node --version
-npm --version
-git --version
-```
-
-已经安装过 M-Claw 时，继续使用原 Python 环境。首次安装逐条执行：
-
-```powershell
-
-
 git clone https://gitcode.com/m-robots/mclaw.git
 cd mclaw
 python -m pip install -e .
@@ -300,16 +274,15 @@ npm --prefix webui run build
 mclaw
 ```
 
-构建后应存在 `mclaw/web/static/index.html`。
-editable 安装直接使用该源码目录，安装后保留目录及其路径。
+首次启动按页面提示完成配置。以后直接运行 `mclaw`，停止后台使用 `mclaw stop`。
 
-首次启动打开设置向导；已有配置直接进入对话。需要终端配置时运行 `mclaw setup`。Linux 可在对应 Python 环境使用相同源码构建流程，将 Python 命令按系统替换为 `python3`；各平台能力见[故障排查](docs/manual/故障排查.md)。
+### Kaihong OS / M-Robots OS
 
-### Kaihong OS / M-Robots OS 安装
+运行设备需要 Python 3.11+。
+开发电脑需要 Git、Node.js 22.12+（npm 10+）和 [HDC](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/dfx/hdc.md)。
+运行时前端产物在开发电脑中构建。
 
-采用 **电脑构建前端 → 传入源码与静态资源 → 设备 editable 安装** 的流程。
-
-**1. 在电脑获取源码并构建前端。** 电脑需要 Git、Node.js 22.12+、npm 10+ 和 HDC；如果只用于前端构建与文件传输，电脑端不需要安装 M-Claw 的 Python 依赖。首次部署执行：
+**1. 在电脑下载源码并构建前端。**
 
 ```powershell
 git clone https://gitcode.com/m-robots/mclaw.git
@@ -318,9 +291,9 @@ npm --prefix webui ci
 npm --prefix webui run build
 ```
 
-已有源码时直接进入该源码根目录执行两条 npm 命令。构建完成后确认 `mclaw/web/static/index.html` 存在。
+**2. 将源码和构建资源传入设备。**
 
-**2. 准备部署目录并传入设备。** 将同版本的以下文件和目录复制到电脑的 `C:\deploy\mclaw`（可替换为自己的路径）：
+把以下文件和目录复制到电脑的 `C:\deploy\mclaw`：
 
 ```text
 mclaw/
@@ -329,104 +302,55 @@ mclaw/
 ├── LICENSE
 ├── THIRD_PARTY_NOTICES.md
 ├── ACKNOWLEDGEMENTS.md
-└── mclaw/                    # 完整 Python 包，含内置技能和其他资源
-    └── web/static/           # 本次构建生成的完整目录
-        ├── index.html
-        └── ...
+└── mclaw/                    # 完整 Python 包，包含构建后的 web/static/
 ```
-
-保留整个 `mclaw/` 包，包括其中的静态资源；无需传输 `webui/node_modules/`、虚拟环境、`.git/` 或缓存。静态构建目录被 Git 忽略，普通源码压缩包需要另行加入该目录。部署目录中不要放入本机凭据或应用数据。
 
 在电脑 PowerShell 中执行：
 
 ```powershell
-hdc list targets
-hdc file send C:\deploy\mclaw /data/local/tmp/mclaw
+hdc file send C:\deploy\mclaw /data/local/tmp/
 hdc shell
 ```
 
-有多台设备时，使用 `hdc -t <设备标识>` 选择目标。HDC 安装与命令说明见 [OpenHarmony 官方文档](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/dfx/hdc.md)。
-
-**3. 在设备安装并启动。** 以下命令在设备 HDC shell 中执行：
+**3. 在设备安装并启动。**
 
 ```sh
 cd /data/local/tmp/mclaw
-ls pyproject.toml mclaw/web/static/index.html
-run python3 --version
 run python3 -m pip install -e .
 run mclaw
 ```
 
-传输后先核对目录层级；如果出现额外的外层目录，进入实际包含 `pyproject.toml` 的源码根目录再安装。设备需要 Python 3.11+、适配系统的 Python 依赖和系统浏览器，运行时无需 Node.js/npm。editable 安装后保留设备上的源码目录。
+首次启动按页面提示配置，也可运行 `run mclaw setup` 在终端配置。以后使用 `run mclaw` 启动、`run mclaw stop` 停止后台。安装后保留原源码目录。
 
-`run` 使用设备系统提供的运行环境。首次启动可在网页完成设置，也可以先在设备终端配置和检查：
+### 可选：浏览器自动化
 
-```sh
-run mclaw setup
-run mclaw doctor
-run mclaw
-```
-
-如果浏览器没有自动打开，使用启动输出提供的完整本机链接在设备浏览器中打开。首次配置步骤见[开始使用](docs/manual/开始使用.md)。
-
-### 按需安装浏览器自动化与桌面能力
-
-Agent 的浏览器自动化需要可选 Python 依赖及 Chromium。在 Windows 的原安装环境、源码根目录执行：
+需要让 Agent 操作浏览器时，在 Windows 的原 Python 环境、源码目录中安装：
 
 ```powershell
 python -m pip install -e ".[browser]"
 python -m playwright install chromium
 ```
 
-Linux 的 Chromium 安装命令为
-`python3 -m playwright install --with-deps chromium`。
-
-### 日常启动和停止
-
-| 命令 | 作用 |
-| --- | --- |
-| `mclaw` | 启动或复用本机后台，打开 M-Claw |
-| `mclaw cli` | 进入终端界面 |
-| `mclaw status` | 查看服务地址与进程状态 |
-| `mclaw stop` | 保存进展，等待任务收尾并停止后台 |
-| `mclaw doctor` | 检查本机环境与可用能力 |
-
-开鸿设备的命令加 `run` 前缀。关闭网页或启动终端后后台继续运行；需要停止服务时使用 `mclaw stop`。实际地址以启动输出为准，默认从 `127.0.0.1:18031` 开始尝试。
+更多操作见[用户手册](docs/manual/README.md)，常见问题见[故障排查](docs/manual/故障排查.md)。
 
 ## 更新
 
-### Windows 更新
+### Windows
 
-**1. 确认原安装环境并停止后台。** 在原源码根目录、原 Python 环境中执行：
+在原源码目录、原 Python 环境中执行：
 
 ```powershell
-git status --short
-git rev-parse HEAD
 mclaw stop
-mclaw status
-```
-
-确认源码位置正确、本地修改已保存，且服务已经停止。关闭浏览器或启动终端不能代替停服。
-
-**2. 更新源码、依赖和前端，然后重启。** 每一步成功后再继续：
-
-```powershell
 git pull --ff-only
 python -m pip install -e .
 npm --prefix webui ci
 npm --prefix webui run build
-mclaw doctor
 mclaw
 ```
 
-每次源码更新都重新安装前端锁定依赖并构建，保证页面与 Python 后台版本一致。已有后台需停止后重新启动，才能加载新版程序。
+### Kaihong OS / M-Robots OS
 
-`git pull --ff-only` 失败时，先检查分支与本地修改。使用可选依赖的环境按需重新安装对应 extras；
-Playwright 更新后再安装匹配的 Chromium。
-
-### Kaihong OS / M-Robots OS 更新
-
-**1. 在开发Windows电脑准备新版本。** 在原源码根目录确认本地修改已保存，然后执行：
+**1. 在电脑的原源码目录更新并构建。**
 
 ```powershell
 git pull --ff-only
@@ -434,38 +358,27 @@ npm --prefix webui ci
 npm --prefix webui run build
 ```
 
-按上方安装步骤准备部署目录 `C:\deploy\mclaw-next`，包含同版本 Python 源码与完整的 `mclaw/web/static/`。
-
-**2. 在设备停止后台。** 在设备 shell 中执行，等待服务停止：
+**2. 在设备停止后台。**
 
 ```sh
 run mclaw stop
-run mclaw status
 ```
 
-**3. 在电脑备份并传入新版。** 另开一个电脑 PowerShell，以下备份目标路径应使用尚不存在的新目录；自定义了 `MCLAW_HOME` 时替换设备数据路径：
+**3. 覆盖设备原目录中的源码和构建资源。** 按安装步骤更新电脑的 `C:\deploy\mclaw`，包含本次构建的完整 `mclaw/web/static/`，再从电脑传入：
 
 ```powershell
-hdc file recv /data/local/tmp/.mclaw C:\backups\mclaw-home-before-update
-hdc file send C:\deploy\mclaw-next /data/local/tmp/mclaw-next
+hdc file send C:\deploy\mclaw /data/local/tmp/
 ```
 
-确认备份完整，并另行备份外部工作区。将新版放到新的源码目录，保留旧源码目录作为回退来源。
-
-**4. 在设备安装新版并启动。** 回到设备 shell，进入新版本源码根目录：
+**4. 在设备原源码目录更新依赖并启动。**
 
 ```sh
-cd /data/local/tmp/mclaw-next
+cd /data/local/tmp/mclaw
 run python3 -m pip install -e .
-run mclaw doctor
 run mclaw
 ```
 
-后续更新换用新的部署目录名称。继续使用原 `MCLAW_HOME`，通常无需重新运行 `setup`。
-
-### 更新后确认
-
-启动 M-Claw，核对配置、凭据状态、技能、会话历史和定时计划，并完成一次简单任务。页面仍显示旧内容时，确认前端构建和后台重启都已完成，再刷新页面。完整验收与回退步骤见[更新与数据恢复](docs/manual/更新与数据恢复.md)。
+更新沿用原配置和应用数据。备份、恢复与更新后的检查见[更新与数据恢复](docs/manual/更新与数据恢复.md)。
 
 ## 开发者生态
 
