@@ -18,6 +18,7 @@ from urllib.parse import quote
 
 import httpx
 
+from mclaw.skills_hub.catalog import coordinate
 from mclaw.skills_hub.models import ExternalSkill
 from mclaw.tools.cancellation import cancellation_checkpoint
 
@@ -129,7 +130,7 @@ class SkillsShSearcher:
         cancel_event: threading.Event | None = None,
         parent_agent=None,
     ) -> List[ExternalSkill]:
-        """Search skills.sh and return installable GitHub-backed records."""
+        """Search skills.sh and return installable public skill records."""
 
         cancellation_checkpoint(cancel_event)
         query = str(query or "").strip()
@@ -162,14 +163,15 @@ class SkillsShSearcher:
             if not isinstance(item, dict):
                 continue
             catalog_id, repository, skill_slug = _skills_sh_catalog_parts(item)
-            repo_parts = [part for part in repository.split("/") if part]
-            # The no-key install path downloads a public GitHub repository.  A
-            # well-known/non-GitHub source cannot be materialized by that path.
-            if len(repo_parts) != 2 or not catalog_id or not skill_slug:
+            if not catalog_id or not skill_slug:
                 continue
             # Build the canonical ID from the independently returned source and
             # selector so an inconsistent upstream id cannot redirect install.
             catalog_id = f"{repository}/{skill_slug}"
+            try:
+                coordinate("skills_sh", catalog_id)
+            except ValueError:
+                continue
             url = _skills_sh_url(catalog_id)
             installs = _as_int(item.get("installs"))
             results.append(
@@ -179,7 +181,7 @@ class SkillsShSearcher:
                     description=str(item.get("description") or "").strip(),
                     slug=skill_slug,
                     url=url,
-                    author=repo_parts[0],
+                    author=repository.split("/", 1)[0],
                     installs=installs,
                     catalog_id=catalog_id,
                     repository=repository,

@@ -14,6 +14,7 @@ M-Claw 的 React / TypeScript 前端，与终端界面共用 Python 应用后台
 | ----------------------------------------- | ---------------------------------------------- |
 | `src/components/`                         | 页面、对话输入、选择器和交互组件               |
 | `src/api.ts`、`src/types.ts`              | HTTP / WebSocket 客户端和数据类型              |
+| `src/skill-market-api.ts`                 | 技能市场 HTTP 客户端和榜单、审核数据类型       |
 | `src/*.test.*`、`src/components/*.test.*` | Vitest 交互测试                                |
 | `public/`                                 | 产品图片、供应商及渠道图标、第三方许可证       |
 | `../mclaw/application/`                   | 会话、任务、配置和设备等共享业务服务           |
@@ -53,7 +54,7 @@ Git 保存源码、测试、`package-lock.json`、构建配置和 `public/` 中�
 
 ## 开发约定
 
-- 通过 `api.ts` 访问后台，为请求、响应和事件维护明确的 TypeScript 类型。
+- 通过 `api.ts` 及功能专用客户端（如 `skill-market-api.ts`）访问后台，为请求、响应和事件维护明确的 TypeScript 类型。
 - API Key 等凭据由后台保存；页面仅保留提交所需的短期表单值。
 - 保持现有配置、技能和历史数据兼容，涉及共享服务时同时验证 Web 与 TUI。
 - 组件测试使用隔离数据和模拟服务；平台发布前分别检查目标浏览器的输入、文件、录音、重连和设备协同。

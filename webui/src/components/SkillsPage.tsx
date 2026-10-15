@@ -17,6 +17,7 @@ import Markdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { skillsApi } from '../api';
 import type { SkillDetail, SkillDraft, SkillFile, SkillSummary } from '../types';
+import { readAudits, SecurityAudits } from './SecurityAudits';
 
 export function sourceLabel(source: unknown, detail = false): string {
   if (typeof source === 'string')
@@ -29,6 +30,7 @@ export function sourceLabel(source: unknown, detail = false): string {
           agent_created: '本机创建',
           github: 'GitHub',
           skills_sh: 'Skills.sh',
+          skillhub_cn: 'SkillHub',
           clawhub: 'ClawHub',
           community: '社区',
           official: '官方',
@@ -48,6 +50,8 @@ export const skillBody = (content: string) =>
   content.replace(/^\uFEFF?---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/, '');
 
 export function ReviewValue({ value }: { value: unknown }) {
+  const audits = readAudits(value);
+  if (audits) return <SecurityAudits audits={audits} showTitle={false} />;
   if (value == null) return null;
   if (typeof value === 'string' || typeof value === 'number')
     return (

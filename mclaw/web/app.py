@@ -59,7 +59,7 @@ class LocalAccess:
                 message.setdefault("headers", []).extend([
                     (b"cache-control", b"no-store"), (b"x-content-type-options", b"nosniff"),
                     (b"referrer-policy", b"no-referrer"), (b"x-frame-options", b"DENY"),
-                    (b"content-security-policy", b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; frame-src blob:; object-src 'none'; connect-src 'self'; frame-ancestors 'none'"),
+                    (b"content-security-policy", b"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://cloudcache.tencent-cloud.com https://skillhub-1388575217.cos.accelerate.myqcloud.com; frame-src blob:; object-src 'none'; connect-src 'self'; frame-ancestors 'none'"),
                 ])
             await send(message)
         return await self.app(scope, receive, secure_send)
@@ -80,9 +80,12 @@ async def body(request: Request) -> dict:
 
 def create_app(home: Path, token: str, *, service: SessionService | None = None,
                setup=None, preferences=None, voice=None, schedules=None, channels=None, providers=None, tools=None, configuration=None, devices=None,
-               shutdown: Callable | None = None, on_ready: Callable | None = None):
+               shutdown: Callable | None = None, on_ready: Callable | None = None, skill_market=None):
     """Create an ASGI adapter; tests inject services without touching user state."""
     service = service or SessionService(home)
+    if skill_market is None:
+        from mclaw.application.skill_market import SkillMarketService
+        skill_market = SkillMarketService(home)
     if devices is None:
         from mclaw.application.devices import DeviceService
         devices = DeviceService(home)
@@ -123,6 +126,7 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
             await devices.start()
             await schedules.start()
             await channels.start()
+            await skill_market.start()
             if on_ready:
                 on_ready()
             yield
@@ -131,6 +135,7 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
             with contextlib.suppress(asyncio.CancelledError):
                 await timer
             await devices.begin_shutdown()
+            await skill_market.close()
             await voice.close()
             await channels.close()
             await schedules.close()
@@ -352,6 +357,7 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
     from mclaw.web.configuration import build_configuration_routes
     from mclaw.web.voice import build_voice_routes
     from mclaw.web.skills import build_skill_routes
+    from mclaw.web.skill_market import build_skill_market_routes
     from mclaw.web.schedules import build_schedule_routes
     from mclaw.application.files import FileService
     from mclaw.web.files import build_file_routes
@@ -367,6 +373,7 @@ def create_app(home: Path, token: str, *, service: SessionService | None = None,
     routes[-1:-1] = build_configuration_routes(configuration)
     routes[-1:-1] = build_voice_routes(voice)
     routes[-1:-1] = build_skill_routes(service)
+    routes[-1:-1] = build_skill_market_routes(skill_market)
     routes[-1:-1] = build_schedule_routes(schedules)
     routes[0:0] = build_file_routes(service, FileService(home))
     routes[0:0] = build_change_routes(service)

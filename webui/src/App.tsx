@@ -15,6 +15,7 @@ import {
   Plus,
   Search,
   Settings,
+  Store,
   WifiOff,
   Wrench,
   X,
@@ -35,6 +36,7 @@ import { ToolsPage } from './components/ToolsPage';
 import { SessionSourceIcon } from './components/SessionSourceIcon';
 import { DeleteSessionDialog, SessionMenu } from './components/SessionMenu';
 import { SkillsPage } from './components/SkillsPage';
+import { SkillMarketPage } from './components/SkillMarketPage';
 import { SchedulesPage } from './components/SchedulesPage';
 import { FilePreviewPanel } from './components/Attachments';
 import { ChangesPanel } from './components/ChangesPanel';
@@ -61,13 +63,14 @@ import {
 } from './session-state';
 import type { Bootstrap, FileReference, Session, TaskCompletionNotice } from './types';
 
-type Page = 'chat' | 'devices' | 'schedules' | 'skills' | 'tools' | 'settings';
+type Page = 'chat' | 'devices' | 'schedules' | 'skills' | 'market' | 'tools' | 'settings';
 const NAV = [
   { id: 'chat', label: '对话', icon: MessageSquare },
   { id: 'devices', label: '设备', icon: Monitor },
   { id: 'schedules', label: '定时任务', icon: Clock3 },
   { id: 'tools', label: '工具', icon: Wrench },
   { id: 'skills', label: '技能', icon: BookOpen },
+  { id: 'market', label: '技能市场', icon: Store },
 ] as const;
 const normalize = (session: Session): Session => ({
   ...session,
@@ -1084,6 +1087,13 @@ export default function App() {
           <ToolsPage />
         ) : page === 'skills' ? (
           <SkillsPage onUse={useSkill} initialSkillName={initialSkillName} />
+        ) : page === 'market' ? (
+          <SkillMarketPage
+            onManage={(name) => {
+              setInitialSkillName(name);
+              setPage('skills');
+            }}
+          />
         ) : page === 'schedules' ? (
           <SchedulesPage onSession={openSession} models={bootstrap.models} />
         ) : page === 'settings' ? (

@@ -322,7 +322,8 @@ class SkillService:
             _, manifest = install_service._read_manifest(drafting_id)
             # Refresh the review if a local editor changed the prepared files.
             from mclaw.skills_hub.security import review_skill_package, write_security_review
-            review = review_skill_package(root / "skill", source=manifest["source"]["type"])
+            review = review_skill_package(root / "skill", source=manifest["source"]["type"],
+                                          source_original=manifest["source"]["original"])
             write_security_review(root, review)
             blocked = review.get("install_allowed") is False or review.get("verdict") == "dangerous"
             manifest["status"] = "blocked" if blocked else "prepared"
