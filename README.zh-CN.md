@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="96" height="96">
+  <img src="webui/public/mclaw-wordmark-fold.svg" alt="M-CLAW" width="360">
 </p>
 
 <h2 align="center">自进化具身智能体运行时<br>Self-Evolving Embodied Agent Harness</h2>
