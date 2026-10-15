@@ -230,132 +230,42 @@ def test_worker_supervisor_reaps_partial_thread_start(monkeypatch) -> None:
     assert events == ["start-0", "start-1", "join-0"]
 
 
-def test_run_interactive_installs_runtime_before_chat_and_copies_toolsets(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from mclaw.cli import app
+@pytest.mark.parametrize("supported,providerless", [(True, False), (False, False), (True, True)])
+def test_interactive_entrypoint_uses_service_without_native_runtime(monkeypatch, tmp_path, supported, providerless):
+    from mclaw.application.client import ApplicationClient
+    from mclaw.cli import app, service_app
+    from mclaw.cli.service_devices import DeviceClient
     from mclaw.dsoftbus import entrypoint, product
 
-    calls: list[object] = []
-    runtime = SimpleNamespace(
-        begin_shutdown=lambda: calls.append("begin"),
-        stop=lambda deadline: calls.append(("stop", deadline)),
+    calls = []
+    client = SimpleNamespace(
+        request=lambda *_args: {"supported": supported, "enabled": supported},
+        close=lambda: calls.append("client-close"),
     )
+    monkeypatch.setattr(ApplicationClient, "connect", lambda: client)
+    monkeypatch.setattr(entrypoint, "is_discovery_only_candidate", lambda _: supported)
+    monkeypatch.setattr(product, "create_product_runtime", lambda **_: pytest.fail("frontend created a native runtime"))
     configured = ["custom"]
-
-    monkeypatch.setattr(entrypoint, "is_discovery_only_candidate", lambda _config: True)
-    monkeypatch.setattr(app, "ensure_workspace_trusted", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        product,
-        "create_product_runtime",
-        lambda **kwargs: calls.append(("create", kwargs)) or runtime,
-    )
+    unavailable = RuntimeError("provider unavailable") if providerless else None
 
     class FakeChat:
-        def __init__(self, **kwargs) -> None:
-            assert get_active_runtime() is runtime
+        def __init__(self, **kwargs):
+            assert kwargs["service_client"] is client
             assert kwargs["workspace_path"] == str(tmp_path.resolve())
-            assert kwargs["enabled_toolsets"] == ["custom", "dsoftbus"]
-            assert kwargs["enabled_toolsets"] is not configured
-            assert kwargs["dsoftbus_runtime"] is runtime
-            calls.append("chat-init")
-
-        def run(self) -> None:
-            calls.append("chat-run")
-
-    monkeypatch.setattr(app, "InteractiveChat", FakeChat)
-    try:
-        app.run_interactive(
-            provider_runtime=object(),
-            enabled_toolsets=configured,
-            config={"dsoftbus": {"enabled": "auto"}},
-            workspace_path=str(tmp_path),
-        )
-    finally:
-        clear_active_runtime(runtime)
-
-    assert configured == ["custom"]
-    assert calls[1:3] == ["chat-init", "chat-run"]
-    assert calls[-2] == "begin"
-    assert calls[-1][0] == "stop"
-
-
-def test_non_kaihong_runtime_constructs_no_endpoint_and_strips_platform_toolsets(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    from mclaw.cli import app
-    from mclaw.dsoftbus import product
-
-    monkeypatch.setattr(app, "ensure_workspace_trusted", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        product,
-        "create_product_runtime",
-        lambda **_kwargs: pytest.fail("direct mclaw created a DSoftBus endpoint"),
-    )
-    observed: list[dict[str, object]] = []
-
-    class FakeChat:
-        def __init__(self, **kwargs) -> None:
-            observed.append(dict(kwargs))
-
-        def run(self) -> None:
-            return None
-
-    monkeypatch.setattr(app, "InteractiveChat", FakeChat)
-    app.run_interactive(
-        provider_runtime=object(),
-        enabled_toolsets=["terminal", "dsoftbus", "dsoftbus-remote"],
-        config={"dsoftbus": {"enabled": "auto"}},
-        workspace_path=str(tmp_path),
-    )
-
-    assert len(observed) == 1
-    assert observed[0]["enabled_toolsets"] == ["terminal"]
-    assert observed[0]["dsoftbus_runtime"] is None
-    assert get_active_runtime() is None
-
-
-def test_providerless_product_runtime_uses_standard_interactive_chat(
-    monkeypatch,
-    tmp_path: Path,
-) -> None:
-    from mclaw.cli import app
-    from mclaw.dsoftbus import entrypoint, product
-
-    calls: list[object] = []
-    runtime = SimpleNamespace(
-        begin_shutdown=lambda: calls.append("begin"),
-        stop=lambda _deadline: calls.append("stop"),
-    )
-    unavailable = RuntimeError("provider unavailable")
-    monkeypatch.setattr(entrypoint, "is_discovery_only_candidate", lambda _config: True)
-    monkeypatch.setattr(app, "ensure_workspace_trusted", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(product, "create_product_runtime", lambda **_kwargs: runtime)
-    class FakeChat:
-        def __init__(self, **kwargs) -> None:
-            assert kwargs["provider_runtime"] is None
             assert kwargs["provider_unavailable_error"] is unavailable
-            assert kwargs["dsoftbus_runtime"] is runtime
+            assert isinstance(kwargs["dsoftbus_runtime"], DeviceClient) if supported else kwargs["dsoftbus_runtime"] is None
+            assert get_active_runtime() is None
             calls.append("chat-init")
 
-        def run(self) -> None:
+        def run(self):
             calls.append("chat-run")
 
-    monkeypatch.setattr(app, "InteractiveChat", FakeChat)
-    try:
-        app.run_interactive(
-            provider_runtime=None,
-            config={"dsoftbus": {"enabled": "auto"}},
-            workspace_path=str(tmp_path),
-            provider_resolution_error=unavailable,
-            discovery_only_approved=True,
-        )
-    finally:
-        clear_active_runtime(runtime)
-
-    assert calls == ["chat-init", "chat-run", "begin", "stop"]
+    monkeypatch.setattr(service_app, "ServiceInteractiveChat", FakeChat)
+    app.run_interactive(provider_runtime=None if providerless else object(), enabled_toolsets=configured,
+                        config={"dsoftbus": {"enabled": "auto"}}, workspace_path=str(tmp_path),
+                        provider_resolution_error=unavailable, discovery_only_approved=providerless)
+    assert configured == ["custom"]
+    assert calls == ["chat-init", "chat-run", "client-close"]
 
 
 def test_interactive_run_cleans_up_when_application_construction_fails() -> None:
@@ -545,6 +455,7 @@ def test_channel_runner_dispose_closes_idle_agents_and_explicit_none_owns_no_db(
 
 def test_scheduler_closes_success_and_timeout_agents_after_worker_fence(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     from mclaw.scheduler.runner import SchedulerRunner
 
@@ -575,14 +486,11 @@ def test_scheduler_closes_success_and_timeout_agents_after_worker_fence(
             return True
 
     def make_runner(agent: Agent) -> SchedulerRunner:
-        runner = SchedulerRunner.__new__(SchedulerRunner)
-        runner.output_dir = "."
-        runner.config = {}
-        runner.print_fn = None
-        runner.store = None
-        runner.session_db = SimpleNamespace()
-        runner.startup_provider_runtime = SimpleNamespace(model="model")
-        runner.agent_factory = lambda **_kwargs: agent
+        runner = SchedulerRunner(
+            provider_runtime=SimpleNamespace(model="model"),
+            session_db=SimpleNamespace(db_path=tmp_path / "state.db"),
+            output_dir=str(tmp_path), agent_factory=lambda **_kwargs: agent,
+        )
         runner._resolve_session = lambda _job, _run: "session"
         runner._history_for_session = lambda _session: []
         runner._effective_toolsets = lambda _job: ["mclaw-required"]

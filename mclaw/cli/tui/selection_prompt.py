@@ -125,7 +125,7 @@ def prompt_builtin_skill_selection(
 ) -> list[str]:
     """Let the user choose setup-time built-in Skills with keyboard navigation."""
     return prompt_multi_select(
-        "M-Claw 内置技能",
+        "内置技能",
         [
             {
                 "id": str(item.get("name") or "").strip(),
@@ -141,6 +141,7 @@ def prompt_builtin_skill_selection(
         hint="选择这次初始化要启用的内置技能。",
         default_selected=default_selected,
         allow_select_all=True,
+        presentation="skills",
     )
 
 
@@ -151,6 +152,8 @@ def prompt_single_select(
     hint: str = "",
     default_selected: str = "",
     max_visible_items: int = 20,
+    presentation: str = "",
+    provider: str = "",
 ) -> str:
     """Run the shared selection prompt in single-choice mode."""
     selected = prompt_multi_select(
@@ -160,6 +163,8 @@ def prompt_single_select(
         default_selected=[default_selected] if default_selected else None,
         max_visible_items=max_visible_items,
         _single=True,
+        presentation=presentation,
+        provider=provider,
     )
     return selected[0] if selected else ""
 
@@ -171,8 +176,10 @@ def prompt_multi_select(
     hint: str = "",
     default_selected: list[str] | None = None,
     max_visible_items: int = 20,
-    allow_select_all: bool = False,
+    allow_select_all: bool = True,
     _single: bool = False,
+    presentation: str = "",
+    provider: str = "",
 ) -> list[str]:
     """Run a compact keyboard-driven multi-select prompt and return selected ids."""
     normalized = [
@@ -187,6 +194,23 @@ def prompt_multi_select(
     ]
     if not normalized:
         return []
+
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        default = list(default_selected or [])
+        if _single and not default:
+            default = [normalized[0]["id"]]
+        return interaction.request(
+            "single_select" if _single else "multi_select",
+            title,
+            hint=hint,
+            options=normalized,
+            default=default,
+            presentation=presentation,
+            provider=provider,
+        )
 
     default_ids = set(default_selected or [])
     initial_index = (
@@ -267,7 +291,7 @@ def prompt_multi_select(
             selected["ids"].add(item_id)
         event.app.invalidate()
 
-    if allow_select_all:
+    if allow_select_all and not _single:
         @kb.add("c-a")
         def _(event):
             all_ids = {item["id"] for item in normalized}

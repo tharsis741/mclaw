@@ -144,6 +144,20 @@ def _probe_kaihong_facts(shell_path: str) -> dict[str, str]:
     return parameters
 
 
+def get_local_device_name() -> str:
+    """Use the system's device identity, independent of collaboration startup."""
+    from mclaw.runtime.manager import RuntimeManager
+
+    facts = _probe_kaihong_facts("/bin/sh") if RuntimeManager.detect() == "kaihong" else {}
+    for candidate in (facts.get("const.product.name", ""), platform.node(), facts.get("const.product.model", "")):
+        name = _valid_parameter_value(candidate)
+        normalized = name.casefold().rstrip(".")
+        if (name and normalized not in {"localhost", "unknown", "(none)"}
+                and not normalized.startswith("localhost.")):
+            return name
+    return "本机设备"
+
+
 def is_wsl() -> bool:
     """Detect Windows Subsystem for Linux without requiring WSL-specific APIs."""
     if sys.platform != "linux":

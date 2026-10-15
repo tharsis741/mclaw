@@ -20,10 +20,14 @@ def review_skill_package(
     skill_dir: Path,
     *,
     source: str = "community",
+    source_original: str = "",
     cancel_event: threading.Event | None = None,
 ) -> dict[str, Any]:
     """Run the guard scanner and serialize the install policy decision."""
     cancel_event = cancel_event or get_interrupt_event()
+    if source in {"skills_sh", "skillhub_cn"}:
+        from mclaw.skills_hub.audits import informational_review
+        return informational_review(source_original, cancel_event=cancel_event)
     result = scan_skill(skill_dir, source=source, cancel_event=cancel_event)
     cancellation_checkpoint(cancel_event)
     allowed, reason = should_allow_install(result)

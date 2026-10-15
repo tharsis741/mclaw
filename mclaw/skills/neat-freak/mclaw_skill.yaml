@@ -4,8 +4,13 @@ short_description: 阶段收尾时同步项目文档、长期记忆和交接信�
 source:
   type: github
   original: https://github.com/KKKKhazix/khazix-skills/tree/main/neat-freak
+  author: 数字生命卡兹克 (KKKKhazix)
+  license: MIT
+  license_file: LICENSE
+  license_url: https://github.com/KKKKhazix/khazix-skills/blob/main/LICENSE
+  copyright: Copyright (c) 2026 数字生命卡兹克
 created_at: '2026-06-11T10:13:30.457149+00:00'
-updated_at: '2026-06-11T10:13:30.457149+00:00'
+updated_at: '2026-10-15T00:00:00+00:00'
 created_by: install
-updated_by: install
+updated_by: bundled
 status: enabled

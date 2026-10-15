@@ -31,6 +31,7 @@ from types import MappingProxyType
 
 ATOMIC_LOCAL_TOOLS = frozenset(
     {
+        "dsoftbus_read_task_result",
         "delete_file",
         "edit_file",
         "list_directory",
@@ -68,6 +69,14 @@ ASYNC_OR_FENCED_TOOLS = frozenset(
         "browser_scroll",
         "browser_snapshot",
         "browser_type",
+        "browser_tabs",
+        "browser_select",
+        "browser_check",
+        "browser_hover",
+        "browser_upload",
+        "browser_handle_dialog",
+        "browser_wait_for",
+        "browser_back",
         "delegate_task",
         "dingtalk_send_file",
         "dsoftbus_get_device_context",

@@ -266,7 +266,7 @@ class OperationJournal:
         session_id: str | None = None,
         workspace: str | None = None,
         include_rollbacks: bool = False,
-        limit: int = 20,
+        limit: int | None = 20,
     ) -> list[dict[str, Any]]:
         """Return recent completed operations, newest first."""
         records: list[dict[str, Any]] = []
@@ -294,7 +294,7 @@ class OperationJournal:
                     if not _record_matches_workspace(record, workspace_resolved):
                         continue
                 records.append(record)
-                if len(records) >= limit:
+                if limit is not None and len(records) >= limit:
                     return records
         return records
 
@@ -314,7 +314,7 @@ class OperationJournal:
             session_id=session_id,
             workspace=workspace,
             include_rollbacks=include_rollbacks,
-            limit=200,
+            limit=None,
         )
         try:
             idx = int(ref) - 1

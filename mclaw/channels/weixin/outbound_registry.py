@@ -77,6 +77,11 @@ def get_weixin_outbound_target(session_id: str) -> WeixinOutboundTarget | None:
     return _targets.get(session_id)
 
 
+def register_weixin_outbound_proxy(session_id: str, target: Any) -> None:
+    """Bind an isolated worker's transport proxy without copying channel credentials."""
+    _targets[session_id] = target
+
+
 def unregister_weixin_outbound_targets_for_adapter(adapter: "WeixinAdapter") -> None:
     """Remove all session targets owned by an adapter during channel shutdown."""
     stale = [session_id for session_id, target in _targets.items() if target.adapter is adapter]

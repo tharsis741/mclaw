@@ -4,6 +4,32 @@ This file contains third-party notices for software included in M-Claw. These
 notices are provided for attribution and license compliance; they do not modify
 the license terms for M-Claw's original work.
 
+## Bundled skills
+
+| M-Claw skill directories | Upstream source | License and copyright |
+| --- | --- | --- |
+| `minimax-docx`, `minimax-pdf`, `minimax-xlsx`, `pptx-generator`, `mmx-cli` | [MiniMax-AI/skills](https://github.com/MiniMax-AI/skills/tree/main/skills); `mmx-cli` originates from `minimax-multimodal-toolkit` | MIT, Copyright (c) 2026 MiniMax; the DOCX package retains its Copyright (c) 2026 MiniMaxAI notice |
+| `aihot`, `hv-analysis`, `khazix-writer`, `neat-freak` | [KKKKhazix/khazix-skills](https://github.com/KKKKhazix/khazix-skills) | MIT, Copyright (c) 2026 数字生命卡兹克 |
+| `design-taste-frontend` | [Leonxlnx/taste-skill](https://github.com/Leonxlnx/taste-skill/tree/f624f37a8c650b9cc550253104925efe4c8de246/skills/taste-skill), revision `f624f37a8c650b9cc550253104925efe4c8de246` | MIT, Copyright (c) 2026 Leonxlnx |
+| `internal-comms` | [anthropics/skills](https://github.com/anthropics/skills/tree/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/internal-comms), revision `dbd4588f9e1033efb41dad4bef2f7947c8993d44` | Apache-2.0, Copyright 2026 Anthropic, PBC. |
+| `knowledge-synthesis` | [anthropics/knowledge-work-plugins](https://github.com/anthropics/knowledge-work-plugins/tree/f652327d4e953d7957d99e735c3c7f9964e9d2e5/enterprise-search/skills/knowledge-synthesis), revision `f652327d4e953d7957d99e735c3c7f9964e9d2e5` | Apache-2.0; upstream author Anthropic; the upstream license supplies no filled-in copyright notice |
+| `humanizer-zh` | [op7418/Humanizer-zh](https://github.com/op7418/Humanizer-zh/tree/f4518a8eab97b8bfebc66a89d34320a89bef6930), revision `f4518a8eab97b8bfebc66a89d34320a89bef6930` | MIT, Copyright (c) 2026 歸藏 |
+| `weather` | [openclaw/openclaw](https://github.com/openclaw/openclaw/tree/246adaa1191438b9e9e178384a026b4c123782f1/skills/weather), revision `246adaa1191438b9e9e178384a026b4c123782f1` | MIT, Copyright (c) 2025 Peter Steinberger |
+
+These packages are under `mclaw/skills/`. Each includes an upstream `LICENSE`
+and a `mclaw_skill.yaml` recording the original skill URL, author, license,
+copyright where supplied by upstream, and license URL. Revisions are recorded where the bundled source
+version has been verified; a `main` URL identifies origin, not a pinned version.
+M-Claw's descriptions, metadata, and runtime integrations may differ from upstream.
+
+Taste, Internal Communications, Knowledge Synthesis and Humanizer-zh also include
+a `NOTICE.md` identifying M-Claw's integration changes. Humanizer-zh retains its
+upstream references to blader/humanizer v3.0.0, Humanizer-zh PR 39,
+hardikpandya/stop-slop, and Wikipedia's Signs of AI writing.
+External images, fonts, and other assets used or discovered by a skill retain
+their respective licenses. Repository-level licenses do not replace notices
+or terms applicable to individual third-party assets and dependencies.
+
 ## Hermes Agent
 
 Portions of M-Claw include code or source text derived from Hermes Agent,

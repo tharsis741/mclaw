@@ -88,8 +88,10 @@ def resolve_dashscope_creds(
     profile = get_runtime_profile(
         "qwen-intl" if "dashscope-intl" in result["base_url"].lower() else "qwen"
     )
+    selected = (cfg.get("auxiliary", {}).get("web_search") or {}).get("credential_env")
+    names = [selected] if selected in profile.env_vars else profile.env_vars
     result["api_key"] = next(
-        (value for name in profile.env_vars if (value := authorized_env_value(name))),
+        (value for name in names if (value := authorized_env_value(name))),
         "",
     )
     return result

@@ -21,6 +21,7 @@ from typing import Any
 
 from mclaw.scheduler.formatting import write_final_response_output, write_run_output
 from mclaw.scheduler.models import SchedulerJob, SchedulerRun
+from mclaw.scheduler.ownership import SchedulerOwnership, SchedulerOwnershipError
 from mclaw.scheduler.store import SchedulerStore
 from mclaw.scheduler.triggers import next_run_after
 
@@ -53,9 +54,26 @@ class SchedulerEngine:
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers)
         self._futures: dict[str, concurrent.futures.Future[SchedulerRun]] = {}
         self._lock = threading.Lock()
+        self.ownership = SchedulerOwnership(self.store.session_db.db_path.parent)
+        self._closed = False
+
+    def start(self) -> bool:
+        """Hold the root lock until shutdown; another frontend may keep management open."""
+        if self._closed:
+            return False
+        if self.ownership.acquired:
+            return True
+        if not self.ownership.acquire():
+            return False
+        # Only the new exclusive controller can recover the previous controller's
+        # unfinished records; a competing frontend must never touch them.
+        self.store.recover_stale_runs(time.time() + 1, active_run_ids=self._active_future_run_ids())
+        return True
 
     def tick_once(self, now: float | None = None) -> int:
         """Process one scheduler tick and return completed plus submitted work."""
+        if not self.start():
+            return 0
         now = float(now if now is not None else time.time())
         completed = len(self.drain_completed())
         stale_after = _int_config(self.runtime_config, "stale_run_after_seconds", 3600)
@@ -82,6 +100,8 @@ class SchedulerEngine:
 
     def run_job_now(self, job_id: str, *, manual: bool = True) -> SchedulerRun:
         """Start a job immediately, optionally waiting for manual completion."""
+        if not self.start():
+            raise SchedulerOwnershipError("定时任务已由另一个 M-Claw 入口运行，请在该入口操作立即运行")
         now = time.time()
         job = self.store.get_job(job_id)
         if not job:
@@ -93,7 +113,8 @@ class SchedulerEngine:
             if job.concurrency_policy == "queue":
                 return self.store.enqueue_run(job, scheduled_for=None, now=now)
             if job.concurrency_policy == "replace":
-                self.store.cancel_active_runs(job.id, reason="manual run replaced active run", now=now)
+                for active_run in active:
+                    self.cancel_run(active_run.id, reason="manual run replaced active run")
         if self._free_slots() <= 0 and job.concurrency_policy == "queue":
             return self.store.enqueue_run(job, scheduled_for=None, now=now)
         run = self.store.start_run(job, worker_id=self.worker_id, scheduled_for=None, now=now)
@@ -123,10 +144,31 @@ class SchedulerEngine:
                     completed.append(failed)
         return completed
 
-    def shutdown(self) -> None:
+    def cancel_run(self, run_id: str, *, reason: str = "cancelled by user") -> SchedulerRun:
+        if not self.start():
+            raise SchedulerOwnershipError("定时任务由另一个 M-Claw 入口运行，请在该入口取消")
+        current = self.store.get_run(run_id)
+        if current is not None and current.status in _FINAL_RUN_STATUSES:
+            return current
+        run = self.store.cancel_run(run_id, reason=reason)
+        cancel = getattr(self.runner, "cancel", None)
+        if callable(cancel) and run.status == "cancelled":
+            cancel(run_id)
+        return run
+
+    def shutdown(self, *, cancel_running: bool = False) -> None:
         """Drain finished futures and wait for submitted scheduler work."""
-        self.drain_completed()
-        self._executor.shutdown(wait=True, cancel_futures=False)
+        if self._closed:
+            return
+        if cancel_running and self.ownership.acquired:
+            for run_id in self._active_future_run_ids():
+                self.cancel_run(run_id, reason="scheduler service stopped")
+        self._closed = True
+        try:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+            self.drain_completed()
+        finally:
+            self.ownership.release()
 
     def _handle_due_job(self, job: SchedulerJob, now: float) -> int:
         """Apply the job concurrency policy to one due occurrence."""
@@ -142,7 +184,8 @@ class SchedulerEngine:
                 self._advance_schedule(job, scheduled_for)
                 return 1
             if job.concurrency_policy == "replace":
-                self.store.cancel_active_runs(job.id, reason="replaced by next due occurrence", now=now)
+                for active_run in active:
+                    self.cancel_run(active_run.id, reason="replaced by next due occurrence")
         elif self._free_slots() <= 0 and job.concurrency_policy == "queue":
             self.store.enqueue_run(job, scheduled_for=scheduled_for, now=now)
             self._advance_schedule(job, scheduled_for)
@@ -250,6 +293,8 @@ class SchedulerEngine:
                 patch["status"] = "paused"
         else:
             patch = {"last_run_at": now, "status": "idle"}
+        if not current_job.enabled:
+            patch["status"] = "paused"
         self.store.finish_run(run, job_patch=patch)
 
     def _free_slots(self) -> int:

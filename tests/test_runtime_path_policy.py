@@ -117,6 +117,32 @@ def test_runtime_internal_is_diagnostic_read_only(tmp_path: Path) -> None:
         assert decision.scope == "runtime_internal"
 
 
+def test_task_directory_allows_file_work_and_keeps_private_state_protected(tmp_path: Path) -> None:
+    home = tmp_path / ".mclaw"
+    policy = PathPolicy(mclaw_home=home)
+    document = home / "_temp" / "session_one" / "report.md"
+    for action in ("read", "write", "delete", "move", "copy", "search", "execute"):
+        assert policy.check(action, document).allowed
+    assert not policy.is_runtime_internal_path(document)
+    for path in (home, home / "config.yaml", home / "sessions", home / "_temporary",
+                 home / "_temp" / ".." / "config.yaml"):
+        assert not policy.check("write", path).allowed
+        assert policy.is_runtime_internal_path(path)
+    assert not policy.check("read", document.parent / ".env").allowed
+
+
+def test_task_directory_links_do_not_bypass_private_state_guards(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / ".mclaw"
+    policy = PathPolicy(mclaw_home=home)
+    link = home / "_temp" / "session_one" / "link"
+    original = policy.normalize
+    for target in (home / "config.yaml", home / ".env"):
+        monkeypatch.setattr(policy, "normalize", lambda value, base=None: target if Path(value) == link else original(value, base))
+        assert not policy.check("write", link).allowed
+        assert policy.is_runtime_internal_path(link)
+        assert not policy.is_task_file_path(link)
+
+
 def test_exact_anchors_do_not_make_descendants_read_only(tmp_path: Path) -> None:
     anchor = tmp_path / "protected"
     policy = PathPolicy(

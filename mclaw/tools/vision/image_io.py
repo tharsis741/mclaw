@@ -11,6 +11,7 @@ import ipaddress
 import logging
 import socket
 import threading
+import httpx
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -71,7 +72,7 @@ def _is_safe_url(url: str) -> bool:
     if not url or not isinstance(url, str):
         return False
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme not in ("http", "https") or parsed.username or parsed.password:
         return False
 
     hostname = (parsed.hostname or "").strip().lower()
@@ -83,6 +84,41 @@ def _is_safe_url(url: str) -> bool:
     except OSError:
         return False
     return bool(ips) and all(_ip_is_public(ip) for ip in ips)
+
+
+class _PinnedImageTransport(httpx.AsyncBaseTransport):
+    """Connect to the validated IP while retaining the original Host and TLS SNI."""
+
+    def __init__(self) -> None:
+        self._transports: dict[tuple, httpx.AsyncHTTPTransport] = {}
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        url = request.url
+        if url.scheme not in {"http", "https"} or url.username or url.password:
+            raise ValueError("Blocked: invalid image URL.")
+        addresses = await asyncio.to_thread(_resolve_host_ips, url.host)
+        if not addresses or not all(_ip_is_public(address) for address in addresses):
+            raise ValueError("Blocked: URL targets a private or internal address.")
+        origin = (url.scheme, url.host, url.port)
+        transport = self._transports.get(origin)
+        if transport is None:
+            transport = self._transports[origin] = httpx.AsyncHTTPTransport(trust_env=False, retries=0)
+        last_error = None
+        for address in addresses:
+            pinned = httpx.Request(
+                request.method, url.copy_with(host=str(address)), headers=request.headers,
+                stream=request.stream, extensions={**request.extensions, "sni_hostname": url.host},
+            )
+            try:
+                return await transport.handle_async_request(pinned)
+            except httpx.ConnectError as exc:
+                last_error = exc
+        raise last_error or ValueError("No reachable public image address.")
+
+    async def aclose(self) -> None:
+        for transport in self._transports.values():
+            if transport is not None:
+                await transport.aclose()
 
 
 def _remove_partial_image(destination: Path) -> None:
@@ -144,6 +180,8 @@ async def _download_image_async(
                     timeout=request_timeout,
                     follow_redirects=True,
                     event_hooks={"request": [validate_request]},
+                    transport=_PinnedImageTransport(),
+                    trust_env=False,
                 ) as client:
                     async with asyncio.timeout(request_timeout):
                         async with client.stream(

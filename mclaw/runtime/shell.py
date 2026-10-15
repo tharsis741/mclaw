@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 CWD_MARKER = "__MCLAW_CWD__="
+CWD_BASE64_MARKER = "__MCLAW_CWD_UTF8_BASE64__="
 
 
 def _ps_quote(value: str) -> str:
@@ -41,12 +42,17 @@ class ShellProfile:
             return "\n".join(
                 [
                     "$ErrorActionPreference = 'Continue'",
+                    # Runtime pipes decode UTF-8, regardless of the host code page.
+                    "[Console]::InputEncoding = [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)",
+                    "$OutputEncoding = [Console]::OutputEncoding",
                     f"Set-Location -LiteralPath {_ps_quote(cwd_text)}",
                     "& {",
                     command,
                     "}",
                     "$mclaw_ec = if ($global:LASTEXITCODE -is [int]) { $global:LASTEXITCODE } elseif ($?) { 0 } else { 1 }",
-                    f"Write-Output ({_ps_quote(CWD_MARKER)} + (Get-Location).ProviderPath)",
+                    # Commands may change console encoding; keep cwd transport ASCII.
+                    f"Write-Output ({_ps_quote(CWD_BASE64_MARKER)} + "
+                    "[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((Get-Location).ProviderPath)))",
                     "exit $mclaw_ec",
                 ]
             )

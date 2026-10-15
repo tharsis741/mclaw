@@ -7,14 +7,17 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
+import json
 import re
 import shutil
+import socket
 import tempfile
 import threading
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlparse
 
 import httpx
 
@@ -111,14 +114,58 @@ def resolve_source(
             cancel_event=cancel_event,
             parent_agent=parent_agent,
         )
+    if host in {"skillhub.cn", "www.skillhub.cn"}:
+        return _resolve_skillhub_cn(value, parsed, cancel_event=cancel_event, parent_agent=parent_agent)
     raise SourceResolutionError(
-        "Unsupported skill source. Use skills.sh, GitHub, ClawHub, or a local directory."
+        "Unsupported skill source. Use skills.sh, SkillHub.cn, GitHub, ClawHub, or a local directory."
     )
 
 
 _GITHUB_OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
 _GITHUB_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
 _SKILL_SLUG_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,127})$")
+
+
+def _resolve_skillhub_cn(original: str, parsed, *, cancel_event=None, parent_agent=None) -> ResolvedSource:
+    """Resolve a namespaced SkillHub package and pin its download version."""
+    from mclaw.skills_hub.catalog import SKILLHUB_API, coordinate
+
+    parts = [unquote(part) for part in parsed.path.strip("/").split("/")]
+    query = parse_qs(parsed.query)
+    if len(parts) == 3 and parts[0] == "skills":
+        owner, slug = parts[1:]
+    elif len(parts) == 2 and parts[0] == "skills":
+        owner, slug = query.get("namespace", [""])[0], parts[1]
+    else:
+        raise SourceResolutionError("SkillHub 地址须为 https://skillhub.cn/skills/<namespace>/<slug>。")
+    if not _SKILL_SLUG_RE.fullmatch(slug) or ".." in slug:
+        raise SourceResolutionError("SkillHub 技能名称无效。")
+    if owner:
+        coordinate("skillhub_cn", f"{owner}/{slug}")
+    url = f"{SKILLHUB_API}/skills/{quote(slug, safe='')}"
+    if owner:
+        url += "?" + urlencode({"namespace": owner})
+    cancellation_checkpoint(cancel_event)
+    try:
+        data = _run_http(_get_json_async(url, timeout=15), parent_agent=parent_agent,
+                         timeout=15, operation="skillhub_resolve")
+    except (httpx.HTTPError, ValueError, TimeoutError) as exc:
+        raise SourceResolutionError("无法读取 SkillHub 技能信息，请稍后重试。") from exc
+    cancellation_checkpoint(cancel_event)
+    namespace = data.get("namespace") or {}
+    actual_owner = str(namespace.get("handle") or "")
+    actual_slug = str(namespace.get("publicSlug") or (data.get("skill") or {}).get("slug") or "")
+    if (owner and owner != actual_owner) or slug != actual_slug:
+        raise SourceResolutionError("SkillHub 返回的技能来源不匹配。")
+    coordinate("skillhub_cn", f"{actual_owner}/{actual_slug}")
+    version = query.get("version", [""])[0] or str((data.get("latestVersion") or {}).get("version") or "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,79}", version):
+        raise SourceResolutionError("SkillHub 技能版本无效。")
+    return ResolvedSource(
+        type="skillhub_cn", original=original, owner=actual_owner, slug=actual_slug,
+        catalog_id=f"{actual_owner}/{actual_slug}",
+        fetch_url=f"{SKILLHUB_API}/download?" + urlencode({"slug": actual_slug, "namespace": actual_owner, "version": version}),
+    )
 
 
 def _resolve_skills_sh(
@@ -128,10 +175,18 @@ def _resolve_skills_sh(
     cancel_event: threading.Event | None = None,
     parent_agent=None,
 ) -> ResolvedSource:
-    """Resolve a skills.sh catalog page to its public GitHub repository."""
+    """Resolve a skills.sh entry to GitHub or a public well-known skill directory."""
 
     cancellation_checkpoint(cancel_event)
     parts = [unquote(part) for part in parsed.path.split("/") if part]
+    if len(parts) == 2:
+        from mclaw.skills_hub.catalog import coordinate
+        try:
+            host, slug = coordinate("skills_sh", "/".join(parts))
+        except ValueError as exc:
+            raise SourceResolutionError("skills.sh 技能来源地址无效。") from exc
+        return ResolvedSource(type="skills_sh", original=original, owner=host, slug=slug,
+                              catalog_id=f"{host}/{slug}", fetch_url=f"https://{host}")
     if len(parts) != 3:
         raise SourceResolutionError(
             "skills.sh URL must be https://skills.sh/<owner>/<repo>/<skill>."
@@ -316,6 +371,10 @@ def materialize_source(
         _copy_dir_contents(resolved.local_path, target_dir, cancel_event=cancel_event)
         cancellation_checkpoint(cancel_event)
         return
+    if resolved.type == "skills_sh" and not resolved.repo:
+        _run_http(_materialize_well_known(resolved, target_dir, cancel_event=cancel_event),
+                  parent_agent=parent_agent, timeout=60, operation="well_known_download")
+        return
     download_kwargs = {"cancel_event": cancel_event}
     if parent_agent is not None:
         download_kwargs["parent_agent"] = parent_agent
@@ -347,6 +406,67 @@ def materialize_source(
             archive_path.unlink()
         except OSError:
             pass
+
+
+async def _materialize_well_known(resolved: ResolvedSource, target: Path, *, cancel_event=None) -> None:
+    """Download a public well-known skill directory, including supporting files."""
+    addresses = await asyncio.get_running_loop().getaddrinfo(resolved.owner, 443, type=socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(row[4][0]).is_global for row in addresses):
+        raise SourceResolutionError("技能来源必须是公开网站。")
+    total = 0
+
+    async def read(client, url):
+        nonlocal total
+        cancellation_checkpoint(cancel_event)
+        chunks = bytearray()
+        # Redirects cannot take a package request to an unrelated or private host.
+        async with client.stream("GET", url) as response:
+            response.raise_for_status()
+            async for chunk in response.aiter_bytes():
+                cancellation_checkpoint(cancel_event)
+                chunks.extend(chunk)
+                total += len(chunk)
+                if len(chunks) > 4 * 1024 * 1024 or total > 32 * 1024 * 1024:
+                    raise SourceResolutionError("技能文件超过下载大小限制。")
+        return bytes(chunks)
+
+    async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+        data = None
+        for folder in ("agent-skills", "skills"):
+            base = f"{resolved.fetch_url}/.well-known/{folder}"
+            try:
+                data = json.loads(await read(client, base + "/index.json"))
+                break
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 404:
+                    raise
+        entries = data.get("skills", []) if isinstance(data, dict) else []
+        entries = [entry for entry in entries if isinstance(entry, dict) and entry.get("name") == resolved.slug]
+        if len(entries) != 1:
+            raise SourceResolutionError("来源网站未提供该技能的下载目录。")
+        files = entries[0].get("files", [])
+        if not isinstance(files, list) or not 1 <= len(files) <= 256 or "SKILL.md" not in files:
+            raise SourceResolutionError("来源网站的技能文件目录无效。")
+        for name in files:
+            if (not isinstance(name, str) or not name or "\\" in name or ":" in name
+                    or name.startswith("/") or any(part in {"", ".", ".."} for part in name.split("/"))):
+                raise SourceResolutionError("来源网站包含不安全的文件路径。")
+        limit = asyncio.Semaphore(4)
+
+        async def download(name):
+            async with limit:
+                path = target / name
+                content = await read(client, base + "/" + quote(resolved.slug, safe="") + "/" + quote(name, safe="/"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(content)
+
+        # TaskGroup cancels and joins sibling downloads before staging cleanup.
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                for name in dict.fromkeys(files):
+                    tasks.create_task(download(name))
+        except* (httpx.HTTPError, ValueError, OSError) as exc:
+            raise SourceResolutionError("技能文件下载失败，请稍后重试。") from exc
 
 
 def _find_archive_package_root(

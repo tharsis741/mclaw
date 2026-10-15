@@ -187,7 +187,7 @@ def load_raw_user_config(*, strict: bool = True) -> dict[str, Any]:
     config_path = get_config_path()
     try:
         raw = _load_user_config_file(config_path) if config_path.exists() else {}
-        merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), raw)
+        merged = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), _vision_compat_config(raw))
         _validate_config(merged)
         return copy.deepcopy(raw)
     except ConfigError as exc:
@@ -216,7 +216,11 @@ def load_merged_config(
     snapshot = source_snapshot or load_config_source_snapshot(cwd)
     user_config = snapshot.user_config_copy()
     project_config = _normalize_project_config(snapshot.project_config_copy())
-    config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), user_config)
+    config = _deep_merge(copy.deepcopy(DEFAULT_CONFIG), _vision_compat_config(user_config))
+    user_auxiliary = user_config.get("auxiliary", {})
+    user_vision = user_auxiliary.get("vision", {}) if isinstance(user_auxiliary, dict) else {}
+    if not isinstance(user_vision, dict) or "mode" not in user_vision:
+        project_config = _vision_compat_config(project_config)
     config = _deep_merge(config, project_config)
     if snapshot.project_path is not None:
         config["_project_config_dir"] = str(snapshot.project_path.parent)
@@ -272,6 +276,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "active_provider_profile": "",
     "providers": {},
     "fallback_providers": [],
+    "agent": {
+        "first_response_timeout": 90,
+        "stream_idle_timeout": 60,
+    },
     "reasoning": {
         "effort": "",
     },
@@ -318,10 +326,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "auxiliary": {
         "vision": {
+            "mode": "auto",
             "provider": "qwen",
             "model": "qwen3-vl-flash",
             "base_url": "",
-            "max_pixels": 1_310_720,
+            "max_pixels": None,
             "timeout": 30,
             "download_timeout": 30,
         },
@@ -510,6 +519,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 # Config I/O.
 
+def _vision_compat_config(source: dict) -> dict:
+    """Retain pre-mode independent vision semantics at config source boundaries."""
+    auxiliary = source.get("auxiliary")
+    legacy_vision = auxiliary.get("vision") if isinstance(auxiliary, dict) else None
+    if isinstance(legacy_vision, dict) and "mode" not in legacy_vision and any(key in legacy_vision for key in ("provider", "model", "base_url")):
+        source = copy.deepcopy(source)
+        source["auxiliary"]["vision"]["mode"] = "auxiliary"
+    return source
+
+
 def _deep_merge(base: dict, override: dict) -> dict:
     """Recursively merge override into base, returning a new dict."""
     result = dict(base)
@@ -554,6 +573,13 @@ def _validate_toolset_list(value: Any, path: str) -> None:
 
 def _validate_config(config: Mapping[str, Any]) -> None:
     """Validate host-sensitive configuration after all source merging."""
+    agent = config.get("agent", {})
+    if not isinstance(agent, Mapping):
+        raise ConfigError("agent must be a mapping")
+    for key in ("first_response_timeout", "stream_idle_timeout"):
+        value = agent.get(key, DEFAULT_CONFIG["agent"][key])
+        if type(value) is not int or not 1 <= value <= 600:
+            raise ConfigError(f"agent.{key} must be an integer between 1 and 600")
     dsoftbus = config.get("dsoftbus")
     if not isinstance(dsoftbus, Mapping):
         _raise_dsoftbus_config("dsoftbus")
@@ -604,7 +630,7 @@ def load_config(*, strict: bool = False) -> dict[str, Any]:
     try:
         if config_path.exists():
             user_config = _load_user_config_file(config_path)
-            config = _deep_merge(config, user_config)
+            config = _deep_merge(config, _vision_compat_config(user_config))
         _validate_config(config)
     except ConfigError as exc:
         if strict:
@@ -617,7 +643,10 @@ def load_config(*, strict: bool = False) -> dict[str, Any]:
 
 def save_config(config: dict[str, Any]) -> None:
     """Save configuration to M-Claw home config.yaml."""
+    from mclaw.application.setup_interaction import check_setup_cancelled
     from mclaw.utils import atomic_yaml_write
+
+    check_setup_cancelled()
     ensure_mclaw_home()
     atomic_yaml_write(get_config_path(), config)
     _secure_file(get_config_path())
@@ -693,6 +722,19 @@ def _sanitize_api_key(value: str) -> str:
 
 def save_env_value(key: str, value: str) -> None:
     """Save or update a value in M-Claw home .env."""
+    from mclaw.application.setup_interaction import check_setup_cancelled
+    from mclaw.system.lock import file_lock
+
+    check_setup_cancelled()
+    # This short commit lock is separate from Setup's interactive workflow lock.
+    with file_lock(get_env_path().with_name(".env.lock")):
+        _save_env_value_unlocked(key, value)
+
+
+def _save_env_value_unlocked(key: str, value: str) -> None:
+    from mclaw.application.setup_interaction import check_setup_cancelled
+
+    check_setup_cancelled()
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     value = value.replace("\n", "").replace("\r", "")
@@ -740,6 +782,13 @@ def save_env_value(key: str, value: str) -> None:
 
 def remove_env_value(key: str) -> bool:
     """Remove a key from M-Claw home .env and os.environ."""
+    from mclaw.system.lock import file_lock
+
+    with file_lock(get_env_path().with_name(".env.lock")):
+        return _remove_env_value_unlocked(key)
+
+
+def _remove_env_value_unlocked(key: str) -> bool:
     if not _ENV_VAR_NAME_RE.match(key):
         raise ValueError(f"Invalid environment variable name: {key!r}")
     env_path = get_env_path()

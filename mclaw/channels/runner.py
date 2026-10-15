@@ -724,12 +724,27 @@ class AgentRunner:
         worker_task: asyncio.Task | None = None
         worker_finished = threading.Event()
         discard_agent = False
+        session_lock = None
         try:
             closing_error = await self._wait_for_closing_session(
                 session_id, deadline=deadline_monotonic
             )
             if closing_error:
                 return AgentTurnResult(session_id=session_id, error=closing_error)
+            if getattr(self, "platform", "") in {"weixin", "dingtalk"} and getattr(self, "session_db", None) is not None:
+                from mclaw.cli.runtime.session_lock import InteractiveSessionLock, InteractiveSessionLockError
+
+                session_lock = InteractiveSessionLock(session_id)
+                try:
+                    session_lock.acquire()
+                except InteractiveSessionLockError:
+                    return AgentTurnResult(session_id=session_id, error="此会话正由其他 M-Claw 入口使用，请在原入口暂停或释放后重试。")
+                # Another frontend may have resumed or rolled back this session since
+                # the adapter loaded it. Refresh only after obtaining ownership.
+                conversation_history = self.session_db.get_messages_as_conversation(session_id)
+                row = self.session_db.get_session(session_id) or {}
+                if row.get("workspace"):
+                    workspace_path = str(row["workspace"])
             if (
                 deadline_monotonic is not None
                 and time.monotonic() >= float(deadline_monotonic)
@@ -848,7 +863,9 @@ class AgentRunner:
                             and callable(end_turn)
                             else None
                         ),
+                        session_lock=session_lock,
                     )
+                    session_lock = None  # The cleanup fence owns release now.
 
                 if discard_agent or session_id in self._cancelled_sessions:
                     self._retiring_session_set().add(session_id)
@@ -860,6 +877,8 @@ class AgentRunner:
                     self._try_retire_session(session_id)
                 if discard_agent:
                     self._cancelled_sessions.discard(session_id)
+            if session_lock is not None:
+                session_lock.release()
 
     def _start_closing_session_fence(
         self,
@@ -868,6 +887,7 @@ class AgentRunner:
         agent: "MClaw",
         worker_finished: threading.Event,
         end_turn: Callable[[], None] | None,
+        session_lock=None,
     ) -> None:
         """Keep a session closed until its abandoned worker and operations drain."""
         closing_sessions = getattr(self, "_closing_sessions", None)
@@ -902,6 +922,8 @@ class AgentRunner:
                 has_outstanding = getattr(agent, "_has_outstanding_turn_workers", None)
                 while callable(has_outstanding) and has_outstanding():
                     time.sleep(0.05)
+            if session_lock is not None:
+                session_lock.release()
             try:
                 loop.call_soon_threadsafe(
                     self._release_closing_session,

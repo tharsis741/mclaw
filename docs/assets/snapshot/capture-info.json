@@ -1,0 +1,125 @@
+{
+  "captured_on": "2026-10-15",
+  "source": "http://127.0.0.1:18031/",
+  "platform": "Windows",
+  "browser": "Google Chrome 155.0.8059.40",
+  "viewport": {
+    "width": 1920,
+    "height": 855
+  },
+  "application_version": "1.1.1",
+  "source_revision": "1bc407c795264f1989d115625d894dcc4eabe7fb",
+  "method": "本机已运行的 M-Claw 后台与 Chrome 标签页，通过页面操作直接截取 JPEG",
+  "captures": [
+    {
+      "file": "webui-overview.jpg",
+      "captured_at": "2026-10-15T06:08:07.985Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-market.jpg",
+      "captured_at": "2026-10-15T06:08:36.962Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-market-detail.jpg",
+      "captured_at": "2026-10-15T06:11:57.713Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-market-en.jpg",
+      "captured_at": "2026-10-15T06:12:17.661Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-skills.jpg",
+      "captured_at": "2026-10-15T06:12:34.466Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-skill-detail.jpg",
+      "captured_at": "2026-10-15T06:12:50.053Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-tools.jpg",
+      "captured_at": "2026-10-15T06:13:07.761Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-vision-main.jpg",
+      "captured_at": "2026-10-15T06:13:13.865Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-vision-dedicated.jpg",
+      "captured_at": "2026-10-15T06:13:24.365Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-devices.jpg",
+      "captured_at": "2026-10-15T06:13:30.063Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-schedules.jpg",
+      "captured_at": "2026-10-15T06:13:41.821Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-schedule-editor.jpg",
+      "captured_at": "2026-10-15T06:13:50.161Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-settings.jpg",
+      "captured_at": "2026-10-15T06:14:12.973Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-providers.jpg",
+      "captured_at": "2026-10-15T06:14:29.148Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-provider-settings.jpg",
+      "captured_at": "2026-10-15T06:14:40.107Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-task-settings.jpg",
+      "captured_at": "2026-10-15T06:14:51.139Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-channels.jpg",
+      "captured_at": "2026-10-15T06:14:56.496Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-diagnostics.jpg",
+      "captured_at": "2026-10-15T06:15:34.688Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-setup.jpg",
+      "captured_at": "2026-10-15T06:16:00.510Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-conversation.jpg",
+      "captured_at": "2026-10-15T06:16:36.151Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-task-process.jpg",
+      "captured_at": "2026-10-15T06:16:43.494Z",
+      "source": "http://127.0.0.1:18031/"
+    },
+    {
+      "file": "webui-model-picker.jpg",
+      "captured_at": "2026-10-15T06:16:54.744Z",
+      "source": "http://127.0.0.1:18031/"
+    }
+  ]
+}

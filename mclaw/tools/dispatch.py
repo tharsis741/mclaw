@@ -34,7 +34,8 @@ from mclaw.tools.interrupt import (
     set_interrupt_event,
 )
 from mclaw.tools.registry import registry
-from mclaw.tools.toolsets import DSOFTBUS_TOOLS, resolve_multiple_toolsets
+from mclaw.tools.result_limits import truncate_json_value as _truncate_json_value
+from mclaw.tools.toolsets import DSOFTBUS_TOOLS, effective_disabled_tools, resolve_multiple_toolsets
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,7 @@ def _dsoftbus_forbidden_result(tool_name: str) -> str:
 _current_session_db: ContextVar[Any] = ContextVar("current_session_db", default=None)
 _current_session_id: ContextVar[str] = ContextVar("current_session_id", default="")
 _current_task_id: ContextVar[str] = ContextVar("current_task_id", default="")
+_current_tool_call_id: ContextVar[str] = ContextVar("current_tool_call_id", default="")
 _tool_whitelist: ContextVar[set[str] | None] = ContextVar("tool_whitelist", default=None)
 _tool_action_whitelist: ContextVar[dict[str, set[str]] | None] = ContextVar("tool_action_whitelist", default=None)
 
@@ -87,6 +89,11 @@ def get_session_db() -> Any:
 def get_current_session_id() -> str:
     """Get the current session_id from context."""
     return _current_session_id.get()
+
+
+def get_current_tool_call_id() -> str:
+    """Identify the actual dispatch across thread and async context copies."""
+    return _current_tool_call_id.get()
 
 
 def set_current_task_id(task_id: str) -> Any:
@@ -510,7 +517,7 @@ def get_tool_definitions(
         tools_config = config.get("tools", {})
         raw_disabled = tools_config.get("disabled", []) if isinstance(tools_config, dict) else []
         if isinstance(raw_disabled, (list, tuple, set)):
-            tool_names -= {str(name) for name in raw_disabled}
+            tool_names -= effective_disabled_tools(raw_disabled)
 
     try:
         from mclaw.runtime.manager import RuntimeManager
@@ -1016,59 +1023,6 @@ def _invoke_tool_builtin(
     return None
 
 
-def _truncate_json_value(obj, excess):
-    """Recursively trim longest string by ``excess`` chars.
-
-    Returns ``(new_obj, trimmed_chars)``.  Only performs one truncation
-    per call so the caller can re-serialize and re-check size.
-    """
-    if isinstance(obj, str):
-        if excess <= 0:
-            return obj, 0
-        # Keep at least 100 chars of original content
-        trim = min(excess, max(0, len(obj) - 100))
-        if trim > 0:
-            truncated = obj[: len(obj) - trim]
-            suffix = f"\n[... {trim:,} chars truncated ...]"
-            return truncated + suffix, trim
-        return obj, 0
-
-    if isinstance(obj, dict):
-        # Trim the longest direct string field first.
-        string_items = [
-            (k, v) for k, v in obj.items() if isinstance(v, str) and len(v) > 100
-        ]
-        string_items.sort(key=lambda x: len(x[1]), reverse=True)
-        for k, v in string_items:
-            new_v, trimmed = _truncate_json_value(v, excess)
-            if trimmed:
-                obj = dict(obj)
-                obj[k] = new_v
-                return obj, trimmed
-
-        # If no direct string is large enough, recurse into nested structures.
-        for k, v in list(obj.items()):
-            if isinstance(v, (dict, list)):
-                new_v, trimmed = _truncate_json_value(v, excess)
-                if trimmed:
-                    obj = dict(obj)
-                    obj[k] = new_v
-                    return obj, trimmed
-        return obj, 0
-
-    if isinstance(obj, list):
-        for i, item in enumerate(obj):
-            if isinstance(item, (str, dict, list)):
-                new_item, trimmed = _truncate_json_value(item, excess)
-                if trimmed:
-                    obj = list(obj)
-                    obj[i] = new_item
-                    return obj, trimmed
-        return obj, 0
-
-    return obj, 0
-
-
 def _extract_json_object(s: str) -> dict | None:
     """Extract the first JSON object from a string with trailing content.
 
@@ -1154,6 +1108,7 @@ def _dispatch_single(
         _finalize_operation(operation, builtin_result, _tool_result_success(builtin_result), parent_agent)
         return builtin_result
 
+    call_token = _current_tool_call_id.set(str(call.get("id") or ""))
     try:
         result = registry.dispatch(tool_name, arguments, parent_agent=parent_agent)
     except Exception as e:
@@ -1163,12 +1118,15 @@ def _dispatch_single(
         result = tool_error(str(e), success=False)
         _finalize_operation(operation, result, False, parent_agent)
         return result
+    finally:
+        _current_tool_call_id.reset(call_token)
 
     # Final result-size guard before tool output enters conversation history.
     # Individual tools should limit themselves first; this catches abnormal
     # payloads that would otherwise exceed the context budget.
     max_size = registry.get_max_result_size(tool_name)
     if max_size is not None and isinstance(result, str) and len(result) > max_size:
+        original_size = len(result)
         # Structured truncation preserves JSON parseability.
         parsed = None
         try:
@@ -1190,7 +1148,7 @@ def _dispatch_single(
 
             if isinstance(parsed, dict):
                 parsed["_truncated"] = True
-                parsed["_original_size"] = len(result)
+                parsed["_original_size"] = original_size
                 parsed["_limit"] = max_size
             result = json.dumps(parsed, ensure_ascii=False)
 
@@ -1198,7 +1156,7 @@ def _dispatch_single(
             if len(result) > max_size:
                 result = json.dumps({
                     "_truncated": True,
-                    "_original_size": len(result),
+                    "_original_size": original_size,
                     "_limit": max_size,
                     "error": (
                         f"Tool output exceeded size limit of {max_size:,} chars. "
@@ -1242,6 +1200,7 @@ def _run_tool_worker(
     forbidden_tool_names: set[str] | frozenset[str] | None = None,
 ) -> None:
     """Run one tool into a private slot that the dispatcher snapshots once."""
+    result_slot["started_at"] = time.monotonic()
     token = set_interrupt_event(cancel_event) if cancel_event is not None else None
     try:
         if cancel_event is not None and cancel_event.is_set():
@@ -1427,6 +1386,20 @@ def _skipped_after_unknown_result(tool_name: str) -> str:
     )
 
 
+def _record_tool_timings(calls: list, slots: dict[int, dict], timings: dict[str, int] | None) -> None:
+    """Snapshot individual worker lifetimes, excluding queue and sibling wait time."""
+    if timings is None:
+        return
+    observed_at = time.monotonic()
+    for index, call in enumerate(calls):
+        slot = slots.get(index, {})
+        started = slot.get("started_at")
+        finished = slot.get("finished_at")
+        timings[call["id"]] = 0 if started is None else max(
+            0, round(((finished if finished is not None else observed_at) - started) * 1000)
+        )
+
+
 def handle_function_calls(
     calls: list,
     tool_names: set,
@@ -1435,6 +1408,7 @@ def handle_function_calls(
     parent_agent: Any = None,
     cancel_event: threading.Event | None = None,
     call_source: str = "turn",
+    timings: dict[str, int] | None = None,
 ) -> list:
     """Dispatch a batch of tool calls with turn cancellation and time bounds."""
     if not calls:
@@ -1448,6 +1422,7 @@ def handle_function_calls(
         else None
     )
     use_concurrent = _should_parallelize_tool_batch(calls)
+    slots: dict[int, dict] = {}
 
     if use_concurrent:
         tool_call_names = [c.get("function", {}).get("name", "?") for c in calls]
@@ -1462,6 +1437,7 @@ def handle_function_calls(
             tool_name = tool_call_names[idx]
             tool_timeout = _concurrent_tool_timeout(tool_name, parent_agent)
             result_slot = {"result": None, "finished_at": None}
+            slots[idx] = result_slot
             ctx = copy_context()
             thread = threading.Thread(
                 target=ctx.run,
@@ -1615,6 +1591,7 @@ def handle_function_calls(
                 )
 
         logger.info("[TOOL CONCURRENT END]")
+        _record_tool_timings(calls, slots, timings)
         return results
 
     results = []
@@ -1633,6 +1610,7 @@ def handle_function_calls(
 
         logger.debug("Serial tool %d/%d: %s", idx + 1, len(calls), tool_name)
         result_slot = {"result": None, "finished_at": None}
+        slots[idx] = result_slot
         ctx = copy_context()
         thread = threading.Thread(
             target=ctx.run,
@@ -1764,4 +1742,5 @@ def handle_function_calls(
             for pending in calls[idx + 1:]
         )
         break
+    _record_tool_timings(calls, slots, timings)
     return results

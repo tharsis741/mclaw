@@ -1,0 +1,17 @@
+schema_version: 1
+name: humanizer-zh
+short_description: 中文文字润色：减少空话、重复和模板化表达，保留事实、限定条件与作者语气。
+source:
+  type: github
+  original: https://github.com/op7418/Humanizer-zh/tree/f4518a8eab97b8bfebc66a89d34320a89bef6930
+  revision: f4518a8eab97b8bfebc66a89d34320a89bef6930
+  author: 歸藏 (op7418)
+  license: MIT
+  license_file: LICENSE
+  license_url: https://github.com/op7418/Humanizer-zh/blob/f4518a8eab97b8bfebc66a89d34320a89bef6930/LICENSE
+  copyright: Copyright (c) 2026 歸藏
+created_at: '2026-10-15T00:00:00+08:00'
+updated_at: '2026-10-15T00:00:00+08:00'
+created_by: bundled
+updated_by: bundled
+status: enabled

@@ -1,0 +1,17 @@
+schema_version: 1
+name: internal-comms
+short_description: 办公沟通写作：将工作记录整理成周报、项目汇报、内部通知和常见问题解答。
+source:
+  type: github
+  original: https://github.com/anthropics/skills/tree/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/internal-comms
+  revision: dbd4588f9e1033efb41dad4bef2f7947c8993d44
+  author: Anthropic
+  license: Apache-2.0
+  license_file: LICENSE
+  license_url: https://github.com/anthropics/skills/blob/dbd4588f9e1033efb41dad4bef2f7947c8993d44/skills/internal-comms/LICENSE.txt
+  copyright: Copyright 2026 Anthropic, PBC.
+created_at: '2026-10-15T00:00:00+08:00'
+updated_at: '2026-10-15T00:00:00+08:00'
+created_by: bundled
+updated_by: bundled
+status: enabled

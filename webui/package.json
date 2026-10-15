@@ -1,0 +1,40 @@
+{
+  "name": "mclaw-webui",
+  "version": "1.1.2",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.12",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b --pretty false",
+    "test": "vitest run",
+    "preview": "vite preview --host 127.0.0.1",
+    "format": "prettier --write src index.html vite.config.ts tsconfig.json package.json README.md THIRD_PARTY_NOTICES.md",
+    "format:check": "prettier --check src index.html vite.config.ts tsconfig.json package.json README.md THIRD_PARTY_NOTICES.md"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@testing-library/user-event": "^14.5.2",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "jsdom": "^26.0.0",
+    "prettier": "^3.9.7",
+    "typescript": "^5.7.2",
+    "vite": "^7.3.6",
+    "vitest": "^4.1.11"
+  }
+}

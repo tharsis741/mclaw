@@ -11,7 +11,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from mclaw.prompts.skills import build_skill_invocation_system
+from mclaw.prompts.skills import build_skill_invocation_system, build_skill_runtime_content
 from mclaw.skills_hub import skill_store
 
 
@@ -27,6 +27,7 @@ class RuntimeSkillCommandHooks:
     render_loaded: Callable[[str], None]
     record_loaded_skill: Callable[[str, dict[str, Any]], None] | None = None
     build_base_system_prompt: Callable[[], str] | None = None
+    queue_skill_intent: Callable[[str, str], bool] | None = None
 
 
 @dataclass(frozen=True)
@@ -55,9 +56,22 @@ class RuntimeSkillCommandCoordinator:
 
     def invoke_skill(self, skill: Any, user_intent: str) -> bool:
         """Inject Skill guidance and optionally queue the user's follow-up intent."""
+        if self.hooks.queue_skill_intent is not None:
+            try:
+                queued = self.hooks.queue_skill_intent(str(skill.name), user_intent)
+            except Exception as exc:
+                self.hooks.render_read_error(f"Cannot select skill: {exc}")
+                return True
+            if queued:
+                if str(user_intent or "").strip():
+                    self.hooks.render_processing(str(skill.name))
+                    self.hooks.set_skip_next_prompt()
+                else:
+                    self.hooks.render_loaded(str(skill.name))
+                return True
         try:
             view = skill_store.view_skill(str(skill.name))
-            skill_content = str(view.get("content") or "")
+            skill_content = build_skill_runtime_content(view)
         except Exception as exc:
             self.hooks.render_read_error(f"Cannot read skill: {exc}")
             return True
@@ -93,19 +107,15 @@ class RuntimeSkillCommandCoordinator:
 
     @staticmethod
     def inject_skill_context(messages: list[dict[str, Any]], skill_text: str) -> None:
-        """Append Skill guidance once to the existing system message.
-
-        The first Skill header line is used as the idempotency marker so repeat
-        invocations can refresh context without duplicating the full Skill text.
-        """
-        first_line = str(skill_text or "").splitlines()[0] if str(skill_text or "").splitlines() else ""
-        marker = first_line if first_line.startswith("[Skill:") else skill_text
-        for msg in messages:
-            if msg.get("role") == "system":
-                if marker not in msg.get("content", ""):
-                    msg["content"] += f"\n\n{skill_text}"
-                return
-        messages.insert(0, {"role": "system", "content": skill_text})
+        """Select fresh guidance for the next turn without modifying the base prompt."""
+        if not skill_text.strip():
+            return
+        header = skill_text.splitlines()[0]
+        messages[:] = [message for message in messages if not (
+            message.get("role") == "system" and message.get("_mclaw_pending_skill")
+            and str(message.get("content") or "").splitlines()[:1] == [header]
+        )]
+        messages.append({"role": "system", "content": skill_text, "_mclaw_pending_skill": True})
 
 
 class RuntimeSkillImportConfirmationCoordinator:

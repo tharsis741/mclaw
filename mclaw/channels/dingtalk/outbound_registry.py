@@ -67,6 +67,11 @@ def get_dingtalk_outbound_target(session_id: str) -> DingTalkOutboundTarget | No
     return _targets.get(session_id)
 
 
+def register_dingtalk_outbound_proxy(session_id: str, target: Any) -> None:
+    """Bind an isolated worker's transport proxy without copying channel credentials."""
+    _targets[session_id] = target
+
+
 def unregister_dingtalk_outbound_targets_for_adapter(adapter: "DingTalkAdapter") -> None:
     """Remove stale target bindings when an adapter shuts down."""
     stale = [session_id for session_id, target in _targets.items() if target.adapter is adapter]

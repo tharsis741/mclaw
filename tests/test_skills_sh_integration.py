@@ -42,7 +42,8 @@ def test_skills_sh_search_maps_installable_github_results(monkeypatch) -> None:
 
     results = SkillsShSearcher().search("pdf", limit=10)
 
-    assert len(results) == 1
+    assert len(results) == 2
+    assert results[1].install_source == "https://skills.sh/mintlify.com/mintlify"
     result = results[0]
     assert result.source == "skills_sh"
     assert result.slug == "pdf"
@@ -156,6 +157,9 @@ def test_skills_sh_package_selection_rejects_ambiguous_name(tmp_path) -> None:
 
 
 def test_install_prepare_accepts_skills_sh_provenance(tmp_path, monkeypatch) -> None:
+    from mclaw.skills_hub import audits
+    monkeypatch.setattr(audits, "get_json", lambda *_args, **_kwargs: {})
+    audits._cache.clear()
     drafting_root = tmp_path / "drafts"
     drafting_id = "skill_drafting_20260801_120000_deadbeef"
     resolved = source_resolver.ResolvedSource(

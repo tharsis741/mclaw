@@ -861,7 +861,7 @@ class DsoftbusRuntime:
             text_bytes = text.encode("utf-8")
         except UnicodeEncodeError as error:
             raise DsoftbusRuntimeError("INVALID_PARAMS") from error
-        if not 1 <= len(text_bytes) <= 24_576:
+        if not 1 <= len(text_bytes) <= protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX:
             raise DsoftbusRuntimeError("INVALID_PARAMS")
         try:
             normalized_context_id = (
@@ -905,7 +905,7 @@ class DsoftbusRuntime:
             )
         except (UnicodeEncodeError, protocol.ProtocolError) as error:
             raise DsoftbusRuntimeError("INVALID_PARAMS") from error
-        if len(text_bytes) > 24_576:
+        if len(text_bytes) > protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX:
             raise DsoftbusRuntimeError("INVALID_PARAMS")
         return (
             device_id,

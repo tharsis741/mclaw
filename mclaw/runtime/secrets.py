@@ -16,6 +16,7 @@ from typing import Any
 
 from mclaw.cli.config import get_env_value, save_env_value
 from mclaw.constants import get_mclaw_home
+from mclaw.system.lock import file_lock
 from mclaw.tools.cancellation import cancellation_checkpoint
 from mclaw.tools.interrupt import get_cancel_id, safe_cancel_trace
 from mclaw.utils import atomic_json_write
@@ -132,6 +133,11 @@ def is_authorized(required_for: str, env_var: str) -> bool:
 
 def authorize(required_for: str, env_vars: Iterable[str]) -> list[str]:
     """Add environment variables to a scope allowlist without storing values."""
+    with file_lock(allowlist_path().with_suffix(".lock")):
+        return _authorize_unlocked(required_for, env_vars)
+
+
+def _authorize_unlocked(required_for: str, env_vars: Iterable[str]) -> list[str]:
     bucket, scope_id = parse_scope(required_for)
     data = load_allowlist()
     current = list(data.setdefault(bucket, {}).setdefault(scope_id, []))

@@ -284,6 +284,7 @@ def test_startup_resume_overlay_matrix(monkeypatch, tmp_path) -> None:
     from mclaw import state
 
     db_path = tmp_path / "state.db"
+    monkeypatch.setattr(main, "_open_startup_history", lambda: SessionDB(db_path))
     monkeypatch.setattr(state, "DEFAULT_DB_PATH", db_path)
     monkeypatch.setenv("OPENAI_API_KEY", "current-key")
     snapshot = _context(model="gpt-5.4", key="old-key").snapshot()
@@ -341,6 +342,7 @@ def test_startup_empty_snapshot_bootstraps_from_row_model(monkeypatch, tmp_path)
     from mclaw import state
 
     db_path = tmp_path / "state.db"
+    monkeypatch.setattr(main, "_open_startup_history", lambda: SessionDB(db_path))
     monkeypatch.setattr(state, "DEFAULT_DB_PATH", db_path)
     monkeypatch.setenv("OPENAI_API_KEY", "current-key")
     db = SessionDB(db_path)

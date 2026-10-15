@@ -7,10 +7,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import json
 import threading
 import time
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -187,10 +189,12 @@ class _WireSupervisor:
         self.deliver: Any = None
         self.closed: list[int] = []
         self.send_count = 0
+        self.frame_sizes: list[int] = []
 
     def send_bytes(self, socket: int, data: bytes) -> int:
         assert self.deliver is not None
         self.send_count += 1
+        self.frame_sizes.append(len(data))
         self.deliver(data)
         return len(data)
 
@@ -678,6 +682,153 @@ async def test_verified_chunked_artifact_returns_to_requesting_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('unit', ['文🙂', 'a', '\u0000'], ids=['utf8', 'ascii', 'json-escapes'])
+async def test_long_reply_is_reassembled_as_text_with_bounded_frames_and_replay(tmp_path, unit):
+    from mclaw.dsoftbus.task_result import TEXT_RESULT_CAPABILITY
+
+    resources_a, resources_b, supervisor_a, supervisor_b = _ready_wire_resources(tmp_path)
+    supervisor_a.deliver = lambda data: resources_b._handle_binding_bytes(22, base64.b64encode(data).decode('ascii'))
+    supervisor_b.deliver = lambda data: resources_a._handle_binding_bytes(11, base64.b64encode(data).decode('ascii'))
+    dispatcher_a, dispatcher_b = resources_a._task_dispatcher, resources_b._task_dispatcher
+    content = unit * (protocol.REMOTE_TEXT_RESULT_BYTES_MAX // len(unit.encode('utf-8')))
+    content += 'x' * (protocol.REMOTE_TEXT_RESULT_BYTES_MAX - len(content.encode('utf-8')))
+    executor = dispatcher_b._executor
+    executor.result_factory = lambda request: {
+        'completed': True, 'final_response': content,
+        'messages': [{'role': 'user', 'content': request.text}, {'role': 'assistant', 'content': content}],
+    }
+    try:
+        result = await asyncio.wait_for(resources_a.run_agent_task(
+            _DEVICE_B, 'return complete text', context_id=None, message_id=_id(2300),
+        ), timeout=5)
+        assert result['text'] == content
+        assert result['_untrustedRemoteData'] is True
+        assert result['_mclawProvenance']['verifiedBinding'] is True
+        receipt = result['artifacts'][0]
+        assert receipt['artifactRole'] == 'final-response'
+        assert Path(receipt['parts'][0]['localPath']).read_bytes() == content.encode('utf-8')
+        owned = dispatcher_b.task_store.get_task('owned', _DEVICE_A, result['task_id'])
+        assert owned['metadata'][TEXT_RESULT_CAPABILITY]['maxBytes'] == protocol.REMOTE_TEXT_RESULT_BYTES_MAX
+        assert len(json.dumps(owned, default=dict, ensure_ascii=False).encode('utf-8')) < 4096
+        assert max(supervisor_a.frame_sizes + supervisor_b.frame_sizes) <= protocol.REMOTE_FRAME_MAX
+        context = dispatcher_b._contexts[executor.calls[0].conversation_key]
+        assert context.byte_length < protocol.REMOTE_CONTEXT_UTF8_MAX
+        assert content not in context.history[-1]['content']
+        # A duplicate submission uses the durable verified local copy after the sender's ack cleanup.
+        replay = await asyncio.wait_for(resources_a.run_agent_task(
+            _DEVICE_B, 'return complete text', context_id=None, message_id=_id(2300),
+        ), timeout=5)
+        assert replay['text'] == content and len(executor.calls) == 1
+    finally:
+        await dispatcher_a.drain(time.monotonic() + 1)
+        await dispatcher_b.drain(time.monotonic() + 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('length', [24_576, 24_577, 262_145])
+async def test_text_reply_capacity_is_negotiated_and_never_silently_truncated(tmp_path, monkeypatch, length):
+    resources_a, resources_b, supervisor_a, supervisor_b = _ready_wire_resources(tmp_path)
+    supervisor_a.deliver = lambda data: resources_b._handle_binding_bytes(22, base64.b64encode(data).decode('ascii'))
+    supervisor_b.deliver = lambda data: resources_a._handle_binding_bytes(11, base64.b64encode(data).decode('ascii'))
+    dispatcher_a, dispatcher_b = resources_a._task_dispatcher, resources_b._task_dispatcher
+    # Simulate a legacy caller by omitting its receive-capability metadata.
+    if length < 262_145:
+        monkeypatch.setattr(resources_a, '_task_workspace', None)
+    content = '文' * (length // 3) + 'x' * (length % 3)
+    dispatcher_b._executor.result_factory = lambda request: {
+        'completed': True, 'final_response': content,
+        'messages': [{'role': 'user', 'content': request.text}, {'role': 'assistant', 'content': content}],
+    }
+    try:
+        if length == 24_576:
+            result = await asyncio.wait_for(resources_a.run_agent_task(
+                _DEVICE_B, 'legacy reply', context_id=None, message_id=_id(2301),
+            ), timeout=5)
+            assert result['text'] == content
+        else:
+            with pytest.raises(AgentMessageError, match='INVALID_AGENT_RESPONSE'):
+                await asyncio.wait_for(resources_a.run_agent_task(
+                    _DEVICE_B, 'too long', context_id=None, message_id=_id(2301),
+                ), timeout=5)
+    finally:
+        await dispatcher_a.drain(time.monotonic() + 1)
+        await dispatcher_b.drain(time.monotonic() + 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fault', ['retry', 'hash', 'offset', 'cancel'])
+async def test_long_reply_transfer_failure_never_acknowledges_partial_text(tmp_path, fault):
+    resources_a, resources_b, supervisor_a, supervisor_b = _ready_wire_resources(tmp_path)
+    supervisor_a.deliver = lambda data: resources_b._handle_binding_bytes(22, base64.b64encode(data).decode('ascii'))
+    supervisor_b.deliver = lambda data: resources_a._handle_binding_bytes(11, base64.b64encode(data).decode('ascii'))
+    dispatcher_a, dispatcher_b = resources_a._task_dispatcher, resources_b._task_dispatcher
+    content = '验证完整性🙂' * 10000
+    executor = dispatcher_b._executor
+    executor.result_factory = lambda request: {
+        'completed': True, 'final_response': content,
+        'messages': [{'role': 'user', 'content': request.text}, {'role': 'assistant', 'content': content}],
+    }
+    original = resources_a._request_application
+    interrupted = False
+    offsets = []
+    acknowledged = []
+    reached = asyncio.Event()
+
+    async def inject(connection, method, params, **kwargs):
+        nonlocal interrupted
+        if method == 'mclaw.taskResult.ack':
+            acknowledged.append(params['id'])
+        if method == 'mclaw.taskArtifact.read':
+            offsets.append(params['offset'])
+            if params['offset'] and not interrupted:
+                interrupted = True
+                if fault == 'cancel':
+                    reached.set()
+                    await asyncio.Event().wait()
+                if fault == 'retry':
+                    raise AgentMessageError('STALE_GENERATION')
+        response = await original(connection, method, params, **kwargs)
+        if method == 'mclaw.taskArtifact.read' and params['offset'] == 0:
+            value = dict(response.result)
+            if fault == 'hash':
+                chunk = base64.b64decode(value['data'])
+                value['data'] = base64.b64encode(b'x' + chunk[1:]).decode('ascii')
+            elif fault == 'offset':
+                value['nextOffset'] += 1
+            response = replace(response, result=value)
+        return response
+
+    resources_a._request_application = inject
+    pending = asyncio.create_task(resources_a.run_agent_task(
+        _DEVICE_B, 'receive verified reply', context_id=None, message_id=_id(2302),
+    ))
+    try:
+        if fault == 'cancel':
+            await asyncio.wait_for(reached.wait(), timeout=3)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+        elif fault == 'retry':
+            result = await asyncio.wait_for(pending, timeout=5)
+            assert result['text'] == content
+            assert offsets.count(0) == 1  # Partial verified staging resumes at its offset.
+            assert offsets.count(protocol.TASK_TRANSFER_CHUNK_BYTES_MAX) == 2
+            assert len(executor.calls) == 1 and acknowledged
+        else:
+            with pytest.raises(AgentMessageError):
+                await asyncio.wait_for(pending, timeout=5)
+        if fault != 'retry':
+            assert not acknowledged
+            assert dispatcher_a.task_store.list_pending_result_acks(_DEVICE_B) == ()
+    finally:
+        if not pending.done():
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+        await dispatcher_a.drain(time.monotonic() + 1)
+        await dispatcher_b.drain(time.monotonic() + 1)
+
+
+@pytest.mark.asyncio
 async def test_lost_result_ack_is_durably_retried_without_dropping_artifacts(
     tmp_path: Path,
 ) -> None:
@@ -839,8 +990,9 @@ async def test_remote_task_browses_searches_and_fetches_shared_directory(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('long_reply', [False, True])
 async def test_input_required_resumes_the_same_task_with_text(
-    tmp_path: Path,
+    tmp_path: Path, long_reply: bool,
 ) -> None:
     resources_a, resources_b, supervisor_a, supervisor_b = (
         _ready_wire_resources(tmp_path)
@@ -890,13 +1042,13 @@ async def test_input_required_resumes_the_same_task_with_text(
         return {
             "completed": True,
             "interrupted": False,
-            "final_response": f"已处理模块：{request.text}",
+            "final_response": f"已处理模块：{request.text}" + (' 完整分析' * 10000 if long_reply else ''),
             "messages": [
                 *request.history,
                 {"role": "user", "content": request.text},
                 {
                     "role": "assistant",
-                    "content": f"已处理模块：{request.text}",
+                    "content": f"已处理模块：{request.text}" + (' 完整分析' * 10000 if long_reply else ''),
                 },
             ],
             "token_usage": {"input_tokens": 12, "output_tokens": 7},
@@ -927,7 +1079,7 @@ async def test_input_required_resumes_the_same_task_with_text(
     assert completed["task_id"] == waiting["task_id"]
     assert completed["context_id"] == waiting["context_id"]
     assert completed["task_state"] == "TASK_STATE_COMPLETED"
-    assert completed["text"] == "已处理模块：authentication"
+    assert completed["text"] == "已处理模块：authentication" + (' 完整分析' * 10000 if long_reply else '')
     assert len(completed["artifacts"]) == 2
     assert len(executor_b.calls) == 2
     assert executor_b.calls[0].task_id == executor_b.calls[1].task_id
@@ -1554,8 +1706,9 @@ async def test_cancel_task_requires_an_exact_canceled_task_response(
 
 
 @pytest.mark.asyncio
-async def test_task_stream_disconnect_recovers_with_get_then_subscribe() -> None:
-    resources_a, resources_b, supervisor_a, supervisor_b = _ready_wire_resources()
+@pytest.mark.parametrize('long_reply', [False, True])
+async def test_task_stream_disconnect_recovers_with_get_then_subscribe(tmp_path, long_reply) -> None:
+    resources_a, resources_b, supervisor_a, supervisor_b = _ready_wire_resources(tmp_path)
     supervisor_a.deliver = lambda data: resources_b._handle_binding_bytes(
         22, base64.b64encode(data).decode("ascii")
     )
@@ -1567,6 +1720,12 @@ async def test_task_stream_disconnect_recovers_with_get_then_subscribe() -> None
     executor_b = dispatcher_b._executor
     assert isinstance(executor_b, _Executor)
     executor_b.gate = asyncio.Event()
+
+    expected = '完整长回复🙂' * 10000 if long_reply else 'reply:survive-one-generation'
+    executor_b.result_factory = lambda request: {
+        'completed': True, 'final_response': expected,
+        'messages': [{'role': 'user', 'content': request.text}, {'role': 'assistant', 'content': expected}],
+    }
 
     pending = asyncio.create_task(
         resources_a.run_agent_task(
@@ -1615,7 +1774,7 @@ async def test_task_stream_disconnect_recovers_with_get_then_subscribe() -> None
 
     result = await asyncio.wait_for(pending, timeout=2.0)
     assert result["success"] is True
-    assert result["text"] == "reply:survive-one-generation"
+    assert result["text"] == expected
     assert result["task_state"] == "TASK_STATE_COMPLETED"
     assert result["_mclawProvenance"]["connectionGeneration"] == 2
     assert len(executor_b.calls) == 1

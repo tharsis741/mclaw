@@ -146,10 +146,18 @@ class PathPolicy:
     def process_log_root(self) -> Path:
         return self.mclaw_home / "process_logs"
 
+    def task_files_root(self) -> Path:
+        """Return the managed task workspace, separate from private state."""
+        return self.mclaw_home / "_temp"
+
+    def is_task_file_path(self, path_value: str | os.PathLike) -> bool:
+        """Resolve links and traversal before recognizing task files."""
+        return is_relative_to(self.normalize(path_value), self.task_files_root())
+
     def is_runtime_internal_path(self, path_value: str | os.PathLike) -> bool:
         """Return whether a path belongs to M-Claw's private runtime state."""
         path = self.normalize(path_value)
-        return is_relative_to(path, self.mclaw_home)
+        return is_relative_to(path, self.mclaw_home) and not is_relative_to(path, self.task_files_root())
 
     @staticmethod
     def is_credential_path(path: Path) -> bool:
@@ -200,7 +208,7 @@ class PathPolicy:
     def classify(self, path: Path) -> str:
         if self.is_credential_path(path):
             return "credential"
-        if is_relative_to(path, self.mclaw_home):
+        if is_relative_to(path, self.mclaw_home) and not is_relative_to(path, self.task_files_root()):
             return "runtime_internal"
         if self._is_pseudo_path(path):
             return "pseudo"

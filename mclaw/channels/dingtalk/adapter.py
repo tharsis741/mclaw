@@ -373,13 +373,14 @@ class DingTalkAdapter:
                 await self.send(chat_id, command.text, reply_to=message_id, route=reply_route, done_message=message)
             elif command.action == "stop":
                 interrupted = self.runner.interrupt(routed.session_id)
+                control_error = getattr(self.runner, "control_error", lambda _sid: "")(routed.session_id)
                 await self.send(
                     chat_id,
                     (
-                        "Cancellation requested. Cleanup continues in the background; "
+                        control_error or ("Cancellation requested. Cleanup continues in the background; "
                         "if process termination cannot be confirmed, restart the runtime."
                         if interrupted
-                        else "No running turn."
+                        else "No running turn.")
                     ),
                     reply_to=message_id,
                     route=reply_route,
@@ -661,22 +662,21 @@ class DingTalkAdapter:
     def _has_send_route(self, chat_id: str) -> bool:
         return self._get_valid_webhook(chat_id) is not None
 
-    async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> None:
+    async def _reply_callback(self, message: ChannelMessage, result: AgentTurnResult) -> SendResult | None:
         """Send the final agent result through the route captured on the inbound message."""
         route = self._route_from_channel_message(message)
         if result.error:
             safe_text = result.final_response.strip() or f"Error: {result.error}"
-            await self.send(
+            return await self.send(
                 message.source.chat_id,
                 safe_text,
                 reply_to=message.source.message_id,
                 route=route,
                 done_message=message,
             )
-            return
         text = result.final_response.strip()
         if text:
-            await self.send(
+            return await self.send(
                 message.source.chat_id,
                 text,
                 reply_to=message.source.message_id,

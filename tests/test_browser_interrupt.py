@@ -727,7 +727,7 @@ def _element_ref(snapshot: str, element: str) -> str:
 )
 @pytest.mark.parametrize(
     "operation",
-    ["navigate", "snapshot", "click", "type", "scroll", "press", "screenshot", "download"],
+    ["navigate", "snapshot", "click", "type", "scroll", "press", "screenshot", "download", "wait_for"],
 )
 def test_real_playwright_cancel_drains_each_browser_tool(
     operation,
@@ -748,6 +748,16 @@ def test_real_playwright_cancel_drains_each_browser_tool(
         backend.navigate(session_id, stall_server.base_url + page_url)
         if operation == "snapshot":
             invoke = lambda: backend.snapshot(session_id)
+        elif operation == "wait_for":
+            page = backend._sessions[session_id].page
+            original_wait = page.wait_for_timeout
+
+            def wait_with_signal(*args, **kwargs):
+                started.set()
+                return original_wait(*args, **kwargs)
+
+            backend._run_on_worker(setattr, page, "wait_for_timeout", wait_with_signal)
+            invoke = lambda: backend.wait_for(session_id, text="not present", timeout_ms=30000)
         elif operation == "scroll":
             invoke = lambda: backend.scroll(session_id)
         elif operation == "download":

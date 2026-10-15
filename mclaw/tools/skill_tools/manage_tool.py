@@ -155,6 +155,14 @@ def skill_manage(
                 f"Unknown action. Use: {', '.join(SKILL_MANAGE_ACTION_ORDER)}",
                 success=False,
             )
+        on_write = getattr(parent_agent, "_on_skill_write", None)
+        if callable(on_write):
+            try:
+                on_write(action, result)
+            except Exception:
+                # The store has already committed. Notification failures must
+                # not turn a successful save into a misleading tool error.
+                logger.warning("Skill write notification failed: action=%s", action, exc_info=True)
         return _json(result)
     except InterruptedError as exc:
         return tool_error(
@@ -184,7 +192,7 @@ SKILL_MANAGE_SCHEMA = {
         "description": (
             "Scaffold, validate, create, install, enable, edit, patch, delete, and maintain local M-Claw Skills. "
             "All Skill writes must use this tool. create_scaffold initializes a minimal editable Skill; "
-            "install_prepare prepares skills.sh, GitHub, ClawHub, or local directory Skills and returns one "
+            "install_prepare prepares skills.sh, SkillHub.cn, GitHub, ClawHub, or local directory Skills and returns one "
             "skill_enable_drafting confirmation payload plus dependency_hints. install_prepare never "
             "collects secrets; use secret_request_many later when a Skill actually needs a key."
         ),
@@ -200,7 +208,9 @@ SKILL_MANAGE_SCHEMA = {
                     "type": "string",
                     "description": (
                         "Full SKILL.md content for create/edit. Must include YAML frontmatter "
-                        "with name and description."
+                        "with name and description, followed by reusable instructions only. "
+                        "Do not copy mclaw_skill metadata or skill_evolution memory into this field; "
+                        "the service owns metadata, and experience uses initial_evolution/evolution_update."
                     ),
                 },
                 "short_description": {
@@ -250,7 +260,7 @@ SKILL_MANAGE_SCHEMA = {
                 "new_text": {"type": "string", "description": "Replacement text for patch."},
                 "source": {
                     "type": "string",
-                    "description": "skills.sh, GitHub, ClawHub, or local Skill folder source.",
+                    "description": "skills.sh, SkillHub.cn, GitHub, ClawHub, or local Skill folder source.",
                 },
                 "user_intent": {
                     "type": "string",

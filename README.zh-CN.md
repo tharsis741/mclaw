@@ -1,11 +1,12 @@
 <p align="center">
-  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
+  <img src="webui/public/mclaw-wordmark-fold.svg" alt="M-CLAW" width="360">
 </p>
 
 <h2 align="center">自进化具身智能体运行时<br>Self-Evolving Embodied Agent Harness</h2>
 
 <p align="center">
   <a href="#安装与启动">快速开始</a> ·
+  <a href="#更新">版本更新</a> ·
   <a href="#能力概览">功能</a> ·
   <a href="docs/manual/README.md">操作手册</a> ·
   <a href="#智能体循环">架构</a> ·
@@ -13,7 +14,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.1.1-2f80ed">
+  <img alt="version" src="https://img.shields.io/badge/version-1.1.2-2f80ed">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-green">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Kaihong%20OS%20%7C%20M--Robots%20OS-6f42c1">
@@ -21,13 +22,16 @@
 
 **M-CLAW 是 M-Robots OS 原生的具身智能体运行时，面向异构多机协同场景，打通模型与物理世界的执行桥梁。**
 
-**以 Agent Harness 为核心，将空间上下文认知与记忆、工具与 Skill调用、安全设备控制、和协作任务按需组织为统一的智能体运行闭环；依托 M-Robots OS 的 M-DDS 带来的设备协同能力，支持“一机一脑、多脑协同”的分布式智能架构。**
+**以 Agent Harness 为核心，将空间上下文认知与记忆、智能体工具与 Skill调用、安全设备控制、和多智能体协作组织为统一的智能体运行闭环；依托 M-Robots OS 的 M-DDS 带来的设备协同能力，支持“一机一脑、多脑协同”的分布式智能架构。**
 
-> 当前版本：1.1.1<br>
+![M-Claw 1.1.2 在 Kaihong BotBook 上的主界面](docs/assets/snapshot/kaihong-overview.png)
+
+<p align="center"><em>M-CLAW Version 1.1.2 Overview</em></p>
+
+> 当前版本：1.1.2<br>
 > 开源协议：Apache-2.0<br>
-> 当前安装方式：从源码安装
-
-> 📖 **完整用户指南：** [M-Claw 操作手册](docs/manual/README.md) — 按功能查看设计说明、操作步骤、内置指令、示例提示词和平台限制。
+> 当前安装方式：从源码安装<br>
+> 📖 [M-CLAW 用户手册](docs/manual/README.md)
 
 ## Roadmap
 
@@ -45,13 +49,13 @@
 - 控制模块（小脑）：负责高频、稳定、实时的动作执行。
 
 
-### 2026.10 | **1.2.0 Mycelium 具身智能平台与 Skill 生态管理**
+### 2026.11 | **1.2.0 具身智能平台与 Skill 生态管理**
 
-构建统一任务控制平台（Mycelium Control Panel），实现对机器人、设备、Skill 与执行任务的集中调度与生命周期管理，使任务从“单次执行”升级为“可持续调度与可演化任务流”。
+构建具身智能平台（Mycelium Control Panel），实现对机器人、设备、Skill 与执行任务的集中调度与生命周期管理，使任务从“单次执行”升级为“可持续调度与可演化任务流”。
 
 同时推出 Skill Hub 生态系统，支持 Skill 的发布、安装、更新与复用，使 M-CLAW 从执行运行时扩展为具备开发者生态的具身智能基础设施。
 
-### 2026.12 | **2.0.0 空间智能体运行时**
+### 2027.2 | **2.0.0 空间智能体运行时**
 
 统一时空上下文，统一设备能力语义、实现异构多机协同，M-CLAW 将演进为M-Robots OS的具身智能底座，使系统能够在统一空间表示下理解环境状态、维护位置记忆，并在多机器人与多设备之间进行任务协调与执行编排。
 
@@ -63,9 +67,9 @@
 - 安全执行能力：模型仅生成预备动作执行提案，由独立控制边界审计后决定真实执行
 
 
-## 当前能力（1.1.0版本）
+## 当前能力
 
-**当前版本已在M-Robots OS / Kaihong OS 上形成多设备智能体协作运行闭环。智能体可以在本设备完成模型推理和工具编排，也可以通过分布式软总线调用其他可信设备上的 M-Claw Agent。**
+**当前版本已在M-Robots OS / Kaihong OS 上形成多设备智能体协作运行闭环。智能体可以在本设备完成模型推理和工具编排，也可以通过 M-DDS 自主调用其他已配对设备上的 M-Claw进行复杂任务协作。**
 
 运行时包含：
 
@@ -80,9 +84,9 @@
 当前已经包含以下智能体工具和运行时能力：
 
 - **21 个基础工具**：默认工具集，覆盖凭据授权、文件读写、终端、记忆、Skill、历史会话检索和子代理委派。
-- **13 个可选工具**：覆盖联网搜索、网页提取、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
+- **21 个可选工具**：覆盖联网搜索、网页提取、视觉分析、浏览器自动化、微信和钉钉通道发送能力。
 - **可信设备协作工具**：在 M-Robots OS/Kaihong OS 上提供 4 个设备协作入口工具，并在远端任务中按上下文提供 5 个结果返回、补充输入和源文件按需获取工具。
-- **22 个内置命令**：包括动态模型切换、搜索/提取后端切换、语音输入、查看历史会话、操作回退、定时任务、Skill 管理和运行环境诊断；M-Robots OS/Kaihong OS 激活可信设备协作后增加 `/devices`、`/pair`、`/unpair` 3 个设备管理命令。
+- **功能管理**：通过对话、设备、定时任务、工具、技能、技能市场和设置完成日常操作；对话输入框提供[斜杠快捷操作](docs/manual/对话.md#斜杠快捷操作)，用于新建会话、查找历史和选择模型，执行中的任务通过对应按钮控制。
 
 - **三层记忆体系**：会话级记忆、长期记忆和 Skill 级运行/优化记忆。
 - **操作系统运行时适配**：针对不同操作系统的运行时适配。
@@ -142,18 +146,18 @@
 | 工具集 | 工具 | 能力 |
 | --- | --- | --- |
 | web | `web_search`, `web_extract` | 搜索互联网并返回答案与来源；提取指定网页的正文。 |
-| vision | `vision_analyze` | 使用 Qwen 视觉模型分析 URL 或本地图片。 |
-| browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download` | 打开网页并执行点击、输入、滚动、截图和下载等操作。 |
+| vision | `vision_analyze` | 使用当前模型或专用视觉模型分析图片，以 models.dev 判断图片输入能力。 |
+| browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download`, `browser_tabs`, `browser_select`, `browser_check`, `browser_hover`, `browser_upload`, `browser_handle_dialog`, `browser_wait_for`, `browser_back` | 页面与标签页交互、表单、上传下载、弹窗响应、条件等待和截图。 |
 | weixin | `weixin_send_file` | 在当前微信会话中发送文件。 |
 | dingtalk | `dingtalk_send_file` | 在当前钉钉会话中发送文件。 |
 
-网页搜索支持 Tavily 和 Qwen。可使用 `/search-backend dashscope|tavily|auto` 查看或切换搜索后端。
+网页搜索支持 Tavily 和 Qwen。在“工具 → 网页搜索”中选择服务来源并配置凭据。
 
-网页提取支持 Trafilatura、Tavily 和 Firecrawl。可使用 `/extract-backend trafilatura|tavily|firecrawl` 查看或切换当前后端。
+网页提取支持 Trafilatura、Tavily 和 Firecrawl。在“工具 → 网页读取”中选择服务来源并保存设置。
 
 ### 可信设备协作工具集
 
-可信设备协作只在 M-Robots OS/Kaihong OS 的 `KaihongRuntime` 提供。用户在 Setup 流程中启用该能力且运行环境校验通过后，M-Claw 会向本机 Agent 加入以下工具：
+可信设备协作只在 M-Robots OS/Kaihong OS 的 `KaihongRuntime` 提供。在“设备”页面开启“M-Claw 协同”且运行环境校验通过后，M-Claw 会向本机 Agent 加入以下工具：
 
 | 工具集 | 工具 | 能力 |
 | --- | --- | --- |
@@ -218,9 +222,9 @@ CheckpointManager 使用单个共享 shadow git store，在文件写入、patch�
 
 ### Rollback
 
-RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可同步回滚会话上下文。 内置命令提供 `/rollback` 和 `/checkpoints` 命令查看、预览、撤销和恢复变更。
+RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可同步回滚会话上下文。在会话顶部的“变更”中查看差异、撤销或恢复文件操作；在“设置 → 任务执行 → 文件恢复”中管理恢复记录的保存策略。
 
-### **M-Claw 1.1.0 不提供安全沙箱或权限分级。**
+M-Claw 使用当前操作系统用户的权限执行任务，不提供安全沙箱或权限分级。
 
 ## 系统运行时适配
 
@@ -234,134 +238,150 @@ RollbackCoordinator 基于操作日志恢复文件、创建冲突备份，并可
 
 可信设备协作是 M-Robots OS/Kaihong OS 的专属系统能力。系统需要具备受支持的 ARM64 OpenHarmony 运行环境、DSoftBus 系统组件和对应运行权限。
 
-用户在 Setup 中启用“可信设备协作”且环境校验通过后，M-Claw 才会启动 DSoftBus Runtime、加载协作工具，并显示 `/devices`、`/pair`、`/unpair`内置指令。
+在“设备”页面开启“M-Claw 协同”，环境校验通过后即可搜索、配对并管理可信设备。M-Claw 根据协同运行状态加载设备协作工具。
 
 ## 通道、语音与定时任务
 
-M-Claw 支持以下交互入口：
+M-Claw 通过以下方式接收任务并返回结果：
 
-- **CLI/TUI**：基于 Rich 与 prompt_toolkit 终端交互入口。
-- **Voice Input**：通过 Qwen realtime ASR 接入语音输入，支持 wake word 和 push-to-talk 两种模式。
-- **Weixin / DingTalk Channels**：通过 channel runner 将外部消息映射到 M-Claw session，并把结果发回对应通道。
+- **对话**：提交任务、查看过程与结果，通过输入区按钮补充、停止或继续任务。
+- **语音输入**：在“设置 → 常规 → 语音输入”中完成配置，通过对话输入框的麦克风录音，检查转写草稿后发送。
+- **微信与钉钉**：在“设置 → 消息渠道”中配置和连接，接收对应聊天的任务，并将结果返回原会话。
+- **定时任务**：在“定时任务”中创建执行计划，选择结果保存或投递的位置，查看每次运行记录。
 
 
 ## 终端命令入口
 
 ```bash
-mclaw                         # 启动Agent Runtime
+mclaw                         # 启动或复用本机后台，并打开 M-Claw
+mclaw status                  # 查看服务地址与进程号
+mclaw stop                    # 保存进展、等待工具收尾并停止本机后台
+mclaw cli                     # 进入终端交互界面
 mclaw setup                   # 首次配置
 mclaw doctor                  # 检查核心运行时、工具能力和 IM 通道状态
 mclaw help                    # 查看命令指引
-mclaw resume                  # 恢复最近一次会话
-mclaw resume <session_id>     # 按会话 ID 或前缀恢复会话
-mclaw weixin login            # 微信 iLink Bot 扫码登录
-mclaw weixin                  # 启动微信私聊网关
-mclaw dingtalk login          # 配置钉钉 Stream 网关凭据
-mclaw dingtalk                # 启动钉钉 Stream 网关
 ```
 
 ## 安装与启动
 
-**当前以源码形式分发**
+### Windows
 
-### Windows / Linux
+必须安装 [Python 3.11+](https://www.python.org/downloads/windows/)、[Git](https://git-scm.com/downloads/win) 和 [Node.js 22.12+（npm 10+）](https://nodejs.org/en/download)
 
-#### 步骤一：安装Git
-
-如果 Windows 主机尚未安装 Git，请以下方式安装：
-
-- 官方下载：[git-scm.com/download/win](https://git-scm.com/download/win)
-- 国内镜像：[华为云 Git for Windows 镜像](https://mirrors.huaweicloud.com/git-for-windows/)
-
-如果 Linux 主机尚未安装 Git，请以下方式安装：
-```bash
-sudo apt update
-sudo apt install -y git
-```
-
-安装完成后确认 Git 可用：
-
-```powershell
-git --version
-```
-
-#### 步骤二：拉取源码并安装M-CLAW
-
-从官方库拉取源码
 ```powershell
 git clone https://gitcode.com/m-robots/mclaw.git
-```
-
-在源码目录执行安装：
-
-```powershell
-cd 源码目录路径
-pip install -e .
-```
-
-安装浏览器自动化运行时：
-
-```powershell
-# Windows
-python -m playwright install chromium
-```
-
-```bash
-# Linux
-python -m playwright install --with-deps chromium
-```
-
-#### 步骤三：进入初始化设置流程
-首次配置：
-
-```powershell
-mclaw setup
-```
-
-#### 步骤四：首次启动M-CLAW
-启动命令：
-
-```powershell
+cd mclaw
+python -m pip install -e .
+npm --prefix webui ci
+npm --prefix webui run build
 mclaw
 ```
 
-#### 后续 M-Claw 更新：
+首次启动按页面提示完成配置。以后直接运行 `mclaw`，停止后台使用 `mclaw stop`。
+
+### Kaihong OS / M-Robots OS
+
+运行设备需要 Python 3.11+。
+开发电脑需要 Git、Node.js 22.12+（npm 10+）和 [HDC](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/dfx/hdc.md)。
+运行时前端产物在开发电脑中构建。
+
+**1. 在电脑下载源码并构建前端。**
 
 ```powershell
-# 首先退出正在运行的 M-Claw
-git status --porcelain
+git clone https://gitcode.com/m-robots/mclaw.git
+cd mclaw
+npm --prefix webui ci
+npm --prefix webui run build
+```
+
+**2. 将源码和构建资源传入设备。**
+
+把以下文件和目录复制到电脑的 `C:\deploy\mclaw`：
+
+```text
+mclaw/
+├── pyproject.toml
+├── README.zh-CN.md
+├── LICENSE
+├── THIRD_PARTY_NOTICES.md
+├── ACKNOWLEDGEMENTS.md
+└── mclaw/                    # 完整 Python 包，包含构建后的 web/static/
+```
+
+在电脑 PowerShell 中执行：
+
+```powershell
+hdc file send C:\deploy\mclaw /data/local/tmp/
+hdc shell
+```
+
+**3. 在设备安装并启动。**
+
+```sh
+cd /data/local/tmp/mclaw
+run python3 -m pip install -e .
+run mclaw
+```
+
+首次启动按页面提示配置，也可运行 `run mclaw setup` 在终端配置。以后使用 `run mclaw` 启动、`run mclaw stop` 停止后台。安装后保留原源码目录。
+
+### 可选：浏览器自动化
+
+需要让 Agent 操作浏览器时，在 Windows 的原 Python 环境、源码目录中安装：
+
+```powershell
+python -m pip install -e ".[browser]"
+python -m playwright install chromium
+```
+
+更多操作见[用户手册](docs/manual/README.md)，常见问题见[故障排查](docs/manual/故障排查.md)。
+
+## 更新
+
+### Windows
+
+在原源码目录、原 Python 环境中执行：
+
+```powershell
+mclaw stop
 git pull --ff-only
-pip install -e .
+python -m pip install -e .
+npm --prefix webui ci
+npm --prefix webui run build
+mclaw
 ```
 
 ### Kaihong OS / M-Robots OS
 
-将源码下载或解压到设备上路径，进入源码根目录后安装：
+**1. 在电脑的原源码目录更新并构建。**
 
-```bash
+```powershell
+git pull --ff-only
+npm --prefix webui ci
+npm --prefix webui run build
+```
+
+**2. 在设备停止后台。**
+
+```sh
+run mclaw stop
+```
+
+**3. 覆盖设备原目录中的源码和构建资源。** 按安装步骤更新电脑的 `C:\deploy\mclaw`，包含本次构建的完整 `mclaw/web/static/`，再从电脑传入：
+
+```powershell
+hdc file send C:\deploy\mclaw /data/local/tmp/
+```
+
+**4. 在设备原源码目录更新依赖并启动。**
+
+```sh
+cd /data/local/tmp/mclaw
 run python3 -m pip install -e .
-```
-
-
-首次配置：
-
-```bash
-run mclaw setup
-```
-
-启动命令：
-
-```bash
 run mclaw
 ```
 
-### 要求：
-
-- Python 3.11 或更新版本。
-- Windows/Linux 桌面环境需要安装 Git，并确保 `git` 已加入 `PATH`。源码获取、版本管理以及 Checkpoint/Rollback 会使用 Git；未安装时 checkpoint 能力会被禁用。Kaihong OS/M-Robots OS当前禁用 checkpoint，不要求安装 Git。
-- 如需使用浏览器自动化工具，需要安装 Playwright 管理的 Chromium。
-- 安装完成后可运行 `mclaw doctor` 验证核心运行时、工具能力和 IM 通道状态。
-- 部分内置 Skill 可能在首次使用时，按需安装额外工具链。
+更新沿用原配置和应用数据。备份、恢复与更新后的检查见[更新与数据恢复](docs/manual/更新与数据恢复.md)。
 
 ## 开发者生态
 

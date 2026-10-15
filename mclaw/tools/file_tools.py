@@ -17,6 +17,14 @@ from pathlib import Path
 
 from mclaw.tools import file_operations as ops
 from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.file_concurrency import (
+    FileVersionConflict,
+    file_session,
+    file_version,
+    locked_target,
+    remember_version,
+    version_is_current,
+)
 from mclaw.tools.interrupt import get_interrupt_event
 from mclaw.tools.registry import registry, tool_error
 from mclaw.constants import get_skills_dir
@@ -115,6 +123,53 @@ def read_file_tool(
     task_id: str = "default",
     max_chars: int | None = None,
 ) -> str:
+    """Return file text and associate the delivered version with this session."""
+    from mclaw.tools.read_tracker import reset_file_dedup
+
+    cancel_event = get_interrupt_event()
+    try:
+        target = ops._checked_path(path, "read")
+        with file_session(task_id if task_id != "default" else None):
+            with locked_target(target, cancel_event):
+                version = file_version(target, cancel_event)
+                if not version_is_current(target, version):
+                    # mtime-only read dedup must not suppress a required reread,
+                    # including external writes that preserve size and mtime.
+                    reset_file_dedup(task_id)
+                if version is None:
+                    remember_version(target, None)
+                result = _read_file_tool_locked(path, offset, limit, task_id, max_chars)
+                parsed = json.loads(result)
+                if "error" not in parsed:
+                    if version != file_version(target, cancel_event):
+                        raise FileVersionConflict(target)
+                    remember_version(target, version)
+                return result
+    except FileVersionConflict as exc:
+        return _version_conflict_result(exc)
+    except InterruptedError as exc:
+        return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
+    except OSError as exc:
+        return json.dumps({"error": str(exc)}, ensure_ascii=False)
+
+
+def _version_conflict_result(exc: FileVersionConflict) -> str:
+    return tool_error(
+        str(exc),
+        success=False,
+        code="FILE_VERSION_CONFLICT",
+        path=exc.path,
+        requires_reread=True,
+    )
+
+
+def _read_file_tool_locked(
+    path: str,
+    offset: int,
+    limit: int | None,
+    task_id: str,
+    max_chars: int | None,
+) -> str:
     """Read a file with optional character offset and limit.
 
     Args:
@@ -142,7 +197,7 @@ def read_file_tool(
         if limit is None:
             # Probe whether the remaining content exceeds the hard safety cap.
             probe_limit = hard_limit + 1
-            content = ops.read_file(path, offset=offset, limit=probe_limit)
+            content = ops.read_file(path, offset=offset, limit=probe_limit, record_version=False)
 
             if len(content) > hard_limit:
                 return json.dumps({
@@ -174,7 +229,7 @@ def read_file_tool(
         else:
             # Model supplied an explicit limit — respect it but never exceed the hard cap.
             effective_limit = min(limit, hard_limit)
-            content = ops.read_file(path, offset=offset, limit=effective_limit)
+            content = ops.read_file(path, offset=offset, limit=effective_limit, record_version=False)
 
             result = {
                 "content": content,
@@ -208,6 +263,8 @@ def read_file_tool(
 
         return json.dumps(result, ensure_ascii=False)
 
+    except (FileVersionConflict, InterruptedError):
+        raise
     except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -247,6 +304,8 @@ def write_file_tool(path: str, content: str) -> str:
         }, ensure_ascii=False)
     except InterruptedError as exc:
         return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
+    except FileVersionConflict as exc:
+        return _version_conflict_result(exc)
     except OSError as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -274,6 +333,8 @@ def patch_tool(path: str, old_str: str, new_str: str) -> str:
         return json.dumps({"path": patched}, ensure_ascii=False)
     except InterruptedError as exc:
         return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
+    except FileVersionConflict as exc:
+        return _version_conflict_result(exc)
     except (OSError, ValueError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -303,6 +364,8 @@ def edit_file_tool(path: str, old_block: str, new_block: str) -> str:
         return json.dumps({"path": edited}, ensure_ascii=False)
     except InterruptedError as exc:
         return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
+    except FileVersionConflict as exc:
+        return _version_conflict_result(exc)
     except (OSError, ValueError) as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -321,6 +384,8 @@ def delete_file_tool(path: str) -> str:
         return json.dumps({"path": deleted, "deleted": True}, ensure_ascii=False)
     except InterruptedError as exc:
         return tool_error(str(exc), success=False, status="cancelled", interrupted=True)
+    except FileVersionConflict as exc:
+        return _version_conflict_result(exc)
     except OSError as e:
         return json.dumps({"error": str(e), "success": False}, ensure_ascii=False)
 
@@ -599,28 +664,36 @@ def _handle_read_file(args: dict, **kw) -> str:
     )
 
 def _handle_write_file(args: dict, **kw) -> str:
-    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
-    return write_file_tool(path=path, content=args.get("content", ""))
+    parent_agent = kw.get("parent_agent")
+    path = _resolve_agent_path(args.get("path", ""), parent_agent)
+    with file_session(getattr(parent_agent, "session_id", None)):
+        return write_file_tool(path=path, content=args.get("content", ""))
 
 def _handle_patch(args: dict, **kw) -> str:
-    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
-    return patch_tool(
-        path=path,
-        old_str=args.get("old_str", ""),
-        new_str=args.get("new_str", ""),
-    )
+    parent_agent = kw.get("parent_agent")
+    path = _resolve_agent_path(args.get("path", ""), parent_agent)
+    with file_session(getattr(parent_agent, "session_id", None)):
+        return patch_tool(
+            path=path,
+            old_str=args.get("old_str", ""),
+            new_str=args.get("new_str", ""),
+        )
 
 def _handle_edit_file(args: dict, **kw) -> str:
-    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
-    return edit_file_tool(
-        path=path,
-        old_block=args.get("old_block", ""),
-        new_block=args.get("new_block", ""),
-    )
+    parent_agent = kw.get("parent_agent")
+    path = _resolve_agent_path(args.get("path", ""), parent_agent)
+    with file_session(getattr(parent_agent, "session_id", None)):
+        return edit_file_tool(
+            path=path,
+            old_block=args.get("old_block", ""),
+            new_block=args.get("new_block", ""),
+        )
 
 def _handle_delete_file(args: dict, **kw) -> str:
-    path = _resolve_agent_path(args.get("path", ""), kw.get("parent_agent"))
-    return delete_file_tool(path=path)
+    parent_agent = kw.get("parent_agent")
+    path = _resolve_agent_path(args.get("path", ""), parent_agent)
+    with file_session(getattr(parent_agent, "session_id", None)):
+        return delete_file_tool(path=path)
 
 def _handle_search_files(args: dict, **kw) -> str:
     directory = _resolve_agent_path(args.get("directory", ""), kw.get("parent_agent"))

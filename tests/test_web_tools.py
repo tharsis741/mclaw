@@ -65,37 +65,13 @@ def test_model_facing_web_tool_contracts_are_small_and_distinct() -> None:
 
 def test_browser_definition_reserves_browser_for_interaction_and_visual_inspection() -> None:
     definitions = {item["name"]: item["description"] for item in browser_tool._BROWSER_TOOLS}
-    assert definitions == {
-        "browser_navigate": (
-            "Navigate to a URL in the interactive browser. Initializes the session, loads "
-            "the page, and returns a compact snapshot of the current viewport with element "
-            "refs. For information "
-            "retrieval, prefer web_search or web_extract. Use browser tools when you need to "
-            "interact with a page, such as clicking or filling forms. Call browser_navigate "
-            "before browser tools that act on or inspect the current page; browser_snapshot "
-            "is not needed immediately after navigation."
-        ),
-        "browser_snapshot": (
-            "Refresh the compact snapshot of the current viewport and its element refs."
-        ),
-        "browser_screenshot": "Save a full-page screenshot and return its file path.",
-        "browser_click": (
-            "Click an element by ref and return the updated current-viewport snapshot."
-        ),
-        "browser_type": (
-            "Set an input's text by ref and return the updated current-viewport snapshot."
-        ),
-        "browser_scroll": (
-            "Scroll the current page and return a compact snapshot of the new viewport."
-        ),
-        "browser_press": (
-            "Press a keyboard key and return the updated current-viewport snapshot."
-        ),
-        "browser_download": (
-            "Download from ref if provided, otherwise from url; with neither, return the latest "
-            "captured download."
-        ),
-    }
+    assert "prefer web_search or web_extract" in definitions["browser_navigate"]
+    assert "latest returned snapshot" in definitions["browser_navigate"]
+    assert "Replaces all earlier element refs" in definitions["browser_snapshot"]
+    assert "BEFORE triggering" in definitions["browser_handle_dialog"]
+    assert "Unconfigured dialogs are dismissed" in definitions["browser_handle_dialog"]
+    assert "automatic upload" in definitions["browser_upload"]
+    assert "exactly one of text" in definitions["browser_wait_for"]
     assert BROWSER_TOOLS == list(definitions)
     assert all("JavaScript" not in description for description in definitions.values())
     assert next(
@@ -132,12 +108,20 @@ def test_model_facing_web_browser_index_is_capability_only() -> None:
         "web_extract": "Extract content from known public URLs",
         "browser_navigate": "Navigate the interactive browser to a URL",
         "browser_snapshot": "Refresh the current viewport snapshot and element refs",
-        "browser_screenshot": "Save a full-page screenshot",
+        "browser_screenshot": "Save a full-page or viewport screenshot",
         "browser_click": "Click an element by snapshot ref",
         "browser_type": "Set text in an input by snapshot ref",
         "browser_scroll": "Scroll the current page",
         "browser_press": "Press a keyboard key on the current page",
         "browser_download": "Download a file by URL or snapshot ref",
+        "browser_tabs": "List, create, select, or close browser tabs",
+        "browser_select": "Select native dropdown options by value",
+        "browser_check": "Set a checkbox or radio button state",
+        "browser_hover": "Hover over an element by snapshot ref",
+        "browser_upload": "Choose local files for a page upload",
+        "browser_handle_dialog": "Set the response for the next browser dialog",
+        "browser_wait_for": "Wait for page text or an element to appear or disappear",
+        "browser_back": "Go back in the selected tab's history",
     }
 
     assert {
@@ -164,7 +148,7 @@ def test_delegated_web_tools_keep_the_web_content_safety_boundary() -> None:
 def test_enabled_skill_prompts_use_current_web_tool_names() -> None:
     skills_root = Path(__file__).parents[1] / "mclaw" / "skills"
     prompt_files = [skills_root / "hv-analysis" / "SKILL.md"]
-    prompt_files.extend((skills_root / "popular-web-designs").rglob("*.md"))
+    prompt_files.extend((skills_root / "design-taste-frontend").rglob("*.md"))
     text = "\n".join(path.read_text(encoding="utf-8") for path in prompt_files)
 
     assert "WebSearch" not in text
@@ -464,7 +448,7 @@ def test_setup_selects_web_search_and_extract_independently(monkeypatch) -> None
 
     assert capability_ids[:2] == ["web_extract", "web_search"]
     assert capability_descriptions["web_extract"] == (
-        "使用 Trafilatura、Tavily 或 Firecrawl 提取网页正文。"
+        "读取链接里的正文，方便总结和整理资料。"
     )
     assert config["toolsets"] == ["mclaw-required", "web"]
     assert config["tools"]["disabled"] == ["web_search"]
@@ -527,8 +511,8 @@ def test_setup_reuses_tavily_key_from_extract_for_search(monkeypatch) -> None:
     assert config["auxiliary"]["web_extract"]["backend"] == "tavily"
     assert config["auxiliary"]["web_search"]["backend"] == "tavily"
     assert [title for title, _items, _kwargs in menus] == [
-        "M-Claw 网页提取后端",
-        "M-Claw 网页搜索后端",
+        "网页提取服务",
+        "网页搜索服务",
     ]
     extract_items = menus[0][1]
     assert [item["id"] for item in extract_items] == ["trafilatura", "tavily", "firecrawl"]
@@ -665,7 +649,7 @@ def test_setup_web_search_does_not_skip_tavily_when_qwen_key_exists(monkeypatch)
         Colors=colors,
     )
 
-    assert menu["title"] == "M-Claw 网页搜索后端"
+    assert menu["title"] == "网页搜索服务"
     assert menu["kwargs"]["default_selected"] == ["tavily", "dashscope"]
     assert requested == [["TAVILY_API_KEY"]]
     assert authorized == [
@@ -744,13 +728,14 @@ def test_setup_qwen_features_report_reused_qwen_credentials(monkeypatch) -> None
             print_plain=lambda text="": output.append(text),
             color=lambda text, *_styles: text,
             Colors=colors,
+            config={"auxiliary": {"vision": {"mode": "auxiliary", "provider": "qwen"}}},
         )
 
     assert authorized == [
         ("tool:vision_analyze", ["DASHSCOPE_API_KEY"]),
         ("runtime:asr", ["DASHSCOPE_API_KEY"]),
     ]
-    assert any("视觉分析: 已检测到" in line and "Qwen 凭据" in line for line in output)
+    assert any("视觉分析: 已检测到" in line and "供应商凭据" in line for line in output)
     assert any("语音输入: 已检测到" in line and "Qwen 凭据" in line for line in output)
 
 
@@ -825,9 +810,9 @@ def test_setup_configures_selected_capabilities_in_order_with_qwen_intl(monkeypa
     cli_main._run_setup_capability_selection(config)
 
     assert prompt_titles == [
-        "M-Claw 可选能力",
-        "M-Claw IM 交互配置",
-        "M-Claw 语音输入",
+        "可选能力",
+        "消息渠道",
+        "语音输入",
     ]
     assert actions == [
         "web_extract",

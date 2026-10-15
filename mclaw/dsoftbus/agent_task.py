@@ -47,6 +47,16 @@ from .task_files import (
 )
 from .a2a_media import task_input_manifest_from_parts
 from .task_store import DsoftbusTaskStore, TaskStoreError
+from .task_result import (
+    TEXT_RESULT_CAPABILITY,
+    TaskResultValidationError,
+    continuation_history,
+    prepare_history,
+    result_diagnostics,
+    select_text_result,
+    text_result_limit,
+    validate_final_response,
+)
 from .task_input_request import (
     TaskInputRequestError,
     normalize_input_request,
@@ -1064,40 +1074,20 @@ class DsoftbusTaskDispatcher:
             self._fail("CAPACITY_BUSY")
 
     @staticmethod
-    def _validate_history(value: Any) -> tuple[list[dict[str, Any]], int]:
-        if not isinstance(value, (tuple, list)) or any(
-            not isinstance(item, Mapping) for item in value
-        ):
-            raise AgentMessageError("INVALID_AGENT_RESPONSE")
-        try:
-            raw = _canonical(value)
-            history = json.loads(raw)
-        except (AgentMessageError, json.JSONDecodeError) as error:
-            raise AgentMessageError("INVALID_AGENT_RESPONSE") from error
-        while (
-            len(history) > protocol.REMOTE_CONTEXT_MESSAGE_MAX
-            or len(raw) > protocol.REMOTE_CONTEXT_UTF8_MAX
-        ):
-            assistant_index = next(
-                (
-                    index
-                    for index, item in enumerate(history)
-                    if item.get("role") == "assistant"
-                    and any(
-                        prior.get("role") == "user"
-                        for prior in history[:index]
-                    )
-                ),
-                None,
+    def _validate_history(
+        value: Any, *, task_id: str = ""
+    ) -> tuple[list[dict[str, Any]], int]:
+        history = prepare_history(value)
+        if len(history.messages) != history.original_message_count:
+            logger.info(
+                "Remote task context compacted task_id=%s messages=%s->%s bytes=%s->%s",
+                task_id,
+                history.original_message_count,
+                len(history.messages),
+                history.original_byte_length,
+                history.byte_length,
             )
-            if assistant_index is None:
-                raise AgentMessageError("INVALID_AGENT_RESPONSE")
-            del history[: assistant_index + 1]
-            try:
-                raw = _canonical(history)
-            except AgentMessageError as error:
-                raise AgentMessageError("INVALID_AGENT_RESPONSE") from error
-        return history, len(raw)
+        return history.messages, history.byte_length
 
     async def _ensure_history_capacity(
         self,
@@ -1254,7 +1244,7 @@ class DsoftbusTaskDispatcher:
 
         task_id = _uuid4(task.get("id"), "taskId")
         context_id = _uuid4(task.get("contextId"), "contextId")
-        history, history_bytes = self._validate_history(wait.get("history"))
+        history, history_bytes = self._validate_history(wait.get("history"), task_id=task_id)
         system_context = wait.get("systemContext", "")
         if not isinstance(system_context, str) or len(
             system_context.encode("utf-8")
@@ -1667,6 +1657,10 @@ class DsoftbusTaskDispatcher:
         user_message = _plain(call.params["message"])
         history = [*record.task.get("history", ()), user_message]
         history = history[-protocol.TASK_HISTORY_MAX :]
+        metadata = dict(record.task.get("metadata", {}))
+        metadata.pop(TEXT_RESULT_CAPABILITY, None)
+        if self._workspace is not None:
+            metadata.update(select_text_result(user_message.get("metadata")))
         task = build_task(
             task_id=record.task_id,
             context_id=record.context_id,
@@ -1674,7 +1668,7 @@ class DsoftbusTaskDispatcher:
             history=history,
             artifacts=record.task.get("artifacts", ()),
             status_message=record.task["status"].get("message"),
-            metadata=record.task.get("metadata", {}),
+            metadata=metadata,
         )
         self._save_task(record, task)
         updated_wait = {
@@ -1834,6 +1828,7 @@ class DsoftbusTaskDispatcher:
                 "mclaw.requestMessageId": message_id,
                 "mclaw.peerRuntimeInstanceId": peer_runtime_instance_id,
                 "mclaw.requestDigest": digest,
+                **(select_text_result(user_message.get("metadata")) if self._workspace is not None else {}),
             },
         )
         item_bytes = len(_canonical({"task": task, "text": text, "history": history}))
@@ -2239,7 +2234,7 @@ class DsoftbusTaskDispatcher:
         except TaskInputRequestError as error:
             raise AgentMessageError("INVALID_AGENT_RESPONSE") from error
         normalized_history, history_bytes = self._validate_history(
-            raw.get("messages")
+            raw.get("messages"), task_id=record.task_id
         )
         await self._ensure_history_capacity(
             record.conversation_key,
@@ -2375,11 +2370,16 @@ class DsoftbusTaskDispatcher:
         *,
         state: str,
         failure_reason: str = "",
+        failure_details: Mapping[str, Any] | None = None,
     ) -> None:
         self._close_source_client(record)
         metadata = dict(record.task.get("metadata", {}))
+        failure_metadata: dict[str, Any] = {}
         if failure_reason:
-            metadata["mclaw.failureReason"] = failure_reason
+            failure_metadata["mclaw.failureReason"] = failure_reason
+        if failure_details:
+            failure_metadata["mclaw.failureDetails"] = dict(failure_details)
+        metadata.update(failure_metadata)
         task = build_task(
             task_id=record.task_id,
             context_id=record.context_id,
@@ -2404,11 +2404,7 @@ class DsoftbusTaskDispatcher:
                 task_id=record.task_id,
                 context_id=record.context_id,
                 state=state,
-                metadata=(
-                    {"mclaw.failureReason": failure_reason}
-                    if failure_reason
-                    else None
-                ),
+                metadata=failure_metadata or None,
             ),
         )
         self._close_streams(record)
@@ -2439,13 +2435,9 @@ class DsoftbusTaskDispatcher:
                 failure_reason=reason,
             )
             return
-        text = raw.get("final_response")
-        if raw.get("completed") is not True or not isinstance(text, str) or not text:
-            raise AgentMessageError("INVALID_AGENT_RESPONSE")
-        if len(text.encode("utf-8")) > 24_576:
-            raise AgentMessageError("INVALID_AGENT_RESPONSE")
+        text = validate_final_response(raw, maximum=text_result_limit(record.task.get("metadata")))
         normalized_history, history_bytes = self._validate_history(
-            raw.get("messages")
+            continuation_history(raw.get("messages"), text, record.task_id), task_id=record.task_id
         )
         await self._ensure_history_capacity(
             record.conversation_key,
@@ -2462,6 +2454,15 @@ class DsoftbusTaskDispatcher:
                 "mclaw.artifactRole": "final-response",
             },
         }
+        # Escaping can be much larger than UTF-8. Keep both replay and stream frames small.
+        if (TEXT_RESULT_CAPABILITY in record.task.get("metadata", {})
+                and len(_canonical({"text": text})) > 8192):
+            try:
+                result_artifact = self._store.create_text_result(
+                    record.peer_device_id, record.task_id, result_artifact, text,
+                )
+            except TaskStoreError as error:
+                raise AgentMessageError("INTERNAL_ERROR") from error
         artifacts: list[Mapping[str, Any]] = [
             *record.task.get("artifacts", ()),
             result_artifact,
@@ -2528,9 +2529,11 @@ class DsoftbusTaskDispatcher:
             "contextId": record.context_id,
             "taskId": record.task_id,
             "role": "ROLE_AGENT",
-            "parts": [{"text": text}],
+            "parts": _plain(result_artifact["parts"]),
             "metadata": {"mclaw.requestMessageId": record.message_id},
         }
+        if result_artifact.get("extensions"):
+            agent_message["extensions"] = list(result_artifact["extensions"])
         history = (
             list(record.task.get("history", ())) + [agent_message]
         )[-protocol.TASK_HISTORY_MAX :]
@@ -2615,6 +2618,7 @@ class DsoftbusTaskDispatcher:
             ),
             source_client=record.source_client,
             event_sink=lambda event: self._agent_event(record, event),
+            reply_bytes_max=text_result_limit(record.task.get("metadata")),
         )
         estimate = self._executor.estimate_budget(request)
         self._reserve_tokens(estimate)
@@ -2669,20 +2673,29 @@ class DsoftbusTaskDispatcher:
         finally:
             self._execution_active -= 1
         if not isinstance(raw, Mapping):
+            details = result_diagnostics(raw, TaskResultValidationError("result_format"))
+            logger.warning("Remote task result rejected task_id=%s details=%s", record.task_id, details)
             await self._mark_terminal(
                 record,
                 state="TASK_STATE_FAILED",
                 failure_reason="INVALID_AGENT_RESPONSE",
+                failure_details=details,
             )
             return
         self._settle_tokens(record, raw)
         try:
             await self._complete(record, raw)
         except AgentMessageError as error:
+            details = result_diagnostics(raw, error)
+            logger.warning(
+                "Remote task result rejected task_id=%s code=%s details=%s",
+                record.task_id, error.code, details,
+            )
             await self._mark_terminal(
                 record,
                 state="TASK_STATE_FAILED",
                 failure_reason=error.code,
+                failure_details=details,
             )
 
     async def _consume(self) -> None:

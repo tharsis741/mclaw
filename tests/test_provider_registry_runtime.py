@@ -510,7 +510,7 @@ def test_setup_model_pins_current_or_recommended_first(
     monkeypatch.setattr(selection_prompt, "prompt_single_select", choose)
 
     assert cli_main._select_setup_model("qwen", config, profile_id) == expected
-    assert menu["title"] == "M-Claw 模型选择"
+    assert menu["title"] == "选择模型"
     assert menu["items"][0]["id"] == expected
     assert {item["id"] for item in menu["items"][:-1]} == set(candidates)
     assert menu["items"][-1]["label"] == "其他模型名称"
@@ -595,17 +595,17 @@ def test_setup_skill_selection_ctrl_a_toggles_all() -> None:
 def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.MonkeyPatch) -> None:
     from mclaw.cli import main as cli_main
     from mclaw.cli.tui import console, selection_prompt
-    from mclaw.skills_hub import builtin_sync, skill_store
+    from mclaw.skills_hub import builtin_sync
 
     skills = [
         {"name": "skill-a", "source_key": "group/skill-a"},
         {"name": "skill-b", "source_key": "group/skill-b"},
     ]
     defaults: list[list[str]] = []
-    enabled: list[dict] = []
+    installed: list[str] = []
 
     monkeypatch.setattr(builtin_sync, "list_builtin_skills", lambda: skills)
-    monkeypatch.setattr(skill_store, "list_skills", lambda: enabled)
+    monkeypatch.setattr(builtin_sync, "list_installed_builtin_skills", lambda: installed)
     monkeypatch.setattr(
         selection_prompt,
         "prompt_builtin_skill_selection",
@@ -614,10 +614,7 @@ def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.Monk
     monkeypatch.setattr(console, "print_plain", lambda *_args, **_kwargs: None)
 
     cli_main._run_setup_builtin_skill_selection()
-    enabled.append({
-        "name": "skill-a",
-        "source": {"type": "bundled", "original": "group/skill-a"},
-    })
+    installed.append("skill-a")
     cli_main._run_setup_builtin_skill_selection()
 
     assert defaults == [[], ["skill-a"]]
@@ -890,7 +887,8 @@ def test_qwen_tool_and_feature_metadata_are_registry_derived() -> None:
     assert dashscope_backend.DASHSCOPE_BASE_URL == qwen.base_url
     qwen_groups = (qwen.env_vars, qwen_intl.env_vars)
     assert features.FEATURES["web_search"].requires_any == (("TAVILY_API_KEY",), *qwen_groups)
-    assert features.FEATURES["vision_analyze"].requires_any == qwen_groups
+    assert features.FEATURES["vision_analyze"].requires_any == ()
+    assert features.get_feature("vision_analyze", config={"auxiliary": {"vision": {"mode": "auxiliary", "provider": "qwen"}}}).requires_any == (qwen_groups[0],)
     assert features.FEATURES["asr"].requires_any == qwen_groups
 
 
@@ -1081,7 +1079,7 @@ def test_setup_selects_multiple_providers_before_configuring_each_model(monkeypa
     cli_main._run_setup_impl(object())
 
     item_ids = [item["id"] for item in provider_menu["items"]]
-    assert provider_menu["title"] == "M-Claw 大模型接入配置"
+    assert provider_menu["title"] == "大模型接入配置"
     assert provider_menu["kwargs"]["default_selected"] == ["qwen", "openai"]
     assert "microsoft" in item_ids
     assert "qwen-intl" not in item_ids

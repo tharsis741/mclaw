@@ -12,7 +12,7 @@ import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Sequence
+from typing import Any, Dict, List, Sequence
 
 import yaml
 
@@ -23,6 +23,7 @@ from mclaw.skills_hub.schema import SkillSchemaError
 from mclaw.skills_hub.skill_yaml_store import (
     build_skill_yaml,
     extract_short_description,
+    now_iso,
     read_skill_yaml,
     write_skill_yaml,
 )
@@ -36,6 +37,7 @@ class BuiltinSkill:
     short_description: str
     source_key: str
     path: Path
+    source: dict[str, Any]
     category: str = ""
 
 
@@ -130,6 +132,7 @@ def _discover_builtin_skills(skills_source_dir: Path) -> List[BuiltinSkill]:
                 short_description=short_description,
                 source_key=rel_key,
                 path=skill_dir,
+                source=dict(manifest["source"]),
                 category=rel.parts[0] if len(rel.parts) > 1 else "",
             )
         )
@@ -150,48 +153,92 @@ def _dir_hash(directory: Path, *, exclude_generated_sidecars: bool = False) -> s
     return hasher.hexdigest()
 
 
-def _ensure_skill_sidecars(skill_dir: Path, *, name: str, source_original: str, force: bool = False) -> None:
-    """Ensure bundled Skills have M-Claw sidecars while preserving existing summaries."""
+def _matches_builtin(data: dict, skill: BuiltinSkill) -> bool:
+    """Recognize legacy bundled metadata and installs that retain upstream provenance."""
+
+    source = data.get("source")
+    if not isinstance(source, dict):
+        return False
+    if source.get("type") == "bundled" and source.get("original") == skill.source_key:
+        return True
+    return data.get("created_by") == "bundled" and data.get("name") == skill.name
+
+
+def _ensure_skill_sidecars(
+    skill_dir: Path, *, skill: BuiltinSkill, force: bool = False, refresh_source: bool = False,
+) -> None:
+    """Retain upstream provenance separately from the bundled installation actor."""
 
     skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8", errors="replace")
-    short_description = extract_short_description(skill_md, name)
+    short_description = extract_short_description(skill_md, skill.name)
     manifest_path = skill_dir / "mclaw_skill.yaml"
+    existing: dict = {}
     if manifest_path.exists():
         try:
-            existing = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+            existing = read_skill_yaml(skill_dir)
             short_description = str(existing.get("short_description") or short_description).strip()
-        except (OSError, ValueError, yaml.YAMLError, SkillSchemaError):
+        except (OSError, ValueError, AttributeError, yaml.YAMLError):
             pass
-    if force or not (skill_dir / "mclaw_skill.yaml").exists():
-        write_skill_yaml(
-            skill_dir,
-            build_skill_yaml(
-                name=name,
-                short_description=short_description,
-                source_type="bundled",
-                source_original=source_original,
-                actor="bundled",
-                status="enabled",
-            ),
+    if force or not manifest_path.exists():
+        data = build_skill_yaml(
+            name=skill.name,
+            short_description=short_description,
+            source_type=skill.source["type"],
+            source_original=skill.source["original"],
+            actor="bundled",
+            status="enabled",
         )
+        data["source"] = dict(skill.source)
+        write_skill_yaml(skill_dir, data)
+    elif existing and _matches_builtin(existing, skill):
+        if refresh_source or existing["source"].get("type") == "bundled":
+            source = {**existing["source"], **skill.source}
+        else:
+            # Metadata-only sync must not relabel customized content as a newer revision.
+            defaults = dict(skill.source)
+            if existing["source"].get("original") != skill.source.get("original"):
+                defaults.pop("revision", None)
+            source = {**defaults, **existing["source"]}
+        if source != existing["source"]:
+            existing["source"] = source
+            existing["updated_at"] = now_iso()
+            existing["updated_by"] = "bundled"
+            write_skill_yaml(skill_dir, existing)
     if not (skill_dir / "skill_evolution.json").exists():
         write_default(skill_dir)
 
 
-def _is_existing_same_builtin(dest: Path, source_key: str) -> bool:
+def _is_existing_same_builtin(dest: Path, skill: BuiltinSkill) -> bool:
     """Return whether an existing destination still identifies as this bundled Skill."""
 
-    manifest = dest / "mclaw_skill.yaml"
-    if not manifest.exists():
+    if not (dest / "SKILL.md").is_file():
         return False
     try:
-        data = yaml.safe_load(manifest.read_text(encoding="utf-8")) or {}
-    except (OSError, ValueError, yaml.YAMLError, SkillSchemaError):
+        data = read_skill_yaml(dest)
+    except (OSError, ValueError, AttributeError, yaml.YAMLError):
         return False
-    source = data.get("source") if isinstance(data, dict) else None
-    if not isinstance(source, dict):
-        return False
-    return source.get("type") == "bundled" and source.get("original") == source_key
+    return _matches_builtin(data, skill)
+
+
+def _copy_missing_notices(skill: BuiltinSkill, dest: Path) -> None:
+    """Supply attribution to customized installs without replacing their files."""
+
+    for filename in ("LICENSE", "NOTICE.md"):
+        source = skill.path / filename
+        target = dest / filename
+        if source.is_file() and not target.exists():
+            shutil.copy2(source, target)
+
+
+def list_installed_builtin_skills() -> list[str]:
+    """Return installed bundled Skill names for Setup's default selection."""
+
+    skills_dir = get_skills_dir()
+    return [
+        skill.name
+        for skill in _discover_builtin_skills(_get_builtin_skills_dir())
+        if _is_existing_same_builtin(skills_dir / skill.name, skill)
+    ]
 
 
 def list_builtin_skills() -> list[dict]:
@@ -245,7 +292,6 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
     skipped = 0
 
     for skill in builtin_skills:
-        source_key = skill.source_key
         skill_name = skill.name
         skill_src = skill.path
         dest = skills_dir / skill_name
@@ -253,15 +299,16 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
 
         if skill_name not in manifest:
             if dest.exists():
-                if _is_existing_same_builtin(dest, source_key):
-                    _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key)
+                if _is_existing_same_builtin(dest, skill):
+                    _ensure_skill_sidecars(dest, skill=skill)
+                    _copy_missing_notices(skill, dest)
                     skipped += 1
                     manifest[skill_name] = bundled_hash
                 else:
                     user_modified.append(skill_name)
             else:
                 shutil.copytree(skill_src, dest)
-                _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key, force=True)
+                _ensure_skill_sidecars(dest, skill=skill, force=True)
                 copied.append(skill_name)
                 manifest[skill_name] = bundled_hash
                 if not quiet:
@@ -269,7 +316,7 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
             continue
 
         if dest.exists():
-            _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key)
+            _ensure_skill_sidecars(dest, skill=skill)
             origin_hash = manifest.get(skill_name, "")
             # The sync hash ignores generated sidecars so local Skill memory edits do not
             # make a bundled package look user-modified.
@@ -281,6 +328,8 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
                 continue
 
             if user_hash != origin_hash:
+                if _is_existing_same_builtin(dest, skill):
+                    _copy_missing_notices(skill, dest)
                 user_modified.append(skill_name)
                 if not quiet:
                     print(f"  ~ {skill_name} (user-modified, skipping)")
@@ -292,7 +341,10 @@ def sync_skills(quiet: bool = False, selected_names: set[str] | None = None) -> 
                 try:
                     # Replace through a backup so a failed copy can restore the enabled Skill.
                     shutil.copytree(skill_src, dest)
-                    _ensure_skill_sidecars(dest, name=skill_name, source_original=source_key, force=True)
+                    for filename in SIDECAR_FILENAMES - {"SKILL.md"}:
+                        if (backup / filename).is_file():
+                            shutil.copy2(backup / filename, dest / filename)
+                    _ensure_skill_sidecars(dest, skill=skill, refresh_source=True)
                     manifest[skill_name] = bundled_hash
                     updated.append(skill_name)
                     if not quiet:

@@ -25,9 +25,12 @@ def file_lock(path: str | Path):
     if os.name == "nt":
         import msvcrt
 
-        if not path.exists():
-            path.write_text(" ", encoding="utf-8")
-        with open(path, "r+") as lock_file:
+        # Append mode avoids truncating a lock byte created/held by a competing
+        # process between an existence check and initialization.
+        with open(path, "a+b") as lock_file:
+            if lock_file.seek(0, os.SEEK_END) == 0:
+                lock_file.write(b" ")
+                lock_file.flush()
             deadline = time.monotonic() + 15.0
             while True:
                 try:
