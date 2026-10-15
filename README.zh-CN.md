@@ -30,6 +30,10 @@
 
 > 📖 [M-Claw 1.1.2 用户手册](docs/manual/README.md)
 
+![M-Claw 1.1.2 在 Kaihong BotBook 上的主界面](docs/assets/snapshot/kaihong-overview.png)
+
+<p align="center"><em>M-Claw 1.1.2 · Kaihong BotBook</em></p>
+
 ## Roadmap
 
 ### 2026.06 | **1.0.0 单机智能体运行时**

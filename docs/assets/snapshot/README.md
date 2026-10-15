@@ -1,8 +1,29 @@
 # M-Claw 操作截图
 
-本目录集中保存用户手册图片。手册使用的 22 张 JPEG 均于 2026-10-15 从本机运行的 M-Claw 页面直接采集，保留页面的实际布局与显示内容。
+本目录保存 Windows 与 Kaihong BotBook 上实际运行的 M-Claw 页面截图。图片中的布局、设备和列表内容对应采集时的真实界面。
 
-## 采集环境
+## Kaihong BotBook
+
+| 项目 | 记录 |
+| --- | --- |
+| 采集日期 | 2026-10-15 |
+| 设备 | Kaihong BotBook（KHP-LC802） |
+| 系统 | KaihongOS 5.0.1.52，OpenHarmony 5.0.2.123，API 14 |
+| M-Claw 版本 | 1.1.2 |
+| 浏览器 | 开鸿系统浏览器 `com.kaihong.browser` |
+| 页面尺寸 | 1920 × 918 |
+| 采集方式 | 在设备浏览器操作实际页面，通过系统截图工具采集，再裁剪至页面区域 |
+
+| 文件 | 内容 |
+| --- | --- |
+| [kaihong-overview.png](kaihong-overview.png) | 主界面，用于项目说明与开始使用章节 |
+| [kaihong-devices.png](kaihong-devices.png) | 已启用的设备协同与实际发现的附近设备 |
+
+采集时间、原始截图尺寸、裁剪范围和文件校验信息见 [kaihong-capture-info.json](kaihong-capture-info.json)。
+
+## Windows
+
+22 张 JPEG 于 2026-10-15 从 Windows 本机运行的 M-Claw 页面直接采集。
 
 | 项目 | 记录 |
 | --- | --- |
@@ -18,9 +39,7 @@
 
 供应商配置保留界面的凭据遮蔽。编辑弹窗采集后关闭，未提交修改。专用视觉模式图片展示表单选项，不表示已改变本机当前模式。
 
-本次采集覆盖 Windows 本机页面。Kaihong OS / M-Robots OS 的浏览器、中文输入、附件、录音和可信设备协作，应在目标设备上验证并记录设备及 API 版本。
-
-## 图片索引
+### 图片索引
 
 | 文件 | 内容 |
 | --- | --- |
