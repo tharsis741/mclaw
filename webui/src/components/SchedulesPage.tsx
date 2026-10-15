@@ -649,7 +649,6 @@ export function SchedulesPage({
       <div className="page-heading">
         <div>
           <h2>定时任务</h2>
-          <p>按约定的时间运行任务，查看结果或投递到消息渠道。</p>
         </div>
         <button
           className="primary"

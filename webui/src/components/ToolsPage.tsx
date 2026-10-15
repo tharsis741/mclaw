@@ -523,7 +523,6 @@ export function ToolsPage() {
       <div className="page-heading">
         <div>
           <h2>工具</h2>
-          <p>管理工具开关和服务配置。</p>
         </div>
       </div>
       <div className="tool-toolbar">

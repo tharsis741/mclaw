@@ -18,6 +18,7 @@ import remarkGfm from 'remark-gfm';
 import { skillsApi } from '../api';
 import type { SkillDetail, SkillDraft, SkillFile, SkillSummary } from '../types';
 import { readAudits, SecurityAudits } from './SecurityAudits';
+import { DeleteSkillDialog } from './DeleteSkillDialog';
 
 export function sourceLabel(source: unknown, detail = false): string {
   if (typeof source === 'string')
@@ -279,7 +280,6 @@ export function SkillsPage({
       <div className="page-heading">
         <div>
           <h2>技能</h2>
-          <p>给 M-Claw 添加处理特定任务的方法。</p>
         </div>
         <div className="page-actions">
           <button
@@ -654,7 +654,11 @@ export function SkillsPage({
               </div>
             )}
             <footer className="drawer-footer">
-              <button className="danger-text text-button" onClick={() => setDeleteOpen(true)}>
+              <button
+                className="danger-text text-button"
+                disabled={busy}
+                onClick={() => setDeleteOpen(true)}
+              >
                 <Trash2 size={14} />
                 删除技能
               </button>
@@ -666,32 +670,19 @@ export function SkillsPage({
                 在对话中使用
               </button>
             </footer>
-            {deleteOpen && (
-              <div className="inline-confirm">
-                <strong>删除 {detail.name}？</strong>
-                <p>技能文件会按管理规则删除，已发送任务保留提交时的记录。</p>
-                <div>
-                  <button className="text-button" onClick={() => setDeleteOpen(false)}>
-                    取消
-                  </button>
-                  <button
-                    className="primary"
-                    disabled={busy}
-                    onClick={() =>
-                      void action(async () => {
-                        await skillsApi.remove(detail.name, detail.version);
-                        closeDetail();
-                        await load();
-                      })
-                    }
-                  >
-                    确认删除
-                  </button>
-                </div>
-              </div>
-            )}
           </aside>
         </div>
+      )}
+      {deleteOpen && detail && (
+        <DeleteSkillDialog
+          name={detail.name}
+          onClose={() => setDeleteOpen(false)}
+          onDelete={async () => {
+            await skillsApi.remove(detail.name, detail.version);
+            closeDetail();
+            await load();
+          }}
+        />
       )}
       {createOpen && (
         <div className="modal-backdrop">
