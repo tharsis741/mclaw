@@ -1,6 +1,6 @@
-# M-Claw Web UI
+# M-Claw 前端开发指南
 
-M-Claw 的 React / TypeScript 前端，与终端界面共用 Python 应用后台。使用说明见 [Web 界面](../docs/manual/18-Web界面.md)。
+M-Claw 的 React / TypeScript 前端，与终端界面共用 Python 应用后台。使用说明见 [用户手册](../docs/manual/README.md)。
 
 ## 环境要求
 
@@ -57,5 +57,6 @@ Git 保存源码、测试、`package-lock.json`、构建配置和 `public/` 中�
 - 通过 `api.ts` 及功能专用客户端（如 `skill-market-api.ts`）访问后台，为请求、响应和事件维护明确的 TypeScript 类型。
 - API Key 等凭据由后台保存；页面仅保留提交所需的短期表单值。
 - 保持现有配置、技能和历史数据兼容，涉及共享服务时同时验证 Web 与 TUI。
+- 对话快捷操作由 `src/App.tsx`、`src/components/Composer.tsx` 和 `src/components/useSlashCommands.tsx` 中的实际注册与状态条件决定。调整页面入口或快捷操作时，同步[用户手册](../docs/manual/对话.md#斜杠快捷操作)、[项目说明](../README.zh-CN.md)和手册导航。
 - 组件测试使用隔离数据和模拟服务；平台发布前分别检查目标浏览器的输入、文件、录音、重连和设备协同。
 - 产品资源来源和许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
