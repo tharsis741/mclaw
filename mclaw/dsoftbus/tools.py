@@ -55,7 +55,7 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _encode(value: Mapping[str, Any]) -> str:
+def _encode(value: Mapping[str, Any], *, maximum: int = protocol.TOOL_RESULT_MAX) -> str:
     raw = json.dumps(
         _plain(value),
         allow_nan=False,
@@ -63,7 +63,7 @@ def _encode(value: Mapping[str, Any]) -> str:
         separators=(",", ":"),
         sort_keys=True,
     )
-    if len(raw) > protocol.TOOL_RESULT_MAX:
+    if len(raw) > maximum:
         return json.dumps(
             {
                 "_untrustedRemoteData": False,
@@ -370,7 +370,7 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
         )
         device_id = _device_id(values["device_id"])
         text = values["text"]
-        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= 24_576:
+        if not isinstance(text, str) or not 1 <= len(text.encode("utf-8")) <= protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX:
             raise DsoftbusRuntimeError("INVALID_PARAMS")
         context_id = _canonical_uuid(values.get("context_id"), optional=True)
         message_id = _canonical_uuid(values.get("message_id"), optional=True)
@@ -422,7 +422,7 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
             )
         if not isinstance(result, Mapping):
             raise DsoftbusRuntimeError("INTERNAL_ERROR")
-        return _encode(dict(result))
+        return _encode(dict(result), maximum=protocol.REMOTE_TASK_TOOL_RESULT_CHARS_MAX)
     except Exception as error:
         return _handle_error(
             error,
@@ -430,6 +430,23 @@ async def run_agent_task_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
             context_id=context_id,
             message_id=message_id,
         )
+
+
+def read_task_result_handler(args: Mapping[str, Any], **kwargs: Any) -> str:
+    from mclaw.agent.remote_results import read_reply
+
+    try:
+        values = _validate_exact_args(args, required=frozenset({"tool_call_id"}),
+                                      optional=frozenset({"offset", "limit"}))
+        result = read_reply(kwargs.get("parent_agent"), values["tool_call_id"],
+                            values.get("offset", 0), values.get("limit", 4096))
+        return _encode(result)
+    except LookupError:
+        return _failure("TASK_NOT_FOUND")
+    except (ValueError, TypeError):
+        return _failure("INVALID_PARAMS")
+    except Exception as error:
+        return _handle_error(error)
 
 
 def _artifact_display_name(value: Any) -> str:
@@ -561,7 +578,7 @@ async def continue_agent_task_handler(
         if message_id is None:
             message_id = str(uuid.uuid4())
         text = values.get("text", "")
-        if not isinstance(text, str) or len(text.encode("utf-8")) > 24_576:
+        if not isinstance(text, str) or len(text.encode("utf-8")) > protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX:
             raise DsoftbusRuntimeError("INVALID_PARAMS")
         parent_agent = kwargs.get("parent_agent")
         input_paths = _resolve_task_input_paths(
@@ -617,7 +634,7 @@ async def continue_agent_task_handler(
             )
         if not isinstance(result, Mapping):
             raise DsoftbusRuntimeError("INTERNAL_ERROR")
-        return _encode(dict(result))
+        return _encode(dict(result), maximum=protocol.REMOTE_TASK_TOOL_RESULT_CHARS_MAX)
     except Exception as error:
         logger.warning(
             "DSoftBus Task continuation failed code=%s task_id=%s "
@@ -800,7 +817,7 @@ CONTINUE_AGENT_TASK_SCHEMA = {
                     "type": "string",
                     "format": "uuid",
                 },
-                "text": {"type": "string", "maxLength": 24_576},
+                "text": {"type": "string", "maxLength": protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX},
                 "message_id": {"type": "string", "format": "uuid"},
                 "input_paths": {
                     "type": "array",
@@ -1038,6 +1055,23 @@ registry.register(
     is_async=True,
     emoji="✉",
     async_timeout_seconds=math.inf,
+    max_result_size_chars=protocol.REMOTE_TASK_TOOL_RESULT_CHARS_MAX,
+)
+registry.register(
+    name="dsoftbus_read_task_result",
+    toolset="dsoftbus",
+    handler=read_task_result_handler,
+    schema={"function": {
+        "description": "Read a page of a previously received remote task reply in this session. "
+                       "Use read_more from a shortened result. Offsets and limits count Unicode characters. "
+                       "This reads the local original and does not rerun the remote task.",
+        "parameters": {"type": "object", "properties": {
+            "tool_call_id": {"type": "string", "description": "The original run/continue tool call ID."},
+            "offset": {"type": "integer", "minimum": 0, "default": 0},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 8192, "default": 4096},
+        }, "required": ["tool_call_id"], "additionalProperties": False},
+    }},
+    emoji="✉",
     max_result_size_chars=protocol.TOOL_RESULT_MAX,
 )
 registry.register(
@@ -1057,7 +1091,7 @@ registry.register(
     is_async=True,
     emoji="✉",
     async_timeout_seconds=math.inf,
-    max_result_size_chars=protocol.TOOL_RESULT_MAX,
+    max_result_size_chars=protocol.REMOTE_TASK_TOOL_RESULT_CHARS_MAX,
 )
 registry.register(
     name="request_task_input",

@@ -3,13 +3,14 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/mclaw%20logo.png" alt="M-Claw Logo" width="100%">
+  <img src="webui/public/mclaw-wordmark-fold.svg" alt="M-CLAW" width="360">
 </p>
 
 <h2 align="center">Self-Evolving Embodied Agent Harness</h2>
 
 <p align="center">
   <a href="#installation-and-startup">Quick start</a> ·
+  <a href="#updating-m-claw">Update</a> ·
   <a href="#capabilities">Features</a> ·
   <a href="docs/manual/README.md">User manual (Chinese)</a> ·
   <a href="#agent-loop">Architecture</a> ·
@@ -17,7 +18,7 @@
 </p>
 
 <p align="center">
-  <img alt="version" src="https://img.shields.io/badge/version-1.1.1-2f80ed">
+  <img alt="version" src="https://img.shields.io/badge/version-1.1.2-2f80ed">
   <img alt="python" src="https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white">
   <img alt="license" src="https://img.shields.io/badge/license-Apache--2.0-green">
   <img alt="platform" src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20Kaihong%20OS%20%7C%20M--Robots%20OS-6f42c1">
@@ -25,9 +26,11 @@
 
 **M-Claw is an embodied agent runtime native to M-Robots OS, connecting models to execution in the physical world across heterogeneous devices.**
 
-Its agent harness brings context and memory, tools and Skills, device control, and collaborative tasks into a single execution loop. Device coordination through M-DDS on M-Robots OS supports a distributed architecture in which each device runs its own agent and collaborates with others.
+Its agent harness brings context and memory, tools and Skills, device operations, and collaborative tasks into a single execution loop. Use the Web UI or CLI to start tasks and inspect progress and results. On supported M-Robots OS / Kaihong OS devices, M-DDS enables a distributed architecture in which each device runs its own agent and collaborates with others. Unified spatial representation and persistent location memory remain roadmap items.
 
-> Current version: 1.1.1<br>
+![M-Claw 1.1.2 on Kaihong BotBook](docs/assets/snapshot/kaihong-overview.png)
+
+> Current version: 1.1.2<br>
 > License: Apache-2.0<br>
 > Distribution: install from source
 
@@ -50,13 +53,13 @@ The layered robot control architecture separates:
 - **Runtime (brain):** intent understanding, task planning, and coordination across nodes.
 - **Control module (cerebellum):** stable, high-frequency, real-time motion execution.
 
-### October 2026 | 1.2.0 — Mycelium platform and Skill ecosystem (planned)
+### November 2026 | 1.2.0 — Mycelium platform and Skill ecosystem (planned)
 
 Develop the Mycelium Control Panel for centralized scheduling and lifecycle management of robots, devices, Skills, and tasks, extending one-off execution into persistent, evolving workflows.
 
 Introduce a Skill Hub for publishing, installing, updating, and reusing Skills, expanding M-Claw into embodied intelligence infrastructure with a developer ecosystem.
 
-### December 2026 | 2.0.0 — Spatial agent runtime (planned)
+### February 2027 | 2.0.0 — Spatial agent runtime (planned)
 
 Unify spatial and temporal context and device capability semantics to coordinate heterogeneous devices. The intended runtime will understand environmental state, retain location memory, and orchestrate tasks across robots and devices.
 
@@ -67,7 +70,9 @@ Planned capabilities include:
 - Task allocation and execution coordination across heterogeneous devices in a shared spatial context.
 - Action proposals from models, with actual execution decided by a separate control boundary.
 
-## Current capabilities (1.1.1)
+## Current capabilities (1.1.2)
+
+Version 1.1.2 adds a Web UI that shares the Python application backend with the CLI. Manage conversations, devices, scheduled tasks, tools, Skills, the Skill market, and settings through the interface. Trusted-device collaboration remains platform-dependent.
 
 M-Claw supports multi-device agent collaboration on M-Robots OS / Kaihong OS. An agent can run inference and orchestrate tools locally, or invoke M-Claw agents on other trusted devices through the distributed soft bus.
 
@@ -82,9 +87,9 @@ The runtime includes:
 ## Capabilities
 
 - **21 baseline tools:** scoped credential requests, file operations, terminal execution, memory, Skills, session search, and subagent delegation.
-- **13 optional tools:** web search and extraction, vision, browser automation, and file delivery through Weixin and DingTalk.
+- **21 optional tools:** web search and extraction, vision, browser automation, and file delivery through Weixin and DingTalk.
 - **Trusted-device tools:** four collaboration entry points on M-Robots OS / Kaihong OS, plus five context-dependent tools for returning results, requesting input, and retrieving shared source files in remote tasks.
-- **22 built-in commands:** model switching, search/extraction backend selection, voice input, session history, rollback, scheduling, Skill management, and diagnostics. Trusted-device collaboration adds `/devices`, `/pair`, and `/unpair` on supported platforms.
+- **Web-based management:** conversations, devices, scheduled tasks, tools, Skills, Skill market, and settings. Conversation [slash shortcuts](docs/manual/对话.md#斜杠快捷操作) provide session and model selection; task controls handle running work.
 - **Three memory layers:** session memory, long-term memory, and Skill execution/evolution memory.
 - **OS-specific runtimes:** adapt execution and capabilities to the host system.
 - **Trusted-device collaboration:** device management, agent communication, task dispatch, streaming progress, task continuation, and file exchange.
@@ -143,18 +148,18 @@ M-Claw provides baseline, optional, and platform-specific toolsets. Available to
 | Toolset | Tools | Purpose |
 | --- | --- | --- |
 | web | `web_search`, `web_extract` | Search the web with sources and extract readable page content. |
-| vision | `vision_analyze` | Analyze local images or image URLs with a Qwen vision model. |
-| browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download` | Navigate, click, type, scroll, capture screenshots, and download files. |
+| vision | `vision_analyze` | Analyze images with the current model or a dedicated vision model; image-input capability is determined using models.dev. |
+| browser | `browser_navigate`, `browser_snapshot`, `browser_screenshot`, `browser_click`, `browser_type`, `browser_scroll`, `browser_press`, `browser_download`, `browser_tabs`, `browser_select`, `browser_check`, `browser_hover`, `browser_upload`, `browser_handle_dialog`, `browser_wait_for`, `browser_back` | Interact with pages, tabs, forms, uploads/downloads, dialogs, conditional waits, and screenshots. |
 | weixin | `weixin_send_file` | Send files to the current Weixin conversation. |
 | dingtalk | `dingtalk_send_file` | Send files to the current DingTalk conversation. |
 
-Web search supports Tavily and Qwen. Use `/search-backend dashscope|tavily|auto` to inspect or change the backend.
+Web search supports Tavily and Qwen. Select the provider and configure credentials under Tools → Web search.
 
-Web extraction supports Trafilatura, Tavily, and Firecrawl. Use `/extract-backend trafilatura|tavily|firecrawl` to inspect or change the backend.
+Web extraction supports Trafilatura, Tavily, and Firecrawl. Select the provider and save settings under Tools → Web extraction.
 
 ### Trusted-device collaboration toolsets
 
-Trusted-device collaboration is provided by `KaihongRuntime` on M-Robots OS / Kaihong OS. Once enabled in Setup and validated against the environment, the local agent receives:
+Trusted-device collaboration is provided by `KaihongRuntime` on M-Robots OS / Kaihong OS. Once M-Claw collaboration is enabled on the Devices page and the environment is validated, the local agent receives:
 
 | Toolset | Tools | Purpose |
 | --- | --- | --- |
@@ -215,7 +220,7 @@ CheckpointManager uses a shared shadow Git store to take snapshots before file w
 
 ### Rollback
 
-RollbackCoordinator restores files from operation logs, creates conflict backups, and can roll back session context. `/rollback` and `/checkpoints` provide inspection, preview, undo, and restoration.
+RollbackCoordinator restores files from operation logs, creates conflict backups, and can roll back session context. Use Changes at the top of a conversation to inspect, undo, or restore file operations. Settings → Task execution → File recovery controls retention.
 
 **The current version does not provide a security sandbox or permission tiers.**
 
@@ -231,125 +236,161 @@ At startup, M-Claw selects a runtime for command execution, path policies, proce
 
 Trusted-device collaboration requires M-Robots OS / Kaihong OS with a supported ARM64 OpenHarmony environment, DSoftBus system components, and appropriate permissions.
 
-The DSoftBus Runtime, collaboration tools, and `/devices`, `/pair`, `/unpair` commands activate only after the user enables trusted-device collaboration in Setup and environment validation succeeds.
+Enable M-Claw collaboration on the Devices page. After environment validation succeeds, discover, pair, and manage trusted devices there; the runtime loads collaboration tools according to the collaboration state.
 
 ## Channels, voice, and scheduled tasks
 
-M-Claw supports these interaction entry points:
-
-- **CLI/TUI:** terminal interaction built with Rich and prompt_toolkit.
-- **Voice input:** Qwen realtime ASR with wake-word and push-to-talk modes.
-- **Weixin / DingTalk channels:** channel runners map incoming messages to M-Claw sessions and send results back to the originating channel.
-
-Scheduled tasks can also trigger the agent loop. See the [user manual (Chinese)](docs/manual/README.md) for scheduling commands and configuration.
+- **Conversations:** submit tasks and inspect progress and results; use the input-area controls to add input, stop, or continue work.
+- **Voice input:** configure it in Settings → General → Voice input, record with the microphone control, and review the transcription before sending.
+- **Weixin / DingTalk:** configure message channels in Settings, receive tasks from connected chats, and return results to the originating conversation.
+- **Scheduled tasks:** create schedules, choose where results are saved or delivered, and inspect individual run records.
 
 ## CLI entry points
 
 ```bash
-mclaw                        # Start the agent runtime
-mclaw setup                  # Initial configuration
-mclaw doctor                 # Check runtime, tools, and IM channels
-mclaw help                   # Show command guidance
-mclaw resume                 # Resume the most recent session
-mclaw resume <session_id>    # Resume by session ID or prefix
-mclaw weixin login           # Sign in to the Weixin iLink Bot with a QR code
-mclaw weixin                 # Start the Weixin direct-message gateway
-mclaw dingtalk login         # Configure DingTalk Stream credentials
-mclaw dingtalk               # Start the DingTalk Stream gateway
+mclaw          # Start or reuse the local backend and open the Web UI
+mclaw status   # Show the service address and process ID
+mclaw stop     # Save progress, wait for tools to finish, and stop the backend
+mclaw cli      # Open the terminal interface
+mclaw setup    # Initial configuration
+mclaw doctor   # Check the runtime, tools, and IM channels
+mclaw help     # Show command guidance
 ```
 
 ## Installation and startup
 
-M-Claw is currently distributed as source code.
+M-Claw is distributed as source code. The development/build computer needs Python 3.11+, Git, and Node.js 22.12+ with npm 10+. Once built, frontend assets are served by the Python backend; the runtime device does not need Node.js.
 
 ### Windows / Linux
 
-#### Step 1: Install Git
-
-On Windows, install Git from the [official download page](https://git-scm.com/download/win) or the [Huawei Cloud mirror](https://mirrors.huaweicloud.com/git-for-windows/).
-
-On Debian/Ubuntu Linux:
-
-```bash
-sudo apt update
-sudo apt install -y git
-```
-
-Verify the installation:
-
-```bash
-git --version
-```
-
-#### Step 2: Clone and install M-Claw
+Install [Python](https://www.python.org/downloads/), [Git](https://git-scm.com/downloads), and [Node.js](https://nodejs.org/en/download), then run:
 
 ```bash
 git clone https://github.com/tharsis741/mclaw.git
 cd mclaw
 python -m pip install -e .
-```
-
-For browser automation, first install the optional dependencies:
-
-```bash
-python -m pip install -e ".[browser]"
-```
-
-Then install Chromium:
-
-```powershell
-# Windows
-python -m playwright install chromium
-```
-
-```bash
-# Linux
-python -m playwright install --with-deps chromium
-```
-
-#### Step 3: Run initial setup
-
-```bash
-mclaw setup
-```
-
-#### Step 4: Start M-Claw
-
-```bash
+npm --prefix webui ci
+npm --prefix webui run build
 mclaw
 ```
 
-#### Updating M-Claw
+On Linux, use `python3` if required by your environment. Complete configuration in the page opened on first launch. Use `mclaw` to start again and `mclaw stop` to stop the backend. Keep the source directory when using an editable installation.
 
-Exit any running M-Claw process, then run these commands from the source directory. Check and resolve local changes before pulling.
+### Kaihong OS / M-Robots OS
+
+The device needs Python 3.11+. The development computer needs Git, Node.js 22.12+, npm 10+, and [HDC](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/dfx/hdc.md). Build the frontend on the computer, not on the device.
+
+**1. Download and build on the development computer.**
+
+```powershell
+git clone https://github.com/tharsis741/mclaw.git
+cd mclaw
+npm --prefix webui ci
+npm --prefix webui run build
+```
+
+**2. Copy the source and built assets to the device.**
+
+Prepare the following layout under `C:\\deploy\\mclaw` on the computer:
+
+```text
+mclaw/
+├── pyproject.toml
+├── LICENSE
+├── docs/
+│   ├── README.zh-CN.md
+│   ├── THIRD_PARTY_NOTICES.md
+│   └── ACKNOWLEDGEMENTS.md
+└── mclaw/                    # Complete Python package, including built web/static/
+```
+
+Preserve the `docs/` paths because package metadata references them. From PowerShell:
+
+```powershell
+hdc file send C:\\deploy\\mclaw /data/local/tmp/
+hdc shell
+```
+
+**3. Install and start on the device.**
+
+```sh
+cd /data/local/tmp/mclaw
+run python3 -m pip install -e .
+run mclaw
+```
+
+Follow the initial page configuration or use `run mclaw setup` in the terminal. Use `run mclaw stop` to stop the backend. Retain the source directory after installation.
+
+### Optional browser automation
+
+In the original Python environment and source directory:
 
 ```bash
+python -m pip install -e ".[browser]"
+python -m playwright install chromium
+```
+
+On Linux, Chromium installation can use `python -m playwright install --with-deps chromium`.
+
+See the [user manual](docs/manual/README.md) and [troubleshooting guide](docs/manual/故障排查.md) for further guidance.
+
+## Updating M-Claw
+
+Back up configuration and application data first. Inspect and resolve local source changes before pulling; do not overwrite uncommitted work.
+
+### Windows / Linux
+
+From the original source directory and Python environment:
+
+```bash
+mclaw stop
 git status --porcelain
 git pull --ff-only
 python -m pip install -e .
+npm --prefix webui ci
+npm --prefix webui run build
+mclaw
 ```
 
 ### Kaihong OS / M-Robots OS
 
-Download or extract the source onto the device, enter its root directory, and install:
+**1. Update and build on the development computer.**
 
-```bash
-run python3 -m pip install -e .
+```powershell
+git status --porcelain
+git pull --ff-only
+npm --prefix webui ci
+npm --prefix webui run build
 ```
 
-Configure and start:
+**2. Stop the device backend.**
 
-```bash
-run mclaw setup
+```sh
+run mclaw stop
+```
+
+**3. Refresh the deployment directory using the layout above**, including the complete newly built `mclaw/web/static/`, and send it to the same device location:
+
+```powershell
+hdc file send C:\\deploy\\mclaw /data/local/tmp/
+```
+
+**4. Update dependencies and restart on the device.**
+
+```sh
+cd /data/local/tmp/mclaw
+run python3 -m pip install -e .
 run mclaw
 ```
 
-### Requirements
+Updates reuse existing configuration and application data. See [updates and data recovery](docs/manual/更新与数据恢复.md) for backups, recovery, and post-update checks.
 
-- Python 3.11 or newer.
-- `git` on `PATH` for Windows/Linux source management and Checkpoint/Rollback. Checkpoints are disabled when Git is missing. Kaihong OS / M-Robots OS currently disables checkpoints and does not require Git.
-- Playwright-managed Chromium for browser automation.
-- Run `mclaw doctor` after installation to check the runtime, tools, and IM channels.
+### Runtime requirements and limitations
+
+- Python 3.11+ is required on the runtime host.
+- Git on `PATH` is needed for Windows/Linux source management and Checkpoint/Rollback. Checkpoints are disabled when Git is unavailable; Kaihong OS / M-Robots OS currently disables checkpoints.
+- Playwright-managed Chromium is required for browser automation.
+- Run `mclaw doctor` to inspect the runtime, tools, and channels.
 - Some built-in Skills may install additional toolchains on first use.
 
 ## Developer ecosystem
@@ -358,7 +399,9 @@ The upstream project plans an open Skill ecosystem around Skill Hub. Developers 
 
 ## Source and license
 
-This repository was imported from [m-robots/mclaw on AtomGit](https://atomgit.com/m-robots/mclaw). The original project author is Shenzhen Kaihong Digital Industry Development Co., Ltd. This GitHub repository preserves upstream commit history, copyright, and open-source notices.
+This repository is synchronized from [m-robots/mclaw on AtomGit](https://atomgit.com/m-robots/mclaw). The original project author is Shenzhen Kaihong Digital Industry Development Co., Ltd. This GitHub repository preserves upstream commit history, copyright, and open-source notices, while maintaining an English homepage and Chinese documentation entry point.
+
+Synchronization baseline: upstream `v1.1.2`, commit `624cc6489e898a900ca244412c5bb6f818b715eb`.
 
 M-Claw is licensed under Apache-2.0. See [LICENSE](LICENSE).
 

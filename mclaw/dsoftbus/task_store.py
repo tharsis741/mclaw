@@ -928,6 +928,60 @@ class DsoftbusTaskStore:
                 pass
             raise TaskStoreError("ARTIFACT_IO_ERROR") from error
 
+    def create_text_result(
+        self, peer_device_id: str, task_id: str, artifact: Mapping[str, Any], text: str,
+    ) -> Mapping[str, Any]:
+        """Store a reply payload privately; only its descriptor travels in task JSON."""
+        from .a2a_media import task_artifact_reference_part
+
+        raw = text.encode("utf-8")
+        if not 0 < len(raw) <= protocol.REMOTE_TEXT_RESULT_BYTES_MAX:
+            raise TaskStoreError("ARTIFACT_TOO_LARGE")
+        peer_device_id = _peer(peer_device_id)
+        task_id = _identifier(task_id, "TASK_ID_INVALID")
+        value = _plain(artifact)
+        artifact_id = _identifier(value.get("artifactId"), "ARTIFACT_ID_INVALID")
+        value["parts"] = [task_artifact_reference_part(
+            transfer_id=str(uuid.uuid4()), filename="response.utf8", media_type="text/plain",
+            byte_length=len(raw), sha256=hashlib.sha256(raw).hexdigest(),
+        )]
+        value["extensions"] = [protocol.TASK_FILES_EXTENSION_URI]
+        directory = self._artifact_directory("owned", peer_device_id, task_id, artifact_id)
+        if directory is None or self.get_task("owned", peer_device_id, task_id) is None:
+            raise TaskStoreError("ARTIFACT_IO_ERROR")
+        self._atomic_write(directory / artifact_part_local_filename(value, 0), raw)
+        return value
+
+    def read_text_result(
+        self, direction: TaskDirection, peer_device_id: str, task_id: str,
+        artifact: Mapping[str, Any], *, maximum: int,
+    ) -> str:
+        """Read one bounded, verified UTF-8 reply, including after reconnect/restart."""
+        try:
+            transfers = artifact_transfer_parts(artifact)
+        except TaskArtifactError as error:
+            raise TaskStoreError(error.code) from error
+        if len(artifact.get("parts", ())) != 1 or len(transfers) != 1:
+            raise TaskStoreError("ARTIFACT_INVALID")
+        descriptor = transfers[0][2]
+        if (descriptor["contentMediaType"] != "text/plain"
+                or not 0 < descriptor["byteLength"] <= min(maximum, protocol.REMOTE_TEXT_RESULT_BYTES_MAX)):
+            raise TaskStoreError("ARTIFACT_TOO_LARGE")
+        content = bytearray()
+        while len(content) < descriptor["byteLength"]:
+            record, chunk = self.read_artifact_transfer(
+                direction, peer_device_id, task_id, str(descriptor["transferId"]), len(content),
+            )
+            if record["artifactId"] != artifact["artifactId"]:
+                raise TaskStoreError("ARTIFACT_CONFLICT")
+            content.extend(chunk)
+        if hashlib.sha256(content).hexdigest() != descriptor["sha256"]:
+            raise TaskStoreError("ARTIFACT_HASH_MISMATCH")
+        try:
+            return content.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise TaskStoreError("ARTIFACT_INVALID") from error
+
     def persist_artifact(
         self,
         direction: TaskDirection,
@@ -1055,6 +1109,10 @@ class DsoftbusTaskStore:
             "parts": local_parts,
             "totalByteLength": total,
         }
+        metadata = value.get("metadata")
+        role = metadata.get("mclaw.artifactRole") if isinstance(metadata, Mapping) else None
+        if role in {"final-response", "task-output"}:
+            local["artifactRole"] = role
         local_json = _canonical_json(local)
         try:
             with self._connection:

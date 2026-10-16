@@ -318,6 +318,27 @@ class SchedulerStore:
 
         return self._execute_write(_do)
 
+    def cancel_run(self, run_id: str, *, reason: str = "cancelled by user") -> SchedulerRun:
+        """Cancel exactly one persisted attempt; the engine interrupts its worker."""
+        now = time.time()
+
+        def _do(conn: sqlite3.Connection) -> SchedulerRun:
+            row = conn.execute("SELECT * FROM scheduler_runs WHERE id = ?", (run_id,)).fetchone()
+            if row is None:
+                raise KeyError(run_id)
+            conn.execute(
+                "UPDATE scheduler_runs SET status = 'cancelled', finished_at = ?, error = ? "
+                "WHERE id = ? AND status IN ('running', 'queued')", (now, reason, run_id),
+            )
+            conn.execute(
+                "UPDATE scheduler_jobs SET status = CASE WHEN enabled = 1 THEN 'idle' ELSE 'paused' END "
+                "WHERE id = ? AND NOT EXISTS (SELECT 1 FROM scheduler_runs WHERE job_id = ? AND status = 'running')",
+                (row["job_id"], row["job_id"]),
+            )
+            return SchedulerRun.from_row(conn.execute("SELECT * FROM scheduler_runs WHERE id = ?", (run_id,)).fetchone())
+
+        return self._execute_write(_do)
+
     def finish_run(self, run: SchedulerRun, *, job_patch: dict[str, Any]) -> None:
         """Persist final run output and related job state in one write step."""
         run_row = run.to_row()
@@ -343,6 +364,9 @@ class SchedulerStore:
             job_updates["updated_at"] = _coerce_float(job_patch.get("updated_at", time.time()), time.time(), field="job.updated_at", min_value=0)
 
         def _do(conn: sqlite3.Connection) -> None:
+            current = conn.execute("SELECT status FROM scheduler_runs WHERE id = ?", (run.id,)).fetchone()
+            if current is None or (current["status"] == "cancelled" and run.status != "cancelled"):
+                return
             assignments = ", ".join(f"{key} = ?" for key in run_updates)
             conn.execute(
                 f"UPDATE scheduler_runs SET {assignments} WHERE id = ?",

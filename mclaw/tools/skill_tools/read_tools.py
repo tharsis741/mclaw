@@ -207,6 +207,8 @@ SKILL_VIEW_SCHEMA = {
         "name": "skill_view",
         "description": (
             "Load one Skill's mclaw_skill.yaml, SKILL.md, and full skill_evolution.json. "
+            "content contains only SKILL.md; mclaw_skill and skill_evolution are separate fields. "
+            "Do not copy the sidecar fields into SKILL.md when authoring. "
             "With file_path, read one non-sidecar file under the Skill root."
         ),
         "parameters": {
@@ -229,8 +231,7 @@ SKILL_TREE_SCHEMA = {
         "name": "skill_tree",
         "description": (
             "List one Skill's file tree without reading file contents. "
-            "Use this before skill_view(name, file_path) or skill_manage(write_file/remove_file) "
-            "when you need to discover Skill-internal paths."
+            "Use this to discover Skill-internal paths before reading or modifying package files."
         ),
         "parameters": {
             "type": "object",

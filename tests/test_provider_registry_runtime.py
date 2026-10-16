@@ -16,6 +16,7 @@ from mclaw.agent import context_metadata, models_dev
 from mclaw.agent.models_dev import resolve_models_dev_provider
 from mclaw.cli import auth, provider_profiles
 from mclaw.cli.config import DEFAULT_CONFIG
+from mclaw.cli.model_resolver import resolve_model_input
 from mclaw.providers.base import RuntimeProviderProfile
 from mclaw.providers.anthropic import AnthropicProfile
 from mclaw.providers.deepseek import DeepSeekProfile
@@ -47,6 +48,7 @@ GENERIC_PROVIDERS = {
     "microsoft", "cohere", "amazon", "together", "perplexity", "meta",
     "yi", "stepfun", "baichuan", "doubao", "siliconflow",
 }
+CUSTOM_PROVIDERS = {"custom", "custom_anthropic"}
 GENERIC_BASE_URLS = {
     "baidu": "https://qianfan.baidubce.com/v2",
     "tencent": "https://api.hunyuan.cloud.tencent.com/v1",
@@ -104,13 +106,16 @@ BEHAVIOR_PROFILE_TYPES = {
 
 
 def test_registry_has_exact_canonical_provider_sets_and_profile_bindings() -> None:
-    assert set(PROVIDER_REGISTRY) == BEHAVIOR_PROVIDERS | GENERIC_PROVIDERS
+    assert set(PROVIDER_REGISTRY) == BEHAVIOR_PROVIDERS | GENERIC_PROVIDERS | CUSTOM_PROVIDERS
     assert len(BEHAVIOR_PROVIDERS) == 14
     assert len(GENERIC_PROVIDERS) == 17
+    assert len(CUSTOM_PROVIDERS) == 2
     assert all(
         isinstance(PROVIDER_REGISTRY[name], GenericOpenAICompatibleProfile)
         for name in GENERIC_PROVIDERS
     )
+    assert isinstance(PROVIDER_REGISTRY["custom"], GenericOpenAICompatibleProfile)
+    assert isinstance(PROVIDER_REGISTRY["custom_anthropic"], GenericAnthropicCompatibleProfile)
     assert all(
         not isinstance(PROVIDER_REGISTRY[name], GenericOpenAICompatibleProfile)
         for name in BEHAVIOR_PROVIDERS
@@ -121,17 +126,30 @@ def test_registry_has_exact_canonical_provider_sets_and_profile_bindings() -> No
     } == BEHAVIOR_PROFILE_TYPES
 
 
+@pytest.mark.parametrize("provider", ["custom", "custom_anthropic", "CUSTOM", "CUSTOM_ANTHROPIC"])
+def test_custom_provider_selectors_are_registry_entries(monkeypatch: pytest.MonkeyPatch, provider: str) -> None:
+    monkeypatch.setattr(models_dev, "fetch_models_dev", lambda: {})
+
+    assert "custom" in PROVIDER_REGISTRY
+    assert "custom_anthropic" in PROVIDER_REGISTRY
+    result = resolve_model_input("gateway-model", provider_input=provider)
+    assert result.status == "unverified"
+    assert result.provider == provider.lower()
+    assert result.model == "gateway-model"
+
+
 def test_registry_classification_and_protocol_metadata() -> None:
     assert {name for name, profile in PROVIDER_REGISTRY.items() if profile.provider_kind == "router"} == {
         "openrouter"
     }
     assert {name for name, profile in PROVIDER_REGISTRY.items() if profile.provider_kind == "host"} == {
-        "amazon", "deepinfra", "fireworks", "groq", "microsoft", "siliconflow", "together"
+        "amazon", "custom", "custom_anthropic", "deepinfra", "fireworks", "groq",
+        "microsoft", "siliconflow", "together",
     }
     assert {name for name, profile in PROVIDER_REGISTRY.items() if profile.provider_kind == "direct"} == (
         set(PROVIDER_REGISTRY) - {
             "openrouter", "amazon", "deepinfra", "fireworks", "groq",
-            "microsoft", "siliconflow", "together",
+            "microsoft", "siliconflow", "together", "custom", "custom_anthropic",
         }
     )
     assert PROVIDER_REGISTRY["anthropic"].api_mode == "anthropic_messages"
@@ -139,7 +157,7 @@ def test_registry_classification_and_protocol_metadata() -> None:
     assert all(
         profile.api_mode == "chat_completions" and profile.auth_scheme == "bearer"
         for name, profile in PROVIDER_REGISTRY.items()
-        if name != "anthropic"
+        if name not in {"anthropic", "custom_anthropic"}
     )
 
 
@@ -240,6 +258,48 @@ def test_cli_auth_is_a_registry_derived_view() -> None:
         assert view.aliases == list(profile.aliases)
         assert auth.DEFAULT_PROVIDER_MODELS.get(name, []) == list(profile.fallback_models)
     assert "https://" not in inspect.getsource(auth)
+
+
+@pytest.mark.parametrize(
+    ("provider", "key_env", "base_url_env"),
+    [
+        ("custom", "OPENAI_API_KEY", "MCLAW_BASE_URL"),
+        ("custom_anthropic", "ANTHROPIC_API_KEY", "MCLAW_ANTHROPIC_BASE_URL"),
+    ],
+)
+def test_required_endpoint_providers_are_hidden_without_a_base_url(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    key_env: str,
+    base_url_env: str,
+) -> None:
+    from mclaw.cli import config as cli_config
+
+    values = {key_env: "configured-key"}
+    monkeypatch.setattr(auth, "get_env_value", lambda name: values.get(name))
+    monkeypatch.setattr(cli_config, "load_config", lambda strict=True: {})
+
+    assert provider not in {item["name"] for item in auth.list_configured_providers()}
+
+    values[base_url_env] = "https://gateway.example/v1"
+    assert provider in {item["name"] for item in auth.list_configured_providers()}
+
+
+def test_custom_provider_uses_openai_base_url_compatibility_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mclaw.cli import config as cli_config
+
+    values = {
+        "OPENAI_API_KEY": "configured-key",
+        "OPENAI_BASE_URL": "https://gateway.example/v1",
+    }
+    monkeypatch.setattr(auth, "get_env_value", lambda name: values.get(name))
+    monkeypatch.setattr(cli_config, "load_config", lambda strict=True: {})
+
+    configured = auth.list_configured_providers()
+    custom = next(item for item in configured if item["name"] == "custom")
+    assert custom["has_key"] is True
 
 
 def test_setup_and_catalog_views_bind_callable_runtime_profiles() -> None:
@@ -450,7 +510,7 @@ def test_setup_model_pins_current_or_recommended_first(
     monkeypatch.setattr(selection_prompt, "prompt_single_select", choose)
 
     assert cli_main._select_setup_model("qwen", config, profile_id) == expected
-    assert menu["title"] == "M-Claw 模型选择"
+    assert menu["title"] == "选择模型"
     assert menu["items"][0]["id"] == expected
     assert {item["id"] for item in menu["items"][:-1]} == set(candidates)
     assert menu["items"][-1]["label"] == "其他模型名称"
@@ -535,17 +595,17 @@ def test_setup_skill_selection_ctrl_a_toggles_all() -> None:
 def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.MonkeyPatch) -> None:
     from mclaw.cli import main as cli_main
     from mclaw.cli.tui import console, selection_prompt
-    from mclaw.skills_hub import builtin_sync, skill_store
+    from mclaw.skills_hub import builtin_sync
 
     skills = [
         {"name": "skill-a", "source_key": "group/skill-a"},
         {"name": "skill-b", "source_key": "group/skill-b"},
     ]
     defaults: list[list[str]] = []
-    enabled: list[dict] = []
+    installed: list[str] = []
 
     monkeypatch.setattr(builtin_sync, "list_builtin_skills", lambda: skills)
-    monkeypatch.setattr(skill_store, "list_skills", lambda: enabled)
+    monkeypatch.setattr(builtin_sync, "list_installed_builtin_skills", lambda: installed)
     monkeypatch.setattr(
         selection_prompt,
         "prompt_builtin_skill_selection",
@@ -554,10 +614,7 @@ def test_setup_skill_selection_reads_installed_builtins(monkeypatch: pytest.Monk
     monkeypatch.setattr(console, "print_plain", lambda *_args, **_kwargs: None)
 
     cli_main._run_setup_builtin_skill_selection()
-    enabled.append({
-        "name": "skill-a",
-        "source": {"type": "bundled", "original": "group/skill-a"},
-    })
+    installed.append("skill-a")
     cli_main._run_setup_builtin_skill_selection()
 
     assert defaults == [[], ["skill-a"]]
@@ -830,7 +887,8 @@ def test_qwen_tool_and_feature_metadata_are_registry_derived() -> None:
     assert dashscope_backend.DASHSCOPE_BASE_URL == qwen.base_url
     qwen_groups = (qwen.env_vars, qwen_intl.env_vars)
     assert features.FEATURES["web_search"].requires_any == (("TAVILY_API_KEY",), *qwen_groups)
-    assert features.FEATURES["vision_analyze"].requires_any == qwen_groups
+    assert features.FEATURES["vision_analyze"].requires_any == ()
+    assert features.get_feature("vision_analyze", config={"auxiliary": {"vision": {"mode": "auxiliary", "provider": "qwen"}}}).requires_any == (qwen_groups[0],)
     assert features.FEATURES["asr"].requires_any == qwen_groups
 
 
@@ -943,7 +1001,7 @@ def test_doctor_reports_registry_metadata_and_secret_free_active_provider(monkey
 
     assert results[0].name == "provider registry"
     assert results[0].ok is True
-    assert "canonical=31" in results[0].detail
+    assert "canonical=33" in results[0].detail
     assert results[1].name == "agent provider"
     assert results[1].ok is True
     assert "provider=openai" in results[1].detail
@@ -1021,10 +1079,12 @@ def test_setup_selects_multiple_providers_before_configuring_each_model(monkeypa
     cli_main._run_setup_impl(object())
 
     item_ids = [item["id"] for item in provider_menu["items"]]
-    assert provider_menu["title"] == "M-Claw 大模型接入配置"
+    assert provider_menu["title"] == "大模型接入配置"
     assert provider_menu["kwargs"]["default_selected"] == ["qwen", "openai"]
     assert "microsoft" in item_ids
     assert "qwen-intl" not in item_ids
+    assert "custom" not in item_ids
+    assert "custom_anthropic" not in item_ids
     assert item_ids[-3:] == [
         "__other_provider__",
         "__custom_openai__",

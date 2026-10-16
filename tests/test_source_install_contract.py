@@ -35,7 +35,7 @@ def test_default_install_excludes_platform_optional_dependencies() -> None:
 
 def test_kaihong_editable_install_command_is_documented() -> None:
     readme = (REPOSITORY_ROOT / "docs" / "README.zh-CN.md").read_text(encoding="utf-8")
-    manual = (REPOSITORY_ROOT / "docs" / "manual" / "01-快速开始.md").read_text(
+    manual = (REPOSITORY_ROOT / "docs" / "manual" / "开始使用.md").read_text(
         encoding="utf-8"
     )
 

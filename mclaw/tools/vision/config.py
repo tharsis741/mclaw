@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 from typing import Any
 
@@ -22,7 +23,7 @@ QWEN_DEFAULT_MODEL = "qwen3-vl-flash"
 
 DEFAULT_VISION_TIMEOUT = 30.0
 DEFAULT_DOWNLOAD_TIMEOUT = 30.0
-DEFAULT_MAX_PIXELS = 1_310_720
+DEFAULT_MAX_PIXELS: int | None = None
 MIN_MAX_PIXELS = 65_536
 MAX_MAX_PIXELS = 16_777_216
 MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024
@@ -64,8 +65,29 @@ def effective_config(parent_agent: Any = None, config: dict | None = None) -> di
 def vision_config(parent_agent: Any = None, config: dict | None = None) -> dict:
     """Return the auxiliary.vision section as a normalized dictionary."""
     cfg = effective_config(parent_agent=parent_agent, config=config)
-    vision = cfg.get("auxiliary", {}).get("vision", {}) if isinstance(cfg, dict) else {}
+    auxiliary = cfg.get("auxiliary", {}) if isinstance(cfg, dict) else {}
+    vision = auxiliary.get("vision", {}) if isinstance(auxiliary, dict) else {}
     return vision if isinstance(vision, dict) else {}
+
+
+def resolve_mode(parent_agent: Any = None, config: dict | None = None) -> str:
+    section = vision_config(parent_agent, config)
+    # Existing independent provider configurations keep their original behavior.
+    legacy = any(key in section for key in ("provider", "model", "base_url"))
+    mode = section.get("mode", "auxiliary" if legacy else "auto")
+    if not isinstance(mode, str) or mode not in {"auto", "main", "auxiliary"}:
+        raise ValueError("auxiliary.vision.mode must be auto, main or auxiliary")
+    return mode
+
+
+def _positive_timeout(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+        return min(number, 600.0) if math.isfinite(number) and number > 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
 def resolve_timeout(parent_agent: Any = None) -> float:
@@ -73,13 +95,13 @@ def resolve_timeout(parent_agent: Any = None) -> float:
     val = vision_config(parent_agent=parent_agent).get("timeout")
     if val is not None:
         try:
-            return float(val)
+            return _positive_timeout(val) or DEFAULT_VISION_TIMEOUT
         except (TypeError, ValueError):
             pass
     env_val = os.getenv("MCLAW_VISION_TIMEOUT", "").strip()
     if env_val:
         try:
-            return float(env_val)
+            return _positive_timeout(env_val) or DEFAULT_VISION_TIMEOUT
         except ValueError:
             pass
     return DEFAULT_VISION_TIMEOUT
@@ -90,20 +112,20 @@ def resolve_download_timeout(parent_agent: Any = None) -> float:
     val = vision_config(parent_agent=parent_agent).get("download_timeout")
     if val is not None:
         try:
-            return float(val)
+            return _positive_timeout(val) or DEFAULT_DOWNLOAD_TIMEOUT
         except (TypeError, ValueError):
             pass
     env_val = os.getenv("MCLAW_VISION_DOWNLOAD_TIMEOUT", "").strip()
     if env_val:
         try:
-            return float(env_val)
+            return _positive_timeout(env_val) or DEFAULT_DOWNLOAD_TIMEOUT
         except ValueError:
             pass
     return DEFAULT_DOWNLOAD_TIMEOUT
 
 
-def resolve_max_pixels(parent_agent: Any = None) -> int:
-    """Return a bounded pixel budget for vision image preprocessing."""
+def resolve_max_pixels(parent_agent: Any = None) -> int | None:
+    """Use original resolution unless a bounded resize budget is configured."""
     val = vision_config(parent_agent=parent_agent).get("max_pixels")
     if type(val) is int and MIN_MAX_PIXELS <= val <= MAX_MAX_PIXELS:
         return val

@@ -23,6 +23,15 @@ from mclaw.tools.search.types import SearchResponse
 from mclaw.tools.vision import image_io
 
 
+@pytest.fixture(autouse=True)
+def isolated_tool_configuration(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MCLAW_HOME", str(home))
+    (home / "config.yaml").write_text("auxiliary:\n  vision:\n    mode: auxiliary\n", encoding="utf-8")
+    monkeypatch.setattr(vision_tool.tempfile, "gettempdir", lambda: str(tmp_path))
+
+
 class _ScenarioServer(ThreadingHTTPServer):
     daemon_threads = True
 
@@ -183,6 +192,8 @@ def _configure_local_vision(monkeypatch, image, base_url: str, timeout: float) -
 
 
 def _bypass_test_proxy(monkeypatch) -> None:
+    # Local fixture servers exercise real HTTP cancellation, not the public-IP policy.
+    monkeypatch.setattr(image_io, "_ip_is_public", lambda _ip: True)
     for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
@@ -742,7 +753,10 @@ def test_vision_complete_response_wins(tmp_path, monkeypatch) -> None:
             reset_interrupt_event(token)
 
         assert server.request_count == 1
-        assert result == {"success": True, "analysis": "complete result"}
+        assert result["success"] is True
+        assert result["analysis"] == "complete result"
+        assert result["mode"] == "auxiliary"
+        assert result["status"] == "analyzed"
 
 
 def test_qwen_international_uses_the_qwen_vision_client() -> None:

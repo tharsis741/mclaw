@@ -40,7 +40,7 @@ def build_weixin_channel_context(*, user_id: str = "") -> str:
         "## 当前渠道\n"
         "- 渠道：微信私聊\n"
         f"- 用户：user_{safe_user}\n"
-        "- 用户要求发送本地文件时，使用 weixin_send_file。\n"
+        "- 用户要求发送本地文件时，使用本轮提供的当前渠道文件发送工具；若未提供，说明本轮无法发送文件。\n"
     )
 
 
@@ -58,5 +58,5 @@ def build_dingtalk_channel_context(
         f"- channel_key: dingtalk {display_chat_type}\n"
         f"- 用户：{user_name or user_id}\n"
         "- 回复前结合钉钉附件信息处理图片、视频、语音或文件。\n"
-        "- 用户要求发送本地文件时，使用 dingtalk_send_file。\n"
+        "- 用户要求发送本地文件时，使用本轮提供的当前渠道文件发送工具；若未提供，说明本轮无法发送文件。\n"
     )

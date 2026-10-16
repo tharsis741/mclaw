@@ -65,6 +65,13 @@ class MClawConsole:
 def cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's renderer."""
 
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        interaction.write(text)
+        return
+
     configure_text_output()
     from prompt_toolkit import print_formatted_text
     from prompt_toolkit.formatted_text import ANSI
@@ -132,12 +139,28 @@ def _write_all(fd: int, payload: bytes) -> None:
 def print_rich(*args, **kwargs) -> None:
     """Print Rich content directly to stdout for non-interactive CLI commands."""
 
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        from rich.text import Text
+
+        interaction.write(" ".join(Text.from_markup(str(arg)).plain for arg in args))
+        return
+
     configure_text_output()
     Console(highlight=False).print(*args, **kwargs)
 
 
 def print_plain(*args, **kwargs) -> None:
     """Print plain CLI text through the shared TUI output boundary."""
+
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        interaction.write(str(kwargs.get("sep", " ")).join(str(arg) for arg in args))
+        return
 
     configure_text_output()
     print(*args, **kwargs)

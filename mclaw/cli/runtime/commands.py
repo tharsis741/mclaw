@@ -60,6 +60,8 @@ _COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec("doctor", "检查运行环境和工具可用性"),
     SlashCommandSpec("history", "查看历史会话"),
     SlashCommandSpec("resume", "恢复历史会话"),
+    SlashCommandSpec("continue", "继续原任务，再按顺序处理队列"),
+    SlashCommandSpec("queue", "查看、编辑或移除排队消息"),
     SlashCommandSpec("rollback", "撤销文件变更"),
     SlashCommandSpec("checkpoints", "管理 checkpoint 存储"),
     SlashCommandSpec("title", "设置会话标题"),
@@ -68,7 +70,7 @@ _COMMANDS: tuple[SlashCommandSpec, ...] = (
     SlashCommandSpec("schedule", "管理本地定时任务"),
     SlashCommandSpec("skills", "管理技能"),
     SlashCommandSpec("skill", "Skill subcommands", visible=False),
-    SlashCommandSpec("quit", "退出 M-Claw"),
+    SlashCommandSpec("quit", "退出终端"),
 )
 
 _COMMAND_COMPLETIONS: tuple[SlashCommandSpec, ...] = (

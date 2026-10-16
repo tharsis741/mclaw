@@ -35,6 +35,11 @@ BINDING_VERSION = 1
 NATIVE_ABI_VERSION = 1
 
 REMOTE_FRAME_MAX = 32_768
+# Inline v1 message limit. Larger logical replies need negotiated chunk transport.
+REMOTE_MESSAGE_TEXT_BYTES_MAX = 24_576
+REMOTE_TEXT_RESULT_BYTES_MAX = 262_144
+# JSON can escape every input byte as six characters; leave room for receipts.
+REMOTE_TASK_TOOL_RESULT_CHARS_MAX = REMOTE_TEXT_RESULT_BYTES_MAX * 6 + 65_536
 MIN_NEGOTIATED_FRAME = 4_096
 TERMINAL_ERROR_FRAME_MAX = 1_024
 TRANSIENT_SOCKET_CAP = 2

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Any
 
 CREDENTIALS_TOOLS: list[str] = ["secret_request_many"]
@@ -18,7 +19,7 @@ SESSION_SEARCH_TOOLS = ["session_search"]
 DELEGATION_TOOLS = ["delegate_task"]
 WEB_TOOLS = ["web_search", "web_extract"]
 VISION_TOOLS = ["vision_analyze"]
-BROWSER_TOOLS = [
+_LEGACY_BROWSER_TOOLS = (
     "browser_navigate",
     "browser_snapshot",
     "browser_screenshot",
@@ -27,6 +28,17 @@ BROWSER_TOOLS = [
     "browser_scroll",
     "browser_press",
     "browser_download",
+)
+BROWSER_TOOLS = [
+    *_LEGACY_BROWSER_TOOLS,
+    "browser_tabs",
+    "browser_select",
+    "browser_check",
+    "browser_hover",
+    "browser_upload",
+    "browser_handle_dialog",
+    "browser_wait_for",
+    "browser_back",
 ]
 WEIXIN_TOOLS = ["weixin_send_file"]
 DINGTALK_TOOLS = ["dingtalk_send_file"]
@@ -35,6 +47,7 @@ DSOFTBUS_TOOLS = [
     "dsoftbus_get_device_context",
     "dsoftbus_run_agent_task",
     "dsoftbus_continue_agent_task",
+    "dsoftbus_read_task_result",
 ]
 DSOFTBUS_ARTIFACT_TOOLS = ["return_artifact"]
 DSOFTBUS_TASK_CONTROL_TOOLS = ["request_task_input"]
@@ -46,6 +59,16 @@ DSOFTBUS_SOURCE_TOOLS = [
 
 REQUIRED_TOOLSETS = ["credentials", "terminal", "file", "memory", "skills", "session_search", "delegation"]
 OPTIONAL_TOOLSETS = ["web", "vision", "browser", "weixin", "dingtalk"]
+
+
+def effective_disabled_tools(names: Iterable[str]) -> set[str]:
+    """Preserve an old browser-group off switch as new browser tools are added."""
+    disabled = {str(name) for name in names}
+    # The original group switch persisted its eight member names. Interpret
+    # that complete set as group-off without rewriting existing user data.
+    if set(_LEGACY_BROWSER_TOOLS).issubset(disabled):
+        disabled.update(BROWSER_TOOLS)
+    return disabled
 
 
 def _tools_for_toolsets(toolset_names: list[str], definitions: dict[str, dict[str, Any]]) -> list[str]:
@@ -122,7 +145,7 @@ TOOLSETS: dict[str, dict[str, Any]] = {
         "kind": "optional",
     },
     "browser": {
-        "description": "Headless browser automation (navigate, click, type, scroll, screenshot, download)",
+        "description": "Browser automation with page snapshots, tabs, forms, dialogs, uploads, screenshots, and downloads",
         "display": {"emoji": "🤖", "summary_zh": "浏览器自动化"},
         "tools": BROWSER_TOOLS,
         "kind": "optional",

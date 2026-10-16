@@ -1,11 +1,17 @@
 schema_version: 1
 name: weather
-short_description: 获取当前天气和天气预报，无需 API key。
+short_description: 查询当前天气和天气预报，无需接口密钥。
 source:
-  type: local
-  original: C:\Users\kaihong\Desktop\clawhub_skills_db\生活服务\weather
+  type: github
+  original: https://github.com/openclaw/openclaw/tree/246adaa1191438b9e9e178384a026b4c123782f1/skills/weather
+  revision: 246adaa1191438b9e9e178384a026b4c123782f1
+  author: Peter Steinberger
+  license: MIT
+  license_file: LICENSE
+  license_url: https://github.com/openclaw/openclaw/blob/246adaa1191438b9e9e178384a026b4c123782f1/LICENSE
+  copyright: Copyright (c) 2025 Peter Steinberger
 created_at: '2026-06-13T14:24:37+08:00'
-updated_at: '2026-06-13T14:24:42+08:00'
+updated_at: '2026-10-15T00:00:00+00:00'
 created_by: install
-updated_by: install
+updated_by: bundled
 status: enabled

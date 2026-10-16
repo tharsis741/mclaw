@@ -1,0 +1,45 @@
+{
+  "captured_on": "2026-10-15",
+  "platform": "KaihongOS 5.0.1.52",
+  "openharmony_version": "5.0.2.123",
+  "api_version": 14,
+  "device": "Kaihong BotBook",
+  "model": "KHP-LC802",
+  "browser": "com.kaihong.browser",
+  "application_version": "1.1.2",
+  "description": "Self-Evolving Embodied Agent Harness",
+  "source_revision": "ea98bcd with 1.1.2 release metadata",
+  "wheel_sha256": "7bb9a5407b4d0824140733e9ced3e0a9043f283514ae5a31a5108dfb17377ae1",
+  "source": "http://127.0.0.1:18031/",
+  "display": {
+    "width": 1920,
+    "height": 1080
+  },
+  "method": "Device system snapshot_display, cropped from the actual browser page with System.Drawing",
+  "captures": [
+    {
+      "file": "kaihong-overview.png",
+      "captured_at": "2026-10-15T16:38:05+08:00",
+      "source_sha256": "3b0f55682594e7cd2014e95cad71be0956487e691c6fabca3efe994e99144140",
+      "sha256": "e91d23e879a9ea6a3192ea193b9ae8defc7905484715f74e916a0f9dc36aaf1b",
+      "crop": {
+        "x": 0,
+        "y": 97,
+        "width": 1920,
+        "height": 918
+      }
+    },
+    {
+      "file": "kaihong-devices.png",
+      "captured_at": "2026-10-15T16:39:59+08:00",
+      "source_sha256": "be79427f400b6ad9f38bdd2617cb3b532d5d7693cc897c71375d15d2bd83640f",
+      "sha256": "a1574142246047c0eaf413c9896850daa77e5d7b0e6cbaef6faac49b50b485c0",
+      "crop": {
+        "x": 0,
+        "y": 97,
+        "width": 1920,
+        "height": 918
+      }
+    }
+  ]
+}

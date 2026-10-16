@@ -60,7 +60,7 @@ def _workspace_key(path: str | os.PathLike[str] | None) -> str | None:
     return normalized
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS messages (
     session_id TEXT NOT NULL REFERENCES sessions(id),
     role TEXT NOT NULL,
     content TEXT,
+    image_parts TEXT,
     tool_call_id TEXT,
     tool_calls TEXT,
     tool_name TEXT,
@@ -442,6 +443,7 @@ class SessionDB:
 
         cursor.execute("SELECT version FROM schema_version LIMIT 1")
         row = cursor.fetchone()
+        current_version = 0
         if row is None:
             cursor.execute("INSERT INTO schema_version (version) VALUES (?)", (SCHEMA_VERSION,))
         else:
@@ -541,6 +543,11 @@ class SessionDB:
             if current_version < 9:
                 cursor.executescript(SCHEMA_SQL)
                 cursor.execute("UPDATE schema_version SET version = 9")
+
+        if current_version < 10:
+            columns = {row[1] for row in cursor.execute("PRAGMA table_info(messages)")}
+            if "image_parts" not in columns:
+                cursor.execute("ALTER TABLE messages ADD COLUMN image_parts TEXT")
 
         for col_name, col_type in [
             ("workspace", "TEXT"),
@@ -1346,6 +1353,7 @@ class SessionDB:
         reasoning: str = None, reasoning_details: Any = None,
         codex_reasoning_items: Any = None, turn_id: str = None,
         operation_id: str = None,
+        image_parts: list[dict] | None = None,
     ) -> int:
         """Persist one conversation message and update session counters atomically."""
         reasoning_details_json = json.dumps(reasoning_details) if reasoning_details else None
@@ -1358,11 +1366,12 @@ class SessionDB:
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
                    reasoning, reasoning_details, codex_reasoning_items, turn_id,
-                   operation_id)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   operation_id, image_parts)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (session_id, role, content, tool_call_id, tool_calls_json, tool_name,
                  time.time(), token_count, finish_reason, reasoning,
-                 reasoning_details_json, codex_items_json, turn_id, operation_id),
+                 reasoning_details_json, codex_items_json, turn_id, operation_id,
+                 json.dumps(image_parts, ensure_ascii=False) if image_parts else None),
             )
             msg_id = cursor.lastrowid
             if num_tool_calls > 0:
@@ -1391,6 +1400,16 @@ class SessionDB:
                     msg["tool_calls"] = []
             result.append(msg)
         return result
+
+    def get_tool_result(self, session_id: str, tool_call_id: str) -> dict | None:
+        """Read one active result within the owning session, without loading its history."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT content, tool_name FROM messages WHERE session_id = ? AND role = 'tool' "
+                "AND tool_call_id = ? AND invalidated_at IS NULL ORDER BY id DESC LIMIT 1",
+                (session_id, tool_call_id),
+            ).fetchone()
+        return dict(row) if row is not None else None
 
     def get_pending_tool_call_ids(self, session_id: str) -> set[str]:
         """Recover the newest tool batch not followed by a persisted model reply.
@@ -1450,7 +1469,7 @@ class SessionDB:
         where = "session_id = ?" if include_invalidated else "session_id = ? AND invalidated_at IS NULL"
         with self._lock:
             rows = self._conn.execute(
-                "SELECT role, content, tool_call_id, tool_calls, tool_name, "
+                "SELECT id, role, content, image_parts, tool_call_id, tool_calls, tool_name, "
                 "reasoning, reasoning_details, codex_reasoning_items "
                 f"FROM messages WHERE {where} ORDER BY timestamp, id",
                 (session_id,),
@@ -1458,6 +1477,14 @@ class SessionDB:
         messages = []
         for row in rows:
             msg = {"role": row["role"], "content": row["content"]}
+            if row["image_parts"]:
+                try:
+                    parts = json.loads(row["image_parts"])
+                    if isinstance(parts, list) and all(isinstance(part, dict) for part in parts):
+                        msg["_vision_images"] = parts
+                        msg["_message_id"] = row["id"]
+                except (json.JSONDecodeError, TypeError):
+                    logger.warning("Ignoring invalid image metadata for message %s", row["id"])
             if row["tool_call_id"]:
                 msg["tool_call_id"] = row["tool_call_id"]
             if row["tool_name"]:
@@ -1482,6 +1509,14 @@ class SessionDB:
                         pass
             messages.append(msg)
         return messages
+
+    def update_message_images(self, session_id: str, message_id: int, image_parts: list[dict]) -> None:
+        """Persist a visual fallback observation within the owning session."""
+        payload = json.dumps(image_parts, ensure_ascii=False)
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE messages SET image_parts = ? WHERE id = ? AND session_id = ? AND invalidated_at IS NULL",
+            (payload, message_id, session_id),
+        ))
 
     # ── Search ──
 
@@ -1575,6 +1610,9 @@ class SessionDB:
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and detach children that referenced it as parent."""
         def _do(conn):
+            # Future scheduled runs allocate a fresh conversation. Run history
+            # still retains its original session identifier for audit purposes.
+            conn.execute("UPDATE scheduler_jobs SET session_id = NULL WHERE session_id = ?", (session_id,))
             if conn.execute("SELECT COUNT(*) FROM sessions WHERE id = ?", (session_id,)).fetchone()[0] == 0:
                 return False
             conn.execute("DELETE FROM context_rollbacks WHERE session_id = ?", (session_id,))
@@ -1582,7 +1620,17 @@ class SessionDB:
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
             return True
-        return self._execute_write(_do)
+        deleted = self._execute_write(_do)
+        if deleted:
+            from mclaw.constants import get_mclaw_home
+            # Editing an exported/backup database must never delete live assets.
+            if self.db_path.resolve() == (get_mclaw_home() / "state.db").resolve():
+                try:
+                    from mclaw.tools.vision.assets import remove_session_images
+                    remove_session_images(session_id)
+                except (OSError, ValueError):
+                    logger.warning("Could not clean up image snapshots for deleted session %s", session_id)
+        return deleted
 
     def export_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Return a full session export, including invalidated audit messages."""

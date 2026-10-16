@@ -47,10 +47,19 @@ credentials/
 *.bak
 tmp/
 temp/
+.mclaw/
+
+# Local experiments, deployment bundles, and validation evidence
+/work/
+/design-qa.md
 
 # graphify outputs and scratch files
 graphify-out/
 .graphify_*
+
+# Frontend dependencies and generated Python package resources
+webui/node_modules/
+mclaw/web/static/
 
 # Editor and OS files
 .vscode/

@@ -11,6 +11,7 @@ persistence, and recovery state remain ordered across CLI, channel, and
 scheduler runtimes.
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -26,8 +27,10 @@ from mclaw.agent.context_metadata import resolve_context_length
 from mclaw.agent.context_compressor import ContextCompressor
 from mclaw.agent.memory_manager import MemoryManager
 from mclaw.agent.prompt_cache import build_prompt_cache_plan
-from mclaw.agent.prompt_builder import build_system_prompt
+from mclaw.agent.prompt_builder import SKILL_TOOL_NAMES, build_system_prompt
 from mclaw.agent.retry_utils import jittered_backoff
+from mclaw.agent.remote_results import READ_RESULT_TOOL, REMOTE_TASK_TOOLS, project_history, project_reply
+from mclaw.agent.skill_review_state import get_skill_review_state
 from mclaw.agent.token_budget import estimate_request_budget
 from mclaw.agent.transports.base import (
     ModelCallError,
@@ -38,10 +41,10 @@ from mclaw.agent.transports.base import (
 )
 from mclaw.agent.transports.factory import create_transport
 from mclaw.agent.usage import UsageRecord
+from mclaw.dsoftbus.agent_message import remote_model_accumulator_limit
 from mclaw.dsoftbus.protocol import (
     MODEL_STREAM_QUEUE_BYTES_MAX,
     MODEL_STREAM_QUEUE_MAX,
-    REMOTE_MODEL_ACCUMULATOR_BYTES_MAX,
     REMOTE_MODEL_MAX_OUTPUT_TOKENS,
 )
 from mclaw.prompts.background import build_memory_flush_system_prompt
@@ -58,6 +61,7 @@ _DSOFTBUS_REMOTE_DATA_TOOLS = frozenset(
         "dsoftbus_list_peers",
         "dsoftbus_run_agent_task",
         "dsoftbus_continue_agent_task",
+        "dsoftbus_read_task_result",
     }
 )
 _DSOFTBUS_TASK_INPUT_TOOL = "request_task_input"
@@ -482,6 +486,7 @@ class MClaw:
 
         # Memory subsystem.
         self._memory_manager: Optional[MemoryManager] = None
+        self._memory_initialized = False
         self._memory_store = None  # BuiltinMemoryProvider sets this
         self._recalled_memory: str = ""  # per-turn prefetch, injected at API-call time only
         memory_cfg = self.config.get("memory", {}) if isinstance(self.config, dict) else {}
@@ -657,6 +662,8 @@ class MClaw:
         )
         self.tools = definitions
         self.valid_tool_names = valid_names
+        if getattr(self, "_memory_initialized", False):
+            self._sync_memory_tool_schema()
 
     def _build_checkpoint_manager(self):
         """Build the filesystem checkpoint manager from config and runtime flags."""
@@ -746,13 +753,16 @@ class MClaw:
             logger.warning("Memory subsystem init failed (non-fatal): %s", e)
             self._memory_manager = None
             self._memory_store = None
+        finally:
+            self._memory_initialized = True
 
     def _sync_memory_tool_schema(self) -> None:
         """Align exposed memory tool schema with the active memory provider config."""
         from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES
 
         memory_tool_names = set(MEMORY_TOOL_NAMES)
-        if not (memory_tool_names & set(self.valid_tool_names)):
+        allowed_names = memory_tool_names & set(self.valid_tool_names)
+        if not allowed_names:
             return
 
         memory_schemas = []
@@ -762,23 +772,16 @@ class MClaw:
             except Exception:
                 memory_schemas = []
 
-        if not memory_schemas:
-            self.valid_tool_names.difference_update(memory_tool_names)
-            self.tools = [
-                t for t in self.tools
-                if t.get("function", {}).get("name") not in memory_tool_names
-            ]
-            return
-
+        self.valid_tool_names.difference_update(memory_tool_names)
         self.tools = [
             t for t in self.tools
             if t.get("function", {}).get("name") not in memory_tool_names
         ]
         for schema in memory_schemas:
             name = schema.get("function", {}).get("name")
-            if not name:
+            if name not in allowed_names:
                 continue
-            self.tools.append({"type": "function", "function": dict(schema.get("function", {}))})
+            self.tools.append({"type": "function", "function": copy.deepcopy(schema["function"])})
             self.valid_tool_names.add(name)
 
     # ── Memory flush (pre-eviction) ─────────────────────────────
@@ -804,15 +807,25 @@ class MClaw:
         if not msgs or len(msgs) < 3:
             return
 
+        from mclaw.tools.memory_tool import MEMORY_WRITE_TOOL_NAMES
+        from mclaw.tools.toolsets import effective_disabled_tools
+
+        disabled = effective_disabled_tools(self.config.get("tools", {}).get("disabled", []))
+        memory_tools = self._memory_manager.get_all_tool_schemas()
+        if disabled:
+            memory_tools = [
+                schema for schema in memory_tools
+                if schema.get("function", {}).get("name") not in disabled
+            ]
+        flush_tool_names = {schema.get("function", {}).get("name") for schema in memory_tools}
+        if not flush_tool_names.intersection(MEMORY_WRITE_TOOL_NAMES):
+            return
         flush_msgs = [
-            {"role": "system", "content": build_memory_flush_system_prompt()}
+            {"role": "system", "content": build_memory_flush_system_prompt(tool_schemas=memory_tools)}
         ]
         for msg in msgs[-8:]:
             if msg.get("role") in ("user", "assistant"):
                 flush_msgs.append(msg)
-        memory_tools = self._memory_manager.get_all_tool_schemas()
-        if not memory_tools:
-            return
         transport = self.transport
         provider_runtime = self.provider_runtime
         cache_enabled = bool(
@@ -852,12 +865,12 @@ class MClaw:
                 # Parse tool calls directly and route them through MemoryManager
                 # without asking the model for a second decision.
                 if result.tool_calls:
-                    from mclaw.tools.memory_tool import MEMORY_TOOL_NAMES
-
                     for tc in result.tool_calls:
                         fn = tc.get("function", {})
                         tool_name = fn.get("name")
-                        if tool_name not in MEMORY_TOOL_NAMES:
+                        if tool_name not in flush_tool_names:
+                            continue
+                        if tool_name in effective_disabled_tools(self.config.get("tools", {}).get("disabled", [])):
                             continue
                         try:
                             args = json.loads(fn.get("arguments", "{}"))
@@ -892,11 +905,35 @@ class MClaw:
 
     # Background memory and Skill review.
 
+    @property
+    def _turns_since_evolution_review(self) -> int:
+        return get_skill_review_state(self).turns
+
+    @_turns_since_evolution_review.setter
+    def _turns_since_evolution_review(self, value: int) -> None:
+        get_skill_review_state(self).turns = value
+
+    def _on_skill_write(self, action: str, result: dict[str, Any]) -> None:
+        """Observe a committed tool write, independently of model completion."""
+        if not result.get("success") or action not in SKILL_WRITE_ACTIONS:
+            return
+        owner = getattr(self, "_skill_save_owner", self)
+        if action != "create_scaffold":
+            get_skill_review_state(owner).saved(
+                source=getattr(self, "_execution_actor", "main_agent"), action=action,
+                review_id=getattr(self, "_skill_review_id", None),
+            )
+        owner.mark_prompt_epoch_dirty()
+        notice = getattr(self, "_skill_review_notice", None)
+        if notice is not None:
+            notice.saved(action, result)
+
     def _spawn_background_review(
         self,
         messages_snapshot: List[Dict],
         review_memory: bool = False,
         review_skills: bool = False,
+        pending_skill_review: bool = False,
     ) -> None:
         """Start a background review thread for memory and Skill evolution.
 
@@ -910,6 +947,7 @@ class MClaw:
             messages_snapshot=messages_snapshot,
             review_memory=review_memory,
             review_skills=review_skills,
+            pending_skill_review=pending_skill_review,
         )
         return
 
@@ -1368,10 +1406,11 @@ class MClaw:
 
     def _emit_event(self, event: dict):
         """Send structured agent events to the hosting runtime without failing turns."""
-        if not self._event_callback:
+        callback = getattr(self, "_event_callback", None)
+        if not callback:
             return
         try:
-            self._event_callback(event)
+            callback(event)
         except Exception:
             logger.warning("agent event callback failed", exc_info=True)
 
@@ -1417,6 +1456,7 @@ class MClaw:
             "api_call_index": api_call_index,
             "content": visible_content,
             "content_source": content_source,
+            "reasoning": str(reasoning_content or ""),
             "is_final": is_final,
             "tool_call_count": len(calls),
             "tool_names": [
@@ -1565,6 +1605,9 @@ class MClaw:
                 _close_transport_once(resource)
                 closed_transport_ids.add(identity)
             self._close_complete = True
+            skill_review_state = getattr(self, "_skill_review_state", None)
+            if skill_review_state is not None:
+                skill_review_state.close()
             return True
         except Exception as error:
             if getattr(self, "platform", "") == "dsoftbus":
@@ -1594,10 +1637,15 @@ class MClaw:
             messages.insert(0, {"role": "system", "content": content})
         self._prompt_epoch_dirty = False
 
-    def _build_system_prompt(self, *, model: str | None = None) -> str:
+    def _build_system_prompt(
+        self, *, model: str | None = None,
+        tool_names: set[str] | None = None, tool_schemas: list[dict] | None = None,
+    ) -> str:
         """Assemble the current system prompt from platform, tools, and memory."""
         if self.system_prompt:
             return self.system_prompt
+        effective_names = self.valid_tool_names if tool_names is None else tool_names
+        effective_schemas = self.tools if tool_schemas is None else tool_schemas
         memory_block = None
         if self._memory_manager:
             try:
@@ -1608,7 +1656,7 @@ class MClaw:
         # Build available_toolsets from valid_tool_names.
         from mclaw.tools.dispatch import get_toolset_for_tool
         avail_toolsets: set = set()
-        for t in self.valid_tool_names:
+        for t in effective_names:
             ts = get_toolset_for_tool(t)
             if ts:
                 avail_toolsets.add(ts)
@@ -1617,10 +1665,11 @@ class MClaw:
             agent_platform=self.platform,
             model=model or self.model,
             memory_block=memory_block,
-            tool_names=self.valid_tool_names,
+            tool_names=effective_names,
             available_toolsets=avail_toolsets,
-            available_tool_names=sorted(self.valid_tool_names),
+            available_tool_names=sorted(effective_names),
             config=self.config,
+            tool_schemas=effective_schemas,
         )
 
     def _clear_unconfirmed_context_display(self) -> None:
@@ -1739,6 +1788,9 @@ class MClaw:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event | None = None,
         disabled_tool_names: set[str] | None = None,
+        before_model_callback: Callable[[List[Dict], str], None] | None = None,
+        input_operation_id: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn and discard stale estimates on failure."""
         turn_cancel_event, owns_turn = self._acquire_turn_cancel_event(cancel_event)
@@ -1753,6 +1805,9 @@ class MClaw:
                 deadline_monotonic=deadline_monotonic,
                 cancel_event=turn_cancel_event,
                 disabled_tool_names=disabled_tool_names,
+                before_model_callback=before_model_callback,
+                input_operation_id=input_operation_id,
+                image_paths=image_paths,
             )
         except Exception:
             self._clear_unconfirmed_context_display()
@@ -1773,6 +1828,9 @@ class MClaw:
         deadline_monotonic: float | None = None,
         cancel_event: threading.Event,
         disabled_tool_names: set[str] | None = None,
+        before_model_callback: Callable[[List[Dict], str], None] | None = None,
+        input_operation_id: str | None = None,
+        image_paths: list[str] | None = None,
     ) -> Dict[str, Any]:
         """Run one conversation turn through API, tools, persistence, and review hooks.
 
@@ -1782,6 +1840,8 @@ class MClaw:
         """
         self._memory_changed_in_turn = False
         self._skills_changed_in_turn = False
+        skill_review_state = get_skill_review_state(self)
+        skill_save_generation = skill_review_state.save_generation
         with self._usage_lock:
             self._turn_usage = {
                 "input_tokens": 0,
@@ -1794,7 +1854,12 @@ class MClaw:
 
         # Subagents pass None when they should not inherit the parent history.
         messages = list(conversation_history if conversation_history is not None else [])
-        if self._prompt_epoch_dirty:
+        from mclaw.prompts.skills import prepare_skill_contexts_for_turn
+
+        messages, pending_skills = prepare_skill_contexts_for_turn(messages)
+        if self._prompt_epoch_dirty or (not self.system_prompt and self.valid_tool_names & SKILL_TOOL_NAMES):
+            # A separate Web/CLI process can edit the shared Skill index. Rebuild
+            # at the turn boundary; the builder keys cached text by fresh content.
             self._refresh_prompt_epoch(messages)
 
         # Reset prior token counts for fresh sessions so heavy previous tasks
@@ -1813,6 +1878,7 @@ class MClaw:
             else:
                 logger.info("[SYSTEM PROMPT]\n%s", system_prompt_text)
             messages.insert(0, {"role": "system", "content": system_prompt_text})
+        messages.extend(pending_skills)
 
         self._checkpoint_turn_id = uuid.uuid4().hex[:12]
         self._checkpoint_messages_len_before_turn = len(messages)
@@ -1824,7 +1890,15 @@ class MClaw:
             except Exception:
                 logger.debug("Could not capture checkpoint message marker", exc_info=True)
 
-        messages.append({"role": "user", "content": user_message})
+        user_images = []
+        if image_paths:
+            from mclaw.agent.vision import prepare_user_images
+
+            user_message, user_images = prepare_user_images(self, user_message, image_paths, cancel_event)
+        user_row = {"role": "user", "content": user_message}
+        if user_images:
+            user_row["_vision_images"] = user_images
+        messages.append(user_row)
 
         # Background review counters are advanced only after this user turn completes.
         _should_review_memory = False
@@ -1843,17 +1917,23 @@ class MClaw:
         dynamic_system_context = "\n\n".join(
             part for part in (extra_system, self._recalled_memory) if part
         )
+        if READ_RESULT_TOOL in self.valid_tool_names and not disable_tools and call_source != "dsoftbus":
+            messages = project_history(self, messages)
         cache_enabled = bool(
             self.config.get("prompt_cache", {}).get("enabled", True)
         )
 
         if self._session_db:
-            self._session_db.append_message(
+            user_message_id = self._session_db.append_message(
                 self.session_id,
                 "user",
                 content=user_message,
                 turn_id=self._checkpoint_turn_id,
+                operation_id=input_operation_id,
+                **({"image_parts": user_images} if user_images else {}),
             )
+            if user_images:
+                user_row["_message_id"] = user_message_id
             if hasattr(self._session_db, "count_user_messages"):
                 try:
                     self.session_user_messages = self._session_db.count_user_messages(self.session_id)
@@ -1921,6 +2001,15 @@ class MClaw:
             if self._is_interrupted(cancel_event):
                 interrupted = True
                 break
+
+            # Hosts may apply queued additions only here, between complete tool
+            # batches and model requests. They must persist additions before
+            # acknowledging them to their presentation layer.
+            if before_model_callback is not None:
+                before_model_callback(messages, self._checkpoint_turn_id)
+                if self._is_interrupted(cancel_event):
+                    interrupted = True
+                    break
 
             # Successful write payloads shrink at one boundary for fresh,
             # resumed, and post-tool requests. Pending writes remain raw until
@@ -2053,6 +2142,7 @@ class MClaw:
             result: ModelCallResult | None = None
             retry_count = 0
             context_recovery_attempts = 0
+            vision_recovery_attempted = False
 
             while retry_count < MAX_RETRIES:
                 if _deadline_reached():
@@ -2063,6 +2153,7 @@ class MClaw:
                 if self._is_interrupted(cancel_event):
                     interrupted = True
                     break
+                request_messages = []
                 try:
                     if self._prompt_epoch_dirty:
                         self._refresh_prompt_epoch(messages)
@@ -2141,10 +2232,35 @@ class MClaw:
 
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] 开始 API 调用", getattr(self, "session_id", "?")[-6:])
+                    from mclaw.agent.vision import project_vision_messages
+
+                    try:
+                        request_messages = project_vision_messages(self, messages, cancel_event)
+                    except Exception as image_error:
+                        if getattr(image_error, "termination_fence", None) is not None:
+                            raise
+                        if cancel_event.is_set():
+                            result = None
+                            interrupted = True
+                            break
+                        raise ModelCallError(str(image_error), self.provider, self.model, code="VISION_INPUT_FAILED") from None
+                    if (disable_tools or disabled_names) and not self.system_prompt:
+                        # Restrict only this request's base prompt. The session
+                        # retains its normal capabilities for subsequent turns.
+                        request_messages = list(request_messages)
+                        request_messages[0] = {
+                            **request_messages[0],
+                            "content": self._build_system_prompt(
+                                tool_names=active_tool_names, tool_schemas=active_tools,
+                            ),
+                        }
                     api_call_count += 1
                     self._record_api_attempt()
+                    model_call_started = time.monotonic()
+                    logger.info("[MODEL REQUEST] agent=%s provider=%s model=%s attempt=%d messages=%d",
+                                self.session_id, self.provider, self.model, api_call_count, len(request_messages))
                     result = self.transport.call(
-                        messages=messages,
+                        messages=request_messages,
                         tools=active_tools,
                         options=ModelCallOptions(
                             stream=(
@@ -2152,6 +2268,8 @@ class MClaw:
                                 or bool(self._stream_callback)
                             ),
                             timeout=30.0,
+                            first_response_timeout=self.config.get("agent", {}).get("first_response_timeout", 90),
+                            stream_idle_timeout=self.config.get("agent", {}).get("stream_idle_timeout", 60),
                             max_output_tokens=(
                                 REMOTE_MODEL_MAX_OUTPUT_TOKENS
                                 if call_source == "dsoftbus"
@@ -2162,8 +2280,16 @@ class MClaw:
                             stream_activity_callback=(
                                 self._emit_status if self._stream_callback else None
                             ),
+                            stream_reasoning_callback=(
+                                lambda text: self._emit_event({
+                                    "type": "assistant.reasoning",
+                                    "turn_id": getattr(self, "_checkpoint_turn_id", None),
+                                    "api_call_index": api_call_count,
+                                    "content": text,
+                                })
+                            ) if self._event_callback else None,
                             cache_plan=build_prompt_cache_plan(
-                                messages=messages,
+                                messages=request_messages,
                                 tools=active_tools,
                                 context=self.provider_runtime,
                                 session_id=self.session_id,
@@ -2171,7 +2297,7 @@ class MClaw:
                             ),
                             deadline_monotonic=deadline_monotonic,
                             response_utf8_max_bytes=(
-                                REMOTE_MODEL_ACCUMULATOR_BYTES_MAX
+                                remote_model_accumulator_limit()
                                 if call_source == "dsoftbus"
                                 else None
                             ),
@@ -2186,7 +2312,7 @@ class MClaw:
                                 else None
                             ),
                             stream_accumulator_max_bytes=(
-                                REMOTE_MODEL_ACCUMULATOR_BYTES_MAX
+                                remote_model_accumulator_limit()
                                 if call_source == "dsoftbus"
                                 else None
                             ),
@@ -2204,10 +2330,21 @@ class MClaw:
                         stream_callback=self._stream_callback,
                         interrupted=cancel_event.is_set,
                     )
+                    logger.info("[MODEL RESPONSE] agent=%s attempt=%d finish=%s tools=%d elapsed_ms=%d",
+                                self.session_id, api_call_count, result.finish_reason if result else "interrupted",
+                                len(result.tool_calls or []) if result else 0,
+                                round((time.monotonic() - model_call_started) * 1000))
                     if getattr(self, "_delegate_depth", 0) > 0:
                         logger.info("[subagent-%s] API 调用完成", getattr(self, "session_id", "?")[-6:])
                     break
                 except ModelCallError as error:
+                    from mclaw.agent.vision import recover_image_rejection
+
+                    if not vision_recovery_attempted and not cancel_event.is_set() and error.code != "VISION_INPUT_FAILED":
+                        if recover_image_rejection(self, request_messages, error, cancel_event):
+                            vision_recovery_attempted = True
+                            self._emit_status("当前模型拒绝图片输入，正在使用专用视觉模型…")
+                            continue
                     remote_error_code = (
                         error.code
                         if error.code
@@ -2348,7 +2485,10 @@ class MClaw:
                                 wait,
                                 error,
                             )
-                        self._emit_status(f"Retrying in {wait:.0f}s...")
+                        if error.code == "PROVIDER_TIMEOUT":
+                            self._emit_status(f"Model response timed out; retrying in {wait:.0f}s...")
+                        else:
+                            self._emit_status(f"Retrying in {wait:.0f}s...")
                         retry_deadline = time.monotonic() + wait
                         if deadline_monotonic is not None:
                             retry_deadline = min(
@@ -2432,6 +2572,9 @@ class MClaw:
                 break
 
             if response_confirms_visibility:
+                from mclaw.agent.vision import mark_vision_images_seen
+
+                mark_vision_images_seen(self, messages)
                 # A successful model response proves the pending tool calls and
                 # paired results were visible once.
                 self._tool_visibility_state_reliable = True
@@ -2648,14 +2791,15 @@ class MClaw:
             if (
                 getattr(self, "_evolution_review_round", 0) > 0
                 and "skill_manage" in self.valid_tool_names
+                and getattr(self, "_delegate_depth", 0) == 0
             ):
-                if getattr(self, "_skills_changed_in_turn", False):
-                    self._turns_since_evolution_review = 0
-                else:
-                    self._turns_since_evolution_review = getattr(self, "_turns_since_evolution_review", 0) + 1
-                    if self._turns_since_evolution_review >= getattr(self, "_evolution_review_round", 0):
-                        _should_review_skills = True
-                        self._turns_since_evolution_review = 0
+                _should_review_skills = skill_review_state.complete_turn(
+                    generation=skill_save_generation,
+                    interval=self._evolution_review_round,
+                    messages=messages,
+                    task_id=getattr(self, "_application_task_id", None),
+                    response_id=getattr(self, "_application_response_id", None),
+                )
 
         # Background memory/Skill reviews start after the reply completes so
         # they do not compete with the user task. Subagents are temporary and
@@ -2672,6 +2816,7 @@ class MClaw:
                     messages_snapshot=list(messages),
                     review_memory=_should_review_memory,
                     review_skills=_should_review_skills,
+                    pending_skill_review=True,
                 )
             except Exception as exc:
                 logger.debug("Background review scheduling failed: %s", exc)
@@ -2752,7 +2897,9 @@ class MClaw:
         checkpoint_mgr = self._get_checkpoint_manager()
         checkpoint_mgr.new_turn()
 
-        disabled = set(
+        from mclaw.tools.toolsets import effective_disabled_tools
+
+        disabled = effective_disabled_tools(
             getattr(self, "config", {}).get("tools", {}).get("disabled", [])
         )
         filtered_calls = []
@@ -2812,16 +2959,22 @@ class MClaw:
                 "[TURN TOOL FILTER] rejected_model_calls=%s",
                 rejected_names,
             )
-        if self._tool_callback:
-            for tc in tool_calls:
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                if allowed_tool_names is not None and name not in allowed_tool_names:
-                    continue
-                try:
-                    args = json.loads(fn.get("arguments", "{}"))
-                except (json.JSONDecodeError, TypeError):
-                    args = {}
+        advertised_tool_ids = set()
+        tool_timings: dict[str, int] = {}
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            if allowed_tool_names is not None and name not in allowed_tool_names:
+                continue
+            try:
+                args = json.loads(fn.get("arguments", "{}"))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+            advertised_tool_ids.add(tc["id"])
+            self._emit_event({"type": "tool.started", "tool_call_id": tc["id"],
+                              "name": name, "arguments": args,
+                              "turn_id": getattr(self, "_checkpoint_turn_id", None)})
+            if self._tool_callback:
                 self._tool_callback(name, args)
 
         # Batch dispatch: write tools take the serialized CheckpointManager path.
@@ -2853,6 +3006,7 @@ class MClaw:
                 parent_agent=self,
                 cancel_event=cancel_event,
                 call_source=call_source,
+                timings=tool_timings,
             )
         finally:
             reset_tool_context(context_tokens)
@@ -2887,22 +3041,6 @@ class MClaw:
             except (json.JSONDecodeError, TypeError, AttributeError) as exc:
                 logger.debug("Memory write result could not be parsed: %s", exc)
 
-        # A successful Skill write resets the review interval. Read-only actions
-        # and failed writes leave the completed-turn counter unchanged.
-        if getattr(self, "_evolution_review_round", 0) > 0 and "skill_manage" in self.valid_tool_names:
-            for tc, result in zip(tool_calls, results):
-                fn = tc.get("function", {})
-                if fn.get("name") != "skill_manage":
-                    continue
-                try:
-                    result_data = json.loads(result)
-                    action = str(result_data.get("action") or "").strip()
-                    if result_data.get("success") and action in SKILL_WRITE_ACTIONS:
-                        self._turns_since_evolution_review = 0
-                        break  # One successful write is enough to reset the counter.
-                except (json.JSONDecodeError, TypeError) as exc:
-                    logger.debug("Memory write result could not be parsed: %s", exc)
-
         pending_delegate_data = None
         pending_skill_import_confirmation = None
         pending_task_input_request = None
@@ -2913,14 +3051,27 @@ class MClaw:
             result = results[i] if i < len(results) else json.dumps(
                 {"error": "No result returned"}
             )
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": result,
-            })
-
             fn = tc.get("function", {})
             name = fn.get("name", "")
+            projection = project_reply(self, result, tc["id"], messages) if name in REMOTE_TASK_TOOLS else result
+            from mclaw.agent.vision import tool_images
+
+            images = tool_images(self, name, result, cancel_event)
+            tool_row = {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "content": projection,
+            }
+            if images:
+                tool_row["_vision_images"] = images
+            messages.append(tool_row)
+            if tc["id"] in advertised_tool_ids:
+                logger.info("[TOOL FINISHED] agent=%s call=%s name=%s elapsed_ms=%s",
+                            self.session_id, tc["id"], name, tool_timings.get(tc["id"]))
+                self._emit_event({"type": "tool.finished", "tool_call_id": tc["id"],
+                                  "name": name, "result": result,
+                                  "elapsed_ms": tool_timings.get(tc["id"]),
+                                  "turn_id": getattr(self, "_checkpoint_turn_id", None)})
             if name == "delegate_task":
                 try:
                     result_data = json.loads(result)
@@ -2955,14 +3106,17 @@ class MClaw:
                     pass
 
             if self._session_db:
-                self._session_db.append_message(
+                tool_message_id = self._session_db.append_message(
                     self.session_id, "tool",
                     content=result,
                     tool_name=name,
                     tool_call_id=tc["id"],
                     turn_id=self._checkpoint_turn_id,
                     operation_id=getattr(self, "_tool_operation_ids", {}).get(tc["id"]),
+                    **({"image_parts": images} if images else {}),
                 )
+                if images:
+                    tool_row["_message_id"] = tool_message_id
 
         if memory_prompt_changed or skill_prompt_changed:
             self._refresh_prompt_epoch(messages)

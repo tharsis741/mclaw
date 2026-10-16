@@ -7,13 +7,14 @@
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import math
 import tempfile
 import uuid
 from pathlib import Path
 
-from mclaw.tools.vision.config import DEFAULT_MAX_PIXELS
+from mclaw.tools.vision.config import DEFAULT_MAX_PIXELS, MAX_IMAGE_SIZE_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +37,6 @@ def _detect_image_mime_type(image_path: Path) -> str | None:
         return "image/bmp"
     if len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP":
         return "image/webp"
-    if image_path.suffix.lower() == ".svg":
-        try:
-            head = image_path.read_text(encoding="utf-8", errors="ignore")[:4096].lower()
-            if "<svg" in head:
-                return "image/svg+xml"
-        except Exception:
-            pass
     return None
 
 
@@ -62,52 +56,53 @@ def _rgb_for_jpeg(img):
 
 def _resize_image_if_needed(
     image_path: Path,
-    max_pixels: int = DEFAULT_MAX_PIXELS,
-    alignment: int = 32,
+    max_pixels: int | None = DEFAULT_MAX_PIXELS,
+    alignment: int = 1,
     jpeg_quality: int = 85,
 ) -> Path:
-    """Downscale an image only when its total pixel count exceeds ``max_pixels``."""
-    if max_pixels <= 0:
+    """Preserve original bytes; convert unsupported inputs or honor an explicit resize budget."""
+    if max_pixels is not None and max_pixels <= 0:
         raise ValueError("max_pixels must be positive")
     if alignment <= 0:
         raise ValueError("alignment must be positive")
-    if image_path.suffix.lower() == ".svg":
-        return image_path
-
     try:
         from PIL import Image, ImageOps
     except ImportError:
-        logger.debug("Pillow not installed; skipping image resize")
-        return image_path
+        raise RuntimeError("Pillow is required for safe image decoding and resizing.") from None
 
+    resized_path = None
     try:
         with Image.open(image_path) as img:
             source_format = (img.format or "").upper()
-            img = ImageOps.exif_transpose(img)
-            width, height = img.size
-            source_pixels = width * height
-            if source_pixels <= max_pixels:
+            if source_format not in {"PNG", "JPEG", "WEBP", "GIF", "BMP"}:
+                raise ValueError("Unsupported image format; use PNG, JPEG, WebP, GIF or BMP.")
+            if img.width * img.height > 64_000_000:
+                raise ValueError("Image exceeds 64 million source pixels; crop it before analysis.")
+            animated = getattr(img, "n_frames", 1) > 1
+            img.load()
+            source_pixels = img.width * img.height
+            within_budget = max_pixels is None or source_pixels <= max_pixels
+            if within_budget and source_format != "BMP" and not animated:
                 return image_path
 
-            scale = math.sqrt(max_pixels / source_pixels)
+            img = ImageOps.exif_transpose(img)
+            width, height = img.size
+            scale = min(1.0, math.sqrt(max_pixels / source_pixels)) if max_pixels is not None else 1.0
+            # Align only the long edge, then apply that one scale to both axes.
+            # Independently rounding short edges can badly distort panoramas.
+            longest = max(width, height)
+            if scale < 1 and longest * scale >= alignment:
+                scale = int(longest * scale) // alignment * alignment / longest
             scaled_width = max(1, int(width * scale))
             scaled_height = max(1, int(height * scale))
-            new_width = (
-                scaled_width // alignment * alignment
-                if scaled_width >= alignment
-                else scaled_width
-            )
-            new_height = (
-                scaled_height // alignment * alignment
-                if scaled_height >= alignment
-                else scaled_height
-            )
+            new_width, new_height = scaled_width, scaled_height
 
-            img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+            if img.size != (new_width, new_height):
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
             temp_dir = Path(tempfile.gettempdir()) / "mclaw-vision"
             temp_dir.mkdir(parents=True, exist_ok=True)
-            preserve_png = source_format == "PNG"
+            preserve_png = source_format in {"PNG", "BMP", "GIF"}
             suffix = ".png" if preserve_png else ".jpg"
             resized_path = temp_dir / f"resized_{uuid.uuid4().hex[:8]}{suffix}"
 
@@ -131,14 +126,25 @@ def _resize_image_if_needed(
                 new_width * new_height,
             )
             return resized_path
-    except Exception as exc:
-        logger.warning("Image resize failed (%s), using original", exc)
-        return image_path
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        if resized_path is not None:
+            resized_path.unlink(missing_ok=True)
+        raise ValueError(f"Cannot decode or normalize this image: {exc}") from exc
 
 
 def _image_to_base64_data_url(image_path: Path, mime_type: str | None = None) -> str:
     """Encode an image file into the data URL format expected by chat models."""
-    data = image_path.read_bytes()
+    from PIL import Image
+
+    with image_path.open("rb") as stream:
+        data = stream.read(MAX_IMAGE_SIZE_BYTES + 1)
+    if not data or len(data) > MAX_IMAGE_SIZE_BYTES:
+        raise ValueError("Image exceeds the byte limit or is empty.")
+    with Image.open(io.BytesIO(data)) as image:
+        actual_mime = Image.MIME.get(image.format)
+        image.verify()
+    if actual_mime not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
+        raise ValueError("Image must be normalized before encoding.")
     encoded = base64.b64encode(data).decode("ascii")
-    mime = mime_type or "image/jpeg"
+    mime = actual_mime
     return f"data:{mime};base64,{encoded}"

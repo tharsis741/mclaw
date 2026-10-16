@@ -6,10 +6,8 @@
 
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Protocol
-
-import openai
+from dataclasses import replace
+from typing import Protocol
 
 from mclaw.tools.vision.types import VisionCredentials
 
@@ -28,72 +26,41 @@ class VisionClient(Protocol):
         ...
 
 
-class UnsupportedVisionProviderError(RuntimeError):
-    """Raised when configuration names a provider without an adapter."""
-    pass
+class ProviderVisionClient:
+    """Use shared request shaping, auth, deadlines and protocols for every provider."""
+    provider = "registry"
 
+    async def analyze(self, messages: list, credentials: VisionCredentials, timeout: float) -> str:
+        from mclaw.agent.auxiliary_client import _call_auxiliary_model
+        from mclaw.agent.transports.base import ModelCallOptions
+        from mclaw.providers.resolver import resolve_provider_runtime_context
 
-class QwenVisionClient:
-    """OpenAI-compatible client for Qwen/DashScope vision models."""
-    provider = "qwen"
-
-    async def analyze(
-        self,
-        messages: list,
-        credentials: VisionCredentials,
-        timeout: float,
-    ) -> str:
-        """Call the Qwen vision model and fall back when temperature is rejected."""
-        client = openai.AsyncOpenAI(
-            api_key=credentials.api_key or openai.NOT_GIVEN,
-            base_url=credentials.base_url or openai.NOT_GIVEN,
-            max_retries=0,
-            timeout=timeout,
+        runtime = credentials.runtime or resolve_provider_runtime_context(
+            provider=credentials.provider, model=credentials.model,
+            api_key=credentials.api_key, base_url=credentials.base_url,
         )
-        kwargs: dict[str, Any] = {
-            "model": credentials.model,
-            "messages": messages,
-            "max_tokens": 2000,
-            "temperature": 0.1,
-        }
-        if credentials.model.strip().lower().startswith("qwen3"):
-            kwargs["extra_body"] = {"enable_thinking": False}
-
-        async with client:
-            async with asyncio.timeout(max(0.001, timeout)):
-                try:
-                    response = await client.chat.completions.create(**kwargs)
-                except openai.BadRequestError as exc:
-                    err_msg = str(exc).lower()
-                    if "temperature" not in err_msg:
-                        raise
-                    kwargs.pop("temperature", None)
-                    response = await client.chat.completions.create(**kwargs)
-
-        if not response.choices:
-            return ""
-
-        msg = response.choices[0].message
-        content = msg.content or ""
-        reasoning = getattr(msg, "reasoning_content", None) or ""
-        return content or reasoning or ""
+        runtime = replace(runtime, reasoning_config={"enabled": False})
+        content, usage = await _call_auxiliary_model(
+            runtime, messages, ModelCallOptions(timeout=timeout, max_output_tokens=2000, source="vision"),
+        )
+        return VisionAnalysis(content.strip(), usage)
 
 
-_qwen_client = QwenVisionClient()
-_CLIENTS: dict[str, VisionClient] = {
-    "qwen": _qwen_client,
-    "qwen-intl": _qwen_client,
-    "dashscope": _qwen_client,
-}
+class VisionAnalysis(str):
+    """String-compatible result carrying provider-reported usage to the calling thread."""
+
+    def __new__(cls, content: str, usage=None):
+        instance = super().__new__(cls, content)
+        instance.usage = usage
+        return instance
+
+
+_provider_client = ProviderVisionClient()
 
 
 def get_vision_client(provider: str) -> VisionClient:
     """Resolve a configured provider name to a concrete vision client."""
-    provider_key = str(provider or "").strip().lower()
-    client = _CLIENTS.get(provider_key)
-    if client is None:
-        raise UnsupportedVisionProviderError(f"vision provider '{provider_key}' is not supported")
-    return client
+    return _provider_client
 
 
 async def call_vision_llm(
@@ -103,6 +70,7 @@ async def call_vision_llm(
     base_url: str,
     timeout: float,
     provider: str = "qwen",
+    runtime=None,
 ) -> str:
     """Compatibility wrapper used by the tool-facing vision entrypoint."""
     credentials = VisionCredentials(
@@ -110,6 +78,7 @@ async def call_vision_llm(
         api_key=api_key,
         base_url=base_url,
         model=model,
+        runtime=runtime,
     )
     return await get_vision_client(credentials.provider).analyze(
         messages,

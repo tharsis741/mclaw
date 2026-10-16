@@ -69,7 +69,10 @@ def _format_cli_help() -> str:
     return """M-CLAW 命令指引
 
 核心命令
-  mclaw                         启动交互式 Agent Runtime
+  mclaw                         启动或连接本机后台服务并打开 Web UI
+  mclaw status                  查看本机 Web 服务地址和进程状态
+  mclaw stop                    保存进展、等待工具收尾并停止本机 Web 服务
+  mclaw cli                     启动终端交互界面
   mclaw resume [session_id]      恢复最近会话，或按 ID/前缀恢复指定会话
   mclaw setup                   配置模型、工具、通道和可选能力
   mclaw doctor                  检查运行环境、依赖、凭据、工具和通道配置
@@ -115,6 +118,11 @@ def _add_runtime_selector_args(parser: argparse.ArgumentParser, *, inherited: bo
 
 def _prompt_secret(prompt: str) -> str:
     """Prompt for a secret; echo one '*' per typed character when interactive."""
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        return interaction.request("secret", prompt)
     if os.name != "nt":
         try:
             import termios
@@ -214,6 +222,11 @@ _SETUP_CONFIGURED_COUNT = 0
 
 def _setup_input(prompt: str, *, dim: bool = False) -> str:
     from mclaw.cli.colors import Colors, color
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        return interaction.request("text", prompt).strip()
 
     try:
         style = Colors.DIM if dim else Colors.YELLOW
@@ -231,6 +244,16 @@ def _setup_secret(prompt: str) -> str:
     except (EOFError, KeyboardInterrupt):
         print_plain()
         raise _SetupCancelled
+
+
+def _setup_field(prompt: str, *, title: str, secret: bool = False, **presentation) -> str:
+    """Describe a Web field while retaining the terminal prompt and defaults."""
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        return interaction.request("secret" if secret else "text", title, **presentation).strip()
+    return _setup_secret(prompt) if secret else _setup_input(prompt)
 
 
 def _print_setup_cancelled(configured_count: int = 0) -> None:
@@ -332,21 +355,39 @@ def _print_setup_header(title: str, subtitle: str = "", *, indent: str = "  ") -
 
 def _print_setup_intro() -> bool:
     from mclaw.cli.colors import Colors, color
+    from mclaw.application.setup_interaction import current_setup_interaction
 
-    _print_setup_header("欢迎使用 M-Claw", "本向导将帮助你配置模型供应商与本地运行权限。", indent="")
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        selected = interaction.request(
+            "single_select", "开始使用 M-Claw",
+            presentation="welcome",
+            hint="先连接你要使用的大模型，再选择需要的工具。开始前，请了解它如何使用你的文件和数据。",
+            credential_path=display_mclaw_path(".env"),
+            options=[
+                {"id": "y", "label": "同意并开始配置"},
+                {"id": "n", "label": "暂不配置"},
+            ],
+            default=["y"],
+        )
+        if selected == ["y"]:
+            return True
+        raise _SetupCancelled
+
+    _print_setup_header("欢迎使用 M-Claw", "先连接大模型，再选择需要的工具。", indent="")
     print_plain()
     print_plain(color("使用前确认", Colors.BOLD, Colors.BLUE))
-    print_plain(color("以下内容用于说明在本地运行M-CLAW会涉及的权限边界。", Colors.DIM))
+    print_plain(color("开始前，请了解 M-Claw 如何使用你的文件和数据。", Colors.DIM))
     print_plain()
-    print_plain(color("工作区   ", Colors.BOLD, Colors.CYAN) + color("读取当前工作区，必要上下文可能发送给你选择的模型供应商", Colors.DIM))
-    print_plain(color("凭据     ", Colors.BOLD, Colors.CYAN) + color(f"API Key 等敏感凭据会保存到 {display_mclaw_path('.env')}", Colors.DIM))
-    print_plain(color("操作     ", Colors.BOLD, Colors.CYAN) + color("交互过程中，M-Claw 可能按你的指令读写文件、执行命令或进行敏感操作", Colors.DIM))
+    print_plain(color("你的文件 ", Colors.BOLD, Colors.CYAN) + color("M-Claw 会按你的要求读取和修改文件、运行命令，访问范围取决于当前系统账户的权限。", Colors.DIM))
+    print_plain(color("模型服务 ", Colors.BOLD, Colors.CYAN) + color("对话和完成任务所需的文件内容，可能发送给你选择的模型供应商。", Colors.DIM))
+    print_plain(color("API Key  ", Colors.BOLD, Colors.CYAN) + color(f"密钥保存在这台电脑的 {display_mclaw_path('.env')}，用于连接相应服务。", Colors.DIM))
     print_plain()
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() and current_setup_interaction.get() is None:
         return False
     while True:
         try:
-            choice = _setup_input("输入 Y 继续设置，输入 N 退出设置向导：").lower()
+            choice = _setup_input("输入 Y 同意并开始配置，输入 N 退出：").lower()
         except EOFError:
             return False
         if choice == "y":
@@ -500,6 +541,13 @@ def _resolve_configured_runtime(args, config: dict):
     )
 
 
+def _open_startup_history():
+    from mclaw.application.client import ApplicationClient
+    from mclaw.cli.service_state import ServiceHistory
+
+    return ServiceHistory(ApplicationClient.connect(), owns_client=True)
+
+
 def _resolve_startup_runtime(args, config: dict, workspace: str):
     """Restore a requested session selector before validating startup credentials."""
     from mclaw.providers.resolver import ProviderResolutionError
@@ -522,9 +570,7 @@ def _resolve_startup_runtime(args, config: dict, workspace: str):
         return _configured_resolution()
 
     from mclaw.providers.resolver import restore_provider_runtime_context
-    from mclaw.state import SessionDB
-
-    db = SessionDB()
+    db = _open_startup_history()
     try:
         if resume_ref == RESUME_LATEST_SESSION:
             session_id = db.latest_session_id(source="cli", workspace=workspace)
@@ -775,6 +821,7 @@ def _run_weixin_login(args, *, optional: bool = False, skip_existing: bool = Fal
     from mclaw.channels.weixin.qr_login import qr_login
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.config import ensure_mclaw_home, save_env_value
+    from mclaw.application.setup_interaction import current_setup_interaction
 
     ensure_mclaw_home()
     _render_weixin_login_header()
@@ -785,11 +832,13 @@ def _run_weixin_login(args, *, optional: bool = False, skip_existing: bool = Fal
         return True
 
     _print_setup_step("步骤 1/1  扫码登录", "请在终端二维码出现后使用微信完成确认。")
+    presentation = {"print_fn": print_plain} if current_setup_interaction.get() is not None else {}
     credentials = asyncio.run(
         qr_login(
             bot_type=str(getattr(args, "bot_type", "3") or "3"),
             timeout_seconds=int(getattr(args, "timeout", 480) or 480),
             render_qr=not bool(getattr(args, "no_qr", False)),
+            **presentation,
         )
     )
     if credentials is None:
@@ -920,6 +969,11 @@ def _authorize_dingtalk_credentials() -> None:
 
 def _prompt_required_text(prompt: str) -> str:
     from mclaw.cli.colors import Colors, color
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        return interaction.request("text", prompt).strip()
 
     try:
         return input(color(prompt, Colors.YELLOW)).strip()
@@ -1002,9 +1056,16 @@ def _run_dingtalk_setup(args, *, optional: bool = False) -> bool:
 def _run_dingtalk_group_connection_setup(_args=None) -> None:
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.config import load_config
+    from mclaw.application.setup_interaction import current_setup_interaction
 
-    if not sys.stdin.isatty():
+    if not sys.stdin.isatty() and current_setup_interaction.get() is None:
         return
+
+    def read_value(prompt: str) -> str:
+        interaction = current_setup_interaction.get()
+        if interaction is not None:
+            return interaction.request("text", prompt).strip()
+        return input(color(prompt, Colors.YELLOW)).strip()
 
     while True:
         print_plain(color("\n  钉钉群聊连接", Colors.BOLD, Colors.BLUE))
@@ -1013,15 +1074,15 @@ def _run_dingtalk_group_connection_setup(_args=None) -> None:
         print_plain(f"    {color('2', Colors.BOLD)}. 查看已连接群聊")
         print_plain(f"    {color('3', Colors.BOLD)}. 跳过")
         try:
-            choice = input(color("  请选择 (1/2/3，默认 3 跳过): ", Colors.YELLOW)).strip() or "3"
+            choice = read_value("  请选择 (1/2/3，默认 3 跳过): ") or "3"
         except (EOFError, KeyboardInterrupt):
             print_plain()
             return
         if choice == "1":
             try:
-                group_name = input(color("  群聊备注名: ", Colors.YELLOW)).strip()
-                conversation_id = input(color("  conversation_id: ", Colors.YELLOW)).strip()
-                open_conversation_id = input(color("  open_conversation_id: ", Colors.YELLOW)).strip()
+                group_name = read_value("  群聊备注名: ")
+                conversation_id = read_value("  conversation_id: ")
+                open_conversation_id = read_value("  open_conversation_id: ")
             except (EOFError, KeyboardInterrupt):
                 print_plain()
                 return
@@ -1202,9 +1263,10 @@ def _run_setup_impl(args):
     )
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.model_resolver import resolve_provider_key
-    from mclaw.cli.provider_profiles import CORE_PROVIDER_KEYS, get_provider_profiles
+    from mclaw.cli.provider_profiles import CORE_PROVIDER_KEYS, get_provider_profiles, get_setup_provider_label
     from mclaw.cli.tui.console import print_plain
     from mclaw.cli.tui.selection_prompt import prompt_multi_select
+    from mclaw.providers.registry import PROVIDER_REGISTRY as RUNTIME_PROVIDER_REGISTRY
 
     ensure_mclaw_home()
     config = load_config()
@@ -1226,6 +1288,7 @@ def _run_setup_impl(args):
         for provider_key in PROVIDER_REGISTRY
         if provider_key not in common_providers
         and provider_key not in represented_runtime_providers
+        and RUNTIME_PROVIDER_REGISTRY[provider_key].setup_profiles
     ]
     selectable_providers = [*common_providers, *additional_providers]
     other_provider_id = "__other_provider__"
@@ -1234,8 +1297,7 @@ def _run_setup_impl(args):
     provider_items = [
         {
             "id": provider_key,
-            "label": PROVIDER_REGISTRY[provider_key].display_name,
-            "category": provider_key,
+            "label": get_setup_provider_label(provider_key),
         }
         for provider_key in selectable_providers
     ]
@@ -1290,10 +1352,11 @@ def _run_setup_impl(args):
         leading_blank=not intro_paused,
     )
     selected_provider_ids = prompt_multi_select(
-        "M-Claw 大模型接入配置",
+        "大模型接入配置",
         provider_items,
-        hint="选择需要配置的接入方；每个接入方分别输入 API Key 并选择模型。",
+        hint="选择你使用的供应商，可以多选。接下来分别设置 API 区域、密钥和模型。",
         default_selected=default_selected,
+        presentation="providers",
     )
 
     for selected_id in selected_provider_ids:
@@ -1308,7 +1371,7 @@ def _run_setup_impl(args):
             if result is None:
                 continue
         elif selected_id == other_provider_id:
-            provider_query = _setup_input("  输入接入方名称或 provider key: ")
+            provider_query = _setup_field("  输入接入方名称或 provider key: ", title="查找供应商", field_label="供应商名称")
             provider_key = resolve_provider_key(provider_query)
             if not provider_key or provider_key not in PROVIDER_REGISTRY:
                 models_dev_provider = _select_models_dev_provider_from_query(provider_query)
@@ -1371,7 +1434,21 @@ def _run_setup_impl(args):
             pdisplay = pcfg.display_name if pcfg else pname
             print_plain(f"    {_setup_index(i + 1)}. {color(pdat['model'], Colors.GREEN)} {color(f'({pdisplay})', Colors.DIM)}")
         print_plain()
-        def_choice = _setup_input("  输入编号 [1]: ")
+        from mclaw.application.setup_interaction import current_setup_interaction
+
+        interaction = current_setup_interaction.get()
+        if interaction is not None:
+            selection = interaction.request(
+                "single_select", "选择默认模型",
+                options=[
+                    {"id": str(i + 1), "label": pdat["model"], "description": pname, "category": ""}
+                    for i, (pname, pdat) in enumerate(items)
+                ],
+                default=["1"],
+            )
+            def_choice = selection[0] if selection else ""
+        else:
+            def_choice = _setup_input("  输入编号 [1]: ")
         def_idx = int(def_choice) - 1 if def_choice.isdigit() else 0
         def_idx = max(0, min(def_idx, len(items) - 1))
         default = items[def_idx][1]
@@ -1495,10 +1572,11 @@ def _run_setup_dsoftbus_selection(
 
     try:
         choices = prompt_multi_select(
-            "M-Claw 可选能力",
+            "可选能力",
             [dict(_DSOFTBUS_SETUP_OPTION)],
-            hint="使用 ↑/↓ 移动，Space 选择，Enter 确认。",
+            hint="让已配对的设备一起完成任务。",
             default_selected=["dsoftbus"] if _dsoftbus_setup_selected(config) else [],
+            presentation="capabilities",
         )
     except (EOFError, KeyboardInterrupt):
         print_plain()
@@ -1531,17 +1609,17 @@ def _run_setup_capability_selection(config: dict) -> None:
         {
             "id": "web_extract",
             "label": "网页提取",
-            "description": "使用 Trafilatura、Tavily 或 Firecrawl 提取网页正文。",
+            "description": "读取链接里的正文，方便总结和整理资料。",
         },
         {
             "id": "web_search",
             "label": "网页搜索",
-            "description": "通过 Tavily 或 DashScope/Qwen 搜索网页并返回答案与来源。",
+            "description": "搜索网上的信息，并附上来源链接。",
         },
         {
             "id": "vision",
             "label": vision_feature.display_name if vision_feature else "视觉分析",
-            "description": vision_feature.description if vision_feature else "通过 Qwen 视觉模型分析图片。",
+            "description": "识别图片内容，阅读截图中的文字。",
         },
     ]
     if runtime.features.toolset_enabled("browser"):
@@ -1554,13 +1632,13 @@ def _run_setup_capability_selection(config: dict) -> None:
     channel_items = [
         {
             "id": "weixin",
-            "label": "微信私聊网关",
-            "description": "",
+            "label": "微信",
+            "description": "在微信里向 M-Claw 发送消息。",
         },
         {
             "id": "dingtalk",
-            "label": "钉钉私聊/群聊网关",
-            "description": "",
+            "label": "钉钉",
+            "description": "在钉钉私聊或群聊中使用 M-Claw。",
         },
     ]
     current_toolsets = [str(item) for item in config.get("toolsets", []) if str(item).strip()]
@@ -1584,16 +1662,18 @@ def _run_setup_capability_selection(config: dict) -> None:
 
     try:
         optional = prompt_multi_select(
-            "M-Claw 可选能力",
+            "可选能力",
             capability_items,
-            hint="选择需要启用的可选能力；必需能力始终启用。",
+            hint="选上这次想用的工具，也可以稍后在设置中添加。",
             default_selected=default_optional,
+            presentation="capabilities",
         )
         channels = prompt_multi_select(
-            "M-Claw IM 交互配置",
+            "消息渠道",
             channel_items,
-            hint="选择需要接入的消息渠道；选中后进入对应登录流程。",
+            hint="想在哪儿接收和发送消息？选好后，再完成登录或填写凭据。",
             default_selected=default_channels,
+            presentation="channels",
         )
         inbound_audio = config.get("capabilities", {}).get("inbound_audio", {})
         inbound_mode = (
@@ -1612,12 +1692,12 @@ def _run_setup_capability_selection(config: dict) -> None:
         if config.get("auxiliary", {}).get("asr", {}).get("enabled") is True:
             asr_defaults.append("asr")
         asr_choice = prompt_multi_select(
-            "M-Claw 语音输入",
+            "语音输入",
             [
                 {
                     "id": "inbound_audio",
-                    "label": "IM 语音消息识别",
-                    "description": "下载微信/钉钉原始语音，由 M-Claw 独立转写后交给 Agent。",
+                    "label": "语音消息识别",
+                    "description": "将收到的微信、钉钉语音转成文字。",
                 },
                 {
                     "id": "asr",
@@ -1627,6 +1707,7 @@ def _run_setup_capability_selection(config: dict) -> None:
             ],
             hint="两项共用 Qwen ASR 凭据，可分别启用。",
             default_selected=asr_defaults,
+            presentation="voice",
         )
     except (EOFError, KeyboardInterrupt):
         print_plain()
@@ -1652,11 +1733,12 @@ def _run_setup_capability_selection(config: dict) -> None:
         if name in web_tools:
             continue
         if name == "vision":
-            if not _setup_configure_feature_keys(
-                "vision_analyze", print_plain=print_plain, color=color, Colors=Colors
+            from mclaw.tools.vision.config import resolve_mode
+            _ensure_vision_config(config)
+            if resolve_mode(config=config) == "auxiliary" and not _setup_configure_feature_keys(
+                "vision_analyze", print_plain=print_plain, color=color, Colors=Colors, config=config
             ):
                 continue
-            _ensure_vision_config(config)
         elif name != "browser":
             continue
         if name not in enabled_optional:
@@ -1869,9 +1951,9 @@ def _setup_configure_web_extract(config: dict, *, print_plain, color, Colors) ->
             )
 
     selected = prompt_multi_select(
-        "M-Claw 网页提取后端",
+        "网页提取服务",
         backend_items,
-        hint="可选择多个后端；之后可用 /extract-backend 切换当前后端。",
+        hint="选择用来读取网页的服务。Trafilatura 无需密钥，其他服务需要 API Key。",
         default_selected=[
             item["id"] for item in backend_items if item["id"] in previously_selected
         ],
@@ -1993,9 +2075,9 @@ def _setup_configure_web_search_keys(config: dict, *, print_plain, color, Colors
         },
     ]
     selected = prompt_multi_select(
-        "M-Claw 网页搜索后端",
+        "网页搜索服务",
         search_items,
-        hint="可选择多个后端；同时启用时由搜索路由自动选择。",
+        hint="选择用来搜索网页的服务，可以多选。",
         default_selected=default_selected,
     )
     if not selected:
@@ -2110,6 +2192,8 @@ def _ensure_vision_config(config: dict) -> None:
     if not isinstance(vision_cfg, dict):
         vision_cfg = {}
         auxiliary["vision"] = vision_cfg
+    from mclaw.tools.vision.config import resolve_mode
+    vision_cfg.setdefault("mode", resolve_mode(config=config))
     provider = str(vision_cfg.get("provider") or "").strip().lower()
     qwen_provider = _setup_qwen_provider()
     if provider in {"", "auto", "dashscope"} or (
@@ -2118,25 +2202,24 @@ def _ensure_vision_config(config: dict) -> None:
         and not str(vision_cfg.get("base_url") or "").strip()
     ):
         vision_cfg["provider"] = qwen_provider
-    vision_cfg.setdefault("model", "qwen3-vl-flash")
-    if not str(vision_cfg.get("model") or "").strip():
+    if vision_cfg.get("provider") in {"qwen", "qwen-intl"} and not str(vision_cfg.get("model") or "").strip():
         vision_cfg["model"] = "qwen3-vl-flash"
     vision_cfg.setdefault("base_url", "")
-    vision_cfg.setdefault("max_pixels", 1_310_720)
+    vision_cfg.setdefault("max_pixels", None)
     vision_cfg.setdefault("timeout", 30)
     vision_cfg.setdefault("download_timeout", 30)
 
 
-def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colors) -> bool:
+def _setup_configure_feature_keys(feature_name: str, *, print_plain, color, Colors, config=None) -> bool:
     """Ensure setup-selected built-in features have scoped credentials."""
     from mclaw.cli import config as cli_config
     from mclaw.runtime.features import configured_env_vars, get_feature, secret_requests_for_feature
     from mclaw.runtime.secrets import authorize
 
-    spec = get_feature(feature_name)
+    spec = get_feature(feature_name, config=config)
     if spec is None:
         return True
-    credential_label = "Qwen 凭据" if feature_name in {"vision_analyze", "asr"} else "凭据"
+    credential_label = "Qwen 凭据" if feature_name == "asr" else "供应商凭据"
 
     existing = configured_env_vars(spec, cli_config.get_env_value)
     if existing:
@@ -2193,9 +2276,9 @@ def _run_setup_builtin_skill_selection() -> None:
     from mclaw.skills_hub.builtin_sync import (
         get_builtin_skills_dir,
         list_builtin_skills,
+        list_installed_builtin_skills,
         sync_selected_skills,
     )
-    from mclaw.skills_hub.skill_store import list_skills as list_enabled_skills
 
     skills = list_builtin_skills()
     if not skills:
@@ -2211,20 +2294,11 @@ def _run_setup_builtin_skill_selection() -> None:
         )
         return
 
-    installed_builtins = {
-        (str(item.get("name") or ""), str(source.get("original") or ""))
-        for item in list_enabled_skills()
-        if isinstance(item, dict)
-        and isinstance((source := item.get("source")), dict)
-        and source.get("type") == "bundled"
-    }
+    installed_builtins = set(list_installed_builtin_skills())
     default_selected = [
         str(item.get("name") or "")
         for item in skills
-        if (
-            str(item.get("name") or ""),
-            str(item.get("source_key") or ""),
-        ) in installed_builtins
+        if str(item.get("name") or "") in installed_builtins
     ]
 
     try:
@@ -2258,8 +2332,18 @@ def _run_setup_builtin_skill_selection() -> None:
     print_plain(color(f"\n  内置 Skill 已处理：{summary}。\n", Colors.GREEN))
 
 
-def _pause_setup_warning():
+def _pause_setup_warning(message: str = ""):
     """Keep setup warnings visible before the provider menu is redrawn."""
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        interaction.request(
+            "single_select", "这个接口暂时无法配置", presentation="notice",
+            hint=message or "请检查所选的接口类型。",
+            options=[{"id": "continue", "label": "下一步"}], default=["continue"],
+        )
+        return
     _setup_input("\n  按 Enter 继续...", dim=True)
 
 
@@ -2286,7 +2370,10 @@ def _setup_configured_model(config: dict, provider_key: str) -> str:
 def _select_setup_profile(provider_key: str, config: dict):
     """Select a callable provider profile for setup."""
     from mclaw.cli.colors import Colors, color
-    from mclaw.cli.provider_profiles import find_provider_profile, get_default_provider_profile, get_provider_profiles
+    from mclaw.cli.provider_profiles import (
+        find_provider_profile, get_default_provider_profile, get_provider_profiles,
+        get_setup_profile_label, get_setup_provider_label,
+    )
 
     profiles = get_provider_profiles(provider_key)
     if len(profiles) <= 1:
@@ -2336,19 +2423,36 @@ def _select_setup_profile(provider_key: str, config: dict):
                 break
 
     default_profile = previous_profile or get_default_provider_profile(provider_key)
-    print_plain(color("\n  选择接口类型", Colors.BOLD, Colors.BLUE))
+    profile_title = f"{get_setup_provider_label(provider_key)} · API 区域与接口"
+    print_plain(color(f"\n  {profile_title}", Colors.BOLD, Colors.BLUE))
     for idx, profile in enumerate(profiles, 1):
         marker = color(" *", Colors.BOLD, Colors.CYAN) if profile == previous_profile else ""
         status_color = Colors.GREEN if profile.callable else Colors.YELLOW
         status = color(profile.status_label, status_color)
         print_plain(
-            f"    {_setup_index(idx)}. {profile.label} "
+            f"    {_setup_index(idx)}. {get_setup_profile_label(profile)} "
             f"{color(f'({profile.id})', Colors.DIM)}  {status}{marker}"
         )
         if profile.note:
             print_plain(color(f"       {profile.note}", Colors.DIM))
     print_plain()
-    choice = _setup_input(f"  输入接口编号或名称 [{default_profile.id}]: ")
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        selected_ids = interaction.request(
+            "single_select", profile_title,
+            presentation="profiles", provider=provider_key,
+            hint="选择与你的 API Key 对应的区域或接口。不同区域、套餐的密钥可能不通用。",
+            options=[
+                {"id": item.id, "label": get_setup_profile_label(item), "description": item.note, "category": "" if item.callable else "仅供查看模型，暂不支持配置"}
+                for item in profiles
+            ],
+            default=[default_profile.id],
+        )
+        choice = selected_ids[0] if selected_ids else ""
+    else:
+        choice = _setup_input(f"  输入接口编号或名称 [{default_profile.id}]: ")
     selected = default_profile
     if choice:
         if choice.isdigit():
@@ -2376,7 +2480,7 @@ def _select_setup_profile(provider_key: str, config: dict):
         if selected.note:
             print_plain(color(f"  {selected.note}", Colors.DIM))
         print_plain(color("  如需私有部署、网关或特殊套餐，请选择自定义兼容接口。", Colors.DIM))
-        _pause_setup_warning()
+        _pause_setup_warning("这个套餐目前只提供模型列表。若供应商提供兼容接口，可以在供应商列表中选择自定义接口来配置。")
         return None
     return selected
 
@@ -2397,10 +2501,8 @@ def _select_setup_model(
     current_model = _setup_configured_model(config, runtime_provider)
     recommended_models = DEFAULT_PROVIDER_MODELS.get(runtime_provider, [])
     models = models_dev.list_provider_models(provider_key, limit=None, profile_id=profile.id)
-    source = f"models.dev 模型库 / {profile.models_dev_provider}"
     if not models:
         models = recommended_models[:20]
-        source = "本地默认候选"
 
     recommended_model = recommended_models[0] if recommended_models else ""
     preferred_model = current_model or recommended_model
@@ -2427,16 +2529,17 @@ def _select_setup_model(
         manual_id = "__manual_model__"
         items.append({"id": manual_id, "label": "其他模型名称", "category": "手动输入"})
         selected = prompt_single_select(
-            "M-Claw 模型选择",
+            "选择模型",
             items,
-            hint=f"来自 {source}；使用 ↑/↓ 浏览全部模型。",
+            hint="选择要使用的模型，也可以填写其他模型名称。",
             default_selected=models[0],
             max_visible_items=20,
+            presentation="models", provider=runtime_provider,
         )
-        return _setup_input("  输入其他模型名称: ") if selected == manual_id else selected
+        return _setup_field("  输入其他模型名称: ", title="填写模型名称", field_label="模型名称", provider=runtime_provider) if selected == manual_id else selected
 
     prompt = f"  模型名称 [{current_model}]: " if current_model else "  模型名称: "
-    return _setup_input(prompt) or current_model
+    return _setup_field(prompt, title="填写模型名称", field_label="模型名称", provider=runtime_provider, default=current_model) or current_model
 
 
 def _select_models_dev_provider_from_query(query: str) -> str:
@@ -2457,6 +2560,17 @@ def _select_models_dev_provider_from_query(query: str) -> str:
         print_plain(f"    {_setup_index(idx)}. {color(provider_id, Colors.CYAN)}  {color(preview, Colors.DIM)}")
     print_plain(f"    {_setup_index(len(matches) + 1)}. {color('都不是，返回接入方列表', Colors.CYAN)}")
     print_plain()
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        selected = interaction.request(
+            "single_select", "选择供应商", presentation="providers",
+            hint="这些供应商需要通过自定义兼容接口连接。",
+            options=[*({"id": name, "label": name} for name in matches), {"id": "__none__", "label": "都不是，跳过"}],
+            default=[matches[0]],
+        )
+        return selected[0] if selected and selected[0] != "__none__" else ""
     choice = _setup_input("  选择 provider 编号 [1]: ")
     if not choice:
         return matches[0]
@@ -2484,7 +2598,18 @@ def _setup_models_dev_provider(config: dict, models_dev_provider: str):
     print_plain(color("  如果官方接口不是 OpenAI/Anthropic 兼容格式，请以官方文档为准。", Colors.DIM))
     print_plain()
 
-    api_format = _setup_input("  API 格式: 1.OpenAI 兼容  2.Anthropic 兼容 [1]: ")
+    from mclaw.application.setup_interaction import current_setup_interaction
+
+    interaction = current_setup_interaction.get()
+    if interaction is not None:
+        choice = interaction.request(
+            "single_select", "选择接口格式",
+            hint="以供应商提供的 API 文档为准。",
+            options=[{"id": "1", "label": "OpenAI 兼容"}, {"id": "2", "label": "Anthropic 兼容"}], default=["1"],
+        )
+        api_format = choice[0] if choice else "1"
+    else:
+        api_format = _setup_input("  API 格式: 1.OpenAI 兼容  2.Anthropic 兼容 [1]: ")
     fmt = "anthropic" if api_format == "2" else "openai"
     provider_key = "custom_anthropic" if fmt == "anthropic" else "custom"
     suggested_model = models[0] if models else ""
@@ -2528,7 +2653,11 @@ def _setup_custom_endpoint(
 
     example = "https://api.example.com" if is_anthropic else "https://api.example.com/v1"
     hint = f" [{current_url}]" if current_url else f" [例如 {example}]"
-    base_url = _setup_input(f"  API 接口地址{hint}: ")
+    base_url = _setup_field(
+        f"  API 接口地址{hint}: ", title=f"连接自定义 {format_label} 接口",
+        field_label="API 接口地址", default=current_url, placeholder=example,
+        hint="填写服务提供的 API 地址。", provider=provider_key,
+    )
     if not base_url:
         base_url = current_url
     if not base_url:
@@ -2542,7 +2671,18 @@ def _setup_custom_endpoint(
         print_plain()
         print_plain(color(f"  检测到这个接口地址属于已知接入方：{pcfg.display_name} ({matched_provider})", Colors.YELLOW))
         print_plain(color("  建议使用预置接入方，这样 /provider、/model 和模型库识别会保持一致。", Colors.DIM))
-        use_builtin = _setup_input(f"  改用 {pcfg.display_name} 接入方? [Y/n]: ").lower()
+        from mclaw.application.setup_interaction import current_setup_interaction
+
+        interaction = current_setup_interaction.get()
+        if interaction is not None:
+            selected = interaction.request(
+                "single_select", "发现匹配的供应商", provider=matched_provider,
+                hint=f"这个地址属于 {pcfg.display_name}，可以使用它的预置配置。",
+                options=[{"id": "y", "label": "使用预置配置"}, {"id": "n", "label": "继续使用自定义接口"}], default=["y"],
+            )
+            use_builtin = selected[0] if selected else "y"
+        else:
+            use_builtin = _setup_input(f"  改用 {pcfg.display_name} 接入方? [Y/n]: ").lower()
         if use_builtin not in {"n", "no"}:
             profile = _select_setup_profile(matched_provider, config)
             if profile is None:
@@ -2555,7 +2695,11 @@ def _setup_custom_endpoint(
         print_plain(color("  继续按自定义接口保存。", Colors.DIM))
 
     key_hint = f" [{current_key[:8]}...]" if current_key else " [无需密钥可直接回车]"
-    api_key = _setup_secret(f"  API 密钥{key_hint}: ")
+    api_key = _setup_field(
+        f"  API 密钥{key_hint}: ", title="填写 API Key", secret=True,
+        field_label="API Key", secret_configured=bool(current_key), provider=provider_key,
+        hint="如果这个接口不需要密钥，可以留空。",
+    )
     if not api_key:
         api_key = current_key
 
@@ -2604,7 +2748,22 @@ def _setup_custom_endpoint(
         if len(selectable_models) > 20:
             print_plain(color(f"    ... 还有 {len(selectable_models) - 20} 个", Colors.DIM))
         print_plain()
-        model_input = _setup_input(f"  输入模型编号或名称 [{selectable_models[default_idx]}]: ")
+        from mclaw.application.setup_interaction import current_setup_interaction
+
+        interaction = current_setup_interaction.get()
+        if interaction is not None:
+            selected = interaction.request(
+                "single_select", "选择模型", presentation="models", provider=provider_key,
+                hint="选择要使用的模型，也可以填写其他模型名称。",
+                options=[
+                    *({"id": str(index + 1), "label": model} for index, model in enumerate(display_models)),
+                    {"id": str(other_idx), "label": "其他模型名称"},
+                ],
+                default=[str(default_idx + 1)] if default_idx < len(display_models) else [],
+            )
+            model_input = selected[0] if selected else ""
+        else:
+            model_input = _setup_input(f"  输入模型编号或名称 [{selectable_models[default_idx]}]: ")
         if not model_input:
             model_name = selectable_models[default_idx]
         elif model_input.isdigit():
@@ -2612,7 +2771,7 @@ def _setup_custom_endpoint(
             if 1 <= idx <= len(display_models):
                 model_name = display_models[idx - 1]
             elif idx == other_idx:
-                model_name = _setup_input("  输入其他模型名称: ")
+                model_name = _setup_field("  输入其他模型名称: ", title="填写模型名称", field_label="模型名称", provider=provider_key)
                 if not model_name:
                     model_name = selectable_models[default_idx]
             else:
@@ -2622,7 +2781,10 @@ def _setup_custom_endpoint(
     else:
         model_hint = suggested_model or current_model
         prompt = f"  模型名称 [{model_hint}]: " if model_hint else "  模型名称: "
-        model_name = _setup_input(prompt)
+        model_name = _setup_field(
+            prompt, title="填写模型名称", field_label="模型名称", default=model_hint, provider=provider_key,
+            hint="未获取到模型列表，请填写服务提供的模型名称。",
+        )
         if not model_name:
             model_name = suggested_model or current_model
         if not model_name:
@@ -2678,7 +2840,7 @@ def _setup_api_key_provider(
     from mclaw.cli.config import save_env_value, get_env_value, save_config
     from mclaw.cli.colors import Colors, color
     from mclaw.cli.auth import PROVIDER_REGISTRY, resolve_base_url
-    from mclaw.cli.provider_profiles import get_provider_profile
+    from mclaw.cli.provider_profiles import get_provider_profile, get_setup_provider_label, get_setup_profile_label
 
     profile = get_provider_profile(provider_key, profile_id)
     runtime_provider = profile.runtime_provider or provider_key
@@ -2699,7 +2861,12 @@ def _setup_api_key_provider(
     print_plain(_setup_label("接口类型") + color(profile.label, Colors.DIM) + color(f" ({profile.models_dev_provider})", Colors.DIM))
     print_plain(_setup_label("获取密钥") + color(url, Colors.DIM))
     key_hint = f" [{current_key[:8]}...]" if current_key else ""
-    api_key = _setup_secret(f"  {display_name} API 密钥{key_hint}: ")
+    api_key = _setup_field(
+        f"  {display_name} API 密钥{key_hint}: ", title=f"连接 {get_setup_provider_label(provider_key)}", secret=True,
+        field_label="API Key", provider=runtime_provider, key_url=url,
+        secret_configured=bool(current_key),
+        hint=f"{get_setup_profile_label(profile)}。" + ("填写对应的 API Key，留空会跳过此供应商。" if not current_key else ""),
+    )
     if not api_key:
         api_key = current_key
     if not api_key:
@@ -2797,6 +2964,10 @@ def main():
     _add_runtime_selector_args(parser)
     subparsers = parser.add_subparsers(dest="command")
     subparsers.add_parser("help", help=argparse.SUPPRESS)
+    subparsers.add_parser("status", help="查看本机 Web 服务地址和进程状态")
+    subparsers.add_parser("stop", help="保存进展并停止本机 Web 服务")
+    cli_parser = subparsers.add_parser("cli", help="启动终端交互界面")
+    _add_runtime_selector_args(cli_parser, inherited=True)
     resume_parser = subparsers.add_parser("resume", help="恢复历史会话")
     resume_parser.add_argument("session_id", nargs="?", default=RESUME_LATEST_SESSION, help="可选会话 ID 或前缀")
     _add_runtime_selector_args(resume_parser, inherited=True)
@@ -2822,6 +2993,14 @@ def main():
 
     if args.command == "help":
         print_plain(_format_cli_help())
+    elif args.command == "status":
+        from mclaw.web.launcher import show_status
+        show_status()
+    elif args.command == "stop":
+        from mclaw.web.launcher import stop
+        stop()
+    elif args.command == "cli":
+        _run_chat(args)
     elif args.command == "resume":
         args.resume = getattr(args, "session_id", None) or RESUME_LATEST_SESSION
         _run_chat(args)
@@ -2845,7 +3024,13 @@ def main():
         else:
             _run_dingtalk(args)
     else:
-        _run_chat(args)
+        # Keep explicit legacy runtime overrides effective. They are scoped to
+        # this terminal run and must not mutate an already running Web service.
+        if any(getattr(args, key, "") for key in ("model", "provider", "base_url", "api_key")):
+            _run_chat(args)
+            return
+        from mclaw.web.launcher import launch
+        launch()
 
 
 if __name__ == "__main__":

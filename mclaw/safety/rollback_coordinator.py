@@ -36,12 +36,12 @@ class RollbackCoordinator:
         self.config = config or {}
         self.context = ContextRollbackManager(session_db=session_db, agent=agent)
 
-    def list_operations(self, *, session_id: str | None = None, workspace: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    def list_operations(self, *, session_id: str | None = None, workspace: str | None = None, limit: int | None = 20) -> list[dict[str, Any]]:
         """Return rollback-visible file operations from the journal."""
         operations = self.journal.list_operations(
             session_id=session_id,
             workspace=workspace,
-            limit=max(200, limit),
+            limit=None,
         )
         has_checkpoint = getattr(self.checkpoint_manager, "has_checkpoint", None)
         if not callable(has_checkpoint):
@@ -64,9 +64,9 @@ class RollbackCoordinator:
             if str(operation.get("turn_id") or operation.get("operation_id") or "") not in unavailable_groups
         ][:limit]
 
-    def list_groups(self, *, session_id: str | None = None, workspace: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    def list_groups(self, *, session_id: str | None = None, workspace: str | None = None, limit: int | None = 20) -> list[dict[str, Any]]:
         """Group operations by turn so user-facing rollback mirrors chat turns."""
-        operations = self.list_operations(session_id=session_id, workspace=workspace, limit=200)
+        operations = self.list_operations(session_id=session_id, workspace=workspace, limit=None)
         grouped: list[dict[str, Any]] = []
         by_key: dict[str, dict[str, Any]] = {}
         for operation in operations:
@@ -97,7 +97,7 @@ class RollbackCoordinator:
         ref = str(ref or "").strip()
         if not ref:
             return None
-        groups = self.list_groups(session_id=session_id, workspace=workspace, limit=200)
+        groups = self.list_groups(session_id=session_id, workspace=workspace, limit=None)
         try:
             idx = int(ref) - 1
             if 0 <= idx < len(groups):
@@ -349,7 +349,7 @@ class RollbackCoordinator:
 
     def restore_latest_undone_group(self, *, session_id: str | None = None, workspace: str | None = None) -> dict[str, Any]:
         """Restore the newest currently-undone group in the visible rollback list."""
-        groups = self.list_groups(session_id=session_id, workspace=workspace, limit=200)
+        groups = self.list_groups(session_id=session_id, workspace=workspace, limit=None)
         for idx, group in enumerate(groups, 1):
             if (group.get("state") or _group_state(group.get("operations") or [])) == "undone":
                 result = self.restore_group(str(idx), session_id=session_id, workspace=workspace)
@@ -550,7 +550,7 @@ class RollbackCoordinator:
         if not turn_id:
             return {"success": False, "error": f"Turn '{ref}' not found"}
         operations = [
-            op for op in self.list_operations(session_id=session_id, workspace=workspace, limit=200)
+            op for op in self.list_operations(session_id=session_id, workspace=workspace, limit=None)
             if op.get("turn_id") == turn_id and _rollbackable_operation(op)
         ]
         if not operations:
@@ -563,7 +563,7 @@ class RollbackCoordinator:
                 "turn_id": turn_id,
             }
 
-        earliest = sorted(operations, key=lambda op: str(op.get("created_at") or ""))[0]
+        earliest = operations[-1]
         context_session_id = session_id or earliest.get("session_id")
         context_rollback_id = None
         if (
@@ -851,7 +851,7 @@ class RollbackCoordinator:
             session_id=session_id,
             workspace=workspace,
             include_rollbacks=True,
-            limit=500,
+            limit=None,
         ):
             if record.get("action") != "rollback" or not record.get("before_commit"):
                 continue
@@ -869,7 +869,7 @@ class RollbackCoordinator:
             session_id=session_id,
             workspace=workspace,
             include_rollbacks=True,
-            limit=100,
+            limit=None,
         ):
             if record.get("action") == "rollback":
                 return record

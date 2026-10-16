@@ -60,6 +60,26 @@ CORE_PROVIDER_KEYS: list[str] = [
 ]
 
 
+def get_setup_provider_label(provider_key: str) -> str:
+    """Name the brand before the user chooses an API region."""
+    brands = {
+        "qwen": "Alibaba / Qwen", "qwen-intl": "Alibaba / Qwen",
+        "moonshot": "Moonshot / Kimi", "moonshot-intl": "Moonshot / Kimi",
+        "minimax": "MiniMax", "minimax-cn": "MiniMax",
+    }
+    provider = PROVIDER_REGISTRY.get(provider_key)
+    return brands.get(provider_key, provider.display_name if provider else provider_key)
+
+
+def get_setup_profile_label(profile: ProviderProfile) -> str:
+    regions = {
+        "qwen": "中国区 API", "qwen-intl": "国际区 API",
+        "moonshot": "中国区 API", "moonshot-intl": "国际区 API",
+        "minimax-cn": "中国区 API", "minimax": "国际区 API",
+    }
+    return regions.get(profile.runtime_provider, profile.label) if profile.callable else profile.label
+
+
 def get_provider_profiles(provider_key: str) -> list[ProviderProfile]:
     provider = str(provider_key or "").strip()
     if provider in PROVIDER_PROFILES and PROVIDER_PROFILES[provider]:

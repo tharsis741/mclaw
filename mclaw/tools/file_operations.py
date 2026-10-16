@@ -16,10 +16,20 @@ import os
 import shutil
 import tempfile
 import threading
+from functools import wraps
+from inspect import signature
 from pathlib import Path
 
 from mclaw.runtime.manager import RuntimeManager
 from mclaw.tools.cancellation import cancellation_checkpoint
+from mclaw.tools.file_concurrency import (
+    FileVersionConflict,
+    check_write_version,
+    file_version,
+    locked_target,
+    remember_version,
+)
+from mclaw.tools.interrupt import get_interrupt_event
 
 logger = logging.getLogger(__name__)
 _TEXT_IO_CHUNK_CHARS = 1024 * 1024
@@ -67,9 +77,52 @@ def _read_text_cancellable(
     return "".join(chunks)
 
 
-def read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
+def _locked_mutation(action: str):
+    """Keep a standard mutation and its version checks on the same target."""
+    def decorate(handler):
+        parameters = signature(handler)
+
+        @wraps(handler)
+        def guarded(path: str, *args, **kwargs):
+            target = _checked_path(path, action)
+            cancel_event = parameters.bind(path, *args, **kwargs).arguments.get("cancel_event")
+            with locked_target(target, cancel_event):
+                version = file_version(target, cancel_event)
+                check_write_version(target, version)
+                result = handler(str(target), *args, **kwargs)
+                # A committed operation must not become a cancelled result while
+                # updating bookkeeping after its final filesystem side effect.
+                remember_version(target, file_version(target))
+                return result
+        return guarded
+    return decorate
+
+
+def read_file(
+    path: str,
+    offset: int = 0,
+    limit: int | None = None,
+    *,
+    record_version: bool = True,
+) -> str:
     """Read UTF-8 text after runtime path approval."""
     abs_path = _checked_path(path, "read")
+    cancel_event = get_interrupt_event()
+    with locked_target(abs_path, cancel_event):
+        version = file_version(abs_path, cancel_event)
+        if version is None and record_version:
+            # Remember an observed absence so another session's creation is not
+            # silently overwritten by this session's later create attempt.
+            remember_version(abs_path, None)
+        content = _read_file_unlocked(abs_path, path, offset, limit)
+        if version != file_version(abs_path, cancel_event):
+            raise FileVersionConflict(abs_path)
+        if record_version:
+            remember_version(abs_path, version)
+        return content
+
+
+def _read_file_unlocked(abs_path: Path, path: str, offset: int, limit: int | None) -> str:
     try:
         abs_path.stat()
     except OSError as exc:
@@ -85,6 +138,7 @@ def read_file(path: str, offset: int = 0, limit: int | None = None) -> str:
         raise OSError(f"Cannot read file: {path}") from exc
 
 
+@_locked_mutation("write")
 def write_file(
     path: str,
     content: str,
@@ -93,6 +147,7 @@ def write_file(
     """Write UTF-8 content through a same-directory temporary file."""
     abs_path = _checked_path(path, "write")
     cancellation_checkpoint(cancel_event)
+    initial_version = file_version(abs_path, cancel_event)
     abs_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_name = ""
     try:
@@ -119,6 +174,8 @@ def write_file(
                     exc_info=True,
                 )
         cancellation_checkpoint(cancel_event)
+        if file_version(abs_path, cancel_event) != initial_version:
+            raise FileVersionConflict(abs_path)
         os.replace(tmp_name, abs_path)
     except InterruptedError:
         if tmp_name:
@@ -133,10 +190,13 @@ def write_file(
                 os.unlink(tmp_name)
             except OSError:
                 logger.debug("Failed to remove temporary file after write failure: %s", tmp_name, exc_info=True)
+        if isinstance(exc, FileVersionConflict):
+            raise
         raise OSError(f"Cannot write file: {path}") from exc
     return str(abs_path)
 
 
+@_locked_mutation("write")
 def patch_file(
     path: str,
     old_str: str,
@@ -161,6 +221,7 @@ def patch_file(
     )
 
 
+@_locked_mutation("write")
 def edit_file(
     path: str,
     old_block: str,
@@ -189,6 +250,7 @@ def edit_file(
     )
 
 
+@_locked_mutation("delete")
 def delete_file(
     path: str,
     cancel_event: threading.Event | None = None,

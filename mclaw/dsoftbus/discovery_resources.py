@@ -51,6 +51,7 @@ from .task_artifact import (
     artifact_part_local_filename,
     artifact_transfer_parts,
 )
+from .task_result import TEXT_RESULT_CAPABILITY, select_text_result, text_result_capability, text_result_limit
 from .task_files import (
     OutboundTaskFileStore,
     PreparedTaskInputs,
@@ -3635,15 +3636,15 @@ class DiscoveryOwnerResources:
                 "parts": message_parts,
             }
         }
+        if self._task_workspace is not None:
+            params["message"]["metadata"] = {TEXT_RESULT_CAPABILITY: text_result_capability()}
         if message_extensions:
             params["message"]["extensions"] = message_extensions
         if normalized_context_id is not None:
             params["message"]["contextId"] = normalized_context_id
         if requested_task_id is not None:
             params["message"]["taskId"] = requested_task_id
-            params["message"]["metadata"] = {
-                "mclaw.inputRequestId": normalized_input_request_id
-            }
+            params["message"].setdefault("metadata", {})["mclaw.inputRequestId"] = normalized_input_request_id
         task_id = requested_task_id
         effective_context_id = normalized_context_id
         current_task: Mapping[str, Any] | None = mirrored_task
@@ -3684,12 +3685,25 @@ class DiscoveryOwnerResources:
             nonlocal final_text
             if not _is_final_response_artifact(artifact):
                 return
+            if artifact_transfer_parts(artifact):
+                # A Task descriptor can arrive before its payload. Never acknowledge early.
+                if str(artifact["artifactId"]) not in receipts:
+                    return
+                try:
+                    final_text = store.read_text_result(
+                        "received", device_id, task_id, artifact,
+                        maximum=text_result_limit((current_task or {}).get("metadata")),
+                    )
+                except TaskStoreError as error:
+                    raise AgentMessageError("INVALID_AGENT_RESPONSE") from error
+                return
             text_parts = [
                 str(part["text"])
                 for part in artifact.get("parts", ())
                 if isinstance(part, Mapping) and isinstance(part.get("text"), str)
             ]
-            if len(text_parts) != 1 or not text_parts[0]:
+            if (len(text_parts) != 1 or not text_parts[0]
+                    or len(text_parts[0].encode("utf-8")) > protocol.REMOTE_MESSAGE_TEXT_BYTES_MAX):
                 raise AgentMessageError("INVALID_AGENT_RESPONSE")
             final_text = text_parts[0]
 
@@ -3758,6 +3772,15 @@ class DiscoveryOwnerResources:
             if task_id is None:
                 raise AgentMessageError("INVALID_AGENT_RESPONSE")
             artifact_id = str(artifact["artifactId"])
+            if _is_final_response_artifact(artifact):
+                transfers = artifact_transfer_parts(artifact)
+                if transfers and (
+                    TEXT_RESULT_CAPABILITY not in (current_task or {}).get("metadata", {})
+                    or len(transfers) != 1 or len(artifact.get("parts", ())) != 1
+                    or transfers[0][2]["contentMediaType"] != "text/plain"
+                    or not 0 < transfers[0][2]["byteLength"] <= text_result_limit((current_task or {}).get("metadata"))
+                ):
+                    raise AgentMessageError("INVALID_AGENT_RESPONSE")
             if artifact_id in receipts:
                 return
             try:
@@ -4020,6 +4043,12 @@ class DiscoveryOwnerResources:
                     expected_task_id=task_id,
                     expected_context_id=effective_context_id,
                 )
+                capability = normalized.get("metadata", {}).get(TEXT_RESULT_CAPABILITY)
+                if capability is not None and (
+                    self._task_workspace is None
+                    or select_text_result({TEXT_RESULT_CAPABILITY: capability}).get(TEXT_RESULT_CAPABILITY) != capability
+                ):
+                    raise AgentMessageError("INVALID_AGENT_RESPONSE")
                 task_id = str(normalized["id"])
                 effective_context_id = str(normalized["contextId"])
                 persisted = store.get_task("received", device_id, task_id)

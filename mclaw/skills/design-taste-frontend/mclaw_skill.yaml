@@ -1,0 +1,17 @@
+schema_version: 1
+name: design-taste-frontend
+short_description: 网站视觉设计：创建有鲜明风格的官网、落地页、产品展示和个人作品集。
+source:
+  type: github
+  original: https://github.com/Leonxlnx/taste-skill/tree/f624f37a8c650b9cc550253104925efe4c8de246/skills/taste-skill
+  revision: f624f37a8c650b9cc550253104925efe4c8de246
+  author: Leonxlnx
+  license: MIT
+  license_file: LICENSE
+  license_url: https://github.com/Leonxlnx/taste-skill/blob/f624f37a8c650b9cc550253104925efe4c8de246/LICENSE
+  copyright: Copyright (c) 2026 Leonxlnx
+created_at: '2026-10-15T00:00:00+00:00'
+updated_at: '2026-10-15T00:00:00+00:00'
+created_by: bundled
+updated_by: bundled
+status: enabled

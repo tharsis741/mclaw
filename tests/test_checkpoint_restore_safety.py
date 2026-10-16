@@ -67,6 +67,27 @@ def test_runtime_internal_directories_never_create_or_restore_checkpoints(
     assert "runtime directory" in result["error"]
 
 
+def test_managed_task_workspace_supports_checkpoint_and_restore(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / ".mclaw"
+    workspace = home / "_temp" / "session_one"
+    workspace.mkdir(parents=True)
+    target = workspace / "report.txt"
+    target.write_text("before", encoding="utf-8")
+    private = home / "config.yaml"
+    private.write_text("keep", encoding="utf-8")
+    monkeypatch.setenv("MCLAW_HOME", str(home))
+    _use_path_policy(monkeypatch, PathPolicy(mclaw_home=home))
+    manager = _real_checkpoint_manager(monkeypatch, tmp_path)
+    assert manager.create_checkpoint(str(workspace), "before editing")
+    commit = manager.last_attempt["commit"]
+    target.write_text("after", encoding="utf-8")
+    assert manager.restore(str(workspace), commit, create_pre_snapshot=False)["success"]
+    assert target.read_text(encoding="utf-8") == "before"
+    assert private.read_text(encoding="utf-8") == "keep"
+    assert checkpoint_manager._checkpoint_skip_reason(str(home))
+    assert checkpoint_manager._checkpoint_skip_reason(str(home / "sessions"))
+
+
 def test_checkpoint_store_excludes_credentials_even_for_explicit_targets(
     monkeypatch,
     tmp_path: Path,

@@ -250,6 +250,18 @@ def install_prepare(
         materialize_source(resolved, package, **materialize_kwargs)
         cancellation_checkpoint(cancel_event)
         skill_md = _read_root_skill_md(package)
+        if resolved.type == "skillhub_cn":
+            # SkillHub uses Chinese display names; the runtime directory remains
+            # an ASCII slug. Only normalize names which violate our file contract.
+            frontmatter, body = parse_frontmatter(skill_md)
+            try:
+                validate_skill_name(str(frontmatter.get("name") or ""))
+            except ValueError:
+                frontmatter["name"] = validate_skill_name(resolved.slug.lower())
+                skill_md = "---\n" + yaml.safe_dump(frontmatter, allow_unicode=True, sort_keys=False) + "---\n" + body
+                (package / "SKILL.md").write_text(skill_md, encoding="utf-8")
+            # M-Claw owns this sidecar and recreates it from source provenance.
+            (package / "mclaw_skill.yaml").unlink(missing_ok=True)
         cancellation_checkpoint(cancel_event)
         name, short_description = _read_package_metadata(package, skill_md, _fallback_name(resolved, source))
         cancellation_checkpoint(cancel_event)
@@ -274,6 +286,7 @@ def install_prepare(
         review = review_skill_package(
             package,
             source=resolved.type,
+            source_original=resolved.original,
             cancel_event=cancel_event,
         )
         cancellation_checkpoint(cancel_event)
@@ -329,8 +342,9 @@ def install_prepare(
             "skill_name": name,
             "risk_level": review.get("risk_level", "unknown"),
             "verdict": review.get("verdict", "safe"),
-            "summary": f"Skill '{name}' 已准备好启用，安全审查已保存到草稿包。",
+            "summary": f"Skill '{name}' 已准备好启用。" + str(review.get("summary") or ""),
             "findings": _compact_findings(review),
+            "audits": review.get("audits"),
             "source": {
                 "type": resolved.type,
                 "original": resolved.original,
@@ -451,6 +465,7 @@ def security_review(
     review = review_skill_package(
         package,
         source=str(manifest.get("source", {}).get("type") or "community"),
+        source_original=str(manifest.get("source", {}).get("original") or ""),
         cancel_event=cancel_event,
     )
     cancellation_checkpoint(cancel_event)

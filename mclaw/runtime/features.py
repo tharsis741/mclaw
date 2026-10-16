@@ -61,10 +61,19 @@ _TOOL_TO_FEATURE = {
     "browser_scroll": "browser_tool",
     "browser_press": "browser_tool",
     "browser_download": "browser_tool",
+    "browser_tabs": "browser_tool",
+    "browser_select": "browser_tool",
+    "browser_check": "browser_tool",
+    "browser_hover": "browser_tool",
+    "browser_upload": "browser_tool",
+    "browser_handle_dialog": "browser_tool",
+    "browser_wait_for": "browser_tool",
+    "browser_back": "browser_tool",
     "dsoftbus_list_peers": "dsoftbus",
     "dsoftbus_get_device_context": "dsoftbus",
     "dsoftbus_run_agent_task": "dsoftbus",
     "dsoftbus_continue_agent_task": "dsoftbus",
+    "dsoftbus_read_task_result": "dsoftbus",
 }
 
 _TOOLSET_TO_FEATURE = {
@@ -190,9 +199,8 @@ FEATURES: dict[str, FeatureSpec] = {
         name="vision_analyze",
         kind="tool",
         display_name="视觉分析",
-        description="通过 Qwen 视觉模型分析图片。",
+        description="使用当前模型或专用视觉模型分析图片。",
         toolset="vision",
-        requires_any=_QWEN_CREDENTIAL_GROUPS,
     ),
     "asr": FeatureSpec(
         name="asr",
@@ -205,16 +213,35 @@ FEATURES: dict[str, FeatureSpec] = {
 }
 
 
-def get_feature(name: str) -> FeatureSpec | None:
-    return FEATURES.get(name)
+def get_feature(name: str, config: dict | None = None) -> FeatureSpec | None:
+    spec = FEATURES.get(name)
+    if name == "vision_analyze" and spec is not None:
+        from dataclasses import replace
+        from mclaw.tools.vision.config import effective_config, resolve_mode, vision_config
+        from mclaw.providers.resolver import resolve_provider_runtime_context
+
+        config = effective_config(config=config)
+        if resolve_mode(config=config) == "auxiliary":
+            section = vision_config(config=config)
+            runtime = resolve_provider_runtime_context(
+                provider="qwen" if section.get("provider") in {None, "", "auto"} else section["provider"], model=section.get("model") or "qwen3-vl-flash",
+                base_url=section.get("base_url") or "", api_key="vision-metadata-only", config=config,
+            )
+            names = runtime.profile.env_vars
+            selected = section.get("credential_env")
+            if selected in names:
+                names = (selected,)
+            if runtime.profile.credential_required:
+                return replace(spec, requires_any=(tuple(names),))
+    return spec
 
 
 def list_features() -> list[dict[str, Any]]:
-    return [spec.to_dict() for spec in FEATURES.values()]
+    return [spec.to_dict() for spec in list_feature_specs()]
 
 
 def list_feature_specs() -> list[FeatureSpec]:
-    return list(FEATURES.values())
+    return [get_feature(name) for name in FEATURES]
 
 
 def _has_value(get_value, env_var: str) -> bool:
@@ -295,7 +322,7 @@ def authorized_configured_env_vars(spec: FeatureSpec, get_value) -> list[str]:
 
 
 def is_feature_authorized(spec: FeatureSpec, get_value) -> bool:
-    return bool(authorized_configured_env_vars(spec, get_value))
+    return not (spec.requires or spec.requires_any) or bool(authorized_configured_env_vars(spec, get_value))
 
 
 def secret_requests_for_feature(spec: FeatureSpec, get_value) -> list[dict[str, str]]:

@@ -89,6 +89,7 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
     for msg in messages:
         content = _content_to_text(msg.get("content"))
         total += estimate_tokens_rough(content)
+        total += estimate_image_tokens(msg)
         reasoning = msg.get("reasoning")
         if reasoning is None:
             reasoning = msg.get("reasoning_content")
@@ -99,6 +100,18 @@ def estimate_messages_tokens(messages: list[dict]) -> int:
                     fn = tc.get("function", {})
                     total += estimate_tokens_rough(_content_to_text(fn.get("name")))
                     total += estimate_tokens_rough(_content_to_text(fn.get("arguments")))
+    return total
+
+
+def estimate_image_tokens(message: dict) -> int:
+    """Conservative image pressure estimate; actual usage comes from the provider."""
+    total = 0
+    for image in message.get("_vision_images", []):
+        if not isinstance(image, dict):
+            continue
+        width, height = image.get("width", 0), image.get("height", 0)
+        if type(width) is int and type(height) is int:
+            total += max(2048, ((width + 27) // 28) * ((height + 27) // 28))
     return total
 
 
@@ -395,6 +408,7 @@ class ContextCompressor:
                 msg.get("role") != "tool"
                 or not tool_call_id
                 or tool_call_id in protected
+                or any(asset.get("pending") for asset in msg.get("_vision_images", []))
             ):
                 continue
             content = _content_to_text(msg.get("content"))
@@ -404,10 +418,11 @@ class ContextCompressor:
                 f"{_PRUNED_TOOL_RESULT_PREFIX} model previously saw this result; "
                 f"original {len(content)} chars omitted from this request projection]"
             )
-            saved = estimate_tokens_rough(content) - estimate_tokens_rough(marker)
+            saved = estimate_tokens_rough(content) + estimate_image_tokens(msg) - estimate_tokens_rough(marker)
             if saved <= 0:
                 continue
             result[i] = {**msg, "content": marker}
+            result[i].pop("_vision_images", None)
             pruned += 1
             saved_tokens += saved
             if saved_tokens >= tokens_to_save:
@@ -429,6 +444,18 @@ class ContextCompressor:
         for msg in turns:
             role = msg.get("role", "unknown")
             content = _content_to_text(msg.get("content"))
+            if role == "system":
+                from mclaw.prompts.skills import strip_skill_invocations
+
+                # The host restores current selections from immutable inputs.
+                # Summarizing their instructions would leak them into later tasks.
+                content = strip_skill_invocations(content)
+                if not content:
+                    continue
+            for asset in msg.get("_vision_images", []):
+                content += f"\n[Image reference: asset:{asset.get('asset_id', '')}; question: {asset.get('question', '')}; pixels are not included in this summary input.]"
+                if asset.get("analysis"):
+                    content += "\n" + asset["analysis"]
 
             # Tool results: head+tail truncation
             if role == "tool":
@@ -490,7 +517,7 @@ class ContextCompressor:
         for i in range(n - 1, head_end - 1, -1):
             msg = messages[i]
             content = _content_to_text(msg.get("content"))
-            msg_tokens = estimate_tokens_rough(content) + 10
+            msg_tokens = estimate_tokens_rough(content) + estimate_image_tokens(msg) + 10
             for tc in msg.get("tool_calls") or []:
                 if isinstance(tc, dict):
                     args = tc.get("function", {}).get("arguments", "")
@@ -759,6 +786,11 @@ class ContextCompressor:
         )
         if latest_user_idx is not None:
             compress_end = min(compress_end, latest_user_idx)
+        # Multiple user supplements can follow an image before the next model
+        # call. Keep every unseen attachment, not just the last user message.
+        for index, message in enumerate(messages):
+            if any(asset.get("pending") for asset in message.get("_vision_images", [])):
+                compress_end = min(compress_end, index)
 
         # A pending result must remain raw until a successful model response
         # proves that it was visible. Preserve its parent tool-call group too.

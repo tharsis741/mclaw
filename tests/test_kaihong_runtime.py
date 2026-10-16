@@ -17,6 +17,36 @@ from mclaw.runtime.features import FeatureState
 from mclaw.runtime.kaihong import KaihongRuntime
 
 
+@pytest.mark.parametrize("name,model,hostname,expected", [
+    ("Kaihong BotBook", "KHP-LC802", "localhost", "Kaihong BotBook"),
+    ("开鸿工作电脑", "KHP-LC802", "localhost", "开鸿工作电脑"),
+    ("", "KHP-LC802", "localhost", "KHP-LC802"),
+    ("", "", "kaihong-pc", "kaihong-pc"),
+    ("", "", "localhost.localdomain", "本机设备"),
+    ("", "", "", "本机设备"),
+])
+def test_local_device_name_uses_system_identity(monkeypatch, name, model, hostname, expected):
+    from mclaw.runtime.manager import RuntimeManager
+
+    monkeypatch.setattr(RuntimeManager, "detect", lambda: "kaihong")
+    monkeypatch.setattr(platform_detect, "_probe_kaihong_facts", lambda _: {
+        "const.product.name": name, "const.product.model": model,
+    })
+    monkeypatch.setattr(platform_detect.platform, "node", lambda: hostname)
+    assert platform_detect.get_local_device_name() == expected
+
+
+def test_windows_device_name_preserves_computer_name_without_kaihong_probes(monkeypatch):
+    from mclaw.runtime.manager import RuntimeManager
+
+    monkeypatch.setattr(RuntimeManager, "detect", lambda: "windows")
+    monkeypatch.setattr(platform_detect.platform, "node", lambda: "KAIHONG-PC")
+    def unexpected_probe(_):
+        raise AssertionError("Windows must not probe Kaihong system parameters")
+    monkeypatch.setattr(platform_detect, "_probe_kaihong_facts", unexpected_probe)
+    assert platform_detect.get_local_device_name() == "KAIHONG-PC"
+
+
 def _set_board_layout(monkeypatch, tmp_path: Path, parameters: str) -> None:
     param_file = tmp_path / "ohos.para"
     param_file.write_text(

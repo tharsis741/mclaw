@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "m-claw"
-version = "1.1.1"
-description = "Robot agent runtime for M-Robots OS"
+version = "1.1.2"
+description = "Self-Evolving Embodied Agent Harness"
 readme = "docs/README.zh-CN.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -43,6 +43,9 @@ dependencies = [
     # HTTP / networking
     "httpx>=0.28.1,<1",
     "requests>=2.33.0,<3",
+    "starlette>=1.0.0,<2",
+    "uvicorn>=0.44.0,<1",
+    "websockets>=15,<17",
 
     # CLI / TUI
     "fire>=0.7.1,<1",
@@ -70,6 +73,7 @@ dependencies = [
     "sounddevice>=0.5.0",
     "numpy>=1.26",
     "qrcode>=8.0,<9",
+    "Pillow>=10.4,<13",
     "dingtalk-stream>=0.20",
     "alibabacloud-dingtalk>=2.2.39",
 
@@ -107,6 +111,8 @@ mclaw = [
     "skills/**/*",
     "skills/**/.rels",
     "pet/assets/**/*",
+    "web/static/**/*",
+    "web/static/*",
 ]
 
 [tool.setuptools.exclude-package-data]

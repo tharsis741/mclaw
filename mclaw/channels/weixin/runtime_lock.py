@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from mclaw.constants import get_mclaw_home
+from mclaw.system.lock import file_lock
 
 
 class WeixinRuntimeLockError(RuntimeError):
@@ -67,6 +68,10 @@ class WeixinRuntimeLock:
     def acquire(self) -> None:
         """Create the lock file atomically or reject a live existing owner."""
         self.root.mkdir(parents=True, exist_ok=True)
+        with file_lock(self.root / ".runtime-lock.guard"):
+            self._acquire_guarded()
+
+    def _acquire_guarded(self) -> None:
         payload = {
             "pid": os.getpid(),
             "account_id": self.account_id,
@@ -85,6 +90,10 @@ class WeixinRuntimeLock:
         """Release only a lock file still owned by this process."""
         if not self._acquired:
             return
+        with file_lock(self.root / ".runtime-lock.guard"):
+            self._release_guarded()
+
+    def _release_guarded(self) -> None:
         try:
             data = self._read_lock()
             if int(data.get("pid") or 0) == os.getpid():

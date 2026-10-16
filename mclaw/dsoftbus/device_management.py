@@ -707,6 +707,15 @@ class DeviceManagementCoordinator:
             native_code=failure_native_code,
         )
 
+    def snapshot(self) -> DeviceManagementResult:
+        """Read verified identity and trust without initiating a discovery scan."""
+        self._require_active_runtime()
+        return DeviceManagementResult(
+            action="devices", devices=self._devices(),
+            local_device=self._local_device(), trusted_devices=self._trusted_devices(),
+            status="listed",
+        )
+
     def execute(self, action: str) -> DeviceManagementResult:
         if action not in DEVICE_MANAGER_ACTIONS:
             _fail("INVALID_PARAMS")

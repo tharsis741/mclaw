@@ -962,6 +962,107 @@ def test_context_history_drops_oldest_complete_turns_to_protocol_bound(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    "tool_count,tool_text", [(31, "result"), (40, "result"), (1, "文" * 50_000)],
+    ids=["boundary-tools", "many-tools", "large-utf8-tool"],
+)
+def test_long_tool_execution_returns_short_answer_and_can_continue(
+    tmp_path: Path, tool_count: int, tool_text: str,
+) -> None:
+    async def scenario() -> None:
+        executor = _Executor()
+        executor.release.set()
+        executor.messages = [
+            {"role": "system", "content": "remote policy"},
+            {"role": "user", "content": "original request"},
+        ]
+        for index in range(tool_count):
+            identifier = f"call-{index}"
+            executor.messages.extend([
+                {"role": "assistant", "content": None, "tool_calls": [{
+                    "id": identifier, "type": "function",
+                    "function": {"name": "search", "arguments": "{}"},
+                }]},
+                {"role": "tool", "tool_call_id": identifier, "content": tool_text},
+            ])
+        executor.messages.append({"role": "assistant", "content": "远端完成结果"})
+        dispatcher = DsoftbusTaskDispatcher(
+            config=_config(), executor=executor, provider_runtime=object(),
+            provider_ready=True, state_root=tmp_path / "dsoftbus",
+        )
+        first, _ = await dispatcher.submit(
+            peer_device_id=PEER, peer_runtime_instance_id=RUNTIME,
+            call=_call(), subscribe=False,
+        )
+        final = await _wait_for_terminal(dispatcher, RUNTIME, first["id"])
+        assert final["status"]["state"] == "TASK_STATE_COMPLETED"
+        assert final["artifacts"][-1]["parts"][0]["text"] == "远端完成结果"
+        second, _ = await dispatcher.submit(
+            peer_device_id=PEER, peer_runtime_instance_id=RUNTIME,
+            call=_message_call("55200e16-2288-4396-a08f-a5ab86b8e6ae", "continue", context_id=first["contextId"]),
+            subscribe=False,
+        )
+        await _wait_for_terminal(dispatcher, RUNTIME, second["id"])
+        retained = executor.requests[1].history
+        assert retained[0]["content"] == "remote policy"
+        assert retained[1]["content"] == "original request"
+        assert retained[-1]["content"] == "远端完成结果"
+        assert len(retained) <= protocol.REMOTE_CONTEXT_MESSAGE_MAX
+        await dispatcher.drain(asyncio.get_running_loop().time() + 1)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("failure,stage", [
+    ("incomplete", "agent_completion"),
+    ("long_reply", "final_response_size"),
+    ("bad_history", "history_format"),
+    ("bad_result", "result_format"),
+])
+def test_completion_failure_persists_specific_safe_diagnostics(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, failure: str, stage: str,
+) -> None:
+    async def scenario() -> None:
+        class InvalidExecutor(_Executor):
+            async def execute(self, request):
+                value = dict(await super().execute(request))
+                if failure == "bad_result":
+                    return ["private-test-value"]
+                value["final_response"] = "private-test-value"
+                if failure == "incomplete":
+                    value["completed"] = False
+                elif failure == "long_reply":
+                    value["final_response"] *= 2000
+                elif failure == "bad_history":
+                    value["messages"] = "private-test-value"
+                return value
+
+        executor = InvalidExecutor()
+        executor.release.set()
+        dispatcher = DsoftbusTaskDispatcher(
+            config=_config(), executor=executor, provider_runtime=object(),
+            provider_ready=True, state_root=tmp_path / "dsoftbus",
+        )
+        task, subscription = await dispatcher.submit(
+            peer_device_id=PEER, peer_runtime_instance_id=RUNTIME,
+            call=_call(), subscribe=True,
+        )
+        assert subscription is not None
+        events = await _collect(subscription)
+        final = dispatcher.get_task(PEER, RUNTIME, task["id"])
+        assert final["status"]["state"] == "TASK_STATE_FAILED"
+        assert final["metadata"]["mclaw.failureReason"] == "INVALID_AGENT_RESPONSE"
+        details = final["metadata"]["mclaw.failureDetails"]
+        assert details["stage"] == stage
+        terminal = [event["statusUpdate"] for event in events if "statusUpdate" in event][-1]
+        assert terminal["metadata"]["mclaw.failureDetails"] == details
+        assert "private-test-value" not in caplog.text
+        assert stage in caplog.text and task["id"] in caplog.text
+        await dispatcher.drain(asyncio.get_running_loop().time() + 1)
+
+    asyncio.run(scenario())
+
+
 def test_task_response_cache_has_actual_bytes_ttl_and_hard_capacity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1254,8 +1355,10 @@ def test_new_peer_runtime_cancels_predecessor_tasks_but_same_runtime_does_not(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("large_tool_result", [False, True])
 def test_input_required_survives_restart_and_resumes_the_same_task(
     tmp_path: Path,
+    large_tool_result: bool,
 ) -> None:
     async def scenario() -> None:
         class AskingExecutor(_Executor):
@@ -1273,6 +1376,13 @@ def test_input_required_survives_restart_and_resumes_the_same_task(
                     },
                     "messages": [
                         {"role": "user", "content": request.text},
+                        *([
+                            {"role": "assistant", "content": None, "tool_calls": [{
+                                "id": "large-search", "type": "function",
+                                "function": {"name": "search", "arguments": "{}"},
+                            }]},
+                            {"role": "tool", "tool_call_id": "large-search", "content": "x" * 140_000},
+                        ] if large_tool_result else []),
                         {"role": "assistant", "content": "等待模块名称。"},
                     ],
                     "token_usage": {"input_tokens": 10, "output_tokens": 5},

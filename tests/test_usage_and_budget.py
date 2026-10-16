@@ -487,6 +487,8 @@ def test_turn_disabled_tool_names_filter_model_and_dispatch_without_mutating_age
     )
     agent = _runtime_agent(monkeypatch, context, transport)
     agent._tool_callback = lambda name, _args: callbacks.append(name)
+    events: list[dict] = []
+    agent._event_callback = events.append
     original_tools = [
         {"type": "function", "function": {"name": "ordinary_tool", "parameters": {}}},
         {"type": "function", "function": {"name": "delegate_task", "parameters": {}}},
@@ -523,6 +525,11 @@ def test_turn_disabled_tool_names_filter_model_and_dispatch_without_mutating_age
     assert json.loads(ordinary_result)["success"] is True
     assert executed == [{"value": 1}]
     assert callbacks == ["ordinary_tool"]
+    tool_events = [event for event in events if event["type"].startswith("tool.")]
+    assert [event["type"] for event in tool_events] == ["tool.started", "tool.finished"]
+    assert all(event["tool_call_id"] == "ordinary-call" for event in tool_events)
+    assert tool_events[0]["arguments"] == {"value": 1}
+    assert json.loads(tool_events[1]["result"])["success"] is True
     assert any(
         "[TURN TOOL FILTER] rejected_model_calls=['delegate_task']"
         in record.getMessage()
@@ -541,6 +548,33 @@ def test_turn_disabled_tool_names_filter_model_and_dispatch_without_mutating_age
     assert {
         tool["function"]["name"] for tool in transport.calls[2]["tools"]
     } == {"ordinary_tool", "delegate_task"}
+
+
+def test_tool_events_use_dispatch_timings_instead_of_batch_elapsed(monkeypatch) -> None:
+    context = _context()
+    tool_calls = [{"id": name, "type": "function", "function": {"name": "fixture_tool", "arguments": "{}"}}
+                  for name in ("slow", "fast")]
+    transport = _SequenceTransport(
+        ModelCallResult("", tool_calls, "tool_calls", None, None, False, context.provider, context.model),
+        ModelCallResult("done", [], "stop", None, None, False, context.provider, context.model),
+    )
+    agent = _runtime_agent(monkeypatch, context, transport)
+    agent.valid_tool_names = {"fixture_tool"}
+    agent.tools = [{"type": "function", "function": {"name": "fixture_tool", "parameters": {}}}]
+    events = []
+    agent._event_callback = events.append
+
+    def dispatch(**kwargs):
+        kwargs["timings"].update(slow=875, fast=125)
+        return ['{"success": true}'] * 2
+
+    monkeypatch.setattr("mclaw.tools.dispatch.handle_function_calls", dispatch)
+    try:
+        assert agent.run_conversation("test", advance_background_review=False)["completed"]
+        finished = [event for event in events if event["type"] == "tool.finished"]
+        assert {event["tool_call_id"]: event["elapsed_ms"] for event in finished} == {"slow": 875, "fast": 125}
+    finally:
+        agent.close()
 
 
 def test_configured_iteration_limit_returns_incomplete_stop_reason(monkeypatch) -> None:
